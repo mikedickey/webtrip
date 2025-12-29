@@ -10,22 +10,36 @@ crate-type = ["cdylib"]
 
 [dependencies]
 console_error_panic_hook = "0.1.7"
-console_log = "1"
 js-sys = "0.3.83"
 wasm-bindgen = "0.2.106"
 wasm-bindgen-futures = "0.4.56"
 web-sys = { version = "0.3.83", features = [
+  # AudioContext and worklet
   "AudioContext",
+  "AudioContextOptions",
   "AudioDestinationNode",
+  "AudioNode",
   "AudioWorklet",
   "AudioWorkletNode",
   "AudioWorkletNodeOptions",
+  "ChannelCountMode",
+  "MessagePort",
+  
+  # MediaDevices API
+  "MediaDeviceInfo",
+  "MediaDeviceKind",
+  "MediaDevices",
+  "MediaStream",
+  "MediaStreamAudioSourceNode",
+  "MediaStreamConstraints",
+  "MediaStreamTrack",
+  
+  # For dependent_module (worklet.js loading)
   "Blob",
   "BlobPropertyBag",
-  "Document",
-  "Event",
-  "HtmlInputElement",
-  "HtmlLabelElement",
   "Url",
+  
+  # Browser APIs
+  "Navigator",
   "Window",
 ] }

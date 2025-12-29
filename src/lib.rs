@@ -1,20 +1,20 @@
+mod audio_processor;
+mod audio_params;
 mod dependent_module;
-mod gui;
-mod oscillator;
-mod wasm_audio;
+mod audio_devices;
+mod audio_worklet;
+mod audio_engine;
 
-use gui::create_gui;
-use oscillator::{Oscillator, Params};
-use wasm_audio::wasm_audio;
+pub use audio_processor::AudioProcessor;
+pub use audio_params::AudioParams;
+pub use audio_devices::DeviceInfo;
+pub use audio_worklet::ProcessorHandle;
+pub use audio_engine::AudioEngine;
+
 use wasm_bindgen::prelude::*;
 
+/// Initialize the WASM module (call once at startup)
 #[wasm_bindgen]
-pub async fn web_main() {
-    // On the application level, audio worklet internals are abstracted by wasm_audio:
-    let params: &'static Params = Box::leak(Box::default());
-    let mut osc = Oscillator::new(params);
-    let ctx = wasm_audio(Box::new(move |buf| osc.process(buf)))
-        .await
-        .unwrap();
-    create_gui(params, ctx);
+pub fn init() {
+    console_error_panic_hook::set_once();
 }
