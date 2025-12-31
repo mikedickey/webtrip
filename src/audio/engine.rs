@@ -1,7 +1,9 @@
-use crate::audio_devices::{get_media_devices, stop_media_stream};
-use crate::audio_params::AudioParams;
-use crate::audio_processor::AudioProcessor;
-use crate::audio_worklet::{create_worklet_node, register_audio_worklet};
+use crate::audio::devices::{get_media_devices, stop_media_stream};
+use crate::audio::params::AudioParams;
+use crate::audio::processor::AudioProcessor;
+use crate::audio::worklet::{create_worklet_node, register_audio_worklet};
+use crate::audio::jitter_buffer::LockFreeJitterBuffer;
+use crate::audio::ring_buffer::RingBuffer;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
@@ -72,13 +74,27 @@ pub struct AudioEngine {
     source_node: Option<MediaStreamAudioSourceNode>,
     current_stream: Option<MediaStream>,
     params_ptr: *const AudioParams,
+    local_to_network_buffer_ptr: *mut RingBuffer,
+    network_to_local_buffer_ptr: *const LockFreeJitterBuffer,
 }
 
 #[wasm_bindgen]
 impl AudioEngine {
-    /// Create a new audio engine
+    /// Create a new audio engine (without network support)
     #[wasm_bindgen(js_name = create)]
     pub async fn create(params_ptr: *const AudioParams) -> Result<AudioEngine, JsValue> {
+        Self::create_with_network(params_ptr, std::ptr::null_mut(), std::ptr::null()).await
+    }
+
+    /// Create a new audio engine with network audio support
+    /// - local_to_network_buffer_ptr: ring buffer for sending local audio to network
+    /// - network_to_local_buffer_ptr: jitter buffer for receiving audio from network
+    #[wasm_bindgen(js_name = createWithNetwork)]
+    pub async fn create_with_network(
+        params_ptr: *const AudioParams,
+        local_to_network_buffer_ptr: *mut RingBuffer,
+        network_to_local_buffer_ptr: *const LockFreeJitterBuffer,
+    ) -> Result<AudioEngine, JsValue> {
         // Configure AudioContext with minimal latency
         let options = AudioContextOptions::new();
         options.set_latency_hint(&JsValue::from(0));
@@ -92,6 +108,8 @@ impl AudioEngine {
             source_node: None,
             current_stream: None,
             params_ptr,
+            local_to_network_buffer_ptr,
+            network_to_local_buffer_ptr,
         })
     }
 
@@ -99,6 +117,18 @@ impl AudioEngine {
     #[wasm_bindgen(js_name = getSampleRate)]
     pub fn get_sample_rate(&self) -> f32 {
         self.ctx.sample_rate()
+    }
+
+    /// Set the local-to-network ring buffer pointer
+    #[wasm_bindgen(js_name = setLocalToNetworkBuffer)]
+    pub fn set_local_to_network_buffer(&mut self, ptr: *mut RingBuffer) {
+        self.local_to_network_buffer_ptr = ptr;
+    }
+
+    /// Set the network-to-local jitter buffer pointer
+    #[wasm_bindgen(js_name = setNetworkToLocalBuffer)]
+    pub fn set_network_to_local_buffer(&mut self, ptr: *const LockFreeJitterBuffer) {
+        self.network_to_local_buffer_ptr = ptr;
     }
 
     /// Start audio capture from the specified input device
@@ -135,9 +165,16 @@ impl AudioEngine {
         // Create source node from the stream
         let source_node = self.ctx.create_media_stream_source(&stream)?;
 
-        // Create processor once and reuse it for all audio callbacks
+        // Create processor with network support
         let params = unsafe { &*self.params_ptr };
-        let mut processor = AudioProcessor::new(params);
+        let local_to_network_ptr = self.local_to_network_buffer_ptr;
+        let network_to_local_ptr = self.network_to_local_buffer_ptr;
+        
+        let mut processor = if local_to_network_ptr.is_null() && network_to_local_ptr.is_null() {
+            AudioProcessor::new(params)
+        } else {
+            AudioProcessor::with_network(params, local_to_network_ptr, network_to_local_ptr)
+        };
 
         let process = Box::new(move |input: &[f32], output: &mut [f32]| {
             processor.process(input, output)
@@ -187,5 +224,10 @@ impl AudioEngine {
         self.worklet_node = None;
         self.current_stream = None;
     }
-}
 
+    /// Check if audio is currently being captured
+    #[wasm_bindgen(js_name = isCapturing)]
+    pub fn is_capturing(&self) -> bool {
+        self.worklet_node.is_some()
+    }
+}

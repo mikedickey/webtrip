@@ -1,9 +1,10 @@
 [package]
-authors = ["The wasm-bindgen Developers"]
+authors = ["JackTrip Contributors"]
 edition = "2021"
-name = "wasm-audio-worklet"
+name = "jacktrip-web"
+description = "JackTrip audio streaming over WebRTC"
 publish = false
-version = "0.0.0"
+version = "0.1.0"
 
 [lib]
 crate-type = ["cdylib"]
@@ -42,4 +43,34 @@ web-sys = { version = "0.3.83", features = [
   # Browser APIs
   "Navigator",
   "Window",
+  
+  # WebRTC for JackTrip protocol
+  "RtcConfiguration",
+  "RtcDataChannel",
+  "RtcDataChannelEvent",
+  "RtcDataChannelInit",
+  "RtcDataChannelState",
+  "RtcDataChannelType",
+  "RtcIceCandidate",
+  "RtcIceCandidateInit",
+  "RtcIceConnectionState",
+  "RtcIceGatheringState",
+  "RtcPeerConnection",
+  "RtcPeerConnectionIceEvent",
+  "RtcSdpType",
+  "RtcSessionDescription",
+  "RtcSessionDescriptionInit",
+  "RtcSignalingState",
+  "RtcIceServer",
+  
+  # For binary data handling
+  "Crypto",
+  "MessageEvent",
+  
+  # WebSocket for signaling
+  "WebSocket",
+  "BinaryType",
+  
+  # RTC events
+  "RtcTrackEvent",
 ] }

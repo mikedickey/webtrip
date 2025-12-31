@@ -1,15 +1,26 @@
-mod audio_processor;
-mod audio_params;
-mod dependent_module;
-mod audio_devices;
-mod audio_worklet;
-mod audio_engine;
+// Audio subsystem (contains all audio-related modules)
+pub mod audio;
 
-pub use audio_processor::AudioProcessor;
-pub use audio_params::AudioParams;
-pub use audio_devices::DeviceInfo;
-pub use audio_worklet::ProcessorHandle;
-pub use audio_engine::AudioEngine;
+// Other core modules
+mod dependent_module;
+pub mod session;
+
+// Re-export all audio types for convenience
+pub use audio::{
+    // Core audio types
+    AudioProcessor, AudioParams, DeviceInfo, ProcessorHandle, AudioEngine,
+    // Buffer types
+    RingBuffer, LockFreeJitterBuffer, JitterBuffer, JitterBufferConfig, JitterBufferStats, BufferState,
+    // Protocol types
+    AudioFormat, AudioPacket, PacketHeader, StreamStats,
+    // Client types
+    AudioClient, JackTripConfig, ClientState,
+    // Transport types
+    ConnectionState, TransportConfig, WebRtcTransport, WebSocketSignaling,
+};
+
+// Re-export session types
+pub use session::{JackTripSession, SessionState, SessionStats};
 
 use wasm_bindgen::prelude::*;
 
