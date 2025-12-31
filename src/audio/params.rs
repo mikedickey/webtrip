@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use wasm_bindgen::prelude::*;
 
 /// Minimum dB level (silence threshold)
@@ -26,6 +26,10 @@ pub struct AudioParams {
     pub(crate) auto_gain_control: AtomicBool,
     pub(crate) echo_cancellation: AtomicBool,
     pub(crate) noise_suppression: AtomicBool,
+    /// Total number of audio callbacks (process() calls)
+    pub(crate) callback_count: AtomicU64,
+    /// Number of output channels (1=mono, 2=stereo)
+    pub(crate) output_channels: AtomicU32,
 }
 
 impl Default for AudioParams {
@@ -40,7 +44,21 @@ impl Default for AudioParams {
             auto_gain_control: AtomicBool::new(false),
             echo_cancellation: AtomicBool::new(false),
             noise_suppression: AtomicBool::new(false),
+            callback_count: AtomicU64::new(0),
+            output_channels: AtomicU32::new(2), // Default to stereo
         }
+    }
+}
+
+impl AudioParams {
+    /// Set output channels (1=mono, 2=stereo)
+    pub fn set_output_channels(&self, channels: u32) {
+        self.output_channels.store(channels.clamp(1, 8), Ordering::Relaxed);
+    }
+
+    /// Get output channels
+    pub fn get_output_channels(&self) -> u32 {
+        self.output_channels.load(Ordering::Relaxed)
     }
 }
 
@@ -123,6 +141,12 @@ impl AudioParams {
     #[wasm_bindgen(js_name = getNoiseSuppression)]
     pub fn get_noise_suppression(&self) -> bool {
         self.noise_suppression.load(Ordering::Relaxed)
+    }
+
+    /// Get the total number of audio callbacks (process() calls)
+    #[wasm_bindgen(js_name = getCallbackCount)]
+    pub fn get_callback_count(&self) -> u64 {
+        self.callback_count.load(Ordering::Relaxed)
     }
 
     /// Set input gain in dB (-20.0 to +20.0)
@@ -248,5 +272,14 @@ pub fn get_output_volume_from_ptr(ptr: *const AudioParams) -> f32 {
         return 1.0;
     }
     unsafe { (*ptr).get_output_volume() }
+}
+
+/// Get callback count from params pointer
+#[wasm_bindgen(js_name = getCallbackCountFromPtr)]
+pub fn get_callback_count_from_ptr(ptr: *const AudioParams) -> u64 {
+    if ptr.is_null() {
+        return 0;
+    }
+    unsafe { (*ptr).get_callback_count() }
 }
 

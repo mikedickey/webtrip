@@ -24,18 +24,7 @@ const SLOT_WRITING: u32 = 1;
 const SLOT_READY: u32 = 2;
 const SLOT_READING: u32 = 3;
 
-/// Jitter buffer state
-#[wasm_bindgen]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum BufferState {
-    /// Collecting packets before playback starts
-    Buffering = 0,
-    /// Normal playback
-    Playing = 1,
-    /// Buffer underrun, waiting for more data
-    Underrun = 2,
-}
+// BufferState removed - no longer needed since we always output audio (zeros if no packets)
 
 /// A single packet slot in the buffer
 struct PacketSlot {
@@ -82,6 +71,8 @@ pub struct JitterBufferStats {
     pub packets_late: u64,
     pub underruns: u64,
     pub current_depth: u32,
+    pub target_depth: u32,
+    pub is_buffering: bool,
 }
 
 #[wasm_bindgen]
@@ -91,6 +82,12 @@ impl JitterBufferStats {
         Self::default()
     }
 }
+
+/// Default initial target depth
+const DEFAULT_TARGET_DEPTH: u32 = 1;
+
+/// Maximum target depth (don't grow beyond this)
+const MAX_TARGET_DEPTH: u32 = 16;
 
 /// Lock-free jitter buffer for network audio
 /// 
@@ -108,13 +105,8 @@ pub struct LockFreeJitterBuffer {
     /// Highest sequence number received
     write_sequence: AtomicU64,
     
-    /// Current buffer state
-    state: AtomicU32,
-    
-    /// Target buffer depth before playback starts (in packets)
+    /// Current target buffer depth (grows on underrun)
     target_depth: AtomicU32,
-    /// Minimum depth before playback (in packets)
-    min_depth: AtomicU32,
     
     /// Samples per packet (configurable)
     samples_per_packet: AtomicU32,
@@ -129,6 +121,10 @@ pub struct LockFreeJitterBuffer {
     /// Whether the buffer has been initialized with first packet
     initialized: AtomicU32,
     
+    /// Whether we're in buffering mode (waiting to reach target depth)
+    /// 0 = playing, 1 = buffering
+    buffering: AtomicU32,
+    
     /// Previous samples for packet loss concealment
     prev_samples: [AtomicI32; MAX_SAMPLES_PER_PACKET],
 }
@@ -140,9 +136,7 @@ impl LockFreeJitterBuffer {
             slots: std::array::from_fn(|_| PacketSlot::new()),
             read_sequence: AtomicU64::new(0),
             write_sequence: AtomicU64::new(0),
-            state: AtomicU32::new(BufferState::Buffering as u32),
-            target_depth: AtomicU32::new(4),
-            min_depth: AtomicU32::new(2),
+            target_depth: AtomicU32::new(DEFAULT_TARGET_DEPTH),
             samples_per_packet: AtomicU32::new(DEFAULT_SAMPLES_PER_PACKET as u32),
             packets_received: AtomicU64::new(0),
             packets_played: AtomicU64::new(0),
@@ -150,6 +144,7 @@ impl LockFreeJitterBuffer {
             packets_late: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
             initialized: AtomicU32::new(0),
+            buffering: AtomicU32::new(1), // Start in buffering mode
             prev_samples: std::array::from_fn(|_| AtomicI32::new(0)),
         };
         
@@ -162,10 +157,19 @@ impl LockFreeJitterBuffer {
     }
 
     /// Configure the buffer parameters
-    pub fn configure(&self, samples_per_packet: u32, target_depth: u32, min_depth: u32) {
+    pub fn configure(&self, samples_per_packet: u32, _target_depth: u32) {
         self.samples_per_packet.store(samples_per_packet.min(MAX_SAMPLES_PER_PACKET as u32), Ordering::SeqCst);
-        self.target_depth.store(target_depth.min(MAX_PACKETS as u32 / 2), Ordering::SeqCst);
-        self.min_depth.store(min_depth.min(target_depth), Ordering::SeqCst);
+        // Note: target_depth is now managed adaptively, starting at DEFAULT_TARGET_DEPTH
+    }
+    
+    /// Check if we're in buffering mode
+    pub fn is_buffering(&self) -> bool {
+        self.buffering.load(Ordering::Acquire) != 0
+    }
+    
+    /// Get current target depth
+    pub fn target_depth(&self) -> u32 {
+        self.target_depth.load(Ordering::Relaxed)
     }
 
     /// Get current buffer depth (packets available)
@@ -179,15 +183,6 @@ impl LockFreeJitterBuffer {
         }
     }
 
-    /// Get current buffer state
-    pub fn state(&self) -> BufferState {
-        match self.state.load(Ordering::Acquire) {
-            0 => BufferState::Buffering,
-            1 => BufferState::Playing,
-            _ => BufferState::Underrun,
-        }
-    }
-
     /// Get statistics
     pub fn stats(&self) -> JitterBufferStats {
         JitterBufferStats {
@@ -197,6 +192,8 @@ impl LockFreeJitterBuffer {
             packets_late: self.packets_late.load(Ordering::Relaxed),
             underruns: self.underruns.load(Ordering::Relaxed),
             current_depth: self.depth(),
+            target_depth: self.target_depth.load(Ordering::Relaxed),
+            is_buffering: self.buffering.load(Ordering::Relaxed) != 0,
         }
     }
 
@@ -281,16 +278,6 @@ impl LockFreeJitterBuffer {
 
         self.packets_received.fetch_add(1, Ordering::Relaxed);
 
-        // State transition: Buffering/Underrun -> Playing
-        let current_state = self.state.load(Ordering::Acquire);
-        if current_state != BufferState::Playing as u32 {
-            let depth = self.depth();
-            let min = self.min_depth.load(Ordering::Relaxed);
-            if depth >= min {
-                self.state.store(BufferState::Playing as u32, Ordering::Release);
-            }
-        }
-
         true
     }
 
@@ -300,12 +287,20 @@ impl LockFreeJitterBuffer {
     pub fn pop(&self, output: &mut [f32]) -> bool {
         let samples_per_packet = self.samples_per_packet.load(Ordering::Relaxed) as usize;
         let output_len = output.len().min(samples_per_packet);
+        let target = self.target_depth.load(Ordering::Relaxed);
+        let current_depth = self.depth();
 
-        // Check buffer state
-        let current_state = self.state.load(Ordering::Acquire);
-        if current_state == BufferState::Buffering as u32 {
-            output[..output_len].fill(0.0);
-            return false;
+        // Check if we're in buffering mode
+        if self.buffering.load(Ordering::Acquire) != 0 {
+            // Still buffering - check if we've reached target depth
+            if current_depth >= target {
+                // We have enough packets, exit buffering mode
+                self.buffering.store(0, Ordering::Release);
+            } else {
+                // Still buffering - output silence
+                output[..output_len].fill(0.0);
+                return false;
+            }
         }
 
         let read_seq = self.read_sequence.load(Ordering::Acquire);
@@ -346,33 +341,34 @@ impl LockFreeJitterBuffer {
                 self.read_sequence.fetch_add(1, Ordering::AcqRel);
                 self.packets_played.fetch_add(1, Ordering::Relaxed);
 
-                // Check for underrun
-                if self.depth() == 0 {
-                    self.state.store(BufferState::Underrun as u32, Ordering::Release);
-                    self.underruns.fetch_add(1, Ordering::Relaxed);
-                }
-
                 return true;
             }
         }
 
-        // Packet missing or slot busy - use concealment
+        // Packet missing or slot busy - this is an underrun
+        self.underruns.fetch_add(1, Ordering::Relaxed);
         self.packets_lost.fetch_add(1, Ordering::Relaxed);
         
-        // Fade out previous samples for concealment
-        for i in 0..output_len {
-            let prev = Self::i32_to_f32(self.prev_samples[i].load(Ordering::Relaxed));
-            let fade = 1.0 - (i as f32 / output_len as f32) * 0.5;
-            output[i] = prev * fade;
-        }
-
-        // Advance read sequence even for missing packet
+        // Advance read sequence to skip the missing packet
         self.read_sequence.fetch_add(1, Ordering::AcqRel);
-
-        // Check for underrun
-        if self.depth() == 0 {
-            self.state.store(BufferState::Underrun as u32, Ordering::Release);
-            self.underruns.fetch_add(1, Ordering::Relaxed);
+        
+        // Only enter buffering mode if we can still increase target depth
+        // If already at max, just use concealment to avoid lockup
+        if target < MAX_TARGET_DEPTH {
+            let new_target = target + 1;
+            self.target_depth.store(new_target, Ordering::Relaxed);
+            self.buffering.store(1, Ordering::Release);
+            
+            // Output silence (we're now in buffering mode)
+            output[..output_len].fill(0.0);
+        } else {
+            // At max depth - use concealment instead of buffering to avoid lockup
+            // Fade out previous samples
+            for i in 0..output_len {
+                let prev = Self::i32_to_f32(self.prev_samples[i].load(Ordering::Relaxed));
+                let fade = 1.0 - (i as f32 / output_len as f32) * 0.5;
+                output[i] = prev * fade;
+            }
         }
 
         false
@@ -385,17 +381,13 @@ impl LockFreeJitterBuffer {
         }
         self.read_sequence.store(0, Ordering::SeqCst);
         self.write_sequence.store(0, Ordering::SeqCst);
-        self.state.store(BufferState::Buffering as u32, Ordering::SeqCst);
         self.initialized.store(0, Ordering::SeqCst);
+        self.target_depth.store(DEFAULT_TARGET_DEPTH, Ordering::SeqCst);
+        self.buffering.store(1, Ordering::SeqCst); // Start in buffering mode
         
         for sample in &self.prev_samples {
             sample.store(0, Ordering::Relaxed);
         }
-    }
-
-    /// Check if buffer is ready for playback
-    pub fn is_playing(&self) -> bool {
-        self.state.load(Ordering::Acquire) == BufferState::Playing as u32
     }
 
     /// Get current latency in milliseconds (approximate)
@@ -413,8 +405,6 @@ impl Default for LockFreeJitterBuffer {
     }
 }
 
-// Keep the old types for compatibility during transition
-pub use BufferState as OldBufferState;
 
 /// Legacy buffer config (for compatibility)
 #[derive(Debug, Clone, Copy)]

@@ -38,7 +38,7 @@ impl JackTripConfig {
     pub fn low_latency() -> Self {
         Self {
             sample_rate: 48000,
-            channels: 1,
+            channels: 2,
             buffer_size: 64,
             jitter_buffer_ms: 10.0,
             is_initiator: false,
@@ -49,7 +49,7 @@ impl JackTripConfig {
     pub fn stable() -> Self {
         Self {
             sample_rate: 48000,
-            channels: 1,
+            channels: 2,
             buffer_size: 128,
             jitter_buffer_ms: 40.0,
             is_initiator: false,
@@ -81,7 +81,7 @@ impl Default for JackTripConfig {
     fn default() -> Self {
         Self {
             sample_rate: 48000,
-            channels: 1,
+            channels: 2,
             buffer_size: 128,
             jitter_buffer_ms: 20.0,
             is_initiator: false,
@@ -97,10 +97,8 @@ pub enum ClientState {
     Idle,
     /// Establishing WebRTC connection
     Connecting,
-    /// Connected, buffering audio
-    Buffering,
-    /// Fully operational, streaming audio
-    Streaming,
+    /// Connected and transmitting audio
+    Connected,
     /// Connection error
     Error,
     /// Disconnected
@@ -139,14 +137,16 @@ pub struct AudioClient {
     config: JackTripConfig,
     transport: WebRtcTransport,
     state: ClientState,
-    /// Current sequence number for outgoing packets
-    sequence_number: u64,
+    /// Current sequence number for outgoing packets (u16, wraps at 65535)
+    sequence_number: u16,
     /// Current timestamp (in samples)
     timestamp: u64,
     /// Stream statistics
     stats: StreamStats,
     /// JavaScript callbacks
     js_on_state_change: Option<js_sys::Function>,
+    /// Track if we've received the first packet (for debugging)
+    first_packet_received: bool,
 }
 
 #[wasm_bindgen]
@@ -163,34 +163,25 @@ impl AudioClient {
             config,
             transport,
             state: ClientState::Idle,
-            sequence_number: 0,
-            timestamp: 0,
+            sequence_number: 0u16,
+            timestamp: 0u64,
             stats: StreamStats::new(),
             js_on_state_change: None,
+            first_packet_received: false,
         })
     }
 
-    /// Set callback for signaling messages
-    /// callback(type: string, payload: string)
-    pub fn set_on_signaling(&mut self, callback: js_sys::Function) {
-        self.transport.set_on_signaling(callback);
+    /// Set callback for ICE candidates
+    /// callback(candidate: string, sdpMid: string, sdpMLineIndex: number)
+    pub fn set_on_ice_candidate(&mut self, callback: js_sys::Function) {
+        self.transport.set_on_ice_candidate(callback);
     }
 
     /// Set callback for state changes
     /// callback(state: string)
     pub fn set_on_state_change(&mut self, callback: js_sys::Function) {
         self.js_on_state_change = Some(callback.clone());
-        
-        // Also update transport state callback
-        let state_callback = callback.clone();
-        let transport_callback = Closure::wrap(Box::new(move |state: JsValue| {
-            let _ = state_callback.call1(&JsValue::NULL, &state);
-        }) as Box<dyn FnMut(_)>);
-        
-        self.transport.set_on_state_change(
-            transport_callback.as_ref().unchecked_ref::<js_sys::Function>().clone()
-        );
-        transport_callback.forget();
+        self.transport.set_on_state_change(callback);
     }
 
     /// Get current client state
@@ -214,7 +205,7 @@ impl AudioClient {
             sample_rate: self.config.sample_rate,
             channels: self.config.channels,
             buffer_size: self.config.buffer_size,
-            bit_depth: 32,
+            bit_depth: 16,
         }
     }
 
@@ -226,18 +217,10 @@ impl AudioClient {
         Ok(offer)
     }
 
-    /// Handle an incoming offer from a remote peer
-    /// Returns the SDP answer to send back
-    pub async fn handle_offer(&mut self, offer_sdp: &str) -> Result<String, JsValue> {
-        self.set_state(ClientState::Connecting);
-        let answer = self.transport.handle_offer(offer_sdp).await?;
-        Ok(answer)
-    }
-
     /// Handle an incoming answer from the remote peer
     pub async fn handle_answer(&mut self, answer_sdp: &str) -> Result<(), JsValue> {
         self.transport.handle_answer(answer_sdp).await?;
-        self.set_state(ClientState::Buffering);
+        self.set_state(ClientState::Connected);
         Ok(())
     }
 
@@ -263,8 +246,8 @@ impl AudioClient {
         // Send
         self.transport.send_packet(&packet)?;
 
-        // Update counters
-        self.sequence_number += 1;
+        // Update counters (sequence wraps at u16::MAX)
+        self.sequence_number = self.sequence_number.wrapping_add(1);
         self.timestamp += samples.len() as u64 / self.config.channels as u64;
         self.stats.packets_sent += 1;
 
@@ -279,13 +262,45 @@ impl AudioClient {
     pub fn receive_audio(&mut self) -> Result<Vec<f32>, JsValue> {
         // Try to get a packet from the transport
         if let Ok(Some(packet)) = self.transport.receive_packet() {
-            self.stats.packets_received += 1;
-            
-            // Update state if we're still buffering
-            if self.state == ClientState::Buffering {
-                self.set_state(ClientState::Streaming);
+            // Log header information from the first packet
+            if !self.first_packet_received {
+                self.first_packet_received = true;
+                web_sys::console::log_1(&JsValue::from_str("🎵 First audio packet received!"));
+                web_sys::console::log_1(&JsValue::from_str(&format!(
+                    "  Sequence Number: {}",
+                    packet.header.sequence_number
+                )));
+                web_sys::console::log_1(&JsValue::from_str(&format!(
+                    "  Timestamp: {}",
+                    packet.header.timestamp
+                )));
+                web_sys::console::log_1(&JsValue::from_str(&format!(
+                    "  Buffer Size: {} samples",
+                    packet.header.buffer_size
+                )));
+                web_sys::console::log_1(&JsValue::from_str(&format!(
+                    "  Sample Rate: {} Hz",
+                    packet.header.sample_rate_hz()
+                )));
+                web_sys::console::log_1(&JsValue::from_str(&format!(
+                    "  Bit Depth: {} bits",
+                    packet.header.bit_depth
+                )));
+                web_sys::console::log_1(&JsValue::from_str(&format!(
+                    "  Incoming Channels: {}",
+                    packet.header.num_incoming_channels
+                )));
+                web_sys::console::log_1(&JsValue::from_str(&format!(
+                    "  Outgoing Channels: {}",
+                    packet.header.num_outgoing_channels
+                )));
+                web_sys::console::log_1(&JsValue::from_str(&format!(
+                    "  Samples in packet: {}",
+                    packet.samples.len()
+                )));
             }
             
+            self.stats.packets_received += 1;
             return Ok(packet.samples);
         }
         
@@ -293,18 +308,6 @@ impl AudioClient {
         Ok(Vec::new())
     }
 
-    /// Send a heartbeat packet (keeps connection alive)
-    pub fn send_heartbeat(&mut self) -> Result<(), JsValue> {
-        if !self.transport.is_connected() {
-            return Ok(());
-        }
-
-        let packet = AudioPacket::heartbeat(self.sequence_number);
-        self.transport.send_packet(&packet)?;
-        self.sequence_number += 1;
-        
-        Ok(())
-    }
 
     /// Disconnect and clean up
     pub fn disconnect(&mut self) {
@@ -312,14 +315,9 @@ impl AudioClient {
         self.set_state(ClientState::Disconnected);
     }
 
-    /// Check if client is ready to send/receive audio
-    pub fn is_streaming(&self) -> bool {
-        self.state == ClientState::Streaming
-    }
-
-    /// Check if connected (but possibly still buffering)
+    /// Check if connected
     pub fn is_connected(&self) -> bool {
-        matches!(self.state, ClientState::Buffering | ClientState::Streaming)
+        self.state == ClientState::Connected
     }
 
     /// Reset statistics
@@ -341,8 +339,7 @@ impl AudioClient {
             let state_str = match self.state {
                 ClientState::Idle => "idle",
                 ClientState::Connecting => "connecting",
-                ClientState::Buffering => "buffering",
-                ClientState::Streaming => "streaming",
+                ClientState::Connected => "connected",
                 ClientState::Error => "error",
                 ClientState::Disconnected => "disconnected",
             };
@@ -375,21 +372,21 @@ pub fn recommended_config(network_quality: &str) -> JackTripConfig {
     match network_quality {
         "excellent" => JackTripConfig {
             sample_rate: 48000,
-            channels: 1,
+            channels: 2,
             buffer_size: 64,
             jitter_buffer_ms: 10.0,
             is_initiator: false,
         },
         "good" => JackTripConfig {
             sample_rate: 48000,
-            channels: 1,
+            channels: 2,
             buffer_size: 128,
             jitter_buffer_ms: 20.0,
             is_initiator: false,
         },
         "fair" => JackTripConfig {
             sample_rate: 48000,
-            channels: 1,
+            channels: 2,
             buffer_size: 256,
             jitter_buffer_ms: 40.0,
             is_initiator: false,

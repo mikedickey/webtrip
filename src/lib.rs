@@ -18,13 +18,15 @@ pub use audio::{
     // Core audio types
     AudioProcessor, AudioParams, DeviceInfo, ProcessorHandle, AudioEngine,
     // Buffer types
-    RingBuffer, LockFreeJitterBuffer, JitterBuffer, JitterBufferConfig, JitterBufferStats, BufferState,
+    RingBuffer, LockFreeJitterBuffer, JitterBuffer, JitterBufferConfig, JitterBufferStats,
     // Protocol types
     AudioFormat, AudioPacket, PacketHeader, StreamStats,
     // Client types
     AudioClient, JackTripConfig, ClientState,
     // Transport types
-    ConnectionState, TransportConfig, WebRtcTransport, WebSocketSignaling,
+    ConnectionState, TransportConfig, WebRtcTransport,
+    // Signaling types
+    HubSignaling, HubConnectionState, SignalingMessage,
 };
 
 // Re-export session types

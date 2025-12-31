@@ -13,6 +13,7 @@ import init, {
   setInputGainFromPtr,
   setOutputVolumeFromPtr,
   setMonitorVolumeFromPtr,
+  getCallbackCountFromPtr,
   DeviceInfo,
   getAudioDevices,
   JackTripSession,
@@ -23,15 +24,36 @@ interface AudioDevices {
   outputDevices: DeviceInfo[];
 }
 
-type SessionState = "idle" | "local" | "connecting" | "buffering" | "streaming" | "error";
+type SessionState =
+  | "idle"
+  | "connecting"
+  | "negotiating"
+  | "connected"
+  | "error";
 
 class JackTripApp {
   private paramsPtr: number = 0;
   private session: JackTripSession | null = null;
-  private isCapturing = false;
   private animationFrameId: number | null = null;
   private statsIntervalId: number | null = null;
   private sessionState: SessionState = "idle";
+  
+  // Callback rate tracking
+  private lastCallbackCount: bigint = 0n;
+  private lastCallbackTime: number = 0;
+  private callbackRate: number = 0;
+  
+  // Ring buffer rate tracking
+  private lastRingWrites: bigint = 0n;
+  private lastRingSamples: bigint = 0n;
+  private ringWriteRate: number = 0;
+  private avgSamplesPerWrite: number = 0;
+  
+  // Packet rate tracking
+  private lastPacketsSent: bigint = 0n;
+  private lastPacketsReceived: bigint = 0n;
+  private packetSendRate: number = 0;
+  private packetReceiveRate: number = 0;
 
   // UI Elements
   private inputSelect!: HTMLSelectElement;
@@ -45,9 +67,11 @@ class JackTripApp {
   private outputVolumeValue!: HTMLSpanElement;
   private monitorVolumeSlider!: HTMLInputElement;
   private monitorVolumeValue!: HTMLSpanElement;
-  private startButton!: HTMLButtonElement;
   private connectionStatus!: HTMLDivElement;
-  private sdpTextarea!: HTMLTextAreaElement;
+  private serverHostInput!: HTMLInputElement;
+  private serverPortInput!: HTMLInputElement;
+  private connectButton!: HTMLButtonElement;
+  private disconnectButton!: HTMLButtonElement;
   private statsDisplay!: HTMLDivElement;
   private toggleButtons: Map<string, HTMLButtonElement> = new Map();
 
@@ -68,7 +92,10 @@ class JackTripApp {
       this.createUI(devices.inputDevices, devices.outputDevices);
       this.startVolumeAnimation();
     } catch (error) {
-      this.showError("Microphone Access Required", "Please allow microphone access and refresh the page.");
+      this.showError(
+        "Microphone Access Required",
+        "Please allow microphone access and refresh the page."
+      );
       throw error;
     }
   }
@@ -81,20 +108,14 @@ class JackTripApp {
       console.log("Session state:", state);
       this.updateConnectionStatus(state as SessionState);
     });
-
-    // Signaling callback (SDP/ICE)
-    this.session.set_on_signaling((type: string, payload: string) => {
-      console.log(`Signaling [${type}]:`, payload.substring(0, 100) + "...");
-      if (type === "offer" || type === "answer") {
-        this.sdpTextarea.value = payload;
-        this.sdpTextarea.select();
-      }
-    });
   }
 
   // ==================== UI Creation ====================
 
-  private createUI(inputDevices: DeviceInfo[], outputDevices: DeviceInfo[]): void {
+  private createUI(
+    inputDevices: DeviceInfo[],
+    outputDevices: DeviceInfo[]
+  ): void {
     const app = document.getElementById("app")!;
     app.innerHTML = "";
 
@@ -132,45 +153,77 @@ class JackTripApp {
 
   private createConnectionSection(card: HTMLElement): void {
     const header = this.createElement("div", "section-header");
-    header.textContent = "Peer Connection";
+    header.textContent = "Studio Connection";
     card.appendChild(header);
 
     // Connection status
-    this.connectionStatus = this.createElement("div", "connection-status") as HTMLDivElement;
-    this.connectionStatus.innerHTML = '<span class="status-dot"></span><span class="status-text">Not Connected</span>';
+    this.connectionStatus = this.createElement(
+      "div",
+      "connection-status"
+    ) as HTMLDivElement;
+    this.connectionStatus.innerHTML =
+      '<span class="status-dot"></span><span class="status-text">Not Connected</span>';
     card.appendChild(this.connectionStatus);
 
     // Stats display
-    this.statsDisplay = this.createElement("div", "stats-display") as HTMLDivElement;
+    this.statsDisplay = this.createElement(
+      "div",
+      "stats-display"
+    ) as HTMLDivElement;
     this.statsDisplay.style.display = "none";
     card.appendChild(this.statsDisplay);
 
-    // SDP Exchange area
-    const sdpGroup = this.createElement("div", "control-group");
-    const sdpLabel = this.createElement("label", "label");
-    sdpLabel.textContent = "Session Description (SDP)";
-    this.sdpTextarea = document.createElement("textarea");
-    this.sdpTextarea.className = "sdp-textarea";
-    this.sdpTextarea.placeholder = "Paste remote SDP here, or click 'Create Offer' to generate one...";
-    this.sdpTextarea.rows = 3;
-    sdpGroup.appendChild(sdpLabel);
-    sdpGroup.appendChild(this.sdpTextarea);
-    card.appendChild(sdpGroup);
+    // Server host input
+    const hostGroup = this.createElement("div", "control-group");
+    const hostLabel = this.createElement("label", "label");
+    hostLabel.textContent = "Server Host";
+    this.serverHostInput = document.createElement("input");
+    this.serverHostInput.type = "text";
+    this.serverHostInput.className = "text-input";
+    this.serverHostInput.placeholder = "studio.jacktrip.org";
+    this.serverHostInput.value = "localhost";
+    hostGroup.appendChild(hostLabel);
+    hostGroup.appendChild(this.serverHostInput);
+    card.appendChild(hostGroup);
+
+    // Server port input
+    const portGroup = this.createElement("div", "control-group inline");
+    const portLabel = this.createElement("label", "label");
+    portLabel.textContent = "Port";
+    this.serverPortInput = document.createElement("input");
+    this.serverPortInput.type = "number";
+    this.serverPortInput.className = "text-input port-input";
+    this.serverPortInput.placeholder = "4464";
+    this.serverPortInput.value = "4464";
+    portGroup.appendChild(portLabel);
+    portGroup.appendChild(this.serverPortInput);
+    card.appendChild(portGroup);
 
     // Connection buttons
     const buttons = this.createElement("div", "connection-buttons");
 
-    const createOfferBtn = this.createButton("Create Offer", "action-btn", () => this.handleCreateOffer());
-    const acceptOfferBtn = this.createButton("Accept Offer", "action-btn secondary", () => this.handleAcceptOffer());
-    const acceptAnswerBtn = this.createButton("Accept Answer", "action-btn secondary", () => this.handleAcceptAnswer());
+    this.connectButton = this.createButton(
+      "Connect to Studio",
+      "action-btn primary",
+      () => this.handleConnect()
+    );
+    this.disconnectButton = this.createButton(
+      "Disconnect",
+      "action-btn secondary",
+      () => this.handleDisconnect()
+    );
+    this.disconnectButton.disabled = true;
 
-    buttons.appendChild(createOfferBtn);
-    buttons.appendChild(acceptOfferBtn);
-    buttons.appendChild(acceptAnswerBtn);
+    buttons.appendChild(this.connectButton);
+    buttons.appendChild(this.disconnectButton);
     card.appendChild(buttons);
   }
 
-  private createDeviceSection(card: HTMLElement, inputDevices: DeviceInfo[], outputDevices: DeviceInfo[]): void {
+  private createDeviceSection(
+    card: HTMLElement,
+    inputDevices: DeviceInfo[],
+    outputDevices: DeviceInfo[]
+  ): void {
     const header = this.createElement("div", "section-header");
     header.textContent = "Audio Devices";
     card.appendChild(header);
@@ -208,11 +261,24 @@ class JackTripApp {
       { id: "agc", line1: "AGC", line2: "Auto Gain" },
       { id: "echo", line1: "Echo", line2: "Cancellation" },
       { id: "noise", line1: "Noise", line2: "Suppression" },
+      { id: "stereo", line1: "Stereo", line2: "2 Channels" },
     ];
 
     for (const config of toggles) {
       const button = this.createToggleButton(config.line1, config.line2);
-      button.addEventListener("click", () => button.classList.toggle("active"));
+      
+      if (config.id === "stereo") {
+        // Stereo is active by default (session defaults to 2 channels)
+        button.classList.add("active");
+        button.addEventListener("click", () => {
+          button.classList.toggle("active");
+          const isStereo = button.classList.contains("active");
+          this.handleChannelToggle(button, isStereo);
+        });
+      } else {
+        button.addEventListener("click", () => button.classList.toggle("active"));
+      }
+      
       this.toggleButtons.set(config.id, button);
       container.appendChild(button);
     }
@@ -228,31 +294,53 @@ class JackTripApp {
     const container = this.createElement("div", "sliders-container");
 
     // Input Gain
-    const inputGain = this.createSlider("Input Gain", "-20", "+20", "0", "dB", (value) => {
-      setInputGainFromPtr(this.paramsPtr, value);
-      const sign = value >= 0 ? "+" : "";
-      this.inputGainValue.textContent = `${sign}${value.toFixed(1)} dB`;
-    });
+    const inputGain = this.createSlider(
+      "Input Gain",
+      "-20",
+      "20",
+      "0",
+      "dB",
+      (value) => {
+        setInputGainFromPtr(this.paramsPtr, value);
+        const sign = value >= 0 ? "+" : "";
+        this.inputGainValue.textContent = `${sign}${value.toFixed(1)} dB`;
+      }
+    );
     this.inputGainSlider = inputGain.slider;
     this.inputGainValue = inputGain.valueDisplay;
     this.inputGainValue.textContent = "0 dB";
     container.appendChild(inputGain.group);
 
     // Output Volume
-    const outputVol = this.createSlider("Output Volume", "0", "100", "100", "%", (value) => {
-      setOutputVolumeFromPtr(this.paramsPtr, value / 100);
-      this.outputVolumeValue.textContent = `${Math.round(value)}%`;
-    });
+    const outputVol = this.createSlider(
+      "Output Volume",
+      "0",
+      "100",
+      "100",
+      "%",
+      (value) => {
+        setOutputVolumeFromPtr(this.paramsPtr, value / 100);
+        this.outputVolumeValue.textContent = `${Math.round(value)}%`;
+      }
+    );
     this.outputVolumeSlider = outputVol.slider;
     this.outputVolumeValue = outputVol.valueDisplay;
     this.outputVolumeValue.textContent = "100%";
     container.appendChild(outputVol.group);
 
     // Monitor Volume
-    const monitorVol = this.createSlider("Monitor", "0", "100", "0", "%", (value) => {
-      setMonitorVolumeFromPtr(this.paramsPtr, value / 100);
-      this.monitorVolumeValue.textContent = value === 0 ? "Off" : `${Math.round(value)}%`;
-    });
+    const monitorVol = this.createSlider(
+      "Monitor",
+      "0",
+      "100",
+      "0",
+      "%",
+      (value) => {
+        setMonitorVolumeFromPtr(this.paramsPtr, value / 100);
+        this.monitorVolumeValue.textContent =
+          value === 0 ? "Off" : `${Math.round(value)}%`;
+      }
+    );
     this.monitorVolumeSlider = monitorVol.slider;
     this.monitorVolumeValue = monitorVol.valueDisplay;
     this.monitorVolumeValue.textContent = "Off";
@@ -269,8 +357,12 @@ class JackTripApp {
     label.textContent = "Level";
     header.appendChild(label);
 
-    this.peakDbDisplay = this.createElement("div", "peak-db-display") as HTMLDivElement;
-    this.peakDbDisplay.innerHTML = '<span class="peak-label">PEAK</span><span class="peak-value">-∞</span>';
+    this.peakDbDisplay = this.createElement(
+      "div",
+      "peak-db-display"
+    ) as HTMLDivElement;
+    this.peakDbDisplay.innerHTML =
+      '<span class="peak-label">PEAK</span><span class="peak-value">-∞</span>';
     header.appendChild(this.peakDbDisplay);
     group.appendChild(header);
 
@@ -300,7 +392,10 @@ class JackTripApp {
     this.meterFill = this.createElement("div", "meter-fill") as HTMLDivElement;
     container.appendChild(this.meterFill);
 
-    this.peakIndicator = this.createElement("div", "peak-indicator") as HTMLDivElement;
+    this.peakIndicator = this.createElement(
+      "div",
+      "peak-indicator"
+    ) as HTMLDivElement;
     container.appendChild(this.peakIndicator);
 
     container.appendChild(this.createElement("div", "clip-indicator"));
@@ -311,13 +406,7 @@ class JackTripApp {
   }
 
   private createButtonSection(card: HTMLElement): void {
-    const group = this.createElement("div", "button-group");
-    this.startButton = document.createElement("button");
-    this.startButton.className = "start-btn";
-    this.startButton.textContent = "Start Capture";
-    this.startButton.addEventListener("click", () => this.handleStartStop());
-    group.appendChild(this.startButton);
-    card.appendChild(group);
+    // Button section removed - audio capture is now integrated with connection
   }
 
   // ==================== UI Helpers ====================
@@ -328,7 +417,11 @@ class JackTripApp {
     return el;
   }
 
-  private createButton(text: string, className: string, onClick: () => void): HTMLButtonElement {
+  private createButton(
+    text: string,
+    className: string,
+    onClick: () => void
+  ): HTMLButtonElement {
     const btn = document.createElement("button");
     btn.className = className;
     btn.textContent = text;
@@ -360,13 +453,20 @@ class JackTripApp {
     defaultVal: string,
     _unit: string,
     onChange: (value: number) => void
-  ): { group: HTMLElement; slider: HTMLInputElement; valueDisplay: HTMLSpanElement } {
+  ): {
+    group: HTMLElement;
+    slider: HTMLInputElement;
+    valueDisplay: HTMLSpanElement;
+  } {
     const group = this.createElement("div", "slider-group");
 
     const header = this.createElement("div", "slider-header");
     const labelEl = this.createElement("label", "slider-label");
     labelEl.textContent = label;
-    const valueDisplay = this.createElement("span", "slider-value") as HTMLSpanElement;
+    const valueDisplay = this.createElement(
+      "span",
+      "slider-value"
+    ) as HTMLSpanElement;
     header.appendChild(labelEl);
     header.appendChild(valueDisplay);
     group.appendChild(header);
@@ -384,10 +484,15 @@ class JackTripApp {
     slider.max = max;
     slider.step = "0.5";
     slider.value = defaultVal;
+    
+    // Initialize the slider fill based on default value
+    const range = parseFloat(max) - parseFloat(min);
+    const initialPercent = ((parseFloat(defaultVal) - parseFloat(min)) / range) * 100;
+    slider.style.setProperty("--slider-fill", `${initialPercent}%`);
+    
     slider.addEventListener("input", () => {
       const value = parseFloat(slider.value);
       onChange(value);
-      const range = parseFloat(max) - parseFloat(min);
       const percent = ((value - parseFloat(min)) / range) * 100;
       slider.style.setProperty("--slider-fill", `${percent}%`);
     });
@@ -400,11 +505,15 @@ class JackTripApp {
     return { group, slider, valueDisplay };
   }
 
-  private populateDeviceOptions(select: HTMLSelectElement, devices: DeviceInfo[]): void {
+  private populateDeviceOptions(
+    select: HTMLSelectElement,
+    devices: DeviceInfo[]
+  ): void {
     for (const device of devices) {
       const option = document.createElement("option");
       option.value = device.deviceId;
-      option.textContent = device.label || `Device ${device.deviceId.substring(0, 8)}`;
+      option.textContent =
+        device.label || `Device ${device.deviceId.substring(0, 8)}`;
       select.appendChild(option);
     }
   }
@@ -415,112 +524,118 @@ class JackTripApp {
 
   // ==================== Event Handlers ====================
 
-  private async handleStartStop(): Promise<void> {
-    if (this.isCapturing) {
-      await this.stopCapture();
-    } else {
-      await this.startCapture();
-    }
-  }
-
-  private async startCapture(): Promise<void> {
+  private handleChannelToggle(button: HTMLButtonElement, isStereo: boolean): void {
     if (!this.session) return;
 
+    const channels = isStereo ? 2 : 1;
+    this.session.setChannels(channels);
+
+    // Update button text
+    const line1 = button.querySelector(".toggle-line1") as HTMLElement;
+    const line2 = button.querySelector(".toggle-line2") as HTMLElement;
+    
+    if (isStereo) {
+      line1.textContent = "Stereo";
+      line2.textContent = "2 Channels";
+    } else {
+      line1.textContent = "Mono";
+      line2.textContent = "1 Channel";
+    }
+
+    // Log the change
+    console.log(`Audio channels set to: ${channels} (${isStereo ? "Stereo" : "Mono"})`);
+  }
+
+  private async handleConnect(): Promise<void> {
+    if (!this.session) return;
+
+    const serverHost = this.serverHostInput.value.trim();
+    if (!serverHost) {
+      alert("Please enter a server host.");
+      return;
+    }
+
+    const port = parseInt(this.serverPortInput.value, 10) || 4464;
+    const useTls = serverHost.includes("jacktrip.org"); // Use TLS for production servers
+
     try {
-      await this.session.startCapture(
+      this.connectButton.disabled = true;
+      this.connectButton.textContent = "Connecting...";
+
+      console.log("Connecting to studio...");
+      await this.session.connectToStudio(
+        serverHost,
+        port,
+        useTls,
         this.inputSelect.value || undefined,
         this.isToggleActive("agc"),
         this.isToggleActive("echo"),
         this.isToggleActive("noise")
       );
+      console.log("Connected to studio");
 
-      this.isCapturing = true;
-      this.startButton.textContent = "Stop Capture";
-      this.startButton.classList.add("active");
+      this.disconnectButton.disabled = false;
     } catch (error) {
-      console.error("Failed to start capture:", error);
+      console.error("Failed to connect:", error);
+      this.connectButton.disabled = false;
+      this.connectButton.textContent = "Connect to Studio";
+      alert(`Connection failed: ${error}`);
     }
   }
 
-  private async stopCapture(): Promise<void> {
+  private handleDisconnect(): void {
     if (!this.session) return;
 
-    this.session.stopCapture();
-    this.isCapturing = false;
-    this.startButton.textContent = "Start Capture";
-    this.startButton.classList.remove("active");
-  }
-
-  private async handleCreateOffer(): Promise<void> {
-    if (!this.session) return;
-
-    try {
-      const offer = await this.session.createOffer();
-      this.sdpTextarea.value = offer;
-      this.sdpTextarea.select();
-      alert("Offer created! Copy the SDP and send to your peer. Paste their answer and click 'Accept Answer'.");
-    } catch (error) {
-      console.error("Failed to create offer:", error);
-    }
-  }
-
-  private async handleAcceptOffer(): Promise<void> {
-    if (!this.session) return;
-
-    const offerSdp = this.sdpTextarea.value.trim();
-    if (!offerSdp) {
-      alert("Please paste the remote offer SDP first.");
-      return;
-    }
-
-    try {
-      const answer = await this.session.handleOffer(offerSdp);
-      this.sdpTextarea.value = answer;
-      this.sdpTextarea.select();
-      alert("Answer created! Copy and send back to the peer who created the offer.");
-    } catch (error) {
-      console.error("Failed to handle offer:", error);
-    }
-  }
-
-  private async handleAcceptAnswer(): Promise<void> {
-    if (!this.session) return;
-
-    const answerSdp = this.sdpTextarea.value.trim();
-    if (!answerSdp) {
-      alert("Please paste the remote answer SDP first.");
-      return;
-    }
-
-    try {
-      await this.session.handleAnswer(answerSdp);
-    } catch (error) {
-      console.error("Failed to handle answer:", error);
-    }
+    this.session.disconnect();
+    this.connectButton.disabled = false;
+    this.connectButton.textContent = "Connect to Studio";
+    this.disconnectButton.disabled = true;
   }
 
   // ==================== Status Updates ====================
 
   private updateConnectionStatus(state: SessionState): void {
     this.sessionState = state;
-    const statusText = this.connectionStatus.querySelector(".status-text") as HTMLElement;
+    const statusText = this.connectionStatus.querySelector(
+      ".status-text"
+    ) as HTMLElement;
 
-    this.connectionStatus.classList.remove("idle", "local", "connecting", "buffering", "streaming", "error");
+    this.connectionStatus.classList.remove(
+      "idle",
+      "connecting",
+      "negotiating",
+      "connected",
+      "error"
+    );
     this.connectionStatus.classList.add(state);
 
     const labels: Record<SessionState, string> = {
       idle: "Not Connected",
-      local: "Local Audio Only",
-      connecting: "Connecting...",
-      buffering: "Buffering...",
-      streaming: "Connected - Streaming",
+      connecting: "Connecting to Server...",
+      negotiating: "Negotiating WebRTC...",
+      connected: "Connected",
       error: "Connection Error",
     };
 
     statusText.textContent = labels[state] || state;
 
+    // Update button states
+    if (state === "connected") {
+      this.connectButton.disabled = true;
+      this.connectButton.textContent = "Connected";
+      this.disconnectButton.disabled = false;
+    } else if (state === "connecting" || state === "negotiating") {
+      this.connectButton.disabled = true;
+      this.connectButton.textContent = "Connecting...";
+      this.disconnectButton.disabled = false;
+    } else {
+      this.connectButton.disabled = false;
+      this.connectButton.textContent = "Connect to Studio";
+      this.disconnectButton.disabled = true;
+    }
+
     // Show/hide stats
-    if (state === "streaming") {
+    if (state === "connected") {
       this.statsDisplay.style.display = "block";
       this.startStatsUpdate();
     } else {
@@ -531,27 +646,83 @@ class JackTripApp {
 
   private startStatsUpdate(): void {
     if (this.statsIntervalId !== null) return;
+    
+    // Initialize callback tracking
+    this.lastCallbackCount = getCallbackCountFromPtr(this.paramsPtr);
+    this.lastCallbackTime = performance.now();
 
     this.statsIntervalId = window.setInterval(() => {
       if (!this.session) return;
 
       const stats = this.session.get_stats();
+      
+      // Calculate rates
+      const currentCount = getCallbackCountFromPtr(this.paramsPtr);
+      const currentTime = performance.now();
+      const deltaTime = (currentTime - this.lastCallbackTime) / 1000; // seconds
+      const deltaCallbacks = Number(currentCount - this.lastCallbackCount);
+      
+      // Ring buffer write rate
+      const currentRingWrites = stats.ring_buffer_writes;
+      const currentRingSamples = stats.ring_buffer_samples_written;
+      const deltaRingWrites = Number(currentRingWrites - this.lastRingWrites);
+      const deltaRingSamples = Number(currentRingSamples - this.lastRingSamples);
+      
+      // Packet send/receive rate
+      const currentPacketsSent = stats.packets_sent;
+      const currentPacketsReceived = stats.packets_received;
+      const deltaPacketsSent = Number(currentPacketsSent - this.lastPacketsSent);
+      const deltaPacketsReceived = Number(currentPacketsReceived - this.lastPacketsReceived);
+      
+      if (deltaTime > 0) {
+        this.callbackRate = deltaCallbacks / deltaTime;
+        this.ringWriteRate = deltaRingWrites / deltaTime;
+        this.packetSendRate = deltaPacketsSent / deltaTime;
+        this.packetReceiveRate = deltaPacketsReceived / deltaTime;
+        if (deltaRingWrites > 0) {
+          this.avgSamplesPerWrite = deltaRingSamples / deltaRingWrites;
+        }
+      }
+      
+      this.lastCallbackCount = currentCount;
+      this.lastCallbackTime = currentTime;
+      this.lastRingWrites = currentRingWrites;
+      this.lastRingSamples = currentRingSamples;
+      this.lastPacketsSent = currentPacketsSent;
+      this.lastPacketsReceived = currentPacketsReceived;
+
       this.statsDisplay.innerHTML = `
         <div class="stat-row">
-          <span class="stat-label">Sent:</span>
-          <span class="stat-value">${stats.packets_sent}</span>
+          <span class="stat-label">Callbacks/s:</span>
+          <span class="stat-value">${this.callbackRate.toFixed(0)}</span>
         </div>
         <div class="stat-row">
-          <span class="stat-label">Received:</span>
-          <span class="stat-value">${stats.packets_received}</span>
+          <span class="stat-label">Ring writes/s:</span>
+          <span class="stat-value">${this.ringWriteRate.toFixed(0)}</span>
         </div>
         <div class="stat-row">
-          <span class="stat-label">Jitter Buf:</span>
-          <span class="stat-value">${stats.jitter_depth} pkts</span>
+          <span class="stat-label">Samples/write:</span>
+          <span class="stat-value">${this.avgSamplesPerWrite.toFixed(0)}</span>
         </div>
         <div class="stat-row">
-          <span class="stat-label">Latency:</span>
-          <span class="stat-value">${stats.jitter_latency_ms.toFixed(1)} ms</span>
+          <span class="stat-label">Sent/s:</span>
+          <span class="stat-value">${this.packetSendRate.toFixed(0)}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Recv/s:</span>
+          <span class="stat-value">${this.packetReceiveRate.toFixed(0)}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Jitter depth:</span>
+          <span class="stat-value">${stats.jitter_depth}/${stats.jitter_target_depth} ${stats.jitter_buffering ? '(buffering)' : ''}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Jitter played:</span>
+          <span class="stat-value">${stats.jitter_played}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Jitter underruns:</span>
+          <span class="stat-value">${stats.jitter_underruns}</span>
         </div>
       `;
     }, 500);
@@ -568,7 +739,7 @@ class JackTripApp {
 
   private startVolumeAnimation(): void {
     const animate = () => {
-      if (this.isCapturing) {
+      if (this.sessionState === "connected") {
         const volume = getVolumeLevelFromPtr(this.paramsPtr);
         const peakVolume = getPeakLevelFromPtr(this.paramsPtr);
         const db = getDbLevelFromPtr(this.paramsPtr);
@@ -578,7 +749,9 @@ class JackTripApp {
         this.peakIndicator.style.left = `${Math.min(peakVolume, 100)}%`;
         this.peakIndicator.classList.add("active");
 
-        const clipIndicator = document.querySelector(".clip-indicator") as HTMLElement;
+        const clipIndicator = document.querySelector(
+          ".clip-indicator"
+        ) as HTMLElement;
         if (clipIndicator) {
           if (db >= -0.5) {
             clipIndicator.classList.add("clipping");
@@ -587,7 +760,9 @@ class JackTripApp {
           }
         }
 
-        const peakValue = this.peakDbDisplay.querySelector(".peak-value") as HTMLElement;
+        const peakValue = this.peakDbDisplay.querySelector(
+          ".peak-value"
+        ) as HTMLElement;
         if (peakValue) {
           peakValue.textContent = peakDb <= -59 ? "-∞" : peakDb.toFixed(1);
           if (peakDb >= -3) {
@@ -605,10 +780,14 @@ class JackTripApp {
         this.peakIndicator.classList.remove("active");
         this.peakIndicator.style.left = "0%";
 
-        const clipIndicator = document.querySelector(".clip-indicator") as HTMLElement;
+        const clipIndicator = document.querySelector(
+          ".clip-indicator"
+        ) as HTMLElement;
         if (clipIndicator) clipIndicator.classList.remove("clipping");
 
-        const peakValue = this.peakDbDisplay.querySelector(".peak-value") as HTMLElement;
+        const peakValue = this.peakDbDisplay.querySelector(
+          ".peak-value"
+        ) as HTMLElement;
         if (peakValue) peakValue.textContent = "-∞";
         this.peakDbDisplay.classList.remove("hot", "warm");
       }

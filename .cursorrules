@@ -1,0 +1,33 @@
+# JackTrip Web Project Rules
+
+## Build Commands
+
+### ALWAYS use npm scripts for building, never call wasm-pack directly
+- **Reason**: wasm-pack requires specific parameters for threading support (atomics, shared memory)
+- **Correct command**: `npm run build` or `npm run build:wasm`
+- **Wrong command**: `wasm-pack build` (missing required parameters)
+
+### Available npm scripts:
+- `npm run build` - Build both WASM and TypeScript
+- `npm run build:wasm` - Build only the Rust WASM module
+- `npm run build:app` - Build only the TypeScript app
+- `npm run clean` - Clean build artifacts
+- `npm run serve` - Start development server
+
+## Architecture Notes
+
+### Audio Packet Flow
+- **Send path**: AudioWorklet → RingBuffer → Session.tick() → WebRtcTransport → DataChannel
+- **Receive path**: DataChannel → WebRtcTransport → Session.tick() → JitterBuffer → AudioWorklet
+
+### WebRTC Data Channels
+- The JackTrip hub server may create its own data channel (as answerer)
+- Both client-created and server-created channels need message handlers
+- Check console logs for "📥 Server created data channel" messages
+
+### Debugging Packet Reception Issues
+- Look for data channel state messages in console
+- Check if packets are arriving: "📨 Received N bytes" logs
+- Verify packet decoding: "✅ First packet decoded successfully"
+- Monitor jitter buffer depth in stats UI
+

@@ -9,6 +9,7 @@
 //! - AudioWorklet integration
 //! - Ring and jitter buffers
 //! - WebRTC transport
+//! - Hub server signaling
 
 // Core audio modules
 pub mod processor;
@@ -25,8 +26,9 @@ pub mod jitter_buffer;
 pub mod protocol;
 pub mod client;
 
-// Transport modules
+// Transport and signaling modules
 pub mod webrtc;
+pub mod signaling;
 
 // Re-export core audio types
 pub use processor::AudioProcessor;
@@ -38,7 +40,7 @@ pub use engine::AudioEngine;
 // Re-export buffer types
 pub use ring_buffer::RingBuffer;
 pub use jitter_buffer::{
-    LockFreeJitterBuffer, JitterBuffer, JitterBufferConfig, JitterBufferStats, BufferState,
+    LockFreeJitterBuffer, JitterBuffer, JitterBufferConfig, JitterBufferStats,
 };
 
 // Re-export JackTrip types
@@ -46,5 +48,8 @@ pub use protocol::{AudioFormat, AudioPacket, PacketHeader, StreamStats};
 pub use client::{AudioClient, JackTripConfig, ClientState};
 
 // Re-export transport types
-pub use webrtc::{ConnectionState, TransportConfig, WebRtcTransport, WebSocketSignaling};
+pub use webrtc::{ConnectionState, TransportConfig, WebRtcTransport};
+
+// Re-export signaling types
+pub use signaling::{HubSignaling, HubConnectionState, SignalingMessage};
 

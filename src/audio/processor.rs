@@ -18,10 +18,14 @@ pub struct AudioProcessor {
     local_to_network_buffer: Option<*mut RingBuffer>,
     /// Jitter buffer for receiving audio from network (network → main thread → jitter buffer → worklet → audio device)
     network_to_local_buffer: Option<*const LockFreeJitterBuffer>,
-    /// Temporary buffer for gained audio
+    /// Temporary buffer for gained audio (mono from mic)
     gained_buffer: Vec<f32>,
-    /// Temporary buffer for remote audio
+    /// Temporary buffer for remote audio (mono, after downmix)
     remote_buffer: Vec<f32>,
+    /// Buffer for stereo send (mono duplicated to both channels)
+    stereo_buffer: Vec<f32>,
+    /// Buffer for stereo receive (before downmix to mono)
+    stereo_receive_buffer: Vec<f32>,
 }
 
 impl AudioProcessor {
@@ -32,6 +36,8 @@ impl AudioProcessor {
             network_to_local_buffer: None,
             gained_buffer: vec![0.0; 128],
             remote_buffer: vec![0.0; 128],
+            stereo_buffer: vec![0.0; 256], // 128 samples * 2 channels
+            stereo_receive_buffer: vec![0.0; 256], // 128 samples * 2 channels
         }
     }
 
@@ -49,6 +55,8 @@ impl AudioProcessor {
             network_to_local_buffer: if network_to_local_buffer.is_null() { None } else { Some(network_to_local_buffer) },
             gained_buffer: vec![0.0; 128],
             remote_buffer: vec![0.0; 128],
+            stereo_buffer: vec![0.0; 256], // 128 samples * 2 channels
+            stereo_receive_buffer: vec![0.0; 256], // 128 samples * 2 channels
         }
     }
 
@@ -68,6 +76,9 @@ impl AudioProcessor {
 
     /// Process audio: calculate volume levels, handle network audio, and generate output
     pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> bool {
+        // Increment callback counter for stats tracking
+        self.params.callback_count.fetch_add(1, Ordering::Relaxed);
+        
         // Get input gain (dB) and convert to linear
         let input_gain_db = self.params.input_gain_db.load(Ordering::Relaxed) as f32 / 100.0;
         let input_gain_linear = Self::db_to_linear(input_gain_db);
@@ -148,7 +159,7 @@ impl AudioProcessor {
     }
 
     /// Send local audio to network via ring buffer
-    fn send_local_to_network(&self) {
+    fn send_local_to_network(&mut self) {
         let Some(buffer_ptr) = self.local_to_network_buffer else {
             return;
         };
@@ -159,8 +170,28 @@ impl AudioProcessor {
             return;
         }
 
-        // Write gained audio to ring buffer (worklet → main thread → network)
-        buffer.write(&self.gained_buffer);
+        let output_channels = self.params.get_output_channels();
+        
+        if output_channels >= 2 {
+            // Duplicate mono to stereo (interleaved: L R L R ...)
+            let mono_len = self.gained_buffer.len();
+            let stereo_len = mono_len * 2;
+            
+            // Resize stereo buffer if needed
+            if self.stereo_buffer.len() != stereo_len {
+                self.stereo_buffer.resize(stereo_len, 0.0);
+            }
+            
+            for (i, &sample) in self.gained_buffer.iter().enumerate() {
+                self.stereo_buffer[i * 2] = sample;     // Left channel
+                self.stereo_buffer[i * 2 + 1] = sample; // Right channel
+            }
+            
+            buffer.write(&self.stereo_buffer);
+        } else {
+            // Write mono directly
+            buffer.write(&self.gained_buffer);
+        }
     }
 
     /// Receive remote audio from network via jitter buffer
@@ -169,9 +200,34 @@ impl AudioProcessor {
         let Some(buffer_ptr) = self.network_to_local_buffer else {
             self.remote_buffer.fill(0.0);
             return false;
-        }; 
-
-        // Read directly from the lock-free jitter buffer (network → jitter buffer → worklet)
-        unsafe { (*buffer_ptr).pop(&mut self.remote_buffer) }
+        };
+        
+        let output_channels = self.params.get_output_channels();
+        
+        if output_channels >= 2 {
+            // Read stereo packet, then downmix to mono for playback
+            let mono_len = self.remote_buffer.len();
+            let stereo_len = mono_len * 2;
+            
+            // Ensure stereo receive buffer is correct size
+            if self.stereo_receive_buffer.len() != stereo_len {
+                self.stereo_receive_buffer.resize(stereo_len, 0.0);
+            }
+            
+            // Read stereo from jitter buffer
+            let has_data = unsafe { (*buffer_ptr).pop(&mut self.stereo_receive_buffer) };
+            
+            // Downmix stereo to mono (average L+R)
+            for i in 0..mono_len {
+                let left = self.stereo_receive_buffer[i * 2];
+                let right = self.stereo_receive_buffer[i * 2 + 1];
+                self.remote_buffer[i] = (left + right) * 0.5;
+            }
+            
+            has_data
+        } else {
+            // Read mono directly
+            unsafe { (*buffer_ptr).pop(&mut self.remote_buffer) }
+        }
     }
 }

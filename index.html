@@ -167,23 +167,18 @@
             animation: pulse 1s ease-in-out infinite;
         }
 
-        .connection-status.buffering .status-dot {
-            background: #00b8d4;
-            box-shadow: 0 0 10px rgba(0, 184, 212, 0.5);
-            animation: pulse 1s ease-in-out infinite;
-        }
 
-        .connection-status.streaming {
+        .connection-status.connected {
             border-color: var(--accent);
             background: rgba(0, 212, 170, 0.1);
         }
 
-        .connection-status.streaming .status-dot {
+        .connection-status.connected .status-dot {
             background: var(--accent);
             box-shadow: 0 0 10px var(--accent-glow);
         }
 
-        .connection-status.streaming .status-text {
+        .connection-status.connected .status-text {
             color: var(--accent);
         }
 
@@ -399,7 +394,7 @@
         /* Toggles grid */
         .toggles-grid {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            grid-template-columns: repeat(4, 1fr);
             gap: 8px;
             margin-bottom: 16px;
         }

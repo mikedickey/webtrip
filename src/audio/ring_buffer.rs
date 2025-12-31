@@ -32,6 +32,11 @@ pub struct RingBuffer {
     
     /// Flag indicating streaming is active
     streaming_active: AtomicU32,
+    
+    /// Total successful writes
+    writes: AtomicU64,
+    /// Total samples written
+    samples_written: AtomicU64,
 }
 
 #[wasm_bindgen]
@@ -45,6 +50,8 @@ impl RingBuffer {
             read_pos: AtomicU32::new(0),
             overruns: AtomicU64::new(0),
             streaming_active: AtomicU32::new(0),
+            writes: AtomicU64::new(0),
+            samples_written: AtomicU64::new(0),
         }
     }
 
@@ -63,6 +70,16 @@ impl RingBuffer {
         self.overruns.load(Ordering::Relaxed)
     }
 
+    /// Get total write count
+    pub fn writes(&self) -> u64 {
+        self.writes.load(Ordering::Relaxed)
+    }
+
+    /// Get total samples written
+    pub fn samples_written(&self) -> u64 {
+        self.samples_written.load(Ordering::Relaxed)
+    }
+
     /// Get available samples to read
     pub fn available(&self) -> u32 {
         let write = self.write_pos.load(Ordering::Acquire);
@@ -73,6 +90,8 @@ impl RingBuffer {
     /// Reset statistics
     pub fn reset_stats(&self) {
         self.overruns.store(0, Ordering::Relaxed);
+        self.writes.store(0, Ordering::Relaxed);
+        self.samples_written.store(0, Ordering::Relaxed);
     }
 
     // === Called from AudioWorklet (real-time thread) ===
@@ -104,6 +123,10 @@ impl RingBuffer {
             write_pos.wrapping_add(samples.len() as u32),
             Ordering::Release
         );
+
+        // Track statistics
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.samples_written.fetch_add(samples.len() as u64, Ordering::Relaxed);
 
         true
     }

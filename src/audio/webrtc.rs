@@ -3,6 +3,19 @@
 //! This module provides a WebRTC-based transport for sending and receiving
 //! JackTrip audio packets. It uses unreliable, unordered data channels to
 //! mimic UDP behavior for low-latency audio streaming.
+//!
+//! ## Integration with Hub Server
+//!
+//! This transport is designed to work with JackTrip hub servers that support
+//! WebRTC data channels. The signaling is handled by `HubSignaling` which
+//! communicates with the hub server over WebSocket.
+//!
+//! ## Data Channel Configuration
+//!
+//! For low-latency audio, the data channel is configured for:
+//! - Unordered delivery (like UDP)
+//! - No retransmissions (maxRetransmits = 0)
+//! - Binary mode (ArrayBuffer)
 
 use crate::audio::protocol::AudioPacket;
 use js_sys::{Array, ArrayBuffer, Object, Reflect, Uint8Array};
@@ -37,48 +50,6 @@ pub enum ConnectionState {
     Closed,
 }
 
-/// Signaling message types for WebRTC negotiation
-#[wasm_bindgen]
-#[derive(Debug, Clone)]
-pub struct SignalingMessage {
-    msg_type: String,
-    payload: String,
-}
-
-#[wasm_bindgen]
-impl SignalingMessage {
-    #[wasm_bindgen(getter)]
-    pub fn msg_type(&self) -> String {
-        self.msg_type.clone()
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn payload(&self) -> String {
-        self.payload.clone()
-    }
-
-    pub fn offer(sdp: &str) -> SignalingMessage {
-        SignalingMessage {
-            msg_type: "offer".to_string(),
-            payload: sdp.to_string(),
-        }
-    }
-
-    pub fn answer(sdp: &str) -> SignalingMessage {
-        SignalingMessage {
-            msg_type: "answer".to_string(),
-            payload: sdp.to_string(),
-        }
-    }
-
-    pub fn ice_candidate(candidate: &str) -> SignalingMessage {
-        SignalingMessage {
-            msg_type: "ice".to_string(),
-            payload: candidate.to_string(),
-        }
-    }
-}
-
 /// WebRTC transport configuration
 #[wasm_bindgen]
 #[derive(Debug, Clone)]
@@ -100,7 +71,11 @@ impl TransportConfig {
         Self::default()
     }
 
-    /// Create config optimized for low latency
+    /// Create config optimized for low latency (JackTrip style)
+    ///
+    /// This matches the hub server's data channel configuration:
+    /// - Unordered delivery
+    /// - No retransmissions
     pub fn low_latency() -> Self {
         Self {
             ice_servers: vec![
@@ -113,9 +88,14 @@ impl TransportConfig {
         }
     }
 
-    /// Add an ICE server
+    /// Add an ICE server (STUN or TURN)
     pub fn add_ice_server(&mut self, url: String) {
         self.ice_servers.push(url);
+    }
+
+    /// Set ICE servers from a list
+    pub fn set_ice_servers(&mut self, servers: Vec<String>) {
+        self.ice_servers = servers;
     }
 }
 
@@ -128,6 +108,7 @@ impl Default for TransportConfig {
 /// WebRTC Data Channel Transport
 ///
 /// Handles peer-to-peer connection establishment and audio data transmission.
+/// Designed to work with JackTrip hub servers that support WebRTC.
 #[wasm_bindgen]
 pub struct WebRtcTransport {
     config: TransportConfig,
@@ -142,8 +123,9 @@ pub struct WebRtcTransport {
     on_channel_open_closure: Option<Closure<dyn FnMut()>>,
     on_channel_close_closure: Option<Closure<dyn FnMut()>>,
     on_ice_candidate_closure: Option<Closure<dyn FnMut(web_sys::RtcPeerConnectionIceEvent)>>,
-    /// JavaScript callbacks
-    js_on_signaling: Option<js_sys::Function>,
+    on_data_channel_closure: Option<Closure<dyn FnMut(RtcDataChannelEvent)>>,
+    /// JavaScript callbacks for signaling integration
+    js_on_ice_candidate: Option<js_sys::Function>,
     js_on_state_change: Option<js_sys::Function>,
 }
 
@@ -153,7 +135,7 @@ impl WebRtcTransport {
     #[wasm_bindgen(constructor)]
     pub fn new(config: Option<TransportConfig>) -> Result<WebRtcTransport, JsValue> {
         let config = config.unwrap_or_default();
-        
+
         Ok(WebRtcTransport {
             config,
             peer_connection: None,
@@ -164,14 +146,17 @@ impl WebRtcTransport {
             on_channel_open_closure: None,
             on_channel_close_closure: None,
             on_ice_candidate_closure: None,
-            js_on_signaling: None,
+            on_data_channel_closure: None,
+            js_on_ice_candidate: None,
             js_on_state_change: None,
         })
     }
 
-    /// Set callback for signaling messages (offer/answer/ice)
-    pub fn set_on_signaling(&mut self, callback: js_sys::Function) {
-        self.js_on_signaling = Some(callback);
+    /// Set callback for ICE candidates
+    ///
+    /// The callback receives (candidate: string, sdpMid: string, sdpMLineIndex: number)
+    pub fn set_on_ice_candidate(&mut self, callback: js_sys::Function) {
+        self.js_on_ice_candidate = Some(callback);
     }
 
     /// Set callback for connection state changes
@@ -184,7 +169,10 @@ impl WebRtcTransport {
         self.state
     }
 
-    /// Initialize as the offering peer (caller)
+    /// Create an SDP offer (as the initiating peer)
+    ///
+    /// For JackTrip hub connections, the client always initiates.
+    /// Send the returned SDP to the hub server via HubSignaling.
     pub async fn create_offer(&mut self) -> Result<String, JsValue> {
         self.create_peer_connection()?;
         self.create_data_channel()?;
@@ -192,7 +180,7 @@ impl WebRtcTransport {
         self.notify_state_change();
 
         let pc = self.peer_connection.as_ref().unwrap();
-        
+
         // Create offer
         let offer = JsFuture::from(pc.create_offer()).await?;
         let offer_sdp = Reflect::get(&offer, &"sdp".into())?
@@ -204,55 +192,10 @@ impl WebRtcTransport {
         desc.set_sdp(&offer_sdp);
         JsFuture::from(pc.set_local_description(&desc)).await?;
 
-        // Notify via callback
-        if let Some(ref callback) = self.js_on_signaling {
-            let _ = callback.call2(
-                &JsValue::NULL,
-                &JsValue::from_str("offer"),
-                &JsValue::from_str(&offer_sdp),
-            );
-        }
-
         Ok(offer_sdp)
     }
 
-    /// Handle an incoming offer (as answering peer)
-    pub async fn handle_offer(&mut self, offer_sdp: &str) -> Result<String, JsValue> {
-        self.create_peer_connection()?;
-        self.state = ConnectionState::Connecting;
-        self.notify_state_change();
-
-        let pc = self.peer_connection.as_ref().unwrap();
-
-        // Set remote description
-        let desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
-        desc.set_sdp(offer_sdp);
-        JsFuture::from(pc.set_remote_description(&desc)).await?;
-
-        // Create answer
-        let answer = JsFuture::from(pc.create_answer()).await?;
-        let answer_sdp = Reflect::get(&answer, &"sdp".into())?
-            .as_string()
-            .ok_or("No SDP in answer")?;
-
-        // Set local description
-        let local_desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
-        local_desc.set_sdp(&answer_sdp);
-        JsFuture::from(pc.set_local_description(&local_desc)).await?;
-
-        // Notify via callback
-        if let Some(ref callback) = self.js_on_signaling {
-            let _ = callback.call2(
-                &JsValue::NULL,
-                &JsValue::from_str("answer"),
-                &JsValue::from_str(&answer_sdp),
-            );
-        }
-
-        Ok(answer_sdp)
-    }
-
-    /// Handle an incoming answer
+    /// Handle an SDP answer from the hub server
     pub async fn handle_answer(&mut self, answer_sdp: &str) -> Result<(), JsValue> {
         let pc = self
             .peer_connection
@@ -266,25 +209,54 @@ impl WebRtcTransport {
         Ok(())
     }
 
-    /// Add an ICE candidate from the remote peer
-    pub async fn add_ice_candidate(&mut self, candidate_str: &str) -> Result<(), JsValue> {
+    /// Add an ICE candidate from the hub server
+    pub async fn add_ice_candidate(&mut self, candidate_json: &str) -> Result<(), JsValue> {
         let pc = self
             .peer_connection
             .as_ref()
             .ok_or("No peer connection")?;
 
-        if candidate_str.is_empty() {
-            // Empty string signals end of candidates
+        if candidate_json.is_empty() {
             return Ok(());
         }
 
         // Parse the candidate JSON and create init dict
-        let candidate_obj = js_sys::JSON::parse(candidate_str)?;
+        let candidate_obj = js_sys::JSON::parse(candidate_json)?;
         let candidate_init: RtcIceCandidateInit = candidate_obj.unchecked_into();
         let candidate = RtcIceCandidate::new(&candidate_init)?;
-        
+
         JsFuture::from(
             pc.add_ice_candidate_with_opt_rtc_ice_candidate(Some(&candidate)),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Add an ICE candidate with explicit parameters
+    pub async fn add_ice_candidate_explicit(
+        &mut self,
+        candidate: &str,
+        sdp_mid: &str,
+        sdp_m_line_index: u16,
+    ) -> Result<(), JsValue> {
+        let pc = self
+            .peer_connection
+            .as_ref()
+            .ok_or("No peer connection")?;
+
+        if candidate.is_empty() {
+            return Ok(());
+        }
+
+        let candidate_init = RtcIceCandidateInit::new(candidate);
+        candidate_init.set_sdp_mid(Some(sdp_mid));
+        candidate_init.set_sdp_m_line_index(Some(sdp_m_line_index));
+
+        let ice_candidate = RtcIceCandidate::new(&candidate_init)?;
+
+        JsFuture::from(
+            pc.add_ice_candidate_with_opt_rtc_ice_candidate(Some(&ice_candidate)),
         )
         .await?;
 
@@ -294,14 +266,19 @@ impl WebRtcTransport {
     /// Send raw bytes over the data channel
     pub fn send_bytes(&self, data: &[u8]) -> Result<(), JsValue> {
         let channel = self.data_channel.as_ref().ok_or("No data channel")?;
-        
-        if channel.ready_state() != RtcDataChannelState::Open {
-            return Err("Data channel not open".into());
+
+        let state = channel.ready_state();
+        if state != RtcDataChannelState::Open {
+            return Err(format!("Data channel not open (state: {:?})", state).into());
         }
 
         let array = Uint8Array::from(data);
-        channel.send_with_array_buffer_view(&array)?;
-        
+        channel.send_with_array_buffer_view(&array)
+            .map_err(|e| {
+                web_sys::console::error_1(&format!("send_with_array_buffer_view failed: {:?}", e).into());
+                e
+            })?;
+
         Ok(())
     }
 
@@ -330,17 +307,23 @@ impl WebRtcTransport {
         }
         self.state = ConnectionState::Closed;
         self.notify_state_change();
-        
+
         // Clean up closures
         self.on_message_closure = None;
         self.on_channel_open_closure = None;
         self.on_channel_close_closure = None;
         self.on_ice_candidate_closure = None;
+        self.on_data_channel_closure = None;
     }
 
     /// Check if connected and ready to send
     pub fn is_connected(&self) -> bool {
-        self.state == ConnectionState::Connected
+        // Check if data channel is actually open
+        if let Some(ref channel) = self.data_channel {
+            channel.ready_state() == RtcDataChannelState::Open
+        } else {
+            false
+        }
     }
 
     // Private methods
@@ -362,57 +345,64 @@ impl WebRtcTransport {
         let pc = RtcPeerConnection::new_with_configuration(&rtc_config)?;
 
         // Set up ICE candidate handler
-        let js_on_signaling = self.js_on_signaling.clone();
+        let js_on_ice_candidate = self.js_on_ice_candidate.clone();
         let on_ice_candidate = Closure::wrap(Box::new(
             move |event: web_sys::RtcPeerConnectionIceEvent| {
                 if let Some(candidate) = event.candidate() {
-                    if let Some(ref callback) = js_on_signaling {
-                        // Serialize the candidate
-                        let candidate_json = js_sys::JSON::stringify(&candidate).ok();
-                        if let Some(json) = candidate_json {
-                            let _ = callback.call2(
-                                &JsValue::NULL,
-                                &JsValue::from_str("ice"),
-                                &json,
-                            );
-                        }
+                    let candidate_str = candidate.candidate();
+                    let sdp_mid = candidate.sdp_mid().unwrap_or_default();
+                    let sdp_m_line_index = candidate.sdp_m_line_index().unwrap_or(0);
+                    
+                    if let Some(ref callback) = js_on_ice_candidate {
+                        let _ = callback.call3(
+                            &JsValue::NULL,
+                            &JsValue::from_str(&candidate_str),
+                            &JsValue::from_str(&sdp_mid),
+                            &JsValue::from_f64(sdp_m_line_index as f64),
+                        );
                     }
                 }
             },
         ) as Box<dyn FnMut(_)>);
-        
+
         pc.set_onicecandidate(Some(on_ice_candidate.as_ref().unchecked_ref()));
         self.on_ice_candidate_closure = Some(on_ice_candidate);
 
-        // Set up data channel handler for answering peer
+        // Set up data channel handler for when server creates a data channel
+        // (In practice, for JackTrip we create the channel, but this handles the reverse case)
         let receive_queue = self.receive_queue.clone();
         let js_on_state_change = self.js_on_state_change.clone();
-        
+
         let on_datachannel = Closure::wrap(Box::new(move |event: RtcDataChannelEvent| {
             let channel = event.channel();
-            
-            // Set up message handler
+            web_sys::console::log_1(&format!("📥 Server created data channel: {}", channel.label()).into());
+            channel.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
+
+            // Set up message handler for incoming channel
             let queue = receive_queue.clone();
             let on_message = Closure::wrap(Box::new(move |msg_event: MessageEvent| {
                 if let Ok(buffer) = msg_event.data().dyn_into::<ArrayBuffer>() {
                     let array = Uint8Array::new(&buffer);
                     let mut data = vec![0u8; array.length() as usize];
                     array.copy_to(&mut data);
+                    web_sys::console::log_1(&format!("📨 Received {} bytes on server-created channel", data.len()).into());
                     queue.borrow_mut().push_back(data);
+                } else {
+                    web_sys::console::error_1(&"❌ Received non-ArrayBuffer message".into());
                 }
             }) as Box<dyn FnMut(_)>);
-            
+
             channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-            on_message.forget(); // Leak the closure (it needs to live forever)
-            
+            on_message.forget();
+
             // Notify state change
             if let Some(ref callback) = js_on_state_change {
                 let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("connected"));
             }
         }) as Box<dyn FnMut(_)>);
-        
+
         pc.set_ondatachannel(Some(on_datachannel.as_ref().unchecked_ref()));
-        on_datachannel.forget();
+        self.on_data_channel_closure = Some(on_datachannel);
 
         self.peer_connection = Some(pc);
         Ok(())
@@ -424,10 +414,10 @@ impl WebRtcTransport {
             .as_ref()
             .ok_or("No peer connection")?;
 
-        // Configure for low latency
+        // Configure for low latency (matches hub server config)
         let dc_init = RtcDataChannelInit::new();
         dc_init.set_ordered(self.config.ordered);
-        
+
         if self.config.unreliable {
             dc_init.set_max_retransmits(self.config.max_retransmits);
         }
@@ -443,6 +433,8 @@ impl WebRtcTransport {
                 let mut data = vec![0u8; array.length() as usize];
                 array.copy_to(&mut data);
                 receive_queue.borrow_mut().push_back(data);
+            } else {
+                web_sys::console::error_1(&"❌ Received non-ArrayBuffer message on client channel".into());
             }
         }) as Box<dyn FnMut(_)>);
         channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
@@ -450,7 +442,9 @@ impl WebRtcTransport {
 
         // Set up open handler
         let js_on_state_change = self.js_on_state_change.clone();
+        let channel_label = channel.label();
         let on_open = Closure::wrap(Box::new(move || {
+            web_sys::console::log_1(&format!("Data channel '{}' opened!", channel_label).into());
             if let Some(ref callback) = js_on_state_change {
                 let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("connected"));
             }
@@ -505,111 +499,27 @@ impl WebRtcTransport {
             Ok(None)
         }
     }
+
+    /// Mark the connection as connected
+    /// Call this after receiving confirmation that the data channel is open
+    pub fn set_connected(&mut self) {
+        if self.state != ConnectionState::Connected {
+            self.state = ConnectionState::Connected;
+            self.notify_state_change();
+        }
+    }
+
+    /// Mark the connection as failed
+    pub fn set_failed(&mut self) {
+        if self.state != ConnectionState::Failed {
+            self.state = ConnectionState::Failed;
+            self.notify_state_change();
+        }
+    }
 }
 
 impl Drop for WebRtcTransport {
     fn drop(&mut self) {
         self.close();
-    }
-}
-
-/// Helper to create a simple signaling channel using a WebSocket
-/// This is a minimal implementation - in production you'd use a proper signaling server
-#[wasm_bindgen]
-pub struct WebSocketSignaling {
-    url: String,
-    socket: Option<web_sys::WebSocket>,
-    on_offer: Option<js_sys::Function>,
-    on_answer: Option<js_sys::Function>,
-    on_ice: Option<js_sys::Function>,
-}
-
-#[wasm_bindgen]
-impl WebSocketSignaling {
-    #[wasm_bindgen(constructor)]
-    pub fn new(url: &str) -> Self {
-        Self {
-            url: url.to_string(),
-            socket: None,
-            on_offer: None,
-            on_answer: None,
-            on_ice: None,
-        }
-    }
-
-    pub fn set_on_offer(&mut self, callback: js_sys::Function) {
-        self.on_offer = Some(callback);
-    }
-
-    pub fn set_on_answer(&mut self, callback: js_sys::Function) {
-        self.on_answer = Some(callback);
-    }
-
-    pub fn set_on_ice(&mut self, callback: js_sys::Function) {
-        self.on_ice = Some(callback);
-    }
-
-    pub fn connect(&mut self) -> Result<(), JsValue> {
-        let ws = web_sys::WebSocket::new(&self.url)?;
-        ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
-
-        let on_offer = self.on_offer.clone();
-        let on_answer = self.on_answer.clone();
-        let on_ice = self.on_ice.clone();
-
-        let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
-            if let Ok(text) = event.data().dyn_into::<js_sys::JsString>() {
-                let text: String = text.into();
-                // Parse JSON message
-                if let Ok(obj) = js_sys::JSON::parse(&text) {
-                    let msg_type = Reflect::get(&obj, &"type".into())
-                        .ok()
-                        .and_then(|v| v.as_string());
-                    let payload = Reflect::get(&obj, &"payload".into())
-                        .ok()
-                        .and_then(|v| v.as_string());
-
-                    if let (Some(t), Some(p)) = (msg_type, payload) {
-                        match t.as_str() {
-                            "offer" => {
-                                if let Some(ref cb) = on_offer {
-                                    let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(&p));
-                                }
-                            }
-                            "answer" => {
-                                if let Some(ref cb) = on_answer {
-                                    let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(&p));
-                                }
-                            }
-                            "ice" => {
-                                if let Some(ref cb) = on_ice {
-                                    let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(&p));
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }) as Box<dyn FnMut(_)>);
-
-        ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-        on_message.forget();
-
-        self.socket = Some(ws);
-        Ok(())
-    }
-
-    pub fn send(&self, msg_type: &str, payload: &str) -> Result<(), JsValue> {
-        let socket = self.socket.as_ref().ok_or("Not connected")?;
-        let msg = format!(r#"{{"type":"{}","payload":"{}"}}"#, msg_type, payload.replace('"', "\\\""));
-        socket.send_with_str(&msg)?;
-        Ok(())
-    }
-
-    pub fn close(&mut self) {
-        if let Some(ws) = self.socket.take() {
-            let _ = ws.close().ok();
-        }
     }
 }
