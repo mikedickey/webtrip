@@ -1,0 +1,70 @@
+---
+globs: src/api/**,src/models/**,docs/api/**
+alwaysApply: false
+---
+# JackTrip API Development Guidelines
+
+## OpenAPI Specification
+
+When working on files in the following directories, always reference the latest JackTrip Virtual Studio OpenAPI specification:
+
+- `src/api/` - API client implementation
+- `src/models/` - Data models and types
+- `docs/api/` - API documentation
+
+### Accessing the OpenAPI Spec
+
+The latest OpenAPI 3.0 specification can be retrieved from:
+
+```
+https://test.jacktrip.com/api/redirect/openapi
+```
+
+### Key Information
+
+- **API Base URL**: `https://test.jacktrip.com/api`
+- **Authentication**: OAuth2 via Auth0
+- **Client ID**: `YRQnCh5ih32WQcium5GldlKEDc5WJvp6`
+- **Authorization URL**: `https://auth.jacktrip.org/authorize?audience=https%3A%2F%2Fapi.jacktrip.org`
+
+### Important Schemas
+
+When updating models, ensure they match the OpenAPI spec schemas. Key schemas include:
+
+- **ServerConfig** - Studio configuration properties (type, name, serverHost, serverPort, sampleRate, public, stereo, loopback, enabled)
+- **Server** - Full studio model with IDs and timestamps
+- **ServerAgentConfig** - Studio configuration state for devices
+- **AudioProperties** - Shared audio network properties (period, queueBuffer, bufferStrategy)
+- **DeviceConfig** - Device configuration settings
+- **DeviceAgentConfig** - Device configuration when connected to a studio
+
+### Enum Values
+
+Always verify enum values match the spec:
+
+- **StudioType**: "JackTrip", "JackTrip+Jamulus"
+- **SampleRate**: 44100, 48000, 88200, 96000
+- **Period**: 16, 32, 64, 128, 256, 512, 1024, 2048
+- **QueueBuffer**: 0, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32
+- **BufferStrategy**: 1, 2, 3
+- **ResourceStatus**: Starting, Ready, Disabled, Deleting
+- **BroadcastVisibility**: 0 (Off), 1 (Private), 2 (Public)
+
+### API Tags/Categories
+
+- `system` - System status and health
+- `users` - User operations
+- `devices` - Device operations
+- `studios` - Studio operations
+- `subscriptions` - Subscription operations
+- `streams` - Stream operations
+- `events` - Event operations
+- `usage` - Usage operations
+
+### Development Workflow
+
+1. Before adding or modifying API endpoints, fetch the latest spec
+2. Ensure all model fields match the spec's schema properties
+3. Use proper serde attributes for camelCase serialization
+4. Include proper TypeScript type generation via tsify
+5. Update documentation in `docs/api/` when changing API methods

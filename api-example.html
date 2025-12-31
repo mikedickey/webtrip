@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JackTrip API Client Example</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            max-width: 900px;
+            margin: 40px auto;
+            padding: 20px;
+            background: #1a1a2e;
+            color: #eee;
+        }
+        .container {
+            background: #16213e;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        }
+        h1 {
+            color: #00d9ff;
+            margin-top: 0;
+            font-size: 28px;
+        }
+        p {
+            color: #aaa;
+            line-height: 1.6;
+        }
+        .input-group {
+            margin: 20px 0;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: #00d9ff;
+        }
+        input {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #0f3460;
+            border-radius: 6px;
+            font-size: 14px;
+            box-sizing: border-box;
+            background: #0f3460;
+            color: #fff;
+        }
+        input::placeholder {
+            color: #666;
+        }
+        input:focus {
+            outline: none;
+            border-color: #00d9ff;
+        }
+        .button-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        button {
+            background: linear-gradient(135deg, #00d9ff, #0099cc);
+            color: #000;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,217,255,0.3);
+        }
+        button:disabled {
+            background: #333;
+            color: #666;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        .output {
+            margin-top: 20px;
+            padding: 20px;
+            background: #0f3460;
+            border-radius: 8px;
+            border-left: 4px solid #00d9ff;
+        }
+        .error {
+            border-left-color: #e94560;
+            background: #2d1f2f;
+        }
+        .success {
+            border-left-color: #00ff88;
+            background: #1f2d1f;
+        }
+        pre {
+            margin: 15px 0 0 0;
+            padding: 15px;
+            background: #0a0a1a;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-size: 13px;
+            color: #00ff88;
+            font-family: 'Monaco', 'Menlo', monospace;
+        }
+        .loading {
+            color: #00d9ff;
+            font-style: italic;
+        }
+        small {
+            color: #666;
+            display: block;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎵 JackTrip API Client</h1>
+        <p>Test the JackTrip Virtual Studio API using the Rust/WASM client. 
+           Authentication uses either a bearer token or existing cookies from test.jacktrip.com.</p>
+
+        <div class="input-group">
+            <label for="token">Bearer Token (optional):</label>
+            <input type="text" id="token" placeholder="Leave empty to use cookies">
+            <small>If logged into test.jacktrip.com, your session cookies will be used automatically</small>
+        </div>
+
+        <div class="button-group">
+            <button onclick="testPing()">Ping</button>
+            <button onclick="testRegions()">List Regions</button>
+            <button onclick="testCurrentUser()">Current User</button>
+            <button onclick="testDevices()">List Devices</button>
+            <button onclick="testStudios()">List Studios</button>
+            <button onclick="testStreams()">List Streams</button>
+            <button onclick="testEvents()">List Events</button>
+            <button onclick="testRecordings()">List Recordings</button>
+        </div>
+
+        <div id="output"></div>
+    </div>
+
+    <script type="module">
+        import init, { ApiClient } from './pkg/jacktrip_web.js';
+
+        // Initialize WASM module
+        await init();
+        console.log('✅ WASM module initialized');
+
+        // Create API client instance
+        window.apiClient = new ApiClient();
+        
+        // Use proxy for same-origin requests (cookies will work)
+        window.apiClient.setBaseUrl('https://test.jacktrip.com/api');
+        
+        console.log('✅ API client created');
+
+        // Helper function to show output
+        window.showOutput = function(message, data, isError = false) {
+            const output = document.getElementById('output');
+            const className = isError ? 'output error' : 'output success';
+            
+            let html = `<div class="${className}">
+                <strong>${message}</strong>`;
+            
+            if (data !== undefined) {
+                html += `<pre>${JSON.stringify(data, null, 2)}</pre>`;
+            }
+            
+            html += '</div>';
+            output.innerHTML = html;
+        };
+
+        window.showLoading = function(message) {
+            const output = document.getElementById('output');
+            output.innerHTML = `<div class="output"><span class="loading">⏳ ${message}</span></div>`;
+        };
+
+        // Set bearer token if provided
+        window.updateAuth = function() {
+            const token = document.getElementById('token').value;
+            if (token) {
+                window.apiClient.setBearerToken(token);
+            } else {
+                window.apiClient.clearBearerToken();
+            }
+        };
+
+        // Ping
+        window.testPing = async function() {
+            try {
+                updateAuth();
+                showLoading('Pinging JackTrip API...');
+                const data = await window.apiClient.system().ping();
+                showOutput('✅ Ping successful!', data);
+            } catch (error) {
+                showOutput('❌ Ping failed', { error: error.toString() }, true);
+            }
+        };
+
+        // List Regions
+        window.testRegions = async function() {
+            try {
+                updateAuth();
+                showLoading('Fetching regions...');
+                const data = await window.apiClient.system().listRegions();
+                showOutput(`✅ Found ${data.length} region(s)`, data);
+            } catch (error) {
+                showOutput('❌ Failed to fetch regions', { error: error.toString() }, true);
+            }
+        };
+
+        // Current User
+        window.testCurrentUser = async function() {
+            try {
+                updateAuth();
+                showLoading('Fetching current user...');
+                const data = await window.apiClient.users().getCurrentUser();
+                showOutput('✅ User fetched successfully!', data);
+            } catch (error) {
+                showOutput('❌ Failed to fetch user', { error: error.toString() }, true);
+            }
+        };
+
+        // List Devices
+        window.testDevices = async function() {
+            try {
+                updateAuth();
+                showLoading('Fetching devices...');
+                const data = await window.apiClient.devices().listDevices();
+                showOutput(`✅ Found ${data.length} device(s)`, data);
+            } catch (error) {
+                showOutput('❌ Failed to fetch devices', { error: error.toString() }, true);
+            }
+        };
+
+        // List Studios
+        window.testStudios = async function() {
+            try {
+                updateAuth();
+                showLoading('Fetching studios...');
+                const data = await window.apiClient.studios().listStudios();
+                showOutput(`✅ Found ${data.length} studio(s)`, data);
+            } catch (error) {
+                showOutput('❌ Failed to fetch studios', { error: error.toString() }, true);
+            }
+        };
+
+        // List Streams
+        window.testStreams = async function() {
+            try {
+                updateAuth();
+                showLoading('Fetching live streams...');
+                const data = await window.apiClient.streams().listStreams();
+                showOutput(`✅ Found ${data.length} stream(s)`, data);
+            } catch (error) {
+                showOutput('❌ Failed to fetch streams', { error: error.toString() }, true);
+            }
+        };
+
+        // List Events
+        window.testEvents = async function() {
+            try {
+                updateAuth();
+                showLoading('Fetching upcoming events...');
+                const data = await window.apiClient.events().listEvents();
+                showOutput(`✅ Found ${data.length} event(s)`, data);
+            } catch (error) {
+                showOutput('❌ Failed to fetch events', { error: error.toString() }, true);
+            }
+        };
+
+        // List Recordings
+        window.testRecordings = async function() {
+            try {
+                updateAuth();
+                showLoading('Fetching recordings...');
+                const data = await window.apiClient.recordings().listRecordings();
+                showOutput(`✅ Found ${data.length} recording(s)`, data);
+            } catch (error) {
+                showOutput('❌ Failed to fetch recordings', { error: error.toString() }, true);
+            }
+        };
+
+        // Show ready message
+        showOutput('✅ Ready', { 
+            message: 'Click any button to test the API',
+            auth: 'Uses bearer token if provided, otherwise uses cookies from test.jacktrip.com',
+            proxy: 'http://localhost:3000/api → test.jacktrip.com/api'
+        });
+    </script>
+</body>
+</html>

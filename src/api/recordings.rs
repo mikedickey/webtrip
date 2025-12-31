@@ -1,0 +1,316 @@
+//! Recordings API endpoints
+//!
+//! JackTrip Radio recordings management.
+
+use super::{ApiClient, ApiError, urlencode};
+use crate::models;
+use serde::Serialize;
+use wasm_bindgen::prelude::*;
+
+// =============================================================================
+// Recordings API
+// =============================================================================
+
+/// Recordings API for managing recorded content
+#[wasm_bindgen]
+pub struct RecordingsApi {
+    client: ApiClient,
+}
+
+impl RecordingsApi {
+    pub(crate) fn from_client(client: &ApiClient) -> Self {
+        Self {
+            client: client.clone(),
+        }
+    }
+}
+
+// =============================================================================
+// Rust API (primary interface)
+// =============================================================================
+
+impl RecordingsApi {
+    /// List all public recordings
+    pub async fn list_recordings(&self) -> Result<Vec<models::RecordingMetadata>, ApiError> {
+        self.client.get("/recordings").await
+    }
+
+    /// List recordings with pagination
+    pub async fn list_recordings_paginated(
+        &self,
+        page: Option<i32>,
+        limit: Option<i32>,
+        following: Option<bool>,
+    ) -> Result<models::PaginatedRecordings, ApiError> {
+        #[derive(Serialize)]
+        struct Query {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            page: Option<i32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            limit: Option<i32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            following: Option<bool>,
+        }
+
+        if page.is_some() || limit.is_some() || following.is_some() {
+            self.client.get_with_query("/recordings-paginated", &Query { page, limit, following }).await
+        } else {
+            self.client.get("/recordings-paginated").await
+        }
+    }
+
+    /// Get a recording by ID
+    pub async fn get_recording(&self, recording_id: &str) -> Result<models::PersonalizedRecording, ApiError> {
+        let path = format!("/recordings/{}", urlencode(recording_id));
+        self.client.get(&path).await
+    }
+
+    /// Get similar recordings
+    pub async fn get_similar_recordings(&self, recording_id: &str) -> Result<Vec<models::RecordingMetadata>, ApiError> {
+        let path = format!("/recordings/{}/similar", urlencode(recording_id));
+        self.client.get(&path).await
+    }
+
+    /// Like a recording
+    pub async fn like_recording(&self, recording_id: &str) -> Result<(), ApiError> {
+        let path = format!("/recordings/{}/likes", urlencode(recording_id));
+        self.client.post_empty_no_response(&path).await
+    }
+
+    /// Unlike a recording
+    pub async fn unlike_recording(&self, recording_id: &str) -> Result<(), ApiError> {
+        let path = format!("/recordings/{}/likes", urlencode(recording_id));
+        self.client.delete(&path).await
+    }
+
+    /// Get recordings for a stream
+    pub async fn get_stream_recordings(&self, stream_id: &str) -> Result<Vec<models::RecordingMetadata>, ApiError> {
+        let path = format!("/streams/{}/recordings", urlencode(stream_id));
+        self.client.get(&path).await
+    }
+
+    /// Get all recordings for a studio
+    pub async fn get_studio_recordings(&self, studio_id: &str) -> Result<Vec<models::ServerRecording>, ApiError> {
+        let path = format!("/studios/{}/recordings", urlencode(studio_id));
+        self.client.get(&path).await
+    }
+
+    /// Get paginated recordings for a studio
+    pub async fn get_studio_recordings_paginated(
+        &self,
+        studio_id: &str,
+        page: Option<i32>,
+        limit: Option<i32>,
+    ) -> Result<models::PaginatedRecordings, ApiError> {
+        let path = format!("/studios/{}/recordings-paginated", urlencode(studio_id));
+
+        #[derive(Serialize)]
+        struct Query {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            page: Option<i32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            limit: Option<i32>,
+        }
+
+        if page.is_some() || limit.is_some() {
+            self.client.get_with_query(&path, &Query { page, limit }).await
+        } else {
+            self.client.get(&path).await
+        }
+    }
+
+    /// Get a specific recording for a studio
+    pub async fn get_studio_recording(
+        &self,
+        studio_id: &str,
+        recording_id: &str,
+    ) -> Result<models::ServerRecording, ApiError> {
+        let path = format!("/studios/{}/recordings/{}", urlencode(studio_id), urlencode(recording_id));
+        self.client.get(&path).await
+    }
+
+    /// Update a recording for a studio
+    pub async fn update_studio_recording(
+        &self,
+        studio_id: &str,
+        recording_id: &str,
+        metadata: &models::RecordingMetadata,
+    ) -> Result<models::ServerRecording, ApiError> {
+        let path = format!("/studios/{}/recordings/{}", urlencode(studio_id), urlencode(recording_id));
+        self.client.put(&path, metadata).await
+    }
+
+    /// Delete a recording for a studio
+    pub async fn delete_studio_recording(&self, studio_id: &str, recording_id: &str) -> Result<(), ApiError> {
+        let path = format!("/studios/{}/recordings/{}", urlencode(studio_id), urlencode(recording_id));
+        self.client.delete(&path).await
+    }
+
+    /// Get stem information for a recording
+    pub async fn get_recording_stems(
+        &self,
+        studio_id: &str,
+        recording_id: &str,
+    ) -> Result<Vec<models::StemInfo>, ApiError> {
+        let path = format!("/studios/{}/recordings/{}/stems", urlencode(studio_id), urlencode(recording_id));
+        self.client.get(&path).await
+    }
+
+    /// Get all recordings for a user
+    pub async fn get_user_recordings(&self, user_id: &str) -> Result<Vec<models::ServerRecording>, ApiError> {
+        let path = format!("/users/{}/recordings", urlencode(user_id));
+        self.client.get(&path).await
+    }
+
+    /// Get paginated recordings for a user
+    pub async fn get_user_recordings_paginated(
+        &self,
+        user_id: &str,
+        page: Option<i32>,
+        limit: Option<i32>,
+    ) -> Result<models::PaginatedRecordings, ApiError> {
+        let path = format!("/users/{}/recordings-paginated", urlencode(user_id));
+
+        #[derive(Serialize)]
+        struct Query {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            page: Option<i32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            limit: Option<i32>,
+        }
+
+        if page.is_some() || limit.is_some() {
+            self.client.get_with_query(&path, &Query { page, limit }).await
+        } else {
+            self.client.get(&path).await
+        }
+    }
+
+    /// Get recordings quota for a user
+    pub async fn get_recordings_quota(&self, user_id: &str) -> Result<models::RecordingsQuota, ApiError> {
+        let path = format!("/users/{}/recordings/quota", urlencode(user_id));
+        self.client.get(&path).await
+    }
+}
+
+// =============================================================================
+// JavaScript API (wasm_bindgen wrappers)
+// =============================================================================
+
+#[wasm_bindgen]
+impl RecordingsApi {
+    #[wasm_bindgen(constructor)]
+    pub fn new(client: &ApiClient) -> Self {
+        Self::from_client(client)
+    }
+
+    #[wasm_bindgen(js_name = listRecordings)]
+    pub async fn list_recordings_js(&self) -> Result<JsValue, ApiError> {
+        let recordings = self.list_recordings().await?;
+        serde_wasm_bindgen::to_value(&recordings).map_err(|e| ApiError::Serialization(e.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = listRecordingsPaginated)]
+    pub async fn list_recordings_paginated_js(
+        &self,
+        page: Option<i32>,
+        limit: Option<i32>,
+        following: Option<bool>,
+    ) -> Result<models::PaginatedRecordings, ApiError> {
+        self.list_recordings_paginated(page, limit, following).await
+    }
+
+    #[wasm_bindgen(js_name = getRecording)]
+    pub async fn get_recording_js(&self, recording_id: String) -> Result<models::PersonalizedRecording, ApiError> {
+        self.get_recording(&recording_id).await
+    }
+
+    #[wasm_bindgen(js_name = getSimilarRecordings)]
+    pub async fn get_similar_recordings_js(&self, recording_id: String) -> Result<JsValue, ApiError> {
+        let recordings = self.get_similar_recordings(&recording_id).await?;
+        serde_wasm_bindgen::to_value(&recordings).map_err(|e| ApiError::Serialization(e.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = likeRecording)]
+    pub async fn like_recording_js(&self, recording_id: String) -> Result<(), ApiError> {
+        self.like_recording(&recording_id).await
+    }
+
+    #[wasm_bindgen(js_name = unlikeRecording)]
+    pub async fn unlike_recording_js(&self, recording_id: String) -> Result<(), ApiError> {
+        self.unlike_recording(&recording_id).await
+    }
+
+    #[wasm_bindgen(js_name = getStreamRecordings)]
+    pub async fn get_stream_recordings_js(&self, stream_id: String) -> Result<JsValue, ApiError> {
+        let recordings = self.get_stream_recordings(&stream_id).await?;
+        serde_wasm_bindgen::to_value(&recordings).map_err(|e| ApiError::Serialization(e.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = getStudioRecordings)]
+    pub async fn get_studio_recordings_js(&self, studio_id: String) -> Result<JsValue, ApiError> {
+        let recordings = self.get_studio_recordings(&studio_id).await?;
+        serde_wasm_bindgen::to_value(&recordings).map_err(|e| ApiError::Serialization(e.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = getStudioRecordingsPaginated)]
+    pub async fn get_studio_recordings_paginated_js(
+        &self,
+        studio_id: String,
+        page: Option<i32>,
+        limit: Option<i32>,
+    ) -> Result<models::PaginatedRecordings, ApiError> {
+        self.get_studio_recordings_paginated(&studio_id, page, limit).await
+    }
+
+    #[wasm_bindgen(js_name = getStudioRecording)]
+    pub async fn get_studio_recording_js(
+        &self,
+        studio_id: String,
+        recording_id: String,
+    ) -> Result<models::ServerRecording, ApiError> {
+        self.get_studio_recording(&studio_id, &recording_id).await
+    }
+
+    #[wasm_bindgen(js_name = updateStudioRecording)]
+    pub async fn update_studio_recording_js(
+        &self,
+        studio_id: String,
+        recording_id: String,
+        metadata: models::RecordingMetadata,
+    ) -> Result<models::ServerRecording, ApiError> {
+        self.update_studio_recording(&studio_id, &recording_id, &metadata).await
+    }
+
+    #[wasm_bindgen(js_name = deleteStudioRecording)]
+    pub async fn delete_studio_recording_js(&self, studio_id: String, recording_id: String) -> Result<(), ApiError> {
+        self.delete_studio_recording(&studio_id, &recording_id).await
+    }
+
+    #[wasm_bindgen(js_name = getRecordingStems)]
+    pub async fn get_recording_stems_js(&self, studio_id: String, recording_id: String) -> Result<JsValue, ApiError> {
+        let stems = self.get_recording_stems(&studio_id, &recording_id).await?;
+        serde_wasm_bindgen::to_value(&stems).map_err(|e| ApiError::Serialization(e.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = getUserRecordings)]
+    pub async fn get_user_recordings_js(&self, user_id: String) -> Result<JsValue, ApiError> {
+        let recordings = self.get_user_recordings(&user_id).await?;
+        serde_wasm_bindgen::to_value(&recordings).map_err(|e| ApiError::Serialization(e.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = getUserRecordingsPaginated)]
+    pub async fn get_user_recordings_paginated_js(
+        &self,
+        user_id: String,
+        page: Option<i32>,
+        limit: Option<i32>,
+    ) -> Result<models::PaginatedRecordings, ApiError> {
+        self.get_user_recordings_paginated(&user_id, page, limit).await
+    }
+
+    #[wasm_bindgen(js_name = getRecordingsQuota)]
+    pub async fn get_recordings_quota_js(&self, user_id: String) -> Result<models::RecordingsQuota, ApiError> {
+        self.get_recordings_quota(&user_id).await
+    }
+}
