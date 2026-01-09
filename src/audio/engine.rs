@@ -230,4 +230,44 @@ impl AudioEngine {
     pub fn is_capturing(&self) -> bool {
         self.worklet_node.is_some()
     }
+
+    /// Get the worklet node's message port for event-driven audio processing
+    /// 
+    /// The worklet posts 'audio-ready' messages after each process() call,
+    /// allowing the network loop to wake immediately when audio data is available
+    /// instead of polling at a fixed interval.
+    #[wasm_bindgen(js_name = getWorkletPort)]
+    pub fn get_worklet_port(&self) -> Option<web_sys::MessagePort> {
+        self.worklet_node.as_ref().and_then(|node| node.port().ok())
+    }
+
+    /// Set the output audio device (sink) for playback
+    /// 
+    /// Uses the AudioContext.setSinkId() API to route audio to a specific device.
+    /// Pass an empty string to use the default device.
+    /// 
+    /// # Arguments
+    /// * `device_id` - The device ID from the output device selector, or empty string for default
+    #[wasm_bindgen(js_name = setOutputDevice)]
+    pub async fn set_output_device(&self, device_id: Option<String>) -> Result<(), JsValue> {
+        let ctx_obj: &JsValue = self.ctx.as_ref();
+        
+        // Check if setSinkId is available
+        let has_set_sink_id = js_sys::Reflect::has(ctx_obj, &JsValue::from_str("setSinkId"))?;
+        
+        if !has_set_sink_id {
+            web_sys::console::warn_1(&"setSinkId not supported in this browser, using default output device".into());
+            return Ok(());
+        }
+
+        // Call setSinkId with the device ID or empty string for default
+        let sink_id = device_id.unwrap_or_default();
+        let set_sink_id_fn = js_sys::Reflect::get(ctx_obj, &JsValue::from_str("setSinkId"))?
+            .dyn_into::<js_sys::Function>()?;
+        
+        let promise = set_sink_id_fn.call1(ctx_obj, &JsValue::from_str(&sink_id))?;
+        JsFuture::from(js_sys::Promise::from(promise)).await?;
+        
+        Ok(())
+    }
 }

@@ -246,6 +246,12 @@ class JackTripApp {
     this.outputSelect = document.createElement("select");
     this.outputSelect.className = "select";
     this.populateDeviceOptions(this.outputSelect, outputDevices);
+    
+    // Handle output device changes
+    this.outputSelect.addEventListener("change", () => {
+      this.handleOutputDeviceChange();
+    });
+    
     outputGroup.appendChild(outputLabel);
     outputGroup.appendChild(this.outputSelect);
     card.appendChild(outputGroup);
@@ -546,6 +552,19 @@ class JackTripApp {
     console.log(`Audio channels set to: ${channels} (${isStereo ? "Stereo" : "Mono"})`);
   }
 
+  private async handleOutputDeviceChange(): Promise<void> {
+    if (!this.session) return;
+
+    const deviceId = this.outputSelect.value || undefined;
+    
+    try {
+      await this.session.setOutputDevice(deviceId);
+    } catch (error) {
+      console.error("Failed to set output device:", error);
+      alert(`Failed to change output device: ${error}`);
+    }
+  }
+
   private async handleConnect(): Promise<void> {
     if (!this.session) return;
 
@@ -573,6 +592,15 @@ class JackTripApp {
         this.isToggleActive("noise")
       );
       console.log("Connected to studio");
+
+      // Set the output device to the selected device
+      const outputDeviceId = this.outputSelect.value || undefined;
+      try {
+        await this.session.setOutputDevice(outputDeviceId);
+      } catch (error) {
+        console.warn("Failed to set output device:", error);
+        // Don't fail the connection if output device setting fails
+      }
 
       this.disconnectButton.disabled = false;
     } catch (error) {

@@ -127,6 +127,8 @@ pub struct WebRtcTransport {
     /// JavaScript callbacks for signaling integration
     js_on_ice_candidate: Option<js_sys::Function>,
     js_on_state_change: Option<js_sys::Function>,
+    /// Callback for when data is received (enables event-driven receive processing)
+    js_on_data_received: Rc<RefCell<Option<js_sys::Function>>>,
 }
 
 #[wasm_bindgen]
@@ -149,6 +151,7 @@ impl WebRtcTransport {
             on_data_channel_closure: None,
             js_on_ice_candidate: None,
             js_on_state_change: None,
+            js_on_data_received: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -162,6 +165,15 @@ impl WebRtcTransport {
     /// Set callback for connection state changes
     pub fn set_on_state_change(&mut self, callback: js_sys::Function) {
         self.js_on_state_change = Some(callback);
+    }
+
+    /// Set callback for when data is received
+    /// 
+    /// This enables event-driven receive processing - the callback is invoked
+    /// immediately when a packet arrives, allowing the session to process it
+    /// without waiting for the next polling interval.
+    pub fn set_on_data_received(&mut self, callback: js_sys::Function) {
+        *self.js_on_data_received.borrow_mut() = Some(callback);
     }
 
     /// Get current connection state
@@ -372,6 +384,7 @@ impl WebRtcTransport {
         // (In practice, for JackTrip we create the channel, but this handles the reverse case)
         let receive_queue = self.receive_queue.clone();
         let js_on_state_change = self.js_on_state_change.clone();
+        let js_on_data_received_for_server = self.js_on_data_received.clone();
 
         let on_datachannel = Closure::wrap(Box::new(move |event: RtcDataChannelEvent| {
             let channel = event.channel();
@@ -380,6 +393,7 @@ impl WebRtcTransport {
 
             // Set up message handler for incoming channel
             let queue = receive_queue.clone();
+            let on_data_callback = js_on_data_received_for_server.clone();
             let on_message = Closure::wrap(Box::new(move |msg_event: MessageEvent| {
                 if let Ok(buffer) = msg_event.data().dyn_into::<ArrayBuffer>() {
                     let array = Uint8Array::new(&buffer);
@@ -387,6 +401,11 @@ impl WebRtcTransport {
                     array.copy_to(&mut data);
                     web_sys::console::log_1(&format!("📨 Received {} bytes on server-created channel", data.len()).into());
                     queue.borrow_mut().push_back(data);
+                    
+                    // Notify that data is available for immediate processing
+                    if let Some(ref callback) = *on_data_callback.borrow() {
+                        let _ = callback.call0(&JsValue::NULL);
+                    }
                 } else {
                     web_sys::console::error_1(&"❌ Received non-ArrayBuffer message".into());
                 }
@@ -427,12 +446,18 @@ impl WebRtcTransport {
 
         // Set up message handler
         let receive_queue = self.receive_queue.clone();
+        let on_data_received = self.js_on_data_received.clone();
         let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
             if let Ok(buffer) = event.data().dyn_into::<ArrayBuffer>() {
                 let array = Uint8Array::new(&buffer);
                 let mut data = vec![0u8; array.length() as usize];
                 array.copy_to(&mut data);
                 receive_queue.borrow_mut().push_back(data);
+                
+                // Notify that data is available for immediate processing
+                if let Some(ref callback) = *on_data_received.borrow() {
+                    let _ = callback.call0(&JsValue::NULL);
+                }
             } else {
                 web_sys::console::error_1(&"❌ Received non-ArrayBuffer message on client channel".into());
             }

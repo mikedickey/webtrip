@@ -31,6 +31,12 @@ registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProce
         const output = outputs[0]?.[0] || new Float32Array(128);
         
         // Process audio through the Wasm processor
-        return this.processor.process(input, output);
+        const result = this.processor.process(input, output);
+        
+        // Signal main thread that audio data is ready to send
+        // This wakes up the network loop immediately instead of waiting for polling
+        this.port.postMessage('audio-ready');
+        
+        return result;
     }
 });

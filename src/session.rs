@@ -120,14 +120,20 @@ pub struct JackTripSession {
     buffer_size: usize,
     channels: u8,
 
-    // Buffers for network processing
+    // Buffers for network processing (reused to avoid allocations)
     audio_to_send_buffer: Vec<f32>,
+    packet_serialize_buffer: Vec<u8>,
+    packet_receive_buffer: Vec<f32>,
 
     // Callbacks
     on_state_change: Option<js_sys::Function>,
 
-    // Network loop handle
+    // Network loop handle (legacy interval-based, only used as fallback)
     interval_handle: Option<i32>,
+    
+    // Event-driven network loop (preferred)
+    worklet_message_closure: Option<Closure<dyn FnMut(web_sys::MessageEvent)>>,
+    receive_message_closure: Option<Closure<dyn FnMut()>>,
 
     // Stats tracking
     packets_sent: u64,
@@ -135,6 +141,9 @@ pub struct JackTripSession {
 
     // Pending audio capture parameters (to start after connection)
     pending_capture_params: Option<PendingCaptureParams>,
+    
+    // Selected output device ID (stored until audio engine is ready)
+    output_device_id: Option<String>,
 }
 
 /// Parameters for starting audio capture after connection
@@ -169,6 +178,13 @@ impl JackTripSession {
         let samples_per_packet = buffer_size * channels as usize;
         network_to_local_buffer.configure(samples_per_packet as u32, 4);
 
+        // Pre-allocate buffers to avoid allocations in audio hot path
+        let audio_to_send_buffer = vec![0.0; buffer_size * channels as usize];
+        // Worst case: 32-bit samples = 4 bytes per sample
+        let max_packet_bytes = 16 + (buffer_size * channels as usize * 4); 
+        let packet_serialize_buffer = vec![0u8; max_packet_bytes];
+        let packet_receive_buffer = vec![0.0; buffer_size * channels as usize];
+
         Ok(JackTripSession {
             audio_params_ptr,
             audio_engine: None,
@@ -182,12 +198,17 @@ impl JackTripSession {
             sample_rate,
             buffer_size,
             channels,
-            audio_to_send_buffer: vec![0.0; buffer_size * channels as usize],
+            audio_to_send_buffer,
+            packet_serialize_buffer,
+            packet_receive_buffer,
             on_state_change: None,
             interval_handle: None,
+            worklet_message_closure: None,
+            receive_message_closure: None,
             packets_sent: 0,
             packets_received: 0,
             pending_capture_params: None,
+            output_device_id: None,
         })
     }
 
@@ -228,8 +249,13 @@ impl JackTripSession {
     pub fn set_channels(&mut self, channels: u8) {
         if channels >= 1 && channels <= 8 {
             self.channels = channels;
-            // Update audio buffer size
-            self.audio_to_send_buffer = vec![0.0; self.buffer_size * channels as usize];
+            // Update audio buffers (reused, no allocations in hot path)
+            self.audio_to_send_buffer.resize(self.buffer_size * channels as usize, 0.0);
+            self.packet_receive_buffer.resize(self.buffer_size * channels as usize, 0.0);
+            // Update serialize buffer for worst case (32-bit)
+            let max_packet_bytes = 16 + (self.buffer_size * channels as usize * 4);
+            self.packet_serialize_buffer.resize(max_packet_bytes, 0);
+            
             // Sync to AudioParams so processor knows to duplicate mono to stereo
             if !self.audio_params_ptr.is_null() {
                 unsafe {
@@ -246,6 +272,27 @@ impl JackTripSession {
     #[wasm_bindgen(js_name = getChannels)]
     pub fn get_channels(&self) -> u8 {
         self.channels
+    }
+
+    /// Set the output audio device for playback
+    /// 
+    /// This can be called at any time to change the output device,
+    /// even while audio is playing. If the audio engine hasn't been
+    /// created yet, the device will be stored and applied when the
+    /// engine is initialized.
+    /// 
+    /// # Arguments
+    /// * `device_id` - The device ID from the output device selector, or empty string/None for default
+    #[wasm_bindgen(js_name = setOutputDevice)]
+    pub async fn set_output_device(&mut self, device_id: Option<String>) -> Result<(), JsValue> {
+        // Store the desired output device
+        self.output_device_id = device_id.clone();
+        
+        // If audio engine exists, apply immediately
+        if let Some(ref engine) = self.audio_engine {
+            engine.set_output_device(device_id).await?;
+        }
+        Ok(())
     }
 
     /// Start audio capture (internal use only)
@@ -281,6 +328,17 @@ impl JackTripSession {
                 )
                 .await?;
         }
+
+        // Apply stored output device selection now that audio engine is ready
+        if let Some(ref output_device) = self.output_device_id {
+            if let Some(ref engine) = self.audio_engine {
+                engine.set_output_device(Some(output_device.clone())).await?;
+            }
+        }
+
+        // Set up event-driven network loop now that the worklet is ready
+        // This replaces the polling interval with immediate wake-up on audio data
+        self.setup_worklet_message_handler();
 
         Ok(())
     }
@@ -369,6 +427,20 @@ impl JackTripSession {
         
         transport.set_on_ice_candidate(ice_callback.as_ref().unchecked_ref::<js_sys::Function>().clone());
         ice_callback.forget();
+
+        // Set up receive callback for event-driven packet processing
+        // This wakes the session immediately when packets arrive instead of waiting for polling
+        let receive_session_ptr = self as *mut JackTripSession;
+        let receive_callback = Closure::wrap(Box::new(move || {
+            unsafe {
+                if !receive_session_ptr.is_null() {
+                    (*receive_session_ptr).tick();
+                }
+            }
+        }) as Box<dyn FnMut()>);
+        
+        transport.set_on_data_received(receive_callback.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        receive_callback.forget();
 
         // Store components before setting up signaling callbacks
         self.signaling = Some(signaling);
@@ -572,37 +644,35 @@ impl JackTripSession {
         let samples_needed = (self.buffer_size * self.channels as usize) as u32;
         while self.local_to_network_buffer.available() >= samples_needed {
             if self.local_to_network_buffer.read(&mut self.audio_to_send_buffer) {
-                let packet = if self.channels == 1 {
-                    crate::audio::protocol::AudioPacket::mono(
-                        self.sequence_number,
-                        self.timestamp,
-                        self.audio_to_send_buffer.clone(),
-                    )
-                } else {
-                    crate::audio::protocol::AudioPacket::stereo(
-                        self.sequence_number,
-                        self.timestamp,
-                        self.audio_to_send_buffer.clone(),
-                    )
+                // Serialize directly into reusable buffer (no allocations!)
+                let bytes_written = match crate::audio::protocol::AudioPacket::serialize_samples_into(
+                    self.sequence_number,
+                    self.timestamp,
+                    &self.audio_to_send_buffer,
+                    self.channels,
+                    &mut self.packet_serialize_buffer,
+                ) {
+                    Ok(size) => size,
+                    Err(e) => {
+                        web_sys::console::error_1(&format!("❌ Serialize failed: {:?}", e).into());
+                        break;
+                    }
                 };
 
                 // Log first packet details
                 if self.packets_sent == 0 {
                     web_sys::console::log_1(&format!(
-                        "📤 First packet: seq={}, timestamp={}, samples={}, buffer_size in header={}, session buffer_size={}, channels={}, num_incoming={}, num_outgoing={}", 
+                        "📤 First packet: seq={}, timestamp={}, samples={}, buffer_size={}, channels={}", 
                         self.sequence_number,
                         self.timestamp,
-                        packet.samples.len(),
-                        packet.header.buffer_size,
+                        self.audio_to_send_buffer.len(),
                         self.buffer_size,
-                        self.channels,
-                        packet.header.num_incoming_channels,
-                        packet.header.num_outgoing_channels
+                        self.channels
                     ).into());
                 }
 
                 if let Some(ref transport) = self.transport {
-                    match transport.send_packet(&packet) {
+                    match transport.send_bytes(&self.packet_serialize_buffer[..bytes_written]) {
                         Ok(_) => {
                             if self.packets_sent == 0 {
                                 web_sys::console::log_1(&"✅ First packet sent successfully!".into());
@@ -623,38 +693,33 @@ impl JackTripSession {
         }
         
         // === RECEIVE PATH: network → local audio ===
-        // Collect packets first to avoid borrow issues
-        let mut received_packets = Vec::new();
         if let Some(ref transport) = self.transport {
             while transport.has_pending_data() {
-                match transport.receive_packet() {
-                    Ok(Some(packet)) => {
-                        if self.packets_received == 0 {
-                            web_sys::console::log_1(&"✅ First packet decoded successfully!".into());
+                // Get raw bytes from transport (still allocates Vec<u8> from queue)
+                if let Some(data) = transport.receive_bytes() {
+                    // Deserialize into reusable buffer (no samples Vec allocation!)
+                    match crate::audio::protocol::AudioPacket::deserialize_into(&data, &mut self.packet_receive_buffer) {
+                        Ok(header) => {
+                            if self.packets_received == 0 {
+                                web_sys::console::log_1(&format!(
+                                    "✅ First packet decoded successfully! seq={}, samples={}", 
+                                    header.sequence_number,
+                                    self.packet_receive_buffer.len()
+                                ).into());
+                            }
+                            self.network_to_local_buffer
+                                .push(header.sequence_number as u64, &self.packet_receive_buffer);
+                            self.packets_received += 1;
                         }
-                        received_packets.push(packet);
+                        Err(e) => {
+                            web_sys::console::error_1(&format!("❌ Failed to decode packet: {:?}", e).into());
+                            break;
+                        }
                     }
-                    Ok(None) => break,
-                    Err(e) => {
-                        web_sys::console::error_1(&format!("❌ Failed to decode packet: {:?}", e).into());
-                        break;
-                    }
+                } else {
+                    break;
                 }
             }
-        }
-
-        // Process collected packets
-        for packet in received_packets {
-            if self.packets_received == 0 {
-                web_sys::console::log_1(&format!(
-                    "🎵 Processing first packet: seq={}, samples={}", 
-                    packet.header.sequence_number,
-                    packet.samples.len()
-                ).into());
-            }
-            self.network_to_local_buffer
-                .push(packet.header.sequence_number as u64, &packet.samples);
-            self.packets_received += 1;
         }
     }
 
@@ -677,11 +742,15 @@ impl JackTripSession {
         }
     }
 
+    /// Start the event-driven network loop
+    /// 
+    /// Instead of polling at a fixed interval, this sets up message handlers:
+    /// - AudioWorklet posts 'audio-ready' when data is written to ring buffer
+    /// - WebRTC transport's on_data_received callback triggers when packets arrive
+    /// 
+    /// This wakes up immediately when there's work to do, reducing latency
+    /// and eliminating unnecessary wake-ups.
     fn start_network_loop(&mut self) {
-        if self.interval_handle.is_some() {
-            return;
-        }
-
         // Enable streaming on the local-to-network buffer
         self.local_to_network_buffer.set_streaming(true);
 
@@ -692,35 +761,53 @@ impl JackTripSession {
         // Reset network-to-local buffer
         self.network_to_local_buffer.reset();
 
-        // Set up interval using web-sys
-        let window = web_sys::window().expect("no global window");
+        // The worklet message handler is set up after audio capture starts
+        // (see setup_worklet_message_handler)
+        // Incoming packets are handled by the WebRTC on_data_received callback
+        // which was set up in connect_to_studio()
+    }
 
-        // We need to create a closure that calls tick()
-        // Since we can't capture self, we use a raw pointer approach
-        // This is safe because the interval is cleared before the session is dropped
+    /// Set up the worklet message handler for event-driven packet sending
+    /// 
+    /// Called after audio capture starts, when the worklet port is available.
+    fn setup_worklet_message_handler(&mut self) {
+        // Get the worklet port from the audio engine
+        let port = match self.audio_engine.as_ref().and_then(|e| e.get_worklet_port()) {
+            Some(p) => p,
+            None => {
+                web_sys::console::error_1(&"❌ Could not get worklet port for event-driven network loop".into());
+                return;
+            }
+        };
+
         let session_ptr = self as *mut JackTripSession;
 
-        let closure = Closure::wrap(Box::new(move || {
+        // Set up message handler for worklet 'audio-ready' messages
+        let on_message = Closure::wrap(Box::new(move |_event: web_sys::MessageEvent| {
             unsafe {
                 if !session_ptr.is_null() {
                     (*session_ptr).tick();
                 }
             }
-        }) as Box<dyn FnMut()>);
+        }) as Box<dyn FnMut(web_sys::MessageEvent)>);
 
-        let handle = window
-            .set_interval_with_callback_and_timeout_and_arguments_0(
-                closure.as_ref().unchecked_ref(),
-                5, // 5ms interval for low latency
-            )
-            .expect("failed to set interval");
+        port.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+        self.worklet_message_closure = Some(on_message);
 
-        closure.forget(); // Leak the closure so it stays alive
-
-        self.interval_handle = Some(handle);
+        web_sys::console::log_1(&"✅ Event-driven network loop active".into());
     }
 
     fn stop_network_loop(&mut self) {
+        // Clean up worklet message handler
+        if let Some(ref engine) = self.audio_engine {
+            if let Some(port) = engine.get_worklet_port() {
+                port.set_onmessage(None);
+            }
+        }
+        self.worklet_message_closure = None;
+        self.receive_message_closure = None;
+
+        // Clean up any legacy interval handle (in case it was used)
         if let Some(handle) = self.interval_handle.take() {
             if let Some(window) = web_sys::window() {
                 window.clear_interval_with_handle(handle);

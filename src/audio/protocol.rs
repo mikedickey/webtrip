@@ -360,16 +360,74 @@ impl AudioPacket {
         Self { header, samples }
     }
 
-    /// Serialize the entire packet to bytes
+    /// Serialize samples directly into a buffer without creating an AudioPacket (no allocation)
     ///
-    /// Audio samples are serialized according to the bit_depth field in the header.
-    /// f32 samples in the range [-1.0, 1.0] are converted to the appropriate integer format.
-    pub fn serialize(&self) -> Result<Vec<u8>, ProtocolError> {
-        let total_size = self.header.total_packet_size_out();
-        let mut buffer = vec![0u8; total_size];
+    /// This is optimized for the send path where we want to avoid cloning the samples vector.
+    /// Returns the number of bytes written.
+    pub fn serialize_samples_into(
+        sequence_number: u16,
+        timestamp: u64,
+        samples: &[f32],
+        channels: u8,
+        buffer: &mut [u8],
+    ) -> Result<usize, ProtocolError> {
+        // Create header inline
+        let mut header = if channels == 1 {
+            PacketHeader::new(sequence_number, timestamp)
+        } else {
+            PacketHeader::stereo(sequence_number, timestamp)
+        };
+        
+        header.buffer_size = if channels == 1 {
+            samples.len() as u16
+        } else {
+            (samples.len() / channels as usize) as u16
+        };
+        header.num_incoming_channels = channels;
+        header.num_outgoing_channels = channels;
+
+        let total_size = header.total_packet_size_out();
+        if buffer.len() < total_size {
+            return Err(ProtocolError::BufferTooSmall);
+        }
 
         // Serialize header
-        self.header.serialize(&mut buffer)?;
+        header.serialize(&mut buffer[..HEADER_SIZE])?;
+
+        // Serialize audio data based on bit depth
+        let audio_start = HEADER_SIZE;
+        match header.bit_depth {
+            16 => {
+                // 16-bit: convert f32 [-1.0, 1.0] to i16 (little-endian)
+                for (i, &sample) in samples.iter().enumerate() {
+                    let offset = audio_start + i * 2;
+                    let int_sample = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+                    buffer[offset..offset + 2].copy_from_slice(&int_sample.to_le_bytes());
+                }
+            }
+            _ => {
+                // For other bit depths, fall back to the standard path
+                // (in practice we always use 16-bit)
+                return Err(ProtocolError::InvalidBitDepth);
+            }
+        }
+
+        Ok(total_size)
+    }
+
+    /// Serialize the entire packet into a provided buffer (no allocation)
+    ///
+    /// Returns the number of bytes written.
+    /// Audio samples are serialized according to the bit_depth field in the header.
+    /// f32 samples in the range [-1.0, 1.0] are converted to the appropriate integer format.
+    pub fn serialize_into(&self, buffer: &mut [u8]) -> Result<usize, ProtocolError> {
+        let total_size = self.header.total_packet_size_out();
+        if buffer.len() < total_size {
+            return Err(ProtocolError::BufferTooSmall);
+        }
+
+        // Serialize header
+        self.header.serialize(&mut buffer[..HEADER_SIZE])?;
 
         // Serialize audio data based on bit depth
         let audio_start = HEADER_SIZE;
@@ -378,40 +436,32 @@ impl AudioPacket {
                 // 8-bit: convert f32 [-1.0, 1.0] to i8
                 for (i, &sample) in self.samples.iter().enumerate() {
                     let offset = audio_start + i;
-                    if offset < buffer.len() {
-                        let int_sample = (sample.clamp(-1.0, 1.0) * 128.0) as i8;
-                        buffer[offset] = int_sample as u8;
-                    }
+                    let int_sample = (sample.clamp(-1.0, 1.0) * 128.0) as i8;
+                    buffer[offset] = int_sample as u8;
                 }
             }
             16 => {
                 // 16-bit: convert f32 [-1.0, 1.0] to i16 (little-endian)
                 for (i, &sample) in self.samples.iter().enumerate() {
                     let offset = audio_start + i * 2;
-                    if offset + 2 <= buffer.len() {
-                        let int_sample = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
-                        buffer[offset..offset + 2].copy_from_slice(&int_sample.to_le_bytes());
-                    }
+                    let int_sample = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+                    buffer[offset..offset + 2].copy_from_slice(&int_sample.to_le_bytes());
                 }
             }
             24 => {
                 // 24-bit: convert f32 [-1.0, 1.0] to i32 in 3 bytes (little-endian)
                 for (i, &sample) in self.samples.iter().enumerate() {
                     let offset = audio_start + i * 3;
-                    if offset + 3 <= buffer.len() {
-                        let int_sample = (sample.clamp(-1.0, 1.0) * 8388607.0) as i32;
-                        let bytes = int_sample.to_le_bytes();
-                        buffer[offset..offset + 3].copy_from_slice(&bytes[0..3]);
-                    }
+                    let int_sample = (sample.clamp(-1.0, 1.0) * 8388607.0) as i32;
+                    let bytes = int_sample.to_le_bytes();
+                    buffer[offset..offset + 3].copy_from_slice(&bytes[0..3]);
                 }
             }
             32 => {
                 // 32-bit: serialize as f32 (little-endian)
                 for (i, &sample) in self.samples.iter().enumerate() {
                     let offset = audio_start + i * 4;
-                    if offset + 4 <= buffer.len() {
-                        buffer[offset..offset + 4].copy_from_slice(&sample.to_le_bytes());
-                    }
+                    buffer[offset..offset + 4].copy_from_slice(&sample.to_le_bytes());
                 }
             }
             _ => {
@@ -419,11 +469,24 @@ impl AudioPacket {
             }
         }
 
+        Ok(total_size)
+    }
+
+    /// Serialize the entire packet to bytes (allocating version, for compatibility)
+    ///
+    /// Audio samples are serialized according to the bit_depth field in the header.
+    /// f32 samples in the range [-1.0, 1.0] are converted to the appropriate integer format.
+    pub fn serialize(&self) -> Result<Vec<u8>, ProtocolError> {
+        let total_size = self.header.total_packet_size_out();
+        let mut buffer = vec![0u8; total_size];
+        self.serialize_into(&mut buffer)?;
         Ok(buffer)
     }
 
-    /// Deserialize a packet from bytes
-    pub fn deserialize(buffer: &[u8]) -> Result<Self, ProtocolError> {
+    /// Deserialize a packet from bytes into a provided samples buffer (no allocation)
+    ///
+    /// Clears and fills the provided samples vector. Returns the packet header.
+    pub fn deserialize_into(buffer: &[u8], samples: &mut Vec<f32>) -> Result<PacketHeader, ProtocolError> {
         let header = PacketHeader::deserialize(buffer)?;
 
         // For incoming packets, use num_incoming_channels
@@ -440,7 +503,9 @@ impl AudioPacket {
             return Err(ProtocolError::BufferTooSmall);
         }
 
-        let mut samples = Vec::with_capacity(num_samples);
+        // Reuse the provided buffer
+        samples.clear();
+        samples.reserve(num_samples);
         let audio_start = HEADER_SIZE;
 
         // Deserialize based on bit depth
@@ -487,6 +552,13 @@ impl AudioPacket {
             }
         }
 
+        Ok(header)
+    }
+
+    /// Deserialize a packet from bytes (allocating version, for compatibility)
+    pub fn deserialize(buffer: &[u8]) -> Result<Self, ProtocolError> {
+        let mut samples = Vec::new();
+        let header = Self::deserialize_into(buffer, &mut samples)?;
         Ok(Self { header, samples })
     }
 }
