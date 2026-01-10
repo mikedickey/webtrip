@@ -468,22 +468,32 @@ impl HubSignaling {
         let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
             if let Ok(text) = event.data().dyn_into::<js_sys::JsString>() {
                 let text: String = text.into();
+                web_sys::console::debug_1(&format!("📨 Signaling received message: {}", text).into());
+                
                 if let Ok(msg) = SignalingMessage::from_json(&text) {
+                    web_sys::console::debug_1(&format!("✅ Parsed message type: {:?}", msg.msg_type).into());
                     match msg.msg_type {
                         SignalingMessageType::Answer => {
+                            web_sys::console::debug_1(&"📥 Signaling: Answer message detected".into());
                             if let Some(ref callback) = js_on_answer {
                                 if let Some(ref sdp) = msg.sdp {
+                                    web_sys::console::debug_1(&"✅ Signaling: Calling answer callback".into());
                                     let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(sdp));
                                 }
+                            } else {
+                                web_sys::console::warn_1(&"⚠️ Answer callback not set".into());
                             }
                         }
                         SignalingMessageType::Ice => {
                             if let Some(ref callback) = js_on_ice {
                                 let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&text));
+                            } else {
+                                web_sys::console::warn_1(&"⚠️ ICE callback not set".into());
                             }
                         }
                         SignalingMessageType::Error => {
                             let error = msg.error.as_deref().unwrap_or("Unknown error");
+                            web_sys::console::error_1(&format!("❌ Signaling error: {}", error).into());
                             if let Some(ref callback) = js_on_error {
                                 let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(error));
                             }
@@ -492,6 +502,8 @@ impl HubSignaling {
                             message_queue.borrow_mut().push(msg);
                         }
                     }
+                } else {
+                    web_sys::console::warn_1(&"⚠️ Failed to parse signaling message".into());
                 }
             }
         }) as Box<dyn FnMut(_)>);
@@ -505,16 +517,22 @@ impl HubSignaling {
         let is_ready = self.is_ready.clone();
         let outgoing_queue = self.outgoing_queue.clone();
         let on_open = Closure::wrap(Box::new(move || {
+            web_sys::console::debug_1(&"✅ Signaling: WebSocket connected!".into());
+            
             // Send protocol handshake first
             let msg = SignalingMessage::protocol(&client_name);
-            let _ = socket_clone.send_with_str(&msg.to_json());
+            let json = msg.to_json();
+            web_sys::console::debug_1(&format!("📤 Signaling: Sending protocol handshake: {}", json).into());
+            let _ = socket_clone.send_with_str(&json);
             
             // Mark as ready
             *is_ready.borrow_mut() = true;
             
             // Flush any queued outgoing messages
             let queued: Vec<String> = outgoing_queue.borrow_mut().drain(..).collect();
+            web_sys::console::debug_1(&format!("📤 Signaling: Flushing {} queued messages", queued.len()).into());
             for msg in queued {
+                web_sys::console::debug_1(&format!("📤 Signaling: Sending queued: {}", msg).into());
                 let _ = socket_clone.send_with_str(&msg);
             }
         }) as Box<dyn FnMut()>);
@@ -525,6 +543,7 @@ impl HubSignaling {
         // On close
         let js_on_state_change = self.js_on_state_change.clone();
         let on_close = Closure::wrap(Box::new(move || {
+            web_sys::console::warn_1(&"⚠️ Signaling: WebSocket closed".into());
             if let Some(ref callback) = js_on_state_change {
                 let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("closed"));
             }
@@ -535,7 +554,8 @@ impl HubSignaling {
 
         // On error
         let js_on_error_clone = self.js_on_error.clone();
-        let on_error = Closure::wrap(Box::new(move |_event: Event| {
+        let on_error = Closure::wrap(Box::new(move |event: Event| {
+            web_sys::console::error_1(&format!("❌ Signaling: WebSocket error: {:?}", event).into());
             if let Some(ref callback) = js_on_error_clone {
                 let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("WebSocket error"));
             }
@@ -620,13 +640,24 @@ impl HubSignaling {
     }
 
     fn cleanup(&mut self) {
-        self.socket = None;
-        *self.is_ready.borrow_mut() = false;
-        self.outgoing_queue.borrow_mut().clear();
+        // Remove event handlers BEFORE dropping closures to prevent "closure invoked after being dropped" errors
+        if let Some(ref socket) = self.socket {
+            socket.set_onmessage(None);
+            socket.set_onopen(None);
+            socket.set_onclose(None);
+            socket.set_onerror(None);
+        }
+        
+        // Now safe to drop closures
         self.on_message_closure = None;
         self.on_open_closure = None;
         self.on_close_closure = None;
         self.on_error_closure = None;
+        
+        // Finally drop the socket
+        self.socket = None;
+        *self.is_ready.borrow_mut() = false;
+        self.outgoing_queue.borrow_mut().clear();
         self.message_queue.borrow_mut().clear();
     }
 }

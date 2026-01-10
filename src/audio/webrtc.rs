@@ -18,9 +18,13 @@
 //! - Binary mode (ArrayBuffer)
 
 use crate::audio::protocol::AudioPacket;
+use crate::audio::signaling::HubSignaling;
+use crate::audio::transport::{Transport, TransportState as CommonTransportState, TransportType, AudioBufferConfig};
 use js_sys::{Array, ArrayBuffer, Object, Reflect, Uint8Array};
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -109,14 +113,34 @@ impl Default for TransportConfig {
 ///
 /// Handles peer-to-peer connection establishment and audio data transmission.
 /// Designed to work with JackTrip hub servers that support WebRTC.
+/// 
+/// ## Internal Signaling
+/// 
+/// This transport manages all WebRTC signaling internally via `connect_to_hub()`:
+/// - Creates and manages HubSignaling (WebSocket connection)
+/// - Handles SDP offer/answer exchange
+/// - Manages ICE candidate exchange
+/// - Sets up unreliable, unordered data channel for audio
+///
+/// ## Internal Tick Loop
+/// 
+/// WebRTC requires data channel operations to stay on the main JavaScript thread.
+/// To work around this, the WebRTC transport manages its own internal tick loop:
+/// - Reads from the ring buffer (audio to send)
+/// - Writes to the jitter buffer (audio received)
+/// - Uses EventLoop for efficient wake-up (Atomics.waitAsync or postMessage)
+///
+/// Other transports (like WebTransport) don't need this and can run entirely in workers.
 #[wasm_bindgen]
 pub struct WebRtcTransport {
     config: TransportConfig,
     peer_connection: Option<RtcPeerConnection>,
     data_channel: Option<RtcDataChannel>,
     state: ConnectionState,
-    /// Queue for received packets
+    /// Queue for received packets (not used when buffers are provided)
     receive_queue: Rc<RefCell<VecDeque<Vec<u8>>>>,
+    /// Hub signaling client (used when connecting to JackTrip hub)
+    signaling: Option<HubSignaling>,
     /// Callbacks stored as closures
     #[allow(clippy::type_complexity)]
     on_message_closure: Option<Closure<dyn FnMut(MessageEvent)>>,
@@ -124,11 +148,20 @@ pub struct WebRtcTransport {
     on_channel_close_closure: Option<Closure<dyn FnMut()>>,
     on_ice_candidate_closure: Option<Closure<dyn FnMut(web_sys::RtcPeerConnectionIceEvent)>>,
     on_data_channel_closure: Option<Closure<dyn FnMut(RtcDataChannelEvent)>>,
-    /// JavaScript callbacks for signaling integration
-    js_on_ice_candidate: Option<js_sys::Function>,
+    /// JavaScript callbacks for external integration (optional)
     js_on_state_change: Option<js_sys::Function>,
-    /// Callback for when data is received (enables event-driven receive processing)
-    js_on_data_received: Rc<RefCell<Option<js_sys::Function>>>,
+    /// Callback for ICE candidates (enables external ICE handling)
+    js_on_ice_candidate: Option<js_sys::Function>,
+    
+    // Audio buffer configuration for tick processing
+    audio_buffers: Option<AudioBufferConfig>,
+    /// Sequence number for outgoing packets
+    sequence_number: u16,
+    /// Timestamp for outgoing packets
+    timestamp: u64,
+    /// Buffers for packet processing (reused to avoid allocations)
+    audio_to_send_buffer: Vec<f32>,
+    packet_serialize_buffer: Vec<u8>,
 }
 
 #[wasm_bindgen]
@@ -137,6 +170,13 @@ impl WebRtcTransport {
     #[wasm_bindgen(constructor)]
     pub fn new(config: Option<TransportConfig>) -> Result<WebRtcTransport, JsValue> {
         let config = config.unwrap_or_default();
+        
+        // Pre-allocate buffers for tick loop (will be resized based on buffer config)
+        let buffer_size = 128; // Default, will be updated
+        let channels = 2; // Default, will be updated
+        let audio_to_send_buffer = vec![0.0; buffer_size * channels];
+        let max_packet_bytes = 16 + (buffer_size * channels * 4);
+        let packet_serialize_buffer = vec![0u8; max_packet_bytes];
 
         Ok(WebRtcTransport {
             config,
@@ -144,44 +184,343 @@ impl WebRtcTransport {
             data_channel: None,
             state: ConnectionState::Disconnected,
             receive_queue: Rc::new(RefCell::new(VecDeque::with_capacity(64))),
+            signaling: None,
             on_message_closure: None,
             on_channel_open_closure: None,
             on_channel_close_closure: None,
             on_ice_candidate_closure: None,
             on_data_channel_closure: None,
-            js_on_ice_candidate: None,
             js_on_state_change: None,
-            js_on_data_received: Rc::new(RefCell::new(None)),
+            js_on_ice_candidate: None,
+            audio_buffers: None,
+            sequence_number: 0,
+            timestamp: 0,
+            audio_to_send_buffer,
+            packet_serialize_buffer,
         })
     }
 
-    /// Set callback for ICE candidates
-    ///
-    /// The callback receives (candidate: string, sdpMid: string, sdpMLineIndex: number)
-    pub fn set_on_ice_candidate(&mut self, callback: js_sys::Function) {
-        self.js_on_ice_candidate = Some(callback);
-    }
-
-    /// Set callback for connection state changes
+    /// Set callback for connection state changes (optional, for external monitoring)
     pub fn set_on_state_change(&mut self, callback: js_sys::Function) {
         self.js_on_state_change = Some(callback);
     }
 
-    /// Set callback for when data is received
-    /// 
-    /// This enables event-driven receive processing - the callback is invoked
-    /// immediately when a packet arrives, allowing the session to process it
-    /// without waiting for the next polling interval.
-    pub fn set_on_data_received(&mut self, callback: js_sys::Function) {
-        *self.js_on_data_received.borrow_mut() = Some(callback);
+    /// Set callback for ICE candidates (optional, for external signaling)
+    pub fn set_on_ice_candidate(&mut self, callback: js_sys::Function) {
+        self.js_on_ice_candidate = Some(callback);
     }
+
+    /// Process one audio callback tick
+    /// 
+    /// Called by the session layer when the audio worklet's process() callback runs.
+    /// Reads from the ring buffer and writes to the jitter buffer.
+    fn do_tick(&mut self) {
+        // Only process if we have buffers configured and we're connected
+        let buffers = match self.audio_buffers {
+            Some(config) => config,
+            None => return,
+        };
+
+        if !self.is_connected() {
+            return;
+        }
+
+        let samples_needed = (buffers.buffer_size * buffers.channels as usize) as u32;
+        
+        // Safety: We're in single-threaded WASM, and these pointers are valid
+        // for the lifetime of the session
+        let ring_buffer = unsafe { &mut *buffers.local_to_network_ptr };
+        let jitter_buffer = unsafe { &*buffers.network_to_local_ptr };
+        
+        // Interleaved send/receive for better latency balance
+        loop {
+            let mut processed_send = false;
+            let mut processed_receive = false;
+            
+            // Try to process one send packet
+            if ring_buffer.available() >= samples_needed {
+                if ring_buffer.read(&mut self.audio_to_send_buffer) {
+                    // Serialize directly into reusable buffer
+                    match crate::audio::protocol::AudioPacket::serialize_samples_into(
+                        self.sequence_number,
+                        self.timestamp,
+                        &self.audio_to_send_buffer,
+                        buffers.channels,
+                        &mut self.packet_serialize_buffer,
+                    ) {
+                        Ok(bytes_written) => {
+                            if let Some(ref channel) = self.data_channel {
+                                if channel.ready_state() == RtcDataChannelState::Open {
+                                    let array = Uint8Array::from(&self.packet_serialize_buffer[..bytes_written]);
+                                    if let Ok(()) = channel.send_with_array_buffer_view(&array) {
+                                        self.sequence_number = self.sequence_number.wrapping_add(1);
+                                        self.timestamp += buffers.buffer_size as u64;
+                                        processed_send = true;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            web_sys::console::error_1(&format!("❌ WebRTC serialize failed: {:?}", e).into());
+                        }
+                    }
+                }
+            }
+            
+            // Try to process one receive packet
+            if let Some(data) = self.receive_queue.borrow_mut().pop_front() {
+                match AudioPacket::deserialize(&data) {
+                    Ok(packet) => {
+                        jitter_buffer.push(packet.header.sequence_number as u64, &packet.samples);
+                        processed_receive = true;
+                    }
+                    Err(e) => {
+                        web_sys::console::error_1(&format!("❌ WebRTC failed to deserialize: {:?}", e).into());
+                    }
+                }
+            }
+            
+            // Exit loop if neither direction had data to process
+            if !processed_send && !processed_receive {
+                break;
+            }
+        }
+    }
+
+
+    /// Start connection to JackTrip hub server
+    ///
+    /// This method handles all WebRTC signaling internally:
+    /// - Creates and manages HubSignaling
+    /// - Creates SDP offer
+    /// - Handles SDP answer from server
+    /// - Exchanges ICE candidates
+    /// - Sets up data channel
+    ///
+    /// Returns when the connection is fully established and ready to send/receive.
+    async fn connect_to_hub(
+        &mut self,
+        server: &str,
+        port: u16,
+        use_tls: bool,
+        client_name: &str,
+    ) -> Result<(), JsValue> {
+        web_sys::console::log_1(&format!("🔌 Connecting to hub: {}:{} (TLS: {})", server, port, use_tls).into());
+        
+        self.state = ConnectionState::Connecting;
+        self.notify_state_change();
+
+        // Create a Promise that will resolve when connection is established
+        let (promise, resolve, reject) = {
+            let mut resolve_func = None;
+            let mut reject_func = None;
+            let promise = js_sys::Promise::new(&mut |resolve, reject_val| {
+                resolve_func = Some(resolve);
+                reject_func = Some(reject_val);
+            });
+            (promise, resolve_func.unwrap(), reject_func.unwrap())
+        };
+
+        // Wrap resolve/reject in Rc for sharing with closures
+        let resolve_rc = Rc::new(RefCell::new(Some(resolve)));
+        let reject_rc = Rc::new(RefCell::new(Some(reject)));
+        let resolve_for_answer = resolve_rc.clone();
+        let reject_for_answer = reject_rc.clone();
+
+        // Create signaling client wrapped in Rc<RefCell<>> for safe shared ownership
+        let signaling = HubSignaling::new(server, port, use_tls, client_name);
+        self.signaling = Some(signaling);
+
+        // Wrap signaling in Rc<RefCell<>> for safe sharing with closures
+        let signaling_rc = Rc::new(RefCell::new(self.signaling.take()));
+        let signaling_for_ice = signaling_rc.clone();
+        
+        let ice_js_callback = Closure::wrap(Box::new(move |candidate: JsValue, sdp_mid: JsValue, sdp_m_line_index: JsValue| {
+            let candidate_str = candidate.as_string().unwrap_or_default();
+            let sdp_mid_str = sdp_mid.as_string().unwrap_or_else(|| "0".to_string());
+            let index = sdp_m_line_index.as_f64().unwrap_or(0.0) as u16;
+            
+            if let Some(ref sig) = *signaling_for_ice.borrow() {
+                if let Err(e) = sig.send_ice_candidate(&candidate_str, &sdp_mid_str, index) {
+                    web_sys::console::error_1(&format!("❌ Failed to send ICE candidate: {:?}", e).into());
+                }
+            }
+        }) as Box<dyn FnMut(JsValue, JsValue, JsValue)>);
+        
+        // Store the JS callback for ICE candidates
+        self.set_on_ice_candidate(ice_js_callback.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        ice_js_callback.forget();
+
+        // For answer and ICE candidate from server, we need access to peer_connection
+        // which is already stored in self. Clone the Rc so callbacks can access it.
+        let peer_conn_ref = Rc::new(RefCell::new(None::<RtcPeerConnection>));
+        let peer_conn_for_answer = peer_conn_ref.clone();
+        let peer_conn_for_ice = peer_conn_ref.clone();
+        
+        // Share connection state between self and closures
+        let shared_state = Rc::new(RefCell::new(ConnectionState::Connecting));
+        let shared_state_for_answer = shared_state.clone();
+        
+        // Also need access to state callback
+        let state_callback = self.js_on_state_change.clone();
+        let state_callback_for_answer = state_callback.clone();
+        
+        let answer_callback = Closure::wrap(Box::new(move |sdp: JsValue| {
+            web_sys::console::debug_1(&"📥 WebRTC: Received answer from server!".into());
+            let sdp_str = sdp.as_string().unwrap_or_default();
+            let peer_conn = peer_conn_for_answer.clone();
+            let state_cb = state_callback_for_answer.clone();
+            let state_ref = shared_state_for_answer.clone();
+            let resolve = resolve_for_answer.clone();
+            let reject = reject_for_answer.clone();
+            
+            wasm_bindgen_futures::spawn_local(async move {
+                web_sys::console::debug_1(&"🔄 WebRTC: Processing answer...".into());
+                // Get peer connection from shared ref
+                let pc_opt = peer_conn.borrow().clone();
+                if let Some(pc) = pc_opt {
+                    let desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
+                    desc.set_sdp(&sdp_str);
+                    
+                    match JsFuture::from(pc.set_remote_description(&desc)).await {
+                        Ok(_) => {
+                            web_sys::console::debug_1(&"✅ WebRTC connection established".into());
+                            
+                            // Update shared state
+                            *state_ref.borrow_mut() = ConnectionState::Connected;
+                            
+                            // Notify state change
+                            if let Some(ref callback) = state_cb {
+                                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("connected"));
+                            }
+                            
+                            // Resolve the promise to signal connection is complete
+                            if let Some(resolve_fn) = resolve.borrow_mut().take() {
+                                let _ = resolve_fn.call0(&JsValue::NULL);
+                            }
+                        }
+                        Err(e) => {
+                            web_sys::console::error_1(&format!("❌ Failed to handle answer: {:?}", e).into());
+                            
+                            // Update shared state
+                            *state_ref.borrow_mut() = ConnectionState::Failed;
+                            
+                            // Notify state change
+                            if let Some(ref callback) = state_cb {
+                                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("failed"));
+                            }
+                            
+                            // Reject the promise
+                            if let Some(reject_fn) = reject.borrow_mut().take() {
+                                let _ = reject_fn.call1(&JsValue::NULL, &e);
+                            }
+                        }
+                    }
+                } else {
+                    web_sys::console::error_1(&"❌ Peer connection not available in answer callback".into());
+                    if let Some(reject_fn) = reject.borrow_mut().take() {
+                        let _ = reject_fn.call1(&JsValue::NULL, &"Peer connection not available".into());
+                    }
+                }
+            });
+        }) as Box<dyn FnMut(JsValue)>);
+
+        // Set up ICE candidate callback from server
+        let ice_callback = Closure::wrap(Box::new(move |candidate_json: JsValue| {
+            let json_str = candidate_json.as_string().unwrap_or_default();
+            let peer_conn = peer_conn_for_ice.clone();
+            
+            wasm_bindgen_futures::spawn_local(async move {
+                if json_str.is_empty() {
+                    return;
+                }
+                
+                // Get peer connection from shared ref
+                let pc_opt = peer_conn.borrow().clone();
+                if let Some(pc) = pc_opt {
+                    match js_sys::JSON::parse(&json_str) {
+                        Ok(candidate_obj) => {
+                            let candidate_init: RtcIceCandidateInit = candidate_obj.unchecked_into();
+                            match RtcIceCandidate::new(&candidate_init) {
+                                Ok(candidate) => {
+                                    if let Err(e) = JsFuture::from(
+                                        pc.add_ice_candidate_with_opt_rtc_ice_candidate(Some(&candidate))
+                                    ).await {
+                                        web_sys::console::error_1(&format!("❌ Failed to add ICE candidate: {:?}", e).into());
+                                    }
+                                }
+                                Err(e) => {
+                                    web_sys::console::error_1(&format!("❌ Failed to create ICE candidate: {:?}", e).into());
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            web_sys::console::error_1(&format!("❌ Failed to parse ICE candidate JSON: {:?}", e).into());
+                        }
+                    }
+                } else {
+                    web_sys::console::error_1(&"❌ Peer connection not available in ICE callback".into());
+                }
+            });
+        }) as Box<dyn FnMut(JsValue)>);
+
+        // Register callbacks with signaling BEFORE connecting
+        if let Some(ref mut sig) = *signaling_rc.borrow_mut() {
+            sig.set_on_answer(
+                answer_callback.as_ref().unchecked_ref::<js_sys::Function>().clone()
+            );
+            sig.set_on_ice(
+                ice_callback.as_ref().unchecked_ref::<js_sys::Function>().clone()
+            );
+        }
+        
+        // Prevent closures from being dropped
+        answer_callback.forget();
+        ice_callback.forget();
+
+        // Create SDP offer (this will set up the peer connection with ICE handling)
+        let offer_sdp = self.create_offer().await?;
+        
+        // Store peer connection in the shared ref for callbacks
+        *peer_conn_ref.borrow_mut() = self.peer_connection.clone();
+
+        // NOW connect signaling WebSocket (callbacks are already registered)
+        if let Some(ref mut sig) = *signaling_rc.borrow_mut() {
+            web_sys::console::debug_1(&"🔌 WebRTC: Starting WebSocket connection...".into());
+            sig.connect()?;
+            web_sys::console::debug_1(&"📤 WebRTC: Sending offer to hub...".into());
+            // Send offer to hub (will be queued if WebSocket not open yet)
+            sig.send_offer(&offer_sdp)?;
+            web_sys::console::debug_1(&"⏳ WebRTC: Waiting for answer from server...".into());
+        }
+        
+        // Wait for the connection to be established
+        // The promise will be resolved by the answer callback when the connection is ready
+        // NOTE: Must wait before taking signaling so callbacks can still access it
+        web_sys::console::debug_1(&"⏳ WebRTC: Waiting for connection promise to resolve...".into());
+        JsFuture::from(promise).await?;
+        web_sys::console::debug_1(&"✅ WebRTC: Connection promise resolved!".into());
+        
+        // NOW restore signaling back to self (after connection is complete)
+        self.signaling = signaling_rc.borrow_mut().take();
+        
+        // Update our state now that we're connected
+        self.state = ConnectionState::Connected;
+        
+        // NOTE: Do NOT start event loop here - it must be started after the transport
+        // is in its final memory location (after being boxed by the session).
+        // The session will call start_streaming() after setup is complete.
+        
+        Ok(())
+    }
+
 
     /// Get current connection state
     pub fn state(&self) -> ConnectionState {
         self.state
     }
 
-    /// Create an SDP offer (as the initiating peer)
+    /// Create an SDP offer (as the initiating peer) - WebRTC-specific
     ///
     /// For JackTrip hub connections, the client always initiates.
     /// Send the returned SDP to the hub server via HubSignaling.
@@ -207,7 +546,7 @@ impl WebRtcTransport {
         Ok(offer_sdp)
     }
 
-    /// Handle an SDP answer from the hub server
+    /// Handle an SDP answer from the hub server - WebRTC-specific
     pub async fn handle_answer(&mut self, answer_sdp: &str) -> Result<(), JsValue> {
         let pc = self
             .peer_connection
@@ -221,7 +560,7 @@ impl WebRtcTransport {
         Ok(())
     }
 
-    /// Add an ICE candidate from the hub server
+    /// Add an ICE candidate from the hub server - WebRTC-specific
     pub async fn add_ice_candidate(&mut self, candidate_json: &str) -> Result<(), JsValue> {
         let pc = self
             .peer_connection
@@ -311,21 +650,47 @@ impl WebRtcTransport {
 
     /// Close the connection
     pub fn close(&mut self) {
-        if let Some(channel) = self.data_channel.take() {
+        // Disable streaming on ring buffer
+        if let Some(buffers) = self.audio_buffers {
+            unsafe {
+                (*buffers.local_to_network_ptr).set_streaming(false);
+            }
+        }
+        
+        // Disconnect signaling
+        if let Some(mut sig) = self.signaling.take() {
+            sig.disconnect();
+        }
+        
+        // Remove event handlers BEFORE dropping closures to prevent "closure invoked after being dropped" errors
+        if let Some(ref channel) = self.data_channel {
+            channel.set_onmessage(None);
+            channel.set_onopen(None);
+            channel.set_onclose(None);
+            channel.set_onerror(None);
             channel.close();
         }
-        if let Some(pc) = self.peer_connection.take() {
+        
+        if let Some(ref pc) = self.peer_connection {
+            pc.set_onicecandidate(None);
+            pc.set_ondatachannel(None);
+            pc.set_oniceconnectionstatechange(None);
             pc.close();
         }
-        self.state = ConnectionState::Closed;
-        self.notify_state_change();
-
-        // Clean up closures
+        
+        // Now it's safe to drop the closures
         self.on_message_closure = None;
         self.on_channel_open_closure = None;
         self.on_channel_close_closure = None;
         self.on_ice_candidate_closure = None;
         self.on_data_channel_closure = None;
+        
+        // Finally, take ownership to drop
+        self.data_channel = None;
+        self.peer_connection = None;
+        
+        self.state = ConnectionState::Closed;
+        self.notify_state_change();
     }
 
     /// Check if connected and ready to send
@@ -384,28 +749,21 @@ impl WebRtcTransport {
         // (In practice, for JackTrip we create the channel, but this handles the reverse case)
         let receive_queue = self.receive_queue.clone();
         let js_on_state_change = self.js_on_state_change.clone();
-        let js_on_data_received_for_server = self.js_on_data_received.clone();
 
         let on_datachannel = Closure::wrap(Box::new(move |event: RtcDataChannelEvent| {
             let channel = event.channel();
-            web_sys::console::log_1(&format!("📥 Server created data channel: {}", channel.label()).into());
+            web_sys::console::debug_1(&format!("📥 Server created data channel: {}", channel.label()).into());
             channel.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
 
             // Set up message handler for incoming channel
             let queue = receive_queue.clone();
-            let on_data_callback = js_on_data_received_for_server.clone();
             let on_message = Closure::wrap(Box::new(move |msg_event: MessageEvent| {
                 if let Ok(buffer) = msg_event.data().dyn_into::<ArrayBuffer>() {
                     let array = Uint8Array::new(&buffer);
                     let mut data = vec![0u8; array.length() as usize];
                     array.copy_to(&mut data);
-                    web_sys::console::log_1(&format!("📨 Received {} bytes on server-created channel", data.len()).into());
+                    web_sys::console::debug_1(&format!("📨 Received {} bytes on server-created channel", data.len()).into());
                     queue.borrow_mut().push_back(data);
-                    
-                    // Notify that data is available for immediate processing
-                    if let Some(ref callback) = *on_data_callback.borrow() {
-                        let _ = callback.call0(&JsValue::NULL);
-                    }
                 } else {
                     web_sys::console::error_1(&"❌ Received non-ArrayBuffer message".into());
                 }
@@ -446,18 +804,12 @@ impl WebRtcTransport {
 
         // Set up message handler
         let receive_queue = self.receive_queue.clone();
-        let on_data_received = self.js_on_data_received.clone();
         let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
             if let Ok(buffer) = event.data().dyn_into::<ArrayBuffer>() {
                 let array = Uint8Array::new(&buffer);
                 let mut data = vec![0u8; array.length() as usize];
                 array.copy_to(&mut data);
                 receive_queue.borrow_mut().push_back(data);
-                
-                // Notify that data is available for immediate processing
-                if let Some(ref callback) = *on_data_received.borrow() {
-                    let _ = callback.call0(&JsValue::NULL);
-                }
             } else {
                 web_sys::console::error_1(&"❌ Received non-ArrayBuffer message on client channel".into());
             }
@@ -469,7 +821,7 @@ impl WebRtcTransport {
         let js_on_state_change = self.js_on_state_change.clone();
         let channel_label = channel.label();
         let on_open = Closure::wrap(Box::new(move || {
-            web_sys::console::log_1(&format!("Data channel '{}' opened!", channel_label).into());
+            web_sys::console::debug_1(&format!("Data channel '{}' opened!", channel_label).into());
             if let Some(ref callback) = js_on_state_change {
                 let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("connected"));
             }
@@ -506,25 +858,6 @@ impl WebRtcTransport {
 }
 
 impl WebRtcTransport {
-    /// Send an audio packet (internal use, not exposed to JS)
-    pub fn send_packet(&self, packet: &AudioPacket) -> Result<(), JsValue> {
-        let data = packet
-            .serialize()
-            .map_err(|e| JsValue::from_str(&format!("{}", e)))?;
-        self.send_bytes(&data)
-    }
-
-    /// Receive and decode an audio packet (internal use, not exposed to JS)
-    pub fn receive_packet(&self) -> Result<Option<AudioPacket>, JsValue> {
-        if let Some(data) = self.receive_bytes() {
-            let packet = AudioPacket::deserialize(&data)
-                .map_err(|e| JsValue::from_str(&format!("{}", e)))?;
-            Ok(Some(packet))
-        } else {
-            Ok(None)
-        }
-    }
-
     /// Mark the connection as connected
     /// Call this after receiving confirmation that the data channel is open
     pub fn set_connected(&mut self) {
@@ -540,6 +873,113 @@ impl WebRtcTransport {
             self.state = ConnectionState::Failed;
             self.notify_state_change();
         }
+    }
+}
+
+// Implement the Transport trait for WebRtcTransport
+impl Transport for WebRtcTransport {
+    fn transport_type(&self) -> TransportType {
+        TransportType::WebRTC
+    }
+
+    fn state(&self) -> CommonTransportState {
+        match self.state {
+            ConnectionState::Disconnected => CommonTransportState::Disconnected,
+            ConnectionState::Connecting => CommonTransportState::Connecting,
+            ConnectionState::Connected => CommonTransportState::Connected,
+            ConnectionState::Failed => CommonTransportState::Failed,
+            ConnectionState::Closed => CommonTransportState::Closed,
+        }
+    }
+
+    fn set_audio_buffers(&mut self, config: AudioBufferConfig) {
+        // Store buffer configuration
+        self.audio_buffers = Some(config);
+        
+        // Resize internal buffers based on configuration
+        self.audio_to_send_buffer.resize(config.buffer_size * config.channels as usize, 0.0);
+        let max_packet_bytes = 16 + (config.buffer_size * config.channels as usize * 4);
+        self.packet_serialize_buffer.resize(max_packet_bytes, 0);
+        
+        web_sys::console::debug_1(&format!(
+            "✅ WebRTC: Audio buffers configured ({}ch, {} samples)", 
+            config.channels, 
+            config.buffer_size
+        ).into());
+    }
+
+    fn connect(
+        &mut self,
+        server: &str,
+        port: u16,
+        use_tls: bool,
+        client_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), JsValue>> + '_>> {
+        // Convert to owned strings for the async block
+        let server = server.to_string();
+        let client_name = client_name.to_string();
+
+        // Call the existing connect_to_hub implementation
+        Box::pin(async move {
+            self.connect_to_hub(&server, port, use_tls, &client_name).await
+        })
+    }
+
+    fn is_connected(&self) -> bool {
+        // Check if data channel is actually open
+        if let Some(ref channel) = self.data_channel {
+            channel.ready_state() == RtcDataChannelState::Open
+        } else {
+            false
+        }
+    }
+
+    fn tick(&mut self) {
+        self.do_tick();
+    }
+
+    fn close(&mut self) {
+        // Disable streaming on ring buffer
+        if let Some(buffers) = self.audio_buffers {
+            unsafe {
+                (*buffers.local_to_network_ptr).set_streaming(false);
+            }
+        }
+        
+        // Disconnect signaling
+        if let Some(mut sig) = self.signaling.take() {
+            sig.disconnect();
+        }
+        
+        // Remove event handlers BEFORE dropping closures to prevent "closure invoked after being dropped" errors
+        if let Some(ref channel) = self.data_channel {
+            channel.set_onmessage(None);
+            channel.set_onopen(None);
+            channel.set_onclose(None);
+            channel.set_onerror(None);
+            channel.close();
+        }
+        
+        if let Some(ref pc) = self.peer_connection {
+            pc.set_onicecandidate(None);
+            pc.set_ondatachannel(None);
+            pc.set_oniceconnectionstatechange(None);
+            pc.close();
+        }
+        
+        // Now it's safe to drop the closures
+        self.on_message_closure = None;
+        self.on_channel_open_closure = None;
+        self.on_channel_close_closure = None;
+        self.on_ice_candidate_closure = None;
+        self.on_data_channel_closure = None;
+        
+        // Finally, take ownership to drop
+        self.data_channel = None;
+        self.peer_connection = None;
+        
+        self.state = ConnectionState::Closed;
+        self.notify_state_change();
     }
 }
 

@@ -17,7 +17,7 @@ pub mod params;
 pub mod devices;
 pub mod worklet;
 pub mod engine;
-pub mod event_loop;
+pub mod audio_callback_loop;
 
 // Buffer modules
 pub mod ring_buffer;
@@ -25,10 +25,12 @@ pub mod jitter_buffer;
 
 // JackTrip protocol modules
 pub mod protocol;
-pub mod client;
 
 // Transport and signaling modules
+pub mod transport;
 pub mod webrtc;
+pub mod mock_transport;
+pub mod webtransport;
 pub mod signaling;
 
 // Re-export core audio types
@@ -37,7 +39,7 @@ pub use params::AudioParams;
 pub use devices::DeviceInfo;
 pub use worklet::ProcessorHandle;
 pub use engine::AudioEngine;
-pub use event_loop::{EventLoop, has_atomics_wait_async};
+pub use audio_callback_loop::{AudioCallbackLoop, has_atomics_wait_async};
 
 // Re-export buffer types
 pub use ring_buffer::RingBuffer;
@@ -47,10 +49,12 @@ pub use jitter_buffer::{
 
 // Re-export JackTrip types
 pub use protocol::{AudioFormat, AudioPacket, PacketHeader, StreamStats};
-pub use client::{AudioClient, JackTripConfig, ClientState};
 
 // Re-export transport types
+pub use transport::{Transport, TransportType, TransportState};
 pub use webrtc::{ConnectionState, TransportConfig, WebRtcTransport};
+pub use mock_transport::{MockTransport, SineWaveConfig};
+pub use webtransport::WebTransportImpl;
 
 // Re-export signaling types
 pub use signaling::{HubSignaling, HubConnectionState, SignalingMessage};

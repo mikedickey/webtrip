@@ -2,8 +2,7 @@
 //!
 //! High-level session management that coordinates all components:
 //! - AudioEngine (capture/playback via AudioWorklet)
-//! - HubSignaling (WebSocket signaling with hub server)
-//! - WebRtcTransport (data channel for audio packets)
+//! - Transport (abstraction for network layer - WebRTC, WebTransport, or Mock)
 //! - RingBuffer (send path: worklet -> network)
 //! - JitterBuffer (receive path: network -> worklet)
 //!
@@ -12,33 +11,35 @@
 //! ```text
 //! 1. connect_to_studio(server_host, port)
 //!    └─> Stores audio capture parameters for later
-//!    └─> HubSignaling connects via WebSocket
-//!    └─> Sends protocol handshake {"protocol":"webrtc",...}
+//!    └─> Creates WebRtcTransport
+//!    └─> WebRtcTransport.connect_to_hub() handles all signaling internally:
+//!        - Creates HubSignaling (WebSocket)
+//!        - Sends protocol handshake {"protocol":"webrtc",...}
+//!        - Creates SDP offer
+//!        - Handles SDP answer from server
+//!        - Exchanges ICE candidates
+//!        - Establishes data channel
 //!
-//! 2. WebRtcTransport creates SDP offer
-//!    └─> HubSignaling sends offer to server
+//! 2. Connection callback fires when ready
+//!    └─> Transport moved to trait object (Box<dyn Transport>)
+//!    └─> Audio capture starts
+//!    └─> Network loop begins
 //!
-//! 3. Server responds with SDP answer
-//!    └─> WebRtcTransport handles answer
-//!    └─> Audio capture starts (after connection established)
-//!
-//! 4. ICE candidates exchanged
-//!    └─> Data channel established
-//!
-//! 5. Audio streaming begins
-//!    └─> tick() loop sends/receives packets
+//! 3. Audio streaming
+//!    └─> tick() loop sends/receives packets via Transport trait
 //! ```
 
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 
 use crate::audio::engine::AudioEngine;
-use crate::audio::event_loop::EventLoop;
 use crate::audio::jitter_buffer::LockFreeJitterBuffer;
 use crate::audio::params::AudioParams;
 use crate::audio::ring_buffer::RingBuffer;
-use crate::audio::signaling::HubSignaling;
-use crate::audio::webrtc::{TransportConfig, WebRtcTransport};
+use crate::audio::transport::{Transport, TransportType, AudioBufferConfig};
+use crate::audio::webrtc::{TransportConfig as WebRtcConfig, WebRtcTransport};
+use crate::audio::mock_transport::MockTransport;
+use crate::audio::audio_callback_loop::AudioCallbackLoop;
+use wasm_bindgen::closure::Closure;
 
 /// Default signaling port (same as JackTrip TCP port)
 pub const DEFAULT_SIGNALING_PORT: u16 = 4464;
@@ -96,6 +97,7 @@ impl SessionStats {
     }
 }
 
+
 /// JackTrip Session - coordinates all audio and network components
 #[wasm_bindgen]
 pub struct JackTripSession {
@@ -103,44 +105,34 @@ pub struct JackTripSession {
     audio_params_ptr: *const AudioParams,
     audio_engine: Option<AudioEngine>,
 
-    // Owned buffers (shared with AudioWorklet via pointers)
+    // Owned buffers (shared with AudioWorklet and Transport via pointers)
     local_to_network_buffer: Box<RingBuffer>,
     network_to_local_buffer: Box<LockFreeJitterBuffer>,
 
     // Network components
-    signaling: Option<HubSignaling>,
-    transport: Option<WebRtcTransport>,
+    transport: Option<Box<dyn Transport>>,
+    transport_type: TransportType,
 
     // State
     state: SessionState,
-    sequence_number: u16,
-    timestamp: u64,
 
     // Configuration
     sample_rate: u32,
     buffer_size: usize,
     channels: u8,
 
-    // Buffers for network processing (reused to avoid allocations)
-    audio_to_send_buffer: Vec<f32>,
-    packet_serialize_buffer: Vec<u8>,
-    packet_receive_buffer: Vec<f32>,
-
     // Callbacks
     on_state_change: Option<js_sys::Function>,
-
-    // Event-driven network loop
-    event_loop: Option<EventLoop>,
-
-    // Stats tracking
-    packets_sent: u64,
-    packets_received: u64,
 
     // Pending audio capture parameters (to start after connection)
     pending_capture_params: Option<PendingCaptureParams>,
     
     // Selected output device ID (stored until audio engine is ready)
     output_device_id: Option<String>,
+    
+    // Audio callback loop (triggers transport tick on each audio callback)
+    audio_callback_loop: Option<AudioCallbackLoop>,
+    tick_callback_closure: Option<Closure<dyn FnMut()>>,
 }
 
 /// Parameters for starting audio capture after connection
@@ -175,35 +167,22 @@ impl JackTripSession {
         let samples_per_packet = buffer_size * channels as usize;
         network_to_local_buffer.configure(samples_per_packet as u32, 4);
 
-        // Pre-allocate buffers to avoid allocations in audio hot path
-        let audio_to_send_buffer = vec![0.0; buffer_size * channels as usize];
-        // Worst case: 32-bit samples = 4 bytes per sample
-        let max_packet_bytes = 16 + (buffer_size * channels as usize * 4); 
-        let packet_serialize_buffer = vec![0u8; max_packet_bytes];
-        let packet_receive_buffer = vec![0.0; buffer_size * channels as usize];
-
         Ok(JackTripSession {
             audio_params_ptr,
             audio_engine: None,
             local_to_network_buffer,
             network_to_local_buffer,
-            signaling: None,
             transport: None,
+            transport_type: TransportType::WebRTC, // Default to WebRTC
             state: SessionState::Idle,
-            sequence_number: 0,
-            timestamp: 0,
             sample_rate,
             buffer_size,
             channels,
-            audio_to_send_buffer,
-            packet_serialize_buffer,
-            packet_receive_buffer,
             on_state_change: None,
-            event_loop: None,
-            packets_sent: 0,
-            packets_received: 0,
             pending_capture_params: None,
             output_device_id: None,
+            audio_callback_loop: None,
+            tick_callback_closure: None,
         })
     }
 
@@ -221,8 +200,8 @@ impl JackTripSession {
     pub fn get_stats(&self) -> SessionStats {
         let jitter_stats = self.network_to_local_buffer.stats();
         SessionStats {
-            packets_sent: self.packets_sent,
-            packets_received: self.packets_received,
+            packets_sent: 0, // TODO: Get from transport if needed
+            packets_received: 0, // TODO: Get from transport if needed
             jitter_depth: self.network_to_local_buffer.depth(),
             jitter_latency_ms: self.network_to_local_buffer.latency_ms(self.sample_rate),
             send_buffer_available: self.local_to_network_buffer.available(),
@@ -253,12 +232,6 @@ impl JackTripSession {
     pub fn set_channels(&mut self, channels: u8) {
         if channels >= 1 && channels <= 8 {
             self.channels = channels;
-            // Update audio buffers (reused, no allocations in hot path)
-            self.audio_to_send_buffer.resize(self.buffer_size * channels as usize, 0.0);
-            self.packet_receive_buffer.resize(self.buffer_size * channels as usize, 0.0);
-            // Update serialize buffer for worst case (32-bit)
-            let max_packet_bytes = 16 + (self.buffer_size * channels as usize * 4);
-            self.packet_serialize_buffer.resize(max_packet_bytes, 0);
             
             // Sync to AudioParams so processor knows to duplicate mono to stereo
             if !self.audio_params_ptr.is_null() {
@@ -276,6 +249,24 @@ impl JackTripSession {
     #[wasm_bindgen(js_name = getChannels)]
     pub fn get_channels(&self) -> u8 {
         self.channels
+    }
+
+    /// Set the transport type to use for connections
+    /// Must be called before connecting
+    #[wasm_bindgen(js_name = setTransportType)]
+    pub fn set_transport_type(&mut self, transport_type: TransportType) {
+        if self.state == SessionState::Idle {
+            self.transport_type = transport_type;
+            web_sys::console::log_1(&format!("🚀 Transport type set to: {}", transport_type.name()).into());
+        } else {
+            web_sys::console::warn_1(&"⚠️ Cannot change transport type while connected".into());
+        }
+    }
+
+    /// Get the current transport type
+    #[wasm_bindgen(js_name = getTransportType)]
+    pub fn get_transport_type(&self) -> TransportType {
+        self.transport_type
     }
 
     /// Set the output audio device for playback
@@ -340,13 +331,17 @@ impl JackTripSession {
             }
         }
 
+        // Start audio callback loop (driven by worklet's process() callback)
+        self.start_audio_callback_loop();
+
         Ok(())
     }
 
     /// Stop audio capture (internal use only)
     fn stop_capture(&mut self) {
-        self.stop_network_loop();
-
+        // Stop audio callback loop first (no more ticks)
+        self.stop_audio_callback_loop();
+        
         // IMPORTANT: Stop audio engine before dropping
         // This ensures AudioWorklet stops using buffer pointers
         if let Some(ref mut engine) = self.audio_engine {
@@ -404,162 +399,92 @@ impl JackTripSession {
 
         self.set_state(SessionState::Connecting);
 
-        // Create signaling client
-        let signaling = HubSignaling::new(&server_host, port, use_tls, "jacktrip-web");
+        // Create buffer configuration for transports that need it
+        let buffer_config = AudioBufferConfig {
+            local_to_network_ptr: &mut *self.local_to_network_buffer as *mut RingBuffer,
+            network_to_local_ptr: &*self.network_to_local_buffer as *const LockFreeJitterBuffer,
+            buffer_size: self.buffer_size,
+            channels: self.channels,
+        };
 
-        // Create WebRTC transport and SDP offer
-        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))?;
-        let offer_sdp = transport.create_offer().await?;
-
-        // Set up ICE candidate callback on the transport
-        let session_ptr = self as *mut JackTripSession;
-        let ice_callback = Closure::wrap(Box::new(move |candidate: JsValue, sdp_mid: JsValue, sdp_m_line_index: JsValue| {
-            let candidate_str = candidate.as_string().unwrap_or_default();
-            let sdp_mid_str = sdp_mid.as_string().unwrap_or_else(|| "0".to_string());
-            let index = sdp_m_line_index.as_f64().unwrap_or(0.0) as u16;
-            
-            unsafe {
-                if !session_ptr.is_null() {
-                    let _ = (*session_ptr).send_ice_candidate(candidate_str, sdp_mid_str, index);
-                }
+        // Create the appropriate transport based on type
+        use crate::audio::transport::Transport;
+        let transport: Box<dyn Transport> = match self.transport_type {
+            TransportType::WebRTC => {
+                let mut webrtc_transport = WebRtcTransport::new(Some(WebRtcConfig::low_latency()))?;
+                
+                // Configure audio buffers (WebRTC needs these for its internal tick loop)
+                webrtc_transport.set_audio_buffers(buffer_config);
+                
+                // Connect to hub using the unified Transport trait method
+                // This will also start the internal tick loop for WebRTC
+                webrtc_transport.connect(
+                    &server_host,
+                    port,
+                    use_tls,
+                    "jacktrip-web",
+                ).await?;
+                
+                Box::new(webrtc_transport)
             }
-        }) as Box<dyn FnMut(JsValue, JsValue, JsValue)>);
-        
-        transport.set_on_ice_candidate(ice_callback.as_ref().unchecked_ref::<js_sys::Function>().clone());
-        ice_callback.forget();
-
-        // Set up receive callback for event-driven packet processing
-        // This wakes the session immediately when packets arrive instead of waiting for polling
-        let receive_session_ptr = self as *mut JackTripSession;
-        let receive_callback = Closure::wrap(Box::new(move || {
-            unsafe {
-                if !receive_session_ptr.is_null() {
-                    (*receive_session_ptr).tick();
-                }
+            TransportType::Mock => {
+                let mut mock_transport = MockTransport::new();
+                
+                // Configure audio buffers (Mock needs these for its internal tick loop)
+                mock_transport.set_audio_buffers(buffer_config);
+                
+                // Enable sine wave generation for mock transport
+                mock_transport.enable_sine_wave();
+                
+                // Connect (mock transport connects instantly)
+                // Use explicit trait method syntax to avoid ambiguity
+                Transport::connect(
+                    &mut mock_transport,
+                    &server_host,
+                    port,
+                    use_tls,
+                    "jacktrip-web-mock",
+                ).await?;
+                
+                web_sys::console::log_1(&"🎵 Mock transport enabled with sine wave generation".into());
+                
+                Box::new(mock_transport)
             }
-        }) as Box<dyn FnMut()>);
-        
-        transport.set_on_data_received(receive_callback.as_ref().unchecked_ref::<js_sys::Function>().clone());
-        receive_callback.forget();
+            TransportType::WebTransport => {
+                return Err("WebTransport is not yet fully implemented for studio connections".into());
+            }
+        };
 
-        // Store components before setting up signaling callbacks
-        self.signaling = Some(signaling);
+        // Store the connected transport
         self.transport = Some(transport);
 
-        // Set up signaling callbacks to handle server responses
-        let answer_session_ptr = self as *mut JackTripSession;
-        let answer_callback = Closure::wrap(Box::new(move |sdp: JsValue| {
-            let sdp_str = sdp.as_string().unwrap_or_default();
-            
-            wasm_bindgen_futures::spawn_local(async move {
-                unsafe {
-                    if !answer_session_ptr.is_null() {
-                        let _ = (*answer_session_ptr).handle_server_answer(sdp_str).await;
-                    }
-                }
-            });
-        }) as Box<dyn FnMut(JsValue)>);
+        // Connection established - update state
+        self.set_state(SessionState::Connected);
 
-        let ice_session_ptr = self as *mut JackTripSession;
-        let ice_server_callback = Closure::wrap(Box::new(move |candidate_json: JsValue| {
-            let json_str = candidate_json.as_string().unwrap_or_default();
-            
-            wasm_bindgen_futures::spawn_local(async move {
-                unsafe {
-                    if !ice_session_ptr.is_null() {
-                        let _ = (*ice_session_ptr).handle_server_ice_candidate(json_str).await;
-                    }
-                }
-            });
-        }) as Box<dyn FnMut(JsValue)>);
-
-        // Register the callbacks with signaling
-        if let Some(ref mut sig) = self.signaling {
-            sig.set_on_answer(answer_callback.as_ref().unchecked_ref::<js_sys::Function>().clone());
-            sig.set_on_ice(ice_server_callback.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        // Start audio capture if pending (this will also start the audio callback loop)
+        if let Some(params) = self.pending_capture_params.take() {
+            web_sys::console::log_1(&"🎙️ Starting audio capture after connection established".into());
+            self.start_capture(
+                params.device_id,
+                params.auto_gain_control,
+                params.echo_cancellation,
+                params.noise_suppression,
+            ).await?;
         }
-        answer_callback.forget();
-        ice_server_callback.forget();
-
-        // Connect signaling WebSocket
-        if let Some(ref mut sig) = self.signaling {
-            sig.connect()?;
-        }
-
-        self.set_state(SessionState::Negotiating);
-
-        // Send the offer
-        if let Some(ref sig) = self.signaling {
-            sig.send_offer(&offer_sdp)?;
-        }
-
-        // Start network loop to handle audio
-        self.start_network_loop();
 
         Ok(())
     }
 
-    /// Handle an SDP answer from the hub server (called from JS signaling callback)
-    #[wasm_bindgen(js_name = handleServerAnswer)]
-    pub async fn handle_server_answer(&mut self, answer_sdp: String) -> Result<(), JsValue> {
-        if let Some(ref mut transport) = self.transport {
-            transport.handle_answer(&answer_sdp).await?;
-            
-            // Start audio capture now that connection is established
-            if let Some(params) = self.pending_capture_params.take() {
-                web_sys::console::log_1(&"🎙️ Starting audio capture after server connection established".into());
-                self.start_capture(
-                    params.device_id,
-                    params.auto_gain_control,
-                    params.echo_cancellation,
-                    params.noise_suppression,
-                ).await?;
-            }
-            
-            // Transition to Connected when data channel is ready
-            self.set_state(SessionState::Connected);
-        }
-        Ok(())
-    }
-
-    /// Handle an ICE candidate from the hub server (called from JS signaling callback)
-    #[wasm_bindgen(js_name = handleServerIceCandidate)]
-    pub async fn handle_server_ice_candidate(&mut self, candidate_json: String) -> Result<(), JsValue> {
-        if let Some(ref mut transport) = self.transport {
-            transport.add_ice_candidate(&candidate_json).await?;
-        }
-        Ok(())
-    }
-
-    /// Send a local ICE candidate to the hub server
-    #[wasm_bindgen(js_name = sendIceCandidate)]
-    pub fn send_ice_candidate(
-        &self,
-        candidate: String,
-        sdp_mid: String,
-        sdp_m_line_index: u16,
-    ) -> Result<(), JsValue> {
-        if let Some(ref sig) = self.signaling {
-            sig.send_ice_candidate(&candidate, &sdp_mid, sdp_m_line_index)?;
-        }
-        Ok(())
-    }
 
     /// Disconnect from the hub server
     pub fn disconnect(&mut self) {
-        self.stop_network_loop();
-
-        if let Some(ref mut signaling) = self.signaling {
-            signaling.disconnect();
-        }
-        self.signaling = None;
-
+        // Close transport
         if let Some(ref mut transport) = self.transport {
             transport.close();
         }
         self.transport = None;
 
-        // Stop audio capture when disconnecting
+        // Stop audio capture when disconnecting (this will also stop the audio callback loop)
         self.stop_capture();
 
         // Clear any pending capture parameters
@@ -568,12 +493,61 @@ impl JackTripSession {
         // Reset network-to-local buffer
         self.network_to_local_buffer.reset();
 
-        self.sequence_number = 0;
-        self.timestamp = 0;
-        self.packets_sent = 0;
-        self.packets_received = 0;
-
         self.set_state(SessionState::Idle);
+    }
+    
+    /// Start the audio callback loop
+    fn start_audio_callback_loop(&mut self) {
+        if self.audio_callback_loop.is_some() {
+            return; // Already started
+        }
+        
+        // Enable streaming on ring buffer
+        self.local_to_network_buffer.set_streaming(true);
+        
+        // Get ring buffer flag pointer
+        let flag_ptr = self.local_to_network_buffer.get_has_data_flag_ptr();
+        
+        // Create audio callback loop
+        let mut callback_loop = AudioCallbackLoop::new();
+        
+        // Create tick callback that calls transport.tick()
+        let session_ptr = self as *mut JackTripSession;
+        let tick_closure = Closure::wrap(Box::new(move || {
+            unsafe {
+                if !session_ptr.is_null() {
+                    if let Some(ref mut transport) = (*session_ptr).transport {
+                        transport.tick();
+                    }
+                }
+            }
+        }) as Box<dyn FnMut()>);
+        let tick_fn = tick_closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
+        
+        // Try Atomics.waitAsync
+        let memory = wasm_bindgen::memory();
+        
+        match callback_loop.start_with_atomics(&memory, flag_ptr, tick_fn) {
+            Ok(true) => {
+                self.audio_callback_loop = Some(callback_loop);
+                self.tick_callback_closure = Some(tick_closure);
+                web_sys::console::debug_1(&"✅ Audio callback loop started".into());
+            }
+            Ok(false) | Err(_) => {
+                web_sys::console::warn_1(&"⚠️ Atomics.waitAsync not available".into());
+            }
+        }
+    }
+    
+    /// Stop the audio callback loop
+    fn stop_audio_callback_loop(&mut self) {
+        if let Some(mut callback_loop) = self.audio_callback_loop.take() {
+            callback_loop.stop();
+        }
+        self.tick_callback_closure = None;
+        
+        // Disable streaming on ring buffer
+        self.local_to_network_buffer.set_streaming(false);
     }
 
     /// Check if connected to hub server
@@ -585,156 +559,8 @@ impl JackTripSession {
             .unwrap_or(false)
     }
 
-    // ========== Legacy Manual Connection Methods ==========
-    // These are kept for testing/debugging but the preferred method is connect_to_studio()
-
-    /// Create an offer (for manual connection flow)
-    #[wasm_bindgen(js_name = createOffer)]
-    pub async fn create_offer(&mut self) -> Result<String, JsValue> {
-        self.set_state(SessionState::Negotiating);
-
-        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))?;
-        let offer = transport.create_offer().await?;
-
-        self.transport = Some(transport);
-        Ok(offer)
-    }
-
-    /// Handle an incoming answer (for manual connection flow)
-    #[wasm_bindgen(js_name = handleAnswer)]
-    pub async fn handle_answer(&mut self, answer_sdp: String) -> Result<(), JsValue> {
-        if let Some(ref mut transport) = self.transport {
-            transport.handle_answer(&answer_sdp).await?;
-            self.set_state(SessionState::Connected);
-            self.start_network_loop();
-        }
-        Ok(())
-    }
-
-    /// Add an ICE candidate (for manual connection flow)
-    #[wasm_bindgen(js_name = addIceCandidate)]
-    pub async fn add_ice_candidate(&mut self, candidate: String) -> Result<(), JsValue> {
-        if let Some(ref mut transport) = self.transport {
-            transport.add_ice_candidate(&candidate).await?;
-        }
-        Ok(())
-    }
-
-    /// Process one network tick
-    /// 
-    /// This can be called either:
-    /// - By the event-driven loop (Atomics.waitAsync) - preferred
-    /// - By the legacy loop (postMessage) - fallback
-    ///
-    pub fn tick(&mut self) {
-        // Check if transport is connected
-        let is_connected = self
-            .transport
-            .as_ref()
-            .map(|t| t.is_connected())
-            .unwrap_or(false);
-
-        if !is_connected {
-            return;
-        }
-
-        // Update state if we just connected
-        if self.state == SessionState::Negotiating || self.state == SessionState::Connecting {
-            self.set_state(SessionState::Connected);
-        }
-
-        // === INTERLEAVED SEND/RECEIVE: Alternate between send and receive for better latency balance ===
-        // Instead of processing all sends then all receives, we alternate one packet at a time.
-        // This reduces maximum latency by keeping both paths active simultaneously.
-        
-        let samples_needed = (self.buffer_size * self.channels as usize) as u32;
-        
-        // Continue until both queues are empty (checked on each iteration)
-        loop {
-            let mut processed_send = false;
-            let mut processed_receive = false;
-            
-            // Try to process one send packet
-            if self.local_to_network_buffer.available() >= samples_needed {
-                if self.local_to_network_buffer.read(&mut self.audio_to_send_buffer) {
-                    // Serialize directly into reusable buffer (no allocations!)
-                    match crate::audio::protocol::AudioPacket::serialize_samples_into(
-                        self.sequence_number,
-                        self.timestamp,
-                        &self.audio_to_send_buffer,
-                        self.channels,
-                        &mut self.packet_serialize_buffer,
-                    ) {
-                        Ok(bytes_written) => {
-                            // Log first packet details
-                            if self.packets_sent == 0 {
-                                web_sys::console::debug_1(&format!(
-                                    "📤 First packet: seq={}, timestamp={}, samples={}, buffer_size={}, channels={}", 
-                                    self.sequence_number,
-                                    self.timestamp,
-                                    self.audio_to_send_buffer.len(),
-                                    self.buffer_size,
-                                    self.channels
-                                ).into());
-                            }
-
-                            if let Some(ref transport) = self.transport {
-                                match transport.send_bytes(&self.packet_serialize_buffer[..bytes_written]) {
-                                    Ok(_) => {
-                                        if self.packets_sent == 0 {
-                                            web_sys::console::debug_1(&"✅ First packet sent successfully!".into());
-                                        }
-                                        self.sequence_number = self.sequence_number.wrapping_add(1);
-                                        self.timestamp += self.buffer_size as u64;
-                                        self.packets_sent += 1;
-                                        processed_send = true;
-                                    }
-                                    Err(e) => {
-                                        web_sys::console::error_1(&format!("❌ Send failed: {:?}", e).into());
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            web_sys::console::error_1(&format!("❌ Serialize failed: {:?}", e).into());
-                        }
-                    }
-                }
-            }
-            
-            // Try to process one receive packet
-            if let Some(ref transport) = self.transport {
-                if let Some(data) = transport.receive_bytes() {
-                    // Deserialize into reusable buffer (no samples Vec allocation!)
-                    match crate::audio::protocol::AudioPacket::deserialize_into(&data, &mut self.packet_receive_buffer) {
-                        Ok(header) => {
-                            if self.packets_received == 0 {
-                                web_sys::console::debug_1(&format!(
-                                    "✅ First packet decoded successfully! seq={}, samples={}", 
-                                    header.sequence_number,
-                                    self.packet_receive_buffer.len()
-                                ).into());
-                            }
-                            self.network_to_local_buffer
-                                .push(header.sequence_number as u64, &self.packet_receive_buffer);
-                            self.packets_received += 1;
-                            processed_receive = true;
-                        }
-                        Err(e) => {
-                            web_sys::console::error_1(&format!("❌ Failed to decode packet: {:?}", e).into());
-                        }
-                    }
-                }
-            }
-            
-            // Exit loop if neither direction had data to process
-            if !processed_send && !processed_receive {
-                break;
-            }
-        }
-    }
-
     // ========== Private Methods ==========
+
 
     fn set_state(&mut self, state: SessionState) {
         if self.state != state {
@@ -752,78 +578,11 @@ impl JackTripSession {
             }
         }
     }
-
-    /// Start the event-driven network loop
-    /// 
-    /// This sets up the loop using either:
-    /// - Atomics.waitAsync (best performance)
-    /// - postMessage fallback (older browsers)
-    fn start_network_loop(&mut self) {
-        // Enable streaming on the local-to-network buffer
-        self.local_to_network_buffer.set_streaming(true);
-
-        // Reset sequence number and timestamp
-        self.sequence_number = 0;
-        self.timestamp = 0;
-
-        // Reset network-to-local buffer
-        self.network_to_local_buffer.reset();
-
-        // Create event loop
-        let mut event_loop = EventLoop::new();
-        
-        // Create tick callback
-        let session_ptr = self as *mut JackTripSession;
-        let tick_callback = Closure::wrap(Box::new(move || {
-            unsafe {
-                if !session_ptr.is_null() {
-                    (*session_ptr).tick();
-                }
-            }
-        }) as Box<dyn FnMut()>);
-        let tick_fn = tick_callback.as_ref().unchecked_ref::<js_sys::Function>().clone();
-        tick_callback.forget(); // Keep alive
-        
-        // Try Atomics.waitAsync first
-        let memory = wasm_bindgen::memory();
-        let flag_ptr = self.local_to_network_buffer.get_has_data_flag_ptr();
-        
-        match event_loop.start_with_atomics(&memory, flag_ptr, tick_fn.clone()) {
-            Ok(true) => {
-                // Successfully started with Atomics.waitAsync
-                self.event_loop = Some(event_loop);
-            }
-            Ok(false) | Err(_) => {
-                // Fall back to postMessage
-                if let Some(ref engine) = self.audio_engine {
-                    if let Some(port) = engine.get_worklet_port() {
-                        if let Ok(()) = event_loop.start_with_postmessage(&port, tick_fn) {
-                            self.event_loop = Some(event_loop);
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Incoming packets are handled by the WebRTC on_data_received callback
-        // which was set up in connect_to_studio()
-    }
-
-    fn stop_network_loop(&mut self) {
-        // Stop the event loop
-        if let Some(mut event_loop) = self.event_loop.take() {
-            event_loop.stop();
-        }
-
-        // Disable streaming on the local-to-network buffer
-        self.local_to_network_buffer.set_streaming(false);
-    }
 }
 
 impl Drop for JackTripSession {
     fn drop(&mut self) {
         // Critical: Stop in correct order to ensure buffer pointers aren't used after drop
-        self.stop_network_loop();
         self.disconnect();
         self.stop_capture();
     }

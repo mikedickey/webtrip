@@ -17,7 +17,7 @@ import init, {
   DeviceInfo,
   getAudioDevices,
   JackTripSession,
-  hasAtomicsWaitAsync,
+  TransportType,
 } from "../pkg/jacktrip_web.js";
 
 interface AudioDevices {
@@ -49,12 +49,6 @@ class JackTripApp {
   private lastRingSamples: bigint = 0n;
   private ringWriteRate: number = 0;
   private avgSamplesPerWrite: number = 0;
-  
-  // Packet rate tracking
-  private lastPacketsSent: bigint = 0n;
-  private lastPacketsReceived: bigint = 0n;
-  private packetSendRate: number = 0;
-  private packetReceiveRate: number = 0;
 
   // UI Elements
   private inputSelect!: HTMLSelectElement;
@@ -75,6 +69,7 @@ class JackTripApp {
   private disconnectButton!: HTMLButtonElement;
   private statsDisplay!: HTMLDivElement;
   private toggleButtons: Map<string, HTMLButtonElement> = new Map();
+  private transportSelect!: HTMLSelectElement;
 
   async init(): Promise<void> {
     // Initialize WASM module
@@ -106,7 +101,6 @@ class JackTripApp {
 
     // State change callback
     this.session.set_on_state_change((state: string) => {
-      console.log("Session state:", state);
       this.updateConnectionStatus(state as SessionState);
     });
   }
@@ -174,8 +168,15 @@ class JackTripApp {
     this.statsDisplay.style.display = "none";
     card.appendChild(this.statsDisplay);
 
+    // Server host and port - inline
+    const hostPortRow = this.createElement("div", "host-port-row");
+    hostPortRow.style.display = "flex";
+    hostPortRow.style.gap = "1rem";
+    hostPortRow.style.alignItems = "flex-end";
+
     // Server host input
     const hostGroup = this.createElement("div", "control-group");
+    hostGroup.style.flex = "1";
     const hostLabel = this.createElement("label", "label");
     hostLabel.textContent = "Server Host";
     this.serverHostInput = document.createElement("input");
@@ -185,20 +186,54 @@ class JackTripApp {
     this.serverHostInput.value = "localhost";
     hostGroup.appendChild(hostLabel);
     hostGroup.appendChild(this.serverHostInput);
-    card.appendChild(hostGroup);
+    hostPortRow.appendChild(hostGroup);
 
     // Server port input
-    const portGroup = this.createElement("div", "control-group inline");
+    const portGroup = this.createElement("div", "control-group");
+    portGroup.style.width = "80px";
+    portGroup.style.flexShrink = "0";
     const portLabel = this.createElement("label", "label");
     portLabel.textContent = "Port";
     this.serverPortInput = document.createElement("input");
     this.serverPortInput.type = "number";
-    this.serverPortInput.className = "text-input port-input";
+    this.serverPortInput.className = "text-input";
     this.serverPortInput.placeholder = "4464";
     this.serverPortInput.value = "4464";
+    this.serverPortInput.style.width = "100%";
     portGroup.appendChild(portLabel);
     portGroup.appendChild(this.serverPortInput);
-    card.appendChild(portGroup);
+    hostPortRow.appendChild(portGroup);
+
+    card.appendChild(hostPortRow);
+
+    // Transport selector
+    const transportGroup = this.createElement("div", "control-group");
+    const transportLabel = this.createElement("label", "label");
+    transportLabel.textContent = "Transport";
+    this.transportSelect = document.createElement("select");
+    this.transportSelect.className = "select";
+    
+    // Add transport options with feature detection
+    const transports = this.detectAvailableTransports();
+    for (const transport of transports) {
+      const option = document.createElement("option");
+      option.value = transport.id;
+      option.textContent = transport.name + (transport.available ? "" : " (Not Available)");
+      option.disabled = !transport.available;
+      if (transport.id === "webrtc") {
+        option.selected = true; // Default to WebRTC
+      }
+      this.transportSelect.appendChild(option);
+    }
+
+    // Handle transport selection changes
+    this.transportSelect.addEventListener("change", () => {
+      this.handleTransportChange();
+    });
+
+    transportGroup.appendChild(transportLabel);
+    transportGroup.appendChild(this.transportSelect);
+    card.appendChild(transportGroup);
 
     // Connection buttons
     const buttons = this.createElement("div", "connection-buttons");
@@ -218,6 +253,54 @@ class JackTripApp {
     buttons.appendChild(this.connectButton);
     buttons.appendChild(this.disconnectButton);
     card.appendChild(buttons);
+  }
+
+
+  private detectAvailableTransports(): Array<{id: string, name: string, available: boolean}> {
+    const transports = [
+      {
+        id: "webrtc",
+        name: "WebRTC",
+        available: true,
+      },
+      {
+        id: "webtransport",
+        name: "WebTransport",
+        available: typeof (window as any).WebTransport !== "undefined",
+      },
+      {
+        id: "mock",
+        name: "Mock",
+        available: true,
+      },
+    ];
+    return transports;
+  }
+
+  private handleTransportChange(): void {
+    if (!this.session) return;
+
+    const transportId = this.transportSelect.value;
+    
+    // Map string ID to TransportType enum
+    let transportType: TransportType;
+    switch (transportId) {
+      case "webrtc":
+        transportType = TransportType.WebRTC;
+        break;
+      case "webtransport":
+        transportType = TransportType.WebTransport;
+        break;
+      case "mock":
+        transportType = TransportType.Mock;
+        break;
+      default:
+        console.error("Unknown transport type:", transportId);
+        return;
+    }
+
+    this.session.setTransportType(transportType);
+    console.debug(`🚀 Transport changed to: ${transportId}`);
   }
 
   private createDeviceSection(
@@ -550,7 +633,7 @@ class JackTripApp {
     }
 
     // Log the change
-    console.log(`Audio channels set to: ${channels} (${isStereo ? "Stereo" : "Mono"})`);
+    console.debug(`Audio channels set to: ${channels} (${isStereo ? "Stereo" : "Mono"})`);
   }
 
   private async handleOutputDeviceChange(): Promise<void> {
@@ -582,7 +665,6 @@ class JackTripApp {
       this.connectButton.disabled = true;
       this.connectButton.textContent = "Connecting...";
 
-      console.log("Connecting to studio...");
       await this.session.connectToStudio(
         serverHost,
         port,
@@ -592,7 +674,6 @@ class JackTripApp {
         this.isToggleActive("echo"),
         this.isToggleActive("noise")
       );
-      console.log("Connected to studio");
 
       // Set the output device to the selected device
       const outputDeviceId = this.outputSelect.value || undefined;
@@ -698,17 +779,9 @@ class JackTripApp {
       const deltaRingWrites = Number(currentRingWrites - this.lastRingWrites);
       const deltaRingSamples = Number(currentRingSamples - this.lastRingSamples);
       
-      // Packet send/receive rate
-      const currentPacketsSent = stats.packets_sent;
-      const currentPacketsReceived = stats.packets_received;
-      const deltaPacketsSent = Number(currentPacketsSent - this.lastPacketsSent);
-      const deltaPacketsReceived = Number(currentPacketsReceived - this.lastPacketsReceived);
-      
       if (deltaTime > 0) {
         this.callbackRate = deltaCallbacks / deltaTime;
         this.ringWriteRate = deltaRingWrites / deltaTime;
-        this.packetSendRate = deltaPacketsSent / deltaTime;
-        this.packetReceiveRate = deltaPacketsReceived / deltaTime;
         if (deltaRingWrites > 0) {
           this.avgSamplesPerWrite = deltaRingSamples / deltaRingWrites;
         }
@@ -718,8 +791,6 @@ class JackTripApp {
       this.lastCallbackTime = currentTime;
       this.lastRingWrites = currentRingWrites;
       this.lastRingSamples = currentRingSamples;
-      this.lastPacketsSent = currentPacketsSent;
-      this.lastPacketsReceived = currentPacketsReceived;
 
       this.statsDisplay.innerHTML = `
         <div class="stat-row">
@@ -733,14 +804,6 @@ class JackTripApp {
         <div class="stat-row">
           <span class="stat-label">Samples/write:</span>
           <span class="stat-value">${this.avgSamplesPerWrite.toFixed(0)}</span>
-        </div>
-        <div class="stat-row">
-          <span class="stat-label">Sent/s:</span>
-          <span class="stat-value">${this.packetSendRate.toFixed(0)}</span>
-        </div>
-        <div class="stat-row">
-          <span class="stat-label">Recv/s:</span>
-          <span class="stat-value">${this.packetReceiveRate.toFixed(0)}</span>
         </div>
         <div class="stat-row">
           <span class="stat-label">Jitter depth:</span>

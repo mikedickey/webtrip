@@ -21,10 +21,11 @@ pub use audio::{
     RingBuffer, LockFreeJitterBuffer, JitterBuffer, JitterBufferConfig, JitterBufferStats,
     // Protocol types
     AudioFormat, AudioPacket, PacketHeader, StreamStats,
-    // Client types
-    AudioClient, JackTripConfig, ClientState,
     // Transport types
-    ConnectionState, TransportConfig, WebRtcTransport,
+    Transport, TransportType, TransportState,
+    ConnectionState, TransportConfig,
+    WebRtcTransport,
+    MockTransport, WebTransportImpl,
     // Signaling types
     HubSignaling, HubConnectionState, SignalingMessage,
 };

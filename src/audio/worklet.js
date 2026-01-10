@@ -35,18 +35,14 @@ registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProce
         // Get input buffer (from microphone/audio source)
         const input = inputs[0]?.[0];
         
-        // If no input or empty input, keep running but skip processing
-        if (!input || input.length === 0) {
-            return true;
-        }
-        
         // Get output buffer
         const output = outputs[0]?.[0] || new Float32Array(128);
         
-        // Process audio through the Wasm processor
-        const result = this.processor.process(input, output);
+        // Process audio through the Wasm processor (even if no input for playback)
+        const result = this.processor.process(input || new Float32Array(128), output);
         
-        // Signal main thread that audio data is ready to send
+        // Always signal main thread to process send/receive
+        // This ensures bidirectional audio works even in listen-only mode
         if (this.hasAtomics && this.hasFlagPtr !== undefined) {
             // Event-driven: Use Atomics.notify() for zero-CPU wake-up
             // Update Int32Array view (in case memory grew)
@@ -59,7 +55,7 @@ registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProce
             // numWoken will be 1 if main thread was waiting, 0 if it wasn't
         } else {
             // Fallback: Use postMessage (old behavior)
-        this.port.postMessage('audio-ready');
+            this.port.postMessage('audio-ready');
         }
         
         return result;
