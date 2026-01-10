@@ -33,6 +33,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::audio::engine::AudioEngine;
+use crate::audio::event_loop::EventLoop;
 use crate::audio::jitter_buffer::LockFreeJitterBuffer;
 use crate::audio::params::AudioParams;
 use crate::audio::ring_buffer::RingBuffer;
@@ -128,12 +129,8 @@ pub struct JackTripSession {
     // Callbacks
     on_state_change: Option<js_sys::Function>,
 
-    // Network loop handle (legacy interval-based, only used as fallback)
-    interval_handle: Option<i32>,
-    
-    // Event-driven network loop (preferred)
-    worklet_message_closure: Option<Closure<dyn FnMut(web_sys::MessageEvent)>>,
-    receive_message_closure: Option<Closure<dyn FnMut()>>,
+    // Event-driven network loop
+    event_loop: Option<EventLoop>,
 
     // Stats tracking
     packets_sent: u64,
@@ -202,9 +199,7 @@ impl JackTripSession {
             packet_serialize_buffer,
             packet_receive_buffer,
             on_state_change: None,
-            interval_handle: None,
-            worklet_message_closure: None,
-            receive_message_closure: None,
+            event_loop: None,
             packets_sent: 0,
             packets_received: 0,
             pending_capture_params: None,
@@ -241,6 +236,15 @@ impl JackTripSession {
             jitter_target_depth: jitter_stats.target_depth,
             jitter_buffering: jitter_stats.is_buffering,
         }
+    }
+
+    /// Get the ring buffer flag pointer for event-driven wake-up
+    /// 
+    /// Used with Atomics.waitAsync() in JavaScript for zero-CPU idle behavior.
+    /// Returns the memory address of the atomic flag that signals data availability.
+    #[wasm_bindgen(js_name = getRingBufferFlagPtr)]
+    pub fn get_ring_buffer_flag_ptr(&self) -> usize {
+        self.local_to_network_buffer.get_has_data_flag_ptr()
     }
 
     /// Set the number of audio channels (1 for mono, 2 for stereo)
@@ -335,10 +339,6 @@ impl JackTripSession {
                 engine.set_output_device(Some(output_device.clone())).await?;
             }
         }
-
-        // Set up event-driven network loop now that the worklet is ready
-        // This replaces the polling interval with immediate wake-up on audio data
-        self.setup_worklet_message_handler();
 
         Ok(())
     }
@@ -620,7 +620,12 @@ impl JackTripSession {
         Ok(())
     }
 
-    /// Process one network tick (called by interval)
+    /// Process one network tick
+    /// 
+    /// This can be called either:
+    /// - By the event-driven loop (Atomics.waitAsync) - preferred
+    /// - By the legacy loop (postMessage) - fallback
+    ///
     pub fn tick(&mut self) {
         // Check if transport is connected
         let is_connected = self
@@ -638,70 +643,73 @@ impl JackTripSession {
             self.set_state(SessionState::Connected);
         }
 
-        // === SEND PATH: local audio → network ===
-        // Send all available packets immediately
-        // The jitter buffer on the receiving end handles missing packets with zeros
+        // === INTERLEAVED SEND/RECEIVE: Alternate between send and receive for better latency balance ===
+        // Instead of processing all sends then all receives, we alternate one packet at a time.
+        // This reduces maximum latency by keeping both paths active simultaneously.
+        
         let samples_needed = (self.buffer_size * self.channels as usize) as u32;
-        while self.local_to_network_buffer.available() >= samples_needed {
-            if self.local_to_network_buffer.read(&mut self.audio_to_send_buffer) {
-                // Serialize directly into reusable buffer (no allocations!)
-                let bytes_written = match crate::audio::protocol::AudioPacket::serialize_samples_into(
-                    self.sequence_number,
-                    self.timestamp,
-                    &self.audio_to_send_buffer,
-                    self.channels,
-                    &mut self.packet_serialize_buffer,
-                ) {
-                    Ok(size) => size,
-                    Err(e) => {
-                        web_sys::console::error_1(&format!("❌ Serialize failed: {:?}", e).into());
-                        break;
-                    }
-                };
-
-                // Log first packet details
-                if self.packets_sent == 0 {
-                    web_sys::console::log_1(&format!(
-                        "📤 First packet: seq={}, timestamp={}, samples={}, buffer_size={}, channels={}", 
+        
+        // Continue until both queues are empty (checked on each iteration)
+        loop {
+            let mut processed_send = false;
+            let mut processed_receive = false;
+            
+            // Try to process one send packet
+            if self.local_to_network_buffer.available() >= samples_needed {
+                if self.local_to_network_buffer.read(&mut self.audio_to_send_buffer) {
+                    // Serialize directly into reusable buffer (no allocations!)
+                    match crate::audio::protocol::AudioPacket::serialize_samples_into(
                         self.sequence_number,
                         self.timestamp,
-                        self.audio_to_send_buffer.len(),
-                        self.buffer_size,
-                        self.channels
-                    ).into());
-                }
-
-                if let Some(ref transport) = self.transport {
-                    match transport.send_bytes(&self.packet_serialize_buffer[..bytes_written]) {
-                        Ok(_) => {
+                        &self.audio_to_send_buffer,
+                        self.channels,
+                        &mut self.packet_serialize_buffer,
+                    ) {
+                        Ok(bytes_written) => {
+                            // Log first packet details
                             if self.packets_sent == 0 {
-                                web_sys::console::log_1(&"✅ First packet sent successfully!".into());
+                                web_sys::console::debug_1(&format!(
+                                    "📤 First packet: seq={}, timestamp={}, samples={}, buffer_size={}, channels={}", 
+                                    self.sequence_number,
+                                    self.timestamp,
+                                    self.audio_to_send_buffer.len(),
+                                    self.buffer_size,
+                                    self.channels
+                                ).into());
                             }
-                            self.sequence_number = self.sequence_number.wrapping_add(1);
-                            self.timestamp += self.buffer_size as u64;
-                            self.packets_sent += 1;
+
+                            if let Some(ref transport) = self.transport {
+                                match transport.send_bytes(&self.packet_serialize_buffer[..bytes_written]) {
+                                    Ok(_) => {
+                                        if self.packets_sent == 0 {
+                                            web_sys::console::debug_1(&"✅ First packet sent successfully!".into());
+                                        }
+                                        self.sequence_number = self.sequence_number.wrapping_add(1);
+                                        self.timestamp += self.buffer_size as u64;
+                                        self.packets_sent += 1;
+                                        processed_send = true;
+                                    }
+                                    Err(e) => {
+                                        web_sys::console::error_1(&format!("❌ Send failed: {:?}", e).into());
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
-                            web_sys::console::error_1(&format!("❌ Send failed: {:?}", e).into());
-                            break; // Stop if send fails
+                            web_sys::console::error_1(&format!("❌ Serialize failed: {:?}", e).into());
                         }
                     }
                 }
-            } else {
-                break; // No more data to read
             }
-        }
-        
-        // === RECEIVE PATH: network → local audio ===
-        if let Some(ref transport) = self.transport {
-            while transport.has_pending_data() {
-                // Get raw bytes from transport (still allocates Vec<u8> from queue)
+            
+            // Try to process one receive packet
+            if let Some(ref transport) = self.transport {
                 if let Some(data) = transport.receive_bytes() {
                     // Deserialize into reusable buffer (no samples Vec allocation!)
                     match crate::audio::protocol::AudioPacket::deserialize_into(&data, &mut self.packet_receive_buffer) {
                         Ok(header) => {
                             if self.packets_received == 0 {
-                                web_sys::console::log_1(&format!(
+                                web_sys::console::debug_1(&format!(
                                     "✅ First packet decoded successfully! seq={}, samples={}", 
                                     header.sequence_number,
                                     self.packet_receive_buffer.len()
@@ -710,15 +718,18 @@ impl JackTripSession {
                             self.network_to_local_buffer
                                 .push(header.sequence_number as u64, &self.packet_receive_buffer);
                             self.packets_received += 1;
+                            processed_receive = true;
                         }
                         Err(e) => {
                             web_sys::console::error_1(&format!("❌ Failed to decode packet: {:?}", e).into());
-                            break;
                         }
                     }
-                } else {
-                    break;
                 }
+            }
+            
+            // Exit loop if neither direction had data to process
+            if !processed_send && !processed_receive {
+                break;
             }
         }
     }
@@ -744,12 +755,9 @@ impl JackTripSession {
 
     /// Start the event-driven network loop
     /// 
-    /// Instead of polling at a fixed interval, this sets up message handlers:
-    /// - AudioWorklet posts 'audio-ready' when data is written to ring buffer
-    /// - WebRTC transport's on_data_received callback triggers when packets arrive
-    /// 
-    /// This wakes up immediately when there's work to do, reducing latency
-    /// and eliminating unnecessary wake-ups.
+    /// This sets up the loop using either:
+    /// - Atomics.waitAsync (best performance)
+    /// - postMessage fallback (older browsers)
     fn start_network_loop(&mut self) {
         // Enable streaming on the local-to-network buffer
         self.local_to_network_buffer.set_streaming(true);
@@ -761,57 +769,50 @@ impl JackTripSession {
         // Reset network-to-local buffer
         self.network_to_local_buffer.reset();
 
-        // The worklet message handler is set up after audio capture starts
-        // (see setup_worklet_message_handler)
-        // Incoming packets are handled by the WebRTC on_data_received callback
-        // which was set up in connect_to_studio()
-    }
-
-    /// Set up the worklet message handler for event-driven packet sending
-    /// 
-    /// Called after audio capture starts, when the worklet port is available.
-    fn setup_worklet_message_handler(&mut self) {
-        // Get the worklet port from the audio engine
-        let port = match self.audio_engine.as_ref().and_then(|e| e.get_worklet_port()) {
-            Some(p) => p,
-            None => {
-                web_sys::console::error_1(&"❌ Could not get worklet port for event-driven network loop".into());
-                return;
-            }
-        };
-
+        // Create event loop
+        let mut event_loop = EventLoop::new();
+        
+        // Create tick callback
         let session_ptr = self as *mut JackTripSession;
-
-        // Set up message handler for worklet 'audio-ready' messages
-        let on_message = Closure::wrap(Box::new(move |_event: web_sys::MessageEvent| {
+        let tick_callback = Closure::wrap(Box::new(move || {
             unsafe {
                 if !session_ptr.is_null() {
                     (*session_ptr).tick();
                 }
             }
-        }) as Box<dyn FnMut(web_sys::MessageEvent)>);
-
-        port.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-        self.worklet_message_closure = Some(on_message);
-
-        web_sys::console::log_1(&"✅ Event-driven network loop active".into());
+        }) as Box<dyn FnMut()>);
+        let tick_fn = tick_callback.as_ref().unchecked_ref::<js_sys::Function>().clone();
+        tick_callback.forget(); // Keep alive
+        
+        // Try Atomics.waitAsync first
+        let memory = wasm_bindgen::memory();
+        let flag_ptr = self.local_to_network_buffer.get_has_data_flag_ptr();
+        
+        match event_loop.start_with_atomics(&memory, flag_ptr, tick_fn.clone()) {
+            Ok(true) => {
+                // Successfully started with Atomics.waitAsync
+                self.event_loop = Some(event_loop);
+            }
+            Ok(false) | Err(_) => {
+                // Fall back to postMessage
+                if let Some(ref engine) = self.audio_engine {
+                    if let Some(port) = engine.get_worklet_port() {
+                        if let Ok(()) = event_loop.start_with_postmessage(&port, tick_fn) {
+                            self.event_loop = Some(event_loop);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Incoming packets are handled by the WebRTC on_data_received callback
+        // which was set up in connect_to_studio()
     }
 
     fn stop_network_loop(&mut self) {
-        // Clean up worklet message handler
-        if let Some(ref engine) = self.audio_engine {
-            if let Some(port) = engine.get_worklet_port() {
-                port.set_onmessage(None);
-            }
-        }
-        self.worklet_message_closure = None;
-        self.receive_message_closure = None;
-
-        // Clean up any legacy interval handle (in case it was used)
-        if let Some(handle) = self.interval_handle.take() {
-            if let Some(window) = web_sys::window() {
-                window.clear_interval_with_handle(handle);
-            }
+        // Stop the event loop
+        if let Some(mut event_loop) = self.event_loop.take() {
+            event_loop.stop();
         }
 
         // Disable streaming on the local-to-network buffer

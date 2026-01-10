@@ -145,8 +145,6 @@ pub struct AudioClient {
     stats: StreamStats,
     /// JavaScript callbacks
     js_on_state_change: Option<js_sys::Function>,
-    /// Track if we've received the first packet (for debugging)
-    first_packet_received: bool,
 }
 
 #[wasm_bindgen]
@@ -167,7 +165,6 @@ impl AudioClient {
             timestamp: 0u64,
             stats: StreamStats::new(),
             js_on_state_change: None,
-            first_packet_received: false,
         })
     }
 
@@ -262,44 +259,6 @@ impl AudioClient {
     pub fn receive_audio(&mut self) -> Result<Vec<f32>, JsValue> {
         // Try to get a packet from the transport
         if let Ok(Some(packet)) = self.transport.receive_packet() {
-            // Log header information from the first packet
-            if !self.first_packet_received {
-                self.first_packet_received = true;
-                web_sys::console::log_1(&JsValue::from_str("🎵 First audio packet received!"));
-                web_sys::console::log_1(&JsValue::from_str(&format!(
-                    "  Sequence Number: {}",
-                    packet.header.sequence_number
-                )));
-                web_sys::console::log_1(&JsValue::from_str(&format!(
-                    "  Timestamp: {}",
-                    packet.header.timestamp
-                )));
-                web_sys::console::log_1(&JsValue::from_str(&format!(
-                    "  Buffer Size: {} samples",
-                    packet.header.buffer_size
-                )));
-                web_sys::console::log_1(&JsValue::from_str(&format!(
-                    "  Sample Rate: {} Hz",
-                    packet.header.sample_rate_hz()
-                )));
-                web_sys::console::log_1(&JsValue::from_str(&format!(
-                    "  Bit Depth: {} bits",
-                    packet.header.bit_depth
-                )));
-                web_sys::console::log_1(&JsValue::from_str(&format!(
-                    "  Incoming Channels: {}",
-                    packet.header.num_incoming_channels
-                )));
-                web_sys::console::log_1(&JsValue::from_str(&format!(
-                    "  Outgoing Channels: {}",
-                    packet.header.num_outgoing_channels
-                )));
-                web_sys::console::log_1(&JsValue::from_str(&format!(
-                    "  Samples in packet: {}",
-                    packet.samples.len()
-                )));
-            }
-            
             self.stats.packets_received += 1;
             return Ok(packet.samples);
         }

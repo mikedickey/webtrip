@@ -17,6 +17,7 @@ import init, {
   DeviceInfo,
   getAudioDevices,
   JackTripSession,
+  hasAtomicsWaitAsync,
 } from "../pkg/jacktrip_web.js";
 
 interface AudioDevices {
@@ -614,6 +615,7 @@ class JackTripApp {
   private handleDisconnect(): void {
     if (!this.session) return;
 
+    // Disconnect (Rust handles cleanup including event loop)
     this.session.disconnect();
     this.connectButton.disabled = false;
     this.connectButton.textContent = "Connect to Studio";

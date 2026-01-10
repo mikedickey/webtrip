@@ -17,6 +17,7 @@ pub mod params;
 pub mod devices;
 pub mod worklet;
 pub mod engine;
+pub mod event_loop;
 
 // Buffer modules
 pub mod ring_buffer;
@@ -36,6 +37,7 @@ pub use params::AudioParams;
 pub use devices::DeviceInfo;
 pub use worklet::ProcessorHandle;
 pub use engine::AudioEngine;
+pub use event_loop::{EventLoop, has_atomics_wait_async};
 
 // Re-export buffer types
 pub use ring_buffer::RingBuffer;

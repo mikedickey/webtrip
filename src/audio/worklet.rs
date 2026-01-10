@@ -48,6 +48,16 @@ pub fn create_worklet_node(
     ctx: &AudioContext,
     process: ProcessorCallback,
 ) -> Result<AudioWorkletNode, JsValue> {
+    create_worklet_node_with_flag(ctx, process, None)
+}
+
+/// Create an AudioWorkletNode with optional ring buffer flag pointer
+/// for event-driven wake-up using Atomics.notify()
+pub fn create_worklet_node_with_flag(
+    ctx: &AudioContext,
+    process: ProcessorCallback,
+    ring_buffer_flag_ptr: Option<usize>,
+) -> Result<AudioWorkletNode, JsValue> {
     let options = AudioWorkletNodeOptions::new();
     options.set_number_of_inputs(1);
     options.set_number_of_outputs(1);
@@ -58,11 +68,17 @@ pub fn create_worklet_node(
     output_channels.push(&JsValue::from(1));
     options.set_output_channel_count(&output_channels);
 
-    options.set_processor_options(Some(&js_sys::Array::of3(
-        &wasm_bindgen::module(),
-        &wasm_bindgen::memory(),
-        &ProcessorHandle::new(process).into_raw_ptr().into(),
-    )));
+    // Pass module, memory, processor handle, and optionally the ring buffer flag pointer
+    let processor_options = js_sys::Array::new();
+    processor_options.push(&wasm_bindgen::module());
+    processor_options.push(&wasm_bindgen::memory());
+    processor_options.push(&ProcessorHandle::new(process).into_raw_ptr().into());
+    
+    if let Some(flag_ptr) = ring_buffer_flag_ptr {
+        processor_options.push(&JsValue::from_f64(flag_ptr as f64));
+    }
+    
+    options.set_processor_options(Some(&processor_options));
 
     AudioWorkletNode::new_with_options(ctx, "WasmProcessor", &options)
 }

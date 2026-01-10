@@ -15,8 +15,8 @@ const RING_BUFFER_SIZE: usize = 4096;
 /// Shared ring buffer between worklet and main thread
 /// 
 /// Data flow:
-///   Worklet: write() -> ring buffer
-///   Main thread: read() -> WebRTC send
+///   Worklet: write() -> ring buffer -> Atomics.notify()
+///   Main thread: Atomics.waitAsync() -> read() -> WebRTC send
 #[wasm_bindgen]
 pub struct RingBuffer {
     /// Ring buffer for audio going TO the network (local mic -> network)
@@ -37,6 +37,11 @@ pub struct RingBuffer {
     writes: AtomicU64,
     /// Total samples written
     samples_written: AtomicU64,
+    
+    /// Event-driven notification flag
+    /// 0 = no data, 1 = data available
+    /// Used with Atomics.waitAsync() for zero-CPU idle behavior
+    has_data_flag: AtomicU32,
 }
 
 #[wasm_bindgen]
@@ -52,6 +57,7 @@ impl RingBuffer {
             streaming_active: AtomicU32::new(0),
             writes: AtomicU64::new(0),
             samples_written: AtomicU64::new(0),
+            has_data_flag: AtomicU32::new(0),
         }
     }
 
@@ -94,9 +100,23 @@ impl RingBuffer {
         self.samples_written.store(0, Ordering::Relaxed);
     }
 
+    /// Get pointer to the has_data flag for JavaScript Atomics.waitAsync()
+    /// 
+    /// This enables event-driven wake-up instead of polling:
+    /// - AudioWorklet sets flag to 1 and calls Atomics.notify()
+    /// - Main thread waits with Atomics.waitAsync()
+    /// - Zero CPU usage when idle!
+    #[wasm_bindgen(js_name = getHasDataFlagPtr)]
+    pub fn get_has_data_flag_ptr(&self) -> usize {
+        &self.has_data_flag as *const AtomicU32 as usize
+    }
+
     // === Called from AudioWorklet (real-time thread) ===
 
     /// Write audio samples to the buffer
+    /// 
+    /// After writing, sets the has_data_flag to signal waiting threads.
+    /// AudioWorklet should call Atomics.notify() after this returns true.
     pub fn write(&mut self, samples: &[f32]) -> bool {
         if !self.is_streaming() {
             return false;
@@ -128,12 +148,18 @@ impl RingBuffer {
         self.writes.fetch_add(1, Ordering::Relaxed);
         self.samples_written.fetch_add(samples.len() as u64, Ordering::Relaxed);
 
+        // Signal that data is available (for event-driven wake-up)
+        self.has_data_flag.store(1, Ordering::Release);
+
         true
     }
 
     // === Called from main thread (network I/O) ===
 
     /// Read audio samples from the buffer
+    /// 
+    /// Clears the has_data_flag when buffer becomes empty,
+    /// allowing the main thread to sleep via Atomics.waitAsync().
     pub fn read(&mut self, output: &mut [f32]) -> bool {
         let write_pos = self.write_pos.load(Ordering::Acquire);
         let read_pos = self.read_pos.load(Ordering::Acquire);
@@ -142,6 +168,8 @@ impl RingBuffer {
         
         if available < output.len() {
             output.fill(0.0);
+            // No data available - clear flag so main thread can sleep
+            self.has_data_flag.store(0, Ordering::Release);
             return false;
         }
 
@@ -155,6 +183,13 @@ impl RingBuffer {
             read_pos.wrapping_add(output.len() as u32),
             Ordering::Release
         );
+
+        // Check if we've consumed all data
+        let new_available = write_pos.wrapping_sub(read_pos.wrapping_add(output.len() as u32));
+        if new_available == 0 {
+            // Buffer is now empty - clear flag
+            self.has_data_flag.store(0, Ordering::Release);
+        }
 
         true
     }

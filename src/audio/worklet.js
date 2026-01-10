@@ -1,10 +1,23 @@
 registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProcessor {
     constructor(options) {
         super();
-        let [module, memory, handle] = options.processorOptions;
+        let [module, memory, handle, hasFlagPtr] = options.processorOptions;
         bindgen.initSync({ module, memory });
         this.processor = bindgen.ProcessorHandle.from_raw_ptr(handle);
         this.stopped = false;
+        this.memory = memory;
+        this.hasFlagPtr = hasFlagPtr;
+        
+        // Create Int32Array view for Atomics operations
+        // We'll update this on each process() call in case the buffer grows
+        this.int32View = null;
+        
+        // Check if Atomics.notify is available
+        this.hasAtomics = typeof Atomics !== 'undefined' && typeof Atomics.notify === 'function';
+        
+        if (!this.hasAtomics) {
+            console.warn('⚠️ Atomics.notify not available, falling back to postMessage');
+        }
         
         // Listen for stop message from main thread
         this.port.onmessage = (event) => {
@@ -34,8 +47,20 @@ registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProce
         const result = this.processor.process(input, output);
         
         // Signal main thread that audio data is ready to send
-        // This wakes up the network loop immediately instead of waiting for polling
+        if (this.hasAtomics && this.hasFlagPtr !== undefined) {
+            // Event-driven: Use Atomics.notify() for zero-CPU wake-up
+            // Update Int32Array view (in case memory grew)
+            this.int32View = new Int32Array(this.memory.buffer);
+            const flagIndex = this.hasFlagPtr / 4;
+            
+            // The RingBuffer.write() already set the flag to 1
+            // Now notify any waiters (main thread waiting via Atomics.waitAsync)
+            const numWoken = Atomics.notify(this.int32View, flagIndex, 1);
+            // numWoken will be 1 if main thread was waiting, 0 if it wasn't
+        } else {
+            // Fallback: Use postMessage (old behavior)
         this.port.postMessage('audio-ready');
+        }
         
         return result;
     }

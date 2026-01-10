@@ -1,7 +1,7 @@
 use crate::audio::devices::{get_media_devices, stop_media_stream};
 use crate::audio::params::AudioParams;
 use crate::audio::processor::AudioProcessor;
-use crate::audio::worklet::{create_worklet_node, register_audio_worklet};
+use crate::audio::worklet::{create_worklet_node_with_flag, register_audio_worklet};
 use crate::audio::jitter_buffer::LockFreeJitterBuffer;
 use crate::audio::ring_buffer::RingBuffer;
 use wasm_bindgen::prelude::*;
@@ -180,8 +180,18 @@ impl AudioEngine {
             processor.process(input, output)
         });
 
-        // Create worklet node for processing
-        let worklet_node = create_worklet_node(&self.ctx, process)?;
+        // Get ring buffer flag pointer for event-driven wake-up
+        let ring_buffer_flag_ptr = if !local_to_network_ptr.is_null() {
+            unsafe {
+                let ring_buffer = &*local_to_network_ptr;
+                Some(ring_buffer.get_has_data_flag_ptr())
+            }
+        } else {
+            None
+        };
+
+        // Create worklet node for processing (with flag pointer for Atomics.notify)
+        let worklet_node = create_worklet_node_with_flag(&self.ctx, process, ring_buffer_flag_ptr)?;
 
         // Connect: source -> worklet -> destination
         source_node.connect_with_audio_node(&worklet_node)?;

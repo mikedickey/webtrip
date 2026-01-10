@@ -39,3 +39,12 @@ use wasm_bindgen::prelude::*;
 pub fn init() {
     console_error_panic_hook::set_once();
 }
+
+/// Get the WASM memory for use with Atomics.waitAsync
+/// 
+/// This is needed by the event-driven network loop to access
+/// the ring buffer flag via SharedArrayBuffer.
+#[wasm_bindgen(js_name = getWasmMemory)]
+pub fn get_wasm_memory() -> JsValue {
+    wasm_bindgen::memory().into()
+}
