@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::audio::params::{AudioParams, MAX_DB, MIN_DB};
-use crate::audio::jitter_buffer::LockFreeJitterBuffer;
+use crate::audio::regulator::Regulator;
 use crate::audio::ring_buffer::RingBuffer;
 
 /// Peak hold time in process calls (~48kHz / 128 samples = ~375 calls/sec)
@@ -17,7 +17,7 @@ pub struct AudioProcessor {
     /// Ring buffer for sending local audio to network (audio device → worklet → main thread → network)
     local_to_network_buffer: Option<*mut RingBuffer>,
     /// Jitter buffer for receiving audio from network (network → main thread → jitter buffer → worklet → audio device)
-    network_to_local_buffer: Option<*const LockFreeJitterBuffer>,
+    network_to_local_buffer: Option<*mut Regulator>,
     /// Temporary buffer for gained audio (mono from mic)
     gained_buffer: Vec<f32>,
     /// Temporary buffer for remote audio (mono, after downmix)
@@ -47,7 +47,7 @@ impl AudioProcessor {
     pub fn with_network(
         params: &'static AudioParams,
         local_to_network_buffer: *mut RingBuffer,
-        network_to_local_buffer: *const LockFreeJitterBuffer,
+        network_to_local_buffer: *mut Regulator,
     ) -> Self {
         Self {
             params,

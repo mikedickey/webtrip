@@ -32,7 +32,7 @@
 use wasm_bindgen::prelude::*;
 
 use crate::audio::engine::AudioEngine;
-use crate::audio::jitter_buffer::LockFreeJitterBuffer;
+use crate::audio::regulator::Regulator;
 use crate::audio::params::AudioParams;
 use crate::audio::ring_buffer::RingBuffer;
 use crate::audio::transport::{Transport, TransportType, AudioBufferConfig};
@@ -66,27 +66,34 @@ pub enum SessionState {
 pub struct SessionStats {
     pub packets_sent: u64,
     pub packets_received: u64,
-    pub jitter_depth: u32,
-    pub jitter_latency_ms: f32,
+    
+    // Ring buffer stats (send path)
     pub send_buffer_available: u32,
-    /// Number of ring buffer writes from audio callback
     pub ring_buffer_writes: u64,
-    /// Total samples written to ring buffer
     pub ring_buffer_samples_written: u64,
-    /// Ring buffer overruns (writes that failed due to full buffer)
     pub ring_buffer_overruns: u64,
-    /// Jitter buffer: packets that arrived too late (already played that sequence)
-    pub jitter_late_packets: u64,
-    /// Jitter buffer: packets lost (slot wasn't ready when needed)
-    pub jitter_lost_packets: u64,
-    /// Jitter buffer: underruns (depth hit zero)
-    pub jitter_underruns: u64,
-    /// Jitter buffer: packets successfully played
-    pub jitter_played: u64,
-    /// Jitter buffer: current target depth (grows on underrun)
-    pub jitter_target_depth: u32,
-    /// Jitter buffer: whether currently buffering (waiting to reach target)
-    pub jitter_buffering: bool,
+    
+    // Regulator stats (receive path with Burg PLC)
+    /// Current adaptive tolerance in milliseconds
+    pub regulator_tolerance_ms: f64,
+    /// Current headroom (extra buffering) in milliseconds
+    pub regulator_headroom_ms: f64,
+    /// Maximum latency observed in this period (ms)
+    pub regulator_max_latency_ms: f64,
+    /// Current buffer depth (packets buffered)
+    pub regulator_depth: u32,
+    /// Current latency in milliseconds
+    pub regulator_latency_ms: f32,
+    /// Whether regulator is initialized (received first packet)
+    pub regulator_initialized: bool,
+    /// Packets successfully played
+    pub regulator_packets_played: u64,
+    /// Number of PLC activations (packet loss concealment)
+    pub regulator_plc_count: u64,
+    /// Number of packets skipped (late/reordered)
+    pub regulator_skipped: u64,
+    /// Last packet sequence number received (u16, wraps at 65535)
+    pub regulator_last_seq: u16,
 }
 
 #[wasm_bindgen]
@@ -107,7 +114,7 @@ pub struct JackTripSession {
 
     // Owned buffers (shared with AudioWorklet and Transport via pointers)
     local_to_network_buffer: Box<RingBuffer>,
-    network_to_local_buffer: Box<LockFreeJitterBuffer>,
+    network_to_local_buffer: Box<Regulator>,
 
     // Network components
     transport: Option<Box<dyn Transport>>,
@@ -161,11 +168,10 @@ impl JackTripSession {
 
         // Create owned buffers
         let local_to_network_buffer = Box::new(RingBuffer::new());
-        let network_to_local_buffer = Box::new(LockFreeJitterBuffer::new());
+        let mut network_to_local_buffer = Box::new(Regulator::new());
 
-        // Configure jitter buffer with samples per packet = buffer_size * channels
-        let samples_per_packet = buffer_size * channels as usize;
-        network_to_local_buffer.configure(samples_per_packet as u32, 4);
+        // Configure regulator with auto-adaptive tolerance and headroom (-500.0)
+        network_to_local_buffer.configure(channels as usize, buffer_size, sample_rate, -500.0);
 
         Ok(JackTripSession {
             audio_params_ptr,
@@ -198,22 +204,28 @@ impl JackTripSession {
 
     /// Get current statistics
     pub fn get_stats(&self) -> SessionStats {
-        let jitter_stats = self.network_to_local_buffer.stats();
+        let reg_stats = self.network_to_local_buffer.stats();
         SessionStats {
             packets_sent: 0, // TODO: Get from transport if needed
-            packets_received: 0, // TODO: Get from transport if needed
-            jitter_depth: self.network_to_local_buffer.depth(),
-            jitter_latency_ms: self.network_to_local_buffer.latency_ms(self.sample_rate),
+            packets_received: reg_stats.packets_received,
+            
+            // Ring buffer (send path)
             send_buffer_available: self.local_to_network_buffer.available(),
             ring_buffer_writes: self.local_to_network_buffer.writes(),
             ring_buffer_samples_written: self.local_to_network_buffer.samples_written(),
             ring_buffer_overruns: self.local_to_network_buffer.overruns(),
-            jitter_late_packets: jitter_stats.packets_late,
-            jitter_lost_packets: jitter_stats.packets_lost,
-            jitter_underruns: jitter_stats.underruns,
-            jitter_played: jitter_stats.packets_played,
-            jitter_target_depth: jitter_stats.target_depth,
-            jitter_buffering: jitter_stats.is_buffering,
+            
+            // Regulator (receive path with Burg PLC)
+            regulator_tolerance_ms: reg_stats.tolerance_ms,
+            regulator_headroom_ms: reg_stats.headroom_ms,
+            regulator_max_latency_ms: reg_stats.max_latency_ms,
+            regulator_depth: self.network_to_local_buffer.depth(),
+            regulator_latency_ms: self.network_to_local_buffer.latency_ms(),
+            regulator_initialized: self.network_to_local_buffer.is_initialized(),
+            regulator_packets_played: reg_stats.packets_played,
+            regulator_plc_count: reg_stats.glitches,
+            regulator_skipped: reg_stats.skipped,
+            regulator_last_seq: reg_stats.last_seq_received,
         }
     }
 
@@ -239,9 +251,8 @@ impl JackTripSession {
                     (*self.audio_params_ptr).set_output_channels(channels as u32);
                 }
             }
-            // Update jitter buffer configuration with new samples per packet
-            let samples_per_packet = self.buffer_size * channels as usize;
-            self.network_to_local_buffer.configure(samples_per_packet as u32, 4);
+            // Reconfigure regulator with new channel count
+            self.network_to_local_buffer.configure(channels as usize, self.buffer_size, self.sample_rate, -1.0);
         }
     }
 
@@ -300,7 +311,7 @@ impl JackTripSession {
     ) -> Result<(), JsValue> {
         // Get raw pointers to owned buffers
         let local_to_network_ptr = &mut *self.local_to_network_buffer as *mut RingBuffer;
-        let network_to_local_ptr = &*self.network_to_local_buffer as *const LockFreeJitterBuffer;
+        let network_to_local_ptr = &mut *self.network_to_local_buffer as *mut Regulator;
 
         // Create audio engine with network support
         let engine = AudioEngine::create_with_network(
@@ -402,7 +413,7 @@ impl JackTripSession {
         // Create buffer configuration for transports that need it
         let buffer_config = AudioBufferConfig {
             local_to_network_ptr: &mut *self.local_to_network_buffer as *mut RingBuffer,
-            network_to_local_ptr: &*self.network_to_local_buffer as *const LockFreeJitterBuffer,
+            network_to_local_ptr: &mut *self.network_to_local_buffer as *mut Regulator,
             buffer_size: self.buffer_size,
             channels: self.channels,
         };

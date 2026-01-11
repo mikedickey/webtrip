@@ -21,7 +21,7 @@ pub mod audio_callback_loop;
 
 // Buffer modules
 pub mod ring_buffer;
-pub mod jitter_buffer;
+pub mod regulator;
 
 // JackTrip protocol modules
 pub mod protocol;
@@ -43,9 +43,7 @@ pub use audio_callback_loop::{AudioCallbackLoop, has_atomics_wait_async};
 
 // Re-export buffer types
 pub use ring_buffer::RingBuffer;
-pub use jitter_buffer::{
-    LockFreeJitterBuffer, JitterBuffer, JitterBufferConfig, JitterBufferStats,
-};
+pub use regulator::{Regulator, RegulatorStats};
 
 // Re-export JackTrip types
 pub use protocol::{AudioFormat, AudioPacket, PacketHeader, StreamStats};

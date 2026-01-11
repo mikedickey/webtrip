@@ -18,7 +18,7 @@ pub use audio::{
     // Core audio types
     AudioProcessor, AudioParams, DeviceInfo, ProcessorHandle, AudioEngine,
     // Buffer types
-    RingBuffer, LockFreeJitterBuffer, JitterBuffer, JitterBufferConfig, JitterBufferStats,
+    RingBuffer, Regulator, RegulatorStats,
     // Protocol types
     AudioFormat, AudioPacket, PacketHeader, StreamStats,
     // Transport types

@@ -2,7 +2,7 @@ use crate::audio::devices::{get_media_devices, stop_media_stream};
 use crate::audio::params::AudioParams;
 use crate::audio::processor::AudioProcessor;
 use crate::audio::worklet::{create_worklet_node_with_flag, register_audio_worklet};
-use crate::audio::jitter_buffer::LockFreeJitterBuffer;
+use crate::audio::regulator::Regulator;
 use crate::audio::ring_buffer::RingBuffer;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
@@ -75,7 +75,7 @@ pub struct AudioEngine {
     current_stream: Option<MediaStream>,
     params_ptr: *const AudioParams,
     local_to_network_buffer_ptr: *mut RingBuffer,
-    network_to_local_buffer_ptr: *const LockFreeJitterBuffer,
+    network_to_local_buffer_ptr: *mut Regulator,
 }
 
 #[wasm_bindgen]
@@ -83,7 +83,7 @@ impl AudioEngine {
     /// Create a new audio engine (without network support)
     #[wasm_bindgen(js_name = create)]
     pub async fn create(params_ptr: *const AudioParams) -> Result<AudioEngine, JsValue> {
-        Self::create_with_network(params_ptr, std::ptr::null_mut(), std::ptr::null()).await
+        Self::create_with_network(params_ptr, std::ptr::null_mut(), std::ptr::null_mut()).await
     }
 
     /// Create a new audio engine with network audio support
@@ -93,7 +93,7 @@ impl AudioEngine {
     pub async fn create_with_network(
         params_ptr: *const AudioParams,
         local_to_network_buffer_ptr: *mut RingBuffer,
-        network_to_local_buffer_ptr: *const LockFreeJitterBuffer,
+        network_to_local_buffer_ptr: *mut Regulator,
     ) -> Result<AudioEngine, JsValue> {
         // Configure AudioContext with minimal latency
         let options = AudioContextOptions::new();
@@ -127,7 +127,7 @@ impl AudioEngine {
 
     /// Set the network-to-local jitter buffer pointer
     #[wasm_bindgen(js_name = setNetworkToLocalBuffer)]
-    pub fn set_network_to_local_buffer(&mut self, ptr: *const LockFreeJitterBuffer) {
+    pub fn set_network_to_local_buffer(&mut self, ptr: *mut Regulator) {
         self.network_to_local_buffer_ptr = ptr;
     }
 

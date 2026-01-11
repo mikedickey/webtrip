@@ -792,30 +792,53 @@ class JackTripApp {
       this.lastRingWrites = currentRingWrites;
       this.lastRingSamples = currentRingSamples;
 
+      // Calculate PLC rate and packet loss percentage
+      const plcRate = stats.regulator_packets_played > 0 
+        ? (Number(stats.regulator_plc_count) / Number(stats.regulator_packets_played) * 100) 
+        : 0;
+      const lossRate = stats.packets_received > 0
+        ? (Number(stats.regulator_skipped) / Number(stats.packets_received) * 100)
+        : 0;
+      
       this.statsDisplay.innerHTML = `
-        <div class="stat-row">
-          <span class="stat-label">Callbacks/s:</span>
-          <span class="stat-value">${this.callbackRate.toFixed(0)}</span>
+        <div class="stat-section">
+          <div class="stat-section-title">Regulator (Burg PLC)</div>
+          <div class="stat-row">
+            <span class="stat-label">Tolerance:</span>
+            <span class="stat-value">${stats.regulator_tolerance_ms.toFixed(1)} ms ${stats.regulator_initialized ? '' : '(init)'}</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Headroom:</span>
+            <span class="stat-value">${stats.regulator_headroom_ms.toFixed(1)} ms</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Depth:</span>
+            <span class="stat-value">${stats.regulator_depth} pkts</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Max latency:</span>
+            <span class="stat-value">${stats.regulator_max_latency_ms.toFixed(1)} ms</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Last seq #:</span>
+            <span class="stat-value">${stats.regulator_last_seq} ${stats.regulator_last_seq > 65000 ? '(wrap soon)' : ''}</span>
+          </div>
         </div>
-        <div class="stat-row">
-          <span class="stat-label">Ring writes/s:</span>
-          <span class="stat-value">${this.ringWriteRate.toFixed(0)}</span>
-        </div>
-        <div class="stat-row">
-          <span class="stat-label">Samples/write:</span>
-          <span class="stat-value">${this.avgSamplesPerWrite.toFixed(0)}</span>
-        </div>
-        <div class="stat-row">
-          <span class="stat-label">Jitter depth:</span>
-          <span class="stat-value">${stats.jitter_depth}/${stats.jitter_target_depth} ${stats.jitter_buffering ? '(buffering)' : ''}</span>
-        </div>
-        <div class="stat-row">
-          <span class="stat-label">Jitter played:</span>
-          <span class="stat-value">${stats.jitter_played}</span>
-        </div>
-        <div class="stat-row">
-          <span class="stat-label">Jitter underruns:</span>
-          <span class="stat-value">${stats.jitter_underruns}</span>
+        
+        <div class="stat-section">
+          <div class="stat-section-title">Quality</div>
+          <div class="stat-row">
+            <span class="stat-label">Packets played:</span>
+            <span class="stat-value">${stats.regulator_packets_played}</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">PLC activations:</span>
+            <span class="stat-value">${stats.regulator_plc_count} (${plcRate.toFixed(2)}%)</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Packets skipped:</span>
+            <span class="stat-value">${stats.regulator_skipped} (${lossRate.toFixed(2)}%)</span>
+          </div>
         </div>
       `;
     }, 500);

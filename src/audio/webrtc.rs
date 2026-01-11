@@ -230,7 +230,7 @@ impl WebRtcTransport {
         // Safety: We're in single-threaded WASM, and these pointers are valid
         // for the lifetime of the session
         let ring_buffer = unsafe { &mut *buffers.local_to_network_ptr };
-        let jitter_buffer = unsafe { &*buffers.network_to_local_ptr };
+        let jitter_buffer = unsafe { &mut *buffers.network_to_local_ptr };
         
         // Interleaved send/receive for better latency balance
         loop {
@@ -271,7 +271,7 @@ impl WebRtcTransport {
             if let Some(data) = self.receive_queue.borrow_mut().pop_front() {
                 match AudioPacket::deserialize(&data) {
                     Ok(packet) => {
-                        jitter_buffer.push(packet.header.sequence_number as u64, &packet.samples);
+                        jitter_buffer.push(packet.header.sequence_number, &packet.samples);
                         processed_receive = true;
                     }
                     Err(e) => {

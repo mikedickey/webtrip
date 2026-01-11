@@ -260,7 +260,7 @@ impl MockTransport {
         // Safety: We're in single-threaded WASM, and these pointers are valid
         // for the lifetime of the session
         let ring_buffer = unsafe { &mut *buffers.local_to_network_ptr };
-        let jitter_buffer = unsafe { &*buffers.network_to_local_ptr };
+        let jitter_buffer = unsafe { &mut *buffers.network_to_local_ptr };
         
         // Read from ring buffer (simulates sending, stores for testing)
         if ring_buffer.available() >= samples_needed {
@@ -275,7 +275,7 @@ impl MockTransport {
             let packet = Self::generate_sine_wave_packet(&mut sine_state);
             
             // Push directly to jitter buffer
-            jitter_buffer.push(packet.header.sequence_number as u64, &packet.samples);
+            jitter_buffer.push(packet.header.sequence_number, &packet.samples);
         }
     }
 

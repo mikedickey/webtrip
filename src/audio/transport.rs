@@ -64,8 +64,8 @@ pub enum TransportState {
 pub struct AudioBufferConfig {
     /// Pointer to ring buffer (local-to-network)
     pub local_to_network_ptr: *mut crate::audio::ring_buffer::RingBuffer,
-    /// Pointer to jitter buffer (network-to-local)
-    pub network_to_local_ptr: *const crate::audio::jitter_buffer::LockFreeJitterBuffer,
+    /// Pointer to jitter buffer (network-to-local) - mutable for Regulator
+    pub network_to_local_ptr: *mut crate::audio::regulator::Regulator,
     /// Buffer size in samples per channel
     pub buffer_size: usize,
     /// Number of audio channels
