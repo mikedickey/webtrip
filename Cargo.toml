@@ -1,8 +1,8 @@
 [package]
-authors = ["JackTrip Contributors"]
+authors = ["Mike Dickey"]
 edition = "2021"
-name = "jacktrip-web"
-description = "JackTrip audio streaming over WebRTC"
+name = "webtrip"
+description = "Rust rewrite of JackTrip for audio in web browsers"
 publish = false
 version = "0.1.0"
 

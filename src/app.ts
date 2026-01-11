@@ -1,7 +1,7 @@
-// JackTrip WebRTC Audio - UI Controller
+// WebTrip Audio - UI Controller
 //
 // This file handles ONLY UI interactions. All audio and network
-// logic is handled in Rust via JackTripSession.
+// logic is handled in Rust via WebTripSession.
 
 import init, {
   init as wasmInit,
@@ -16,9 +16,9 @@ import init, {
   getCallbackCountFromPtr,
   DeviceInfo,
   getAudioDevices,
-  JackTripSession,
+  WebTripSession,
   TransportType,
-} from "../pkg/jacktrip_web.js";
+} from "../pkg/webtrip.js";
 
 interface AudioDevices {
   inputDevices: DeviceInfo[];
@@ -32,9 +32,9 @@ type SessionState =
   | "connected"
   | "error";
 
-class JackTripApp {
+class WebTripApp {
   private paramsPtr: number = 0;
-  private session: JackTripSession | null = null;
+  private session: WebTripSession | null = null;
   private animationFrameId: number | null = null;
   private statsIntervalId: number | null = null;
   private sessionState: SessionState = "idle";
@@ -80,7 +80,7 @@ class JackTripApp {
     this.paramsPtr = createAudioParams();
 
     // Create session (handles all audio and network logic)
-    this.session = new JackTripSession(this.paramsPtr);
+    this.session = new WebTripSession(this.paramsPtr);
     this.setupSessionCallbacks();
 
     try {
@@ -118,11 +118,11 @@ class JackTripApp {
 
     // Title
     const title = this.createElement("h1", "title");
-    title.textContent = "JackTrip";
+    title.textContent = "WebTrip Demo";
     card.appendChild(title);
 
     const subtitle = this.createElement("p", "subtitle");
-    subtitle.textContent = "Real-time audio streaming over WebRTC";
+    subtitle.textContent = "Real-time lossless audio streaming using WebAssembly";
     card.appendChild(subtitle);
 
     // Connection Section
@@ -812,12 +812,12 @@ class JackTripApp {
             <span class="stat-value">${stats.regulator_headroom_ms.toFixed(1)} ms</span>
           </div>
           <div class="stat-row">
-            <span class="stat-label">Depth:</span>
-            <span class="stat-value">${stats.regulator_depth} pkts</span>
+            <span class="stat-label">Latency:</span>
+            <span class="stat-value">${stats.regulator_max_latency_ms.toFixed(1)} ms</span>
           </div>
           <div class="stat-row">
-            <span class="stat-label">Max latency:</span>
-            <span class="stat-value">${stats.regulator_max_latency_ms.toFixed(1)} ms</span>
+            <span class="stat-label">Queue Depth:</span>
+            <span class="stat-value">${stats.regulator_depth} pkts</span>
           </div>
           <div class="stat-row">
             <span class="stat-label">Last seq #:</span>
@@ -926,5 +926,5 @@ class JackTripApp {
 }
 
 // Initialize the app
-const app = new JackTripApp();
+const app = new WebTripApp();
 app.init().catch(console.error);

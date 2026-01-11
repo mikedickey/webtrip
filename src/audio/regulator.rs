@@ -9,7 +9,10 @@
 //!
 //! Original C++ implementation by Chris Chafe, CCRMA Stanford University.
 
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
+
+/// Sentinel value for "no sequence number" (None)
+const SEQ_NONE: i32 = -1;
 
 // ============================================================================
 // Constants
@@ -470,9 +473,10 @@ pub struct Regulator {
     slots: Vec<Option<PacketSlot>>,
 
     // Sequence tracking
-    last_seq_in: AtomicU16,
+    /// Last sequence number received (SEQ_NONE = not initialized)
+    /// Uses AtomicI32 for thread-safe access between push (writer) and pop (reader) threads
+    last_seq_in: AtomicI32,
     last_seq_out: Option<u16>,
-    initialized: AtomicBool,
 
     // Timing (internal clock using performance.now() equivalent)
     start_time_ms: f64,
@@ -596,9 +600,8 @@ impl Regulator {
             channels: channel_states,
             slots,
 
-            last_seq_in: AtomicU16::new(0),
+            last_seq_in: AtomicI32::new(SEQ_NONE),
             last_seq_out: None,
-            initialized: AtomicBool::new(false),
 
             start_time_ms: 0.0,
             last_pop_time_ms: 0.0,
@@ -645,10 +648,11 @@ impl Regulator {
     /// * `samples` - Interleaved audio samples
     /// * `now_ms` - Current timestamp in milliseconds
     fn push_internal(&mut self, seq_num: u16, samples: &[f32], now_ms: f64) {
+        let current = self.last_seq_in.load(Ordering::Acquire);
+
         // Initialize on first packet
-        if !self.initialized.load(Ordering::Acquire) {
+        if current == SEQ_NONE {
             self.start_time_ms = now_ms;
-            self.initialized.store(true, Ordering::Release);
         }
 
         let slot_idx = (seq_num as usize) % NUM_SLOTS;
@@ -663,10 +667,14 @@ impl Regulator {
 
         // Update last sequence number using wrapping comparison
         // A packet is "newer" if the wrapping distance forward is less than half the space
-        let current = self.last_seq_in.load(Ordering::Acquire);
-        let delta = seq_num.wrapping_sub(current);
-        if delta < u16::MAX / 2 || !self.initialized.load(Ordering::Acquire) {
-            self.last_seq_in.store(seq_num, Ordering::Release);
+        let should_update = if current == SEQ_NONE {
+            true
+        } else {
+            let delta = seq_num.wrapping_sub(current as u16);
+            delta < u16::MAX / 2
+        };
+        if should_update {
+            self.last_seq_in.store(seq_num as i32, Ordering::Release);
         }
     }
 
@@ -694,12 +702,11 @@ impl Regulator {
     /// `true` if real packet data was output, `false` if concealment was used
     fn pop_internal(&mut self, output: &mut [f32], now_ms: f64) -> bool {
         let relative_now = now_ms - self.start_time_ms;
-        let last_seq_in = self.last_seq_in.load(Ordering::Acquire);
+        let last_seq_in_raw = self.last_seq_in.load(Ordering::Acquire);
+        let last_seq_in = last_seq_in_raw as u16;
 
         // Return silence during startup
-        if !self.initialized.load(Ordering::Acquire)
-            || relative_now < self.tolerance_ms
-        {
+        if last_seq_in_raw == SEQ_NONE || relative_now < self.tolerance_ms {
             output.fill(0.0);
             return false;
         }
@@ -1077,7 +1084,8 @@ impl Regulator {
     /// Get current statistics.
     pub fn stats(&self) -> RegulatorStats {
         let total_glitches = self.pull_stats.underruns + self.pull_stats.overruns;
-        let last_seq = self.last_seq_in.load(Ordering::Relaxed);
+        let last_seq_raw = self.last_seq_in.load(Ordering::Relaxed);
+        let last_seq = if last_seq_raw == SEQ_NONE { 0 } else { last_seq_raw as u16 };
         RegulatorStats {
             tolerance_ms: self.tolerance_ms,
             headroom_ms: self.current_headroom,
@@ -1092,8 +1100,7 @@ impl Regulator {
 
     /// Reset the regulator state.
     pub fn reset(&mut self) {
-        self.initialized.store(false, Ordering::Release);
-        self.last_seq_in.store(0, Ordering::Release);
+        self.last_seq_in.store(SEQ_NONE, Ordering::Release);
         self.last_seq_out = None;
         self.packet_count = 0;
         self.skipped = 0;
@@ -1158,12 +1165,16 @@ impl Regulator {
 
     /// Check if the regulator has been initialized (received first packet).
     pub fn is_initialized(&self) -> bool {
-        self.initialized.load(Ordering::Acquire)
+        self.last_seq_in.load(Ordering::Acquire) != SEQ_NONE
     }
 
     /// Get current buffer depth (number of packets buffered).
     pub fn depth(&self) -> u32 {
-        let write = self.last_seq_in.load(Ordering::Acquire);
+        let write_raw = self.last_seq_in.load(Ordering::Acquire);
+        if write_raw == SEQ_NONE {
+            return 0;
+        }
+        let write = write_raw as u16;
         let read = self.last_seq_out.unwrap_or(write);
         // Use wrapping arithmetic to handle sequence number wraparound (u16)
         write.wrapping_sub(read) as u32

@@ -13,10 +13,13 @@ registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProce
         this.int32View = null;
         
         // Check if Atomics.notify is available
+        // Note: This is the optimized event notification path. If unavailable (Safari 15.2-16.3),
+        // we fall back to postMessage for notifications. SharedArrayBuffer is still required for
+        // the actual buffer access in both cases.
         this.hasAtomics = typeof Atomics !== 'undefined' && typeof Atomics.notify === 'function';
         
         if (!this.hasAtomics) {
-            console.warn('⚠️ Atomics.notify not available, falling back to postMessage');
+            console.warn('⚠️ Atomics.notify not available, falling back to postMessage (Safari 15.2-16.3)');
         }
         
         // Listen for stop message from main thread
@@ -44,7 +47,8 @@ registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProce
         // Always signal main thread to process send/receive
         // This ensures bidirectional audio works even in listen-only mode
         if (this.hasAtomics && this.hasFlagPtr !== undefined) {
-            // Event-driven: Use Atomics.notify() for zero-CPU wake-up
+            // Optimized path: Use Atomics.notify() for zero-CPU wake-up
+            // Available in: Chrome 87+, Firefox 89+, Safari 16.4+
             // Update Int32Array view (in case memory grew)
             this.int32View = new Int32Array(this.memory.buffer);
             const flagIndex = this.hasFlagPtr / 4;
@@ -54,7 +58,9 @@ registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProce
             const numWoken = Atomics.notify(this.int32View, flagIndex, 1);
             // numWoken will be 1 if main thread was waiting, 0 if it wasn't
         } else {
-            // Fallback: Use postMessage (old behavior)
+            // Fallback path: Use postMessage for event notification
+            // Used in: Safari 15.2-16.3 (browsers with SharedArrayBuffer but no Atomics.waitAsync)
+            // Note: SharedArrayBuffer is still required for buffer access, this only affects notifications
             this.port.postMessage('audio-ready');
         }
         

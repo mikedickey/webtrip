@@ -31,7 +31,7 @@ pub use audio::{
 };
 
 // Re-export session types
-pub use session::{JackTripSession, SessionState, SessionStats};
+pub use session::{WebTripSession, SessionState, SessionStats};
 
 use wasm_bindgen::prelude::*;
 

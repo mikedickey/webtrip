@@ -1,4 +1,4 @@
-//! JackTrip Session Manager
+//! WebTrip Session Manager
 //!
 //! High-level session management that coordinates all components:
 //! - AudioEngine (capture/playback via AudioWorklet)
@@ -105,9 +105,9 @@ impl SessionStats {
 }
 
 
-/// JackTrip Session - coordinates all audio and network components
+/// WebTrip Session - coordinates all audio and network components
 #[wasm_bindgen]
-pub struct JackTripSession {
+pub struct WebTripSession {
     // Audio components
     audio_params_ptr: *const AudioParams,
     audio_engine: Option<AudioEngine>,
@@ -151,10 +151,10 @@ struct PendingCaptureParams {
 }
 
 #[wasm_bindgen]
-impl JackTripSession {
+impl WebTripSession {
     /// Create a new session
     #[wasm_bindgen(constructor)]
-    pub fn new(audio_params_ptr: *const AudioParams) -> Result<JackTripSession, JsValue> {
+    pub fn new(audio_params_ptr: *const AudioParams) -> Result<WebTripSession, JsValue> {
         let buffer_size = 128;
         let sample_rate = 48000;
         let channels = 2; // Default to stereo
@@ -173,7 +173,7 @@ impl JackTripSession {
         // Configure regulator with auto-adaptive tolerance and headroom (-500.0)
         network_to_local_buffer.configure(channels as usize, buffer_size, sample_rate, -500.0);
 
-        Ok(JackTripSession {
+        Ok(WebTripSession {
             audio_params_ptr,
             audio_engine: None,
             local_to_network_buffer,
@@ -433,7 +433,7 @@ impl JackTripSession {
                     &server_host,
                     port,
                     use_tls,
-                    "jacktrip-web",
+                    "webtrip",
                 ).await?;
                 
                 Box::new(webrtc_transport)
@@ -454,7 +454,7 @@ impl JackTripSession {
                     &server_host,
                     port,
                     use_tls,
-                    "jacktrip-web-mock",
+                    "webtrip-mock",
                 ).await?;
                 
                 web_sys::console::log_1(&"🎵 Mock transport enabled with sine wave generation".into());
@@ -523,7 +523,7 @@ impl JackTripSession {
         let mut callback_loop = AudioCallbackLoop::new();
         
         // Create tick callback that calls transport.tick()
-        let session_ptr = self as *mut JackTripSession;
+        let session_ptr = self as *mut WebTripSession;
         let tick_closure = Closure::wrap(Box::new(move || {
             unsafe {
                 if !session_ptr.is_null() {
@@ -591,7 +591,7 @@ impl JackTripSession {
     }
 }
 
-impl Drop for JackTripSession {
+impl Drop for WebTripSession {
     fn drop(&mut self) {
         // Critical: Stop in correct order to ensure buffer pointers aren't used after drop
         self.disconnect();

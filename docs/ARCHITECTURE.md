@@ -1,21 +1,113 @@
-# JackTrip WebAssembly Architecture
+# WebTrip WebAssembly Architecture
 
-## Browser API Limitations and Workarounds
-
-This document explains the architectural constraints imposed by browser APIs and how we work around them in the JackTrip WebAssembly implementation.
+This document explains the architecture of WebTrip, including how we work around browser API limitations to achieve low-latency, real-time audio streaming.
 
 ---
 
 ## Table of Contents
 
-1. [Threading Model](#threading-model)
-2. [Limitation 1: WebRTC on Main Thread Only](#limitation-1-webrtc-on-main-thread-only)
-3. [Limitation 2: AudioWorklet Thread Isolation](#limitation-2-audioworklet-thread-isolation)
-4. [Limitation 3: No Direct Thread Communication](#limitation-3-no-direct-thread-communication)
-5. [Workaround: Global Static Buffers](#workaround-global-static-buffers)
-6. [Workaround: Main Thread Tick Loop](#workaround-main-thread-tick-loop)
-7. [Complete Data Flow](#complete-data-flow)
-8. [Trade-offs and Alternatives](#trade-offs-and-alternatives)
+1. [High-Level Overview](#high-level-overview)
+2. [Why This Architecture?](#why-this-architecture)
+3. [Threading Model](#threading-model)
+4. [Limitation 1: WebRTC on Main Thread Only](#limitation-1-webrtc-on-main-thread-only)
+5. [Limitation 2: AudioWorklet Thread Isolation](#limitation-2-audioworklet-thread-isolation)
+6. [Limitation 3: No Direct Thread Communication](#limitation-3-no-direct-thread-communication)
+7. [Workaround: Session-Owned Buffers](#workaround-session-owned-buffers-with-shared-pointers)
+8. [Workaround: Main Thread Tick Loop](#workaround-main-thread-tick-loop)
+9. [Complete Data Flow](#complete-data-flow)
+10. [Trade-offs and Alternatives](#trade-offs-and-alternatives)
+
+---
+
+## High-Level Overview
+
+WebTrip uses a multi-threaded architecture with WebAssembly for high-performance audio processing:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Main Thread (TypeScript)                     │
+│                          src/app.ts                              │
+│                                                                   │
+│  • UI rendering and interaction                                  │
+│  • Device selection and configuration                            │
+│  • Volume meter visualization                                    │
+│  • WebRTC signaling and data channel management                 │
+│  • Communicates with WASM via JavaScript bindings               │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                 WASM Layer (Rust - Main Thread)                  │
+│              src/lib.rs, src/session.rs                          │
+│                                                                   │
+│  JackTripSession (High-level orchestrator)                       │
+│    • Manages WebRTC connections and data channels               │
+│    • Owns shared buffers (ring buffer, jitter buffer)           │
+│    • Runs tick() loop to bridge audio and network threads       │
+│    • Lifecycle management (connect/disconnect)                   │
+│                                                                   │
+│  AudioEngine (Audio system manager)                              │
+│    • Manages Web Audio API AudioContext                          │
+│    • Handles device enumeration (MediaDevices API)               │
+│    • Creates and connects audio nodes                            │
+│    • Wraps AudioProcessor in AudioWorkletNode                    │
+│                                                                   │
+│  AudioParams (Shared state)                                      │
+│    • Lock-free atomic values for thread-safe communication       │
+│    • Volumes, gains, dB levels, peak tracking                    │
+│    • Shared between main thread and audio worklet thread         │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│            Audio Worklet Thread (JavaScript + WASM)              │
+│                  src/audio/worklet.js (bridge)                   │
+│                  src/audio/processor.rs (core)                   │
+│                                                                   │
+│  WasmAudioProcessor (JS bridge)                                  │
+│    • AudioWorkletProcessor implementation                        │
+│    • Calls into WASM for each audio buffer                       │
+│    • Bridges Web Audio API and Rust audio processing            │
+│                                                                   │
+│  AudioProcessor (Rust DSP engine)                                │
+│    • Real-time audio processing on 128-sample buffers            │
+│    • Writes captured audio to ring buffer                        │
+│    • Reads remote audio from jitter buffer                       │
+│    • Volume metering (RMS → dB conversion)                       │
+│    • Peak level tracking with hold and decay                     │
+│    • Input gain control and output mixing                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Component Summary
+
+- **Frontend Layer** (`src/app.ts`): TypeScript UI that manages user interactions, device selection, and WebRTC signaling
+- **Session Layer** (`src/session.rs`): Orchestrates network and audio, owns shared buffers, bridges WebRTC and AudioWorklet
+- **Audio Engine** (`src/audio/engine.rs`): Manages Web Audio API, creates AudioContext and worklet nodes
+- **Audio Processor** (`src/audio/processor.rs`): Real-time DSP processing in dedicated audio thread
+
+### Key Data Structures
+
+- **RingBuffer**: Lock-free SPSC queue for local audio capture (AudioWorklet → Main Thread)
+- **JitterBuffer**: Lock-free MPSC queue with packet reordering for network audio (Main Thread → AudioWorklet)
+- **AudioParams**: Atomic values for sharing state (volumes, gains) between threads
+
+---
+
+## Why This Architecture?
+
+- **Performance**: Audio processing in Rust/WASM on dedicated audio thread with zero-copy shared memory
+- **Thread Safety**: Lock-free atomics for communication without blocking real-time audio
+- **Separation of Concerns**: UI, orchestration, network I/O, and DSP are cleanly separated
+- **Extensibility**: Easy to add new audio effects or analysis features to `AudioProcessor`
+- **Web Standards**: Uses Web Audio API best practices (AudioWorklet for low-latency)
+- **Real-time Guarantees**: Audio thread never blocks on network I/O or UI updates
+
+---
+
+## Browser API Limitations and Workarounds
+
+The following sections explain the constraints imposed by browser APIs and how we work around them.
 
 ---
 
@@ -524,6 +616,8 @@ Use MessagePort for communication:
 - ❌ **Fundamental limitation**: Still can't call WebRTC from worklet
 - Still need tick() loop on main thread
 
+**Note:** WebTrip uses MessagePort as a **notification fallback only** for browsers that support SharedArrayBuffer but not `Atomics.waitAsync` (primarily Safari 15.2-16.3). The actual buffer data still requires SharedArrayBuffer - MessagePort only replaces the event notification mechanism.
+
 ### Alternative 3: Redesigned WebRTC API
 
 What we'd ideally want:
@@ -551,6 +645,7 @@ The current architecture uses:
 3. **Lock-free ring buffers** - Efficient, wait-free communication without blocking
 4. **Jitter buffer with atomics** - Thread-safe packet reordering and loss concealment
 5. **Careful lifetime management** - AudioWorklet must stop before buffers are dropped
+6. **Event notification with fallback** - Uses `Atomics.waitAsync()` when available, falls back to `postMessage` for older Safari
 
 These are **not design choices** but **necessary workarounds** for fundamental browser API limitations. Until browsers provide:
 - WebRTC access from AudioWorklet, or
@@ -558,6 +653,15 @@ These are **not design choices** but **necessary workarounds** for fundamental b
 - AudioWorklet access to network APIs
 
 ...we're stuck with this architecture.
+
+### SharedArrayBuffer Requirement
+
+**Important:** SharedArrayBuffer is **absolutely required** for WebTrip to function. The `postMessage` fallback mentioned in point #6 above only affects the *event notification mechanism*, not the underlying buffer access. Both communication modes require:
+- WASM linear memory backed by SharedArrayBuffer
+- Atomic operations for thread-safe buffer synchronization
+- Cross-origin isolation (COOP/COEP headers)
+
+The postMessage fallback provides compatibility for Safari 15.2-16.3 (a 15-month window from Dec 2021 - Mar 2023) where SharedArrayBuffer was available but `Atomics.waitAsync()` was not yet implemented.
 
 The good news: It works well! The use of atomics ensures:
 - **Lock-free**: No blocking in the real-time audio thread
