@@ -106,6 +106,15 @@ pub trait Transport {
         // Default: no-op (not all transports need buffers)
     }
 
+    /// Set callback for transport state changes
+    /// 
+    /// This allows the session layer to be notified when the transport's
+    /// connection state changes (e.g., connected, failed, disconnected).
+    /// The callback receives a state string: "connected", "failed", "disconnected"
+    fn set_on_state_change(&mut self, _callback: js_sys::Function) {
+        // Default: no-op (not all transports need state callbacks)
+    }
+
     /// Connect to a hub server
     /// 
     /// This async method establishes a connection to the hub server and returns

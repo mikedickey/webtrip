@@ -183,7 +183,7 @@ class WebTripApp {
     this.serverHostInput.type = "text";
     this.serverHostInput.className = "text-input";
     this.serverHostInput.placeholder = "studio.jacktrip.org";
-    this.serverHostInput.value = "localhost";
+    this.serverHostInput.value = "localhost.miked.io";
     hostGroup.appendChild(hostLabel);
     hostGroup.appendChild(this.serverHostInput);
     hostPortRow.appendChild(hostGroup);
@@ -220,8 +220,8 @@ class WebTripApp {
       option.value = transport.id;
       option.textContent = transport.name + (transport.available ? "" : " (Not Available)");
       option.disabled = !transport.available;
-      if (transport.id === "webrtc") {
-        option.selected = true; // Default to WebRTC
+      if (transport.id === "auto") {
+        option.selected = true; // Default to Auto
       }
       this.transportSelect.appendChild(option);
     }
@@ -234,6 +234,9 @@ class WebTripApp {
     transportGroup.appendChild(transportLabel);
     transportGroup.appendChild(this.transportSelect);
     card.appendChild(transportGroup);
+    
+    // Initialize transport with the default selection
+    this.handleTransportChange();
 
     // Connection buttons
     const buttons = this.createElement("div", "connection-buttons");
@@ -258,6 +261,11 @@ class WebTripApp {
 
   private detectAvailableTransports(): Array<{id: string, name: string, available: boolean}> {
     const transports = [
+      {
+        id: "auto",
+        name: "Auto",
+        available: true,
+      },
       {
         id: "webrtc",
         name: "WebRTC",
@@ -284,7 +292,21 @@ class WebTripApp {
     
     // Map string ID to TransportType enum
     let transportType: TransportType;
+    let actualTransport: string = transportId;
+    
     switch (transportId) {
+      case "auto":
+        // Auto-detect: use WebTransport if available, otherwise WebRTC
+        const isWebTransportAvailable = typeof (window as any).WebTransport !== "undefined";
+        if (isWebTransportAvailable) {
+          transportType = TransportType.WebTransport;
+          actualTransport = "webtransport";
+        } else {
+          transportType = TransportType.WebRTC;
+          actualTransport = "webrtc";
+        }
+        console.debug(`🚀 Auto transport selected: using ${actualTransport}`);
+        break;
       case "webrtc":
         transportType = TransportType.WebRTC;
         break;
@@ -300,7 +322,9 @@ class WebTripApp {
     }
 
     this.session.setTransportType(transportType);
-    console.debug(`🚀 Transport changed to: ${transportId}`);
+    if (transportId !== "auto") {
+      console.debug(`🚀 Transport changed to: ${transportId}`);
+    }
   }
 
   private createDeviceSection(
@@ -743,6 +767,16 @@ class WebTripApp {
       this.connectButton.disabled = false;
       this.connectButton.textContent = "Connect to Studio";
       this.disconnectButton.disabled = true;
+      
+      // If we received an error state, disconnect and clean up
+      if (state === "error" && this.session) {
+        this.session.disconnect();
+        // Stop stats updates
+        if (this.statsIntervalId !== null) {
+          clearInterval(this.statsIntervalId);
+          this.statsIntervalId = null;
+        }
+      }
     }
 
     // Show/hide stats

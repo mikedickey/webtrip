@@ -31,6 +31,7 @@ pub mod transport;
 pub mod webrtc;
 pub mod mock_transport;
 pub mod webtransport;
+pub mod webtransport_worker;
 pub mod signaling;
 
 // Re-export core audio types

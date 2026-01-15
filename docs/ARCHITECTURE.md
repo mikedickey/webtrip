@@ -571,6 +571,94 @@ Internet                    Main Thread              AudioWorklet Thread        
 
 ---
 
+## Transport Implementations
+
+WebTrip supports two transport mechanisms for streaming audio packets: **WebRTC Data Channels** (main thread) and **WebTransport** (dedicated worker thread). Both share the same buffer infrastructure but differ in their threading model and browser support.
+
+### WebRTC Transport (Default)
+
+The WebRTC transport runs on the main thread using RTCDataChannel:
+
+```
+AudioWorklet → RingBuffer → Main Thread tick() → RTCDataChannel → Network
+Network → RTCDataChannel → Main Thread tick() → JitterBuffer → AudioWorklet
+```
+
+**Pros:**
+- ✅ Universal browser support (Chrome, Firefox, Safari, Edge)
+- ✅ Works with existing JackTrip infrastructure
+- ✅ Battle-tested and stable
+
+**Cons:**
+- ⚠️ Network I/O blocks main thread (can affect UI responsiveness)
+- ⚠️ Requires periodic tick() polling loop (5ms intervals)
+- ⚠️ More complex setup (SDP negotiation, ICE candidates)
+
+### WebTransport Worker
+
+The WebTransport transport offloads network I/O to a dedicated Web Worker:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Main Thread (Rust/WASM)                                     │
+│  ├─ session.rs: Selects WebTransport transport              │
+│  ├─ webtransport.rs: Creates Worker, sends messages         │
+│  └─ Creates SharedArrayBuffer for RingBuffer & Regulator    │
+└─────────────────────────────────────────────────────────────┘
+                           │
+                           │ postMessage({ type: 'init', ... })
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Worker Thread (minimal JS bootstrap)                        │
+│  src/audio/webtransport_worker.js (~40 lines, bundled)      │
+│    1. Loads WASM module via dependent_module! macro         │
+│    2. Initializes with shared memory from main thread       │
+│    3. Forwards all messages to Rust handler                 │
+└─────────────────────────────────────────────────────────────┘
+                           │
+                           │ handleWorkerMessage(msg)
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Worker Thread (Rust/WASM)                                   │
+│  webtransport_worker.rs (100% Rust logic)                   │
+│    ├─ worker_connect(): Establish WebTransport session      │
+│    ├─ send_loop(): Read RingBuffer → QUIC datagrams         │
+│    ├─ receive_loop(): QUIC datagrams → Regulator            │
+│    └─ worker_disconnect(): Clean shutdown                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Pros:**
+- ✅ Network I/O on dedicated worker thread (main thread stays responsive)
+- ✅ Event-driven (no polling, uses QUIC async API)
+- ✅ Lower latency (QUIC avoids head-of-line blocking)
+- ✅ Simpler connection setup (no SDP/ICE negotiation)
+- ✅ All logic in Rust (type-safe, zero-copy buffer access)
+
+**Cons:**
+- ❌ Limited browser support (Chrome 97+, Edge 97+; Safari/Firefox not yet supported)
+- ⚠️ Requires minimal JavaScript bootstrap (~40 lines)
+
+**Why JavaScript Glue is Needed:**
+
+Web Workers must be created from a JavaScript file—browsers don't support loading WASM directly as workers. The JavaScript bootstrap:
+- Dynamically imports the WASM module: `import('./pkg/webtrip.js')`
+- Initializes it with SharedArrayBuffer memory from the main thread
+- Forwards all messages to Rust's `handleWorkerMessage()` function
+
+This follows the **same pattern as AudioWorklet** (`src/audio/worklet.js`):
+- Both use the `dependent_module!` macro to bundle JS into the WASM package as Blob URLs
+- Minimal JavaScript (~40-50 lines) acts as browser-mandated entry point
+- All actual logic executes in Rust for type safety and performance
+- Both files live in `src/audio/` for consistency
+
+**JavaScript (~40 lines):** Module loading, memory initialization, message forwarding  
+**Rust (400+ lines):** Protocol logic, packet processing, buffer management, state tracking, statistics
+
+**Note:** If browser vendors eventually add direct WASM worker support (e.g., `new Worker(url, { type: 'wasm', memory })`), the JavaScript bootstrap could be eliminated entirely.
+
+---
+
 ## Trade-offs and Alternatives
 
 ### Current Approach: Session-Owned Buffers + Tick Loop

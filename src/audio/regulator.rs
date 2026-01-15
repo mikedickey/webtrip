@@ -205,6 +205,8 @@ struct ChannelState {
     prediction: Vec<f32>,
     /// AR coefficients
     coeffs: Vec<f32>,
+    /// Pre-allocated buffer for Burg training (avoids allocation in audio path)
+    train_data: Vec<f32>,
 }
 
 impl ChannelState {
@@ -230,6 +232,7 @@ impl ChannelState {
             predicted_past: vec![vec![0.0; fpp]; packets_in_past],
             prediction: vec![0.0; tail_size],
             coeffs: vec![0.0; coeffs_size],
+            train_data: vec![0.0; up_to_now],
         }
     }
 
@@ -1026,9 +1029,9 @@ impl Regulator {
                     }
                 }
 
-                // Train Burg model
-                let train_data: Vec<f32> = channel.prediction[..self.up_to_now].to_vec();
-                self.burg.train(&train_data, &mut channel.coeffs);
+                // Train Burg model using pre-allocated buffer (no allocation!)
+                channel.train_data[..self.up_to_now].copy_from_slice(&channel.prediction[..self.up_to_now]);
+                self.burg.train(&channel.train_data, &mut channel.coeffs);
 
                 // Predict future samples
                 let tail_size = channel.prediction.len();
@@ -1062,11 +1065,10 @@ impl Regulator {
             // Copy output to tmp_buf for consistency
             channel.tmp_buf.copy_from_slice(&channel.output_now_packet);
 
-            // Shift predicted past
-            for i in 0..(self.packets_in_past - 1) {
-                let next = channel.predicted_past[i + 1].clone();
-                channel.predicted_past[i] = next;
-            }
+            // Shift predicted past (rotate left without allocation)
+            // This moves all packets forward by one position in a single operation
+            channel.predicted_past.rotate_left(1);
+            // Now the last position is free, fill it with current output
             channel.predicted_past[self.packets_in_past - 1]
                 .copy_from_slice(&channel.output_now_packet);
 
@@ -1144,6 +1146,7 @@ impl Regulator {
             }
             channel.prediction.fill(0.0);
             channel.coeffs.fill(0.0);
+            channel.train_data.fill(0.0);
             channel.ring_wptr = channel.ring_size / 2;
         }
     }

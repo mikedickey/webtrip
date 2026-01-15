@@ -55,6 +55,7 @@ web-sys = { version = "0.3.83", features = [
   "Window",
   "console",
   "Event",
+  "ErrorEvent",
   
   # WebRTC for JackTrip protocol
   "RtcConfiguration",
@@ -85,4 +86,28 @@ web-sys = { version = "0.3.83", features = [
   
   # RTC events
   "RtcTrackEvent",
+  
+  # Worker API for WebTransport dedicated thread
+  "Worker",
+  "WorkerOptions",
+  "WorkerType",
+  "DedicatedWorkerGlobalScope",
+  
+  # WebTransport API (Chrome 97+, Edge 97+)
+  "WebTransport",
+  "WebTransportBidirectionalStream",
+  "WebTransportCloseInfo",
+  "WebTransportCongestionControl",
+  "WebTransportDatagramDuplexStream",
+  "WebTransportError",
+  "WebTransportErrorOptions",
+  "WebTransportErrorSource",
+  "WebTransportHash",
+  "WebTransportOptions",
+  "WebTransportReceiveStream",
+  "WebTransportSendStream",
+  "ReadableStream",
+  "ReadableStreamDefaultReader",
+  "WritableStream",
+  "WritableStreamDefaultWriter",
 ] }

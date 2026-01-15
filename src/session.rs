@@ -37,6 +37,7 @@ use crate::audio::params::AudioParams;
 use crate::audio::ring_buffer::RingBuffer;
 use crate::audio::transport::{Transport, TransportType, AudioBufferConfig};
 use crate::audio::webrtc::{TransportConfig as WebRtcConfig, WebRtcTransport};
+use crate::audio::webtransport::{WebTransportImpl, is_webtransport_available};
 use crate::audio::mock_transport::MockTransport;
 use crate::audio::audio_callback_loop::AudioCallbackLoop;
 use wasm_bindgen::closure::Closure;
@@ -280,6 +281,15 @@ impl WebTripSession {
         self.transport_type
     }
 
+    /// Check if WebTransport is available in this browser
+    /// 
+    /// WebTransport is supported in Chrome 97+, Edge 97+.
+    /// Safari and Firefox do not yet support WebTransport.
+    #[wasm_bindgen(js_name = isWebTransportAvailable)]
+    pub fn is_webtransport_available_check() -> bool {
+        is_webtransport_available()
+    }
+
     /// Set the output audio device for playback
     /// 
     /// This can be called at any time to change the output device,
@@ -342,8 +352,19 @@ impl WebTripSession {
             }
         }
 
-        // Start audio callback loop (driven by worklet's process() callback)
-        self.start_audio_callback_loop();
+        // Start audio callback loop ONLY for transports that need main-thread tick()
+        // WebTransport handles all network I/O in a dedicated Worker thread
+        match self.transport_type {
+            TransportType::WebTransport => {
+                // WebTransport worker handles send/receive loops - no tick() needed!
+                // Just enable streaming on ring buffer for the worker to read
+                self.local_to_network_buffer.set_streaming(true);
+            }
+            _ => {
+                // WebRTC and Mock need the audio callback loop for tick()
+                self.start_audio_callback_loop();
+            }
+        }
 
         Ok(())
     }
@@ -427,6 +448,28 @@ impl WebTripSession {
                 // Configure audio buffers (WebRTC needs these for its internal tick loop)
                 webrtc_transport.set_audio_buffers(buffer_config);
                 
+                // Set up state change callback BEFORE connecting
+                // This ensures the data channel and signaling handlers can use it
+                if let Some(ref callback) = self.on_state_change {
+                    let callback_clone = callback.clone();
+                    let state_change_cb = Closure::wrap(Box::new(move |state: String| {
+                        // Map transport states to session states
+                        let session_state = match state.as_str() {
+                            "failed" | "disconnected" | "closed" => "error",
+                            "connected" => "connected",
+                            "connecting" => "connecting",
+                            _ => return,
+                        };
+                        
+                        // Notify the app
+                        let _ = callback_clone.call1(&JsValue::NULL, &JsValue::from_str(session_state));
+                    }) as Box<dyn FnMut(String)>);
+                    
+                    let js_func: js_sys::Function = state_change_cb.as_ref().unchecked_ref::<js_sys::Function>().clone();
+                    webrtc_transport.set_on_state_change(js_func);
+                    state_change_cb.forget(); // Keep callback alive
+                }
+                
                 // Connect to hub using the unified Transport trait method
                 // This will also start the internal tick loop for WebRTC
                 webrtc_transport.connect(
@@ -457,12 +500,52 @@ impl WebTripSession {
                     "webtrip-mock",
                 ).await?;
                 
-                web_sys::console::log_1(&"🎵 Mock transport enabled with sine wave generation".into());
-                
                 Box::new(mock_transport)
             }
             TransportType::WebTransport => {
-                return Err("WebTransport is not yet fully implemented for studio connections".into());
+                // Check if WebTransport is available in this browser
+                if !is_webtransport_available() {
+                    return Err("WebTransport is not supported in this browser. Please use Chrome 97+ or Edge 97+.".into());
+                }
+
+                let mut webtransport = WebTransportImpl::new()?;
+                
+                // Configure audio buffers
+                webtransport.set_audio_buffers(buffer_config);
+                
+                // Set up state change callback BEFORE connecting
+                // This ensures the worker's message handler can use it
+                if let Some(ref callback) = self.on_state_change {
+                    let callback_clone = callback.clone();
+                    let state_change_cb = Closure::wrap(Box::new(move |state: String| {
+                        // Map transport states to session states
+                        let session_state = match state.as_str() {
+                            "failed" | "disconnected" => "error",
+                            "connected" => "connected",
+                            "connecting" => "connecting",
+                            _ => return,
+                        };
+                        
+                        // Notify the app
+                        let _ = callback_clone.call1(&JsValue::NULL, &JsValue::from_str(session_state));
+                    }) as Box<dyn FnMut(String)>);
+                    
+                    let js_func: js_sys::Function = state_change_cb.as_ref().unchecked_ref::<js_sys::Function>().clone();
+                    webtransport.set_on_state_change(js_func);
+                    state_change_cb.forget(); // Keep callback alive
+                }
+                
+                // Connect via worker thread
+                // WebTransport uses a dedicated Worker for network I/O
+                Transport::connect(
+                    &mut webtransport,
+                    &server_host,
+                    port,
+                    use_tls,
+                    "webtrip-webtransport",
+                ).await?;
+                
+                Box::new(webtransport)
             }
         };
 

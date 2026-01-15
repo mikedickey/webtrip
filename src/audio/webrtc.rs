@@ -328,7 +328,22 @@ impl WebRtcTransport {
         let reject_for_answer = reject_rc.clone();
 
         // Create signaling client wrapped in Rc<RefCell<>> for safe shared ownership
-        let signaling = HubSignaling::new(server, port, use_tls, client_name);
+        let mut signaling = HubSignaling::new(server, port, use_tls, client_name);
+        
+        // Set up signaling state change callback to propagate WebSocket closure
+        if let Some(ref callback) = self.js_on_state_change {
+            let callback_clone = callback.clone();
+            let signaling_state_cb = Closure::wrap(Box::new(move |state: String| {
+                // When signaling closes/fails, propagate to transport
+                if state == "closed" || state == "error" {
+                    let _ = callback_clone.call1(&JsValue::NULL, &JsValue::from_str("disconnected"));
+                }
+            }) as Box<dyn FnMut(String)>);
+            
+            signaling.set_on_state_change(signaling_state_cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+            signaling_state_cb.forget(); // Keep callback alive
+        }
+        
         self.signaling = Some(signaling);
 
         // Wrap signaling in Rc<RefCell<>> for safe sharing with closures
@@ -906,6 +921,10 @@ impl Transport for WebRtcTransport {
             config.channels, 
             config.buffer_size
         ).into());
+    }
+
+    fn set_on_state_change(&mut self, callback: js_sys::Function) {
+        self.js_on_state_change = Some(callback);
     }
 
     fn connect(
