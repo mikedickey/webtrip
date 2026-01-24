@@ -480,6 +480,7 @@ pub struct Regulator {
     /// Uses AtomicI32 for thread-safe access between push (writer) and pop (reader) threads
     last_seq_in: AtomicI32,
     last_seq_out: Option<u16>,
+    last_stashed: Option<(u16, usize, u64)>,
 
     // Timing (internal clock using performance.now() equivalent)
     start_time_ms: f64,
@@ -605,6 +606,7 @@ impl Regulator {
 
             last_seq_in: AtomicI32::new(SEQ_NONE),
             last_seq_out: None,
+            last_stashed: None,
 
             start_time_ms: 0.0,
             last_pop_time_ms: 0.0,
@@ -743,8 +745,7 @@ impl Regulator {
                 }
 
                 // Process with Burg algorithm
-                let is_glitch = skipped_count > 0 && !self.last_was_glitch;
-                self.process_burg(is_glitch);
+                self.process_burg(false);
 
                 // Interleave output
                 for (ch, channel) in self.channels.iter().enumerate() {
@@ -758,7 +759,7 @@ impl Regulator {
 
                 self.last_seq_out = Some(seq);
                 self.packet_count += 1;
-                !is_glitch
+                true
             }
             None => {
                 self.handle_underrun(output, relative_now)
@@ -766,7 +767,7 @@ impl Regulator {
         }
     }
 
-    /// Pop samples for playback (compatible with LockFreeJitterBuffer API).
+    /// Pop samples for playback.
     ///
     /// # Arguments
     /// * `output` - Buffer to write samples to (interleaved)
@@ -824,6 +825,11 @@ impl Regulator {
     /// Find the best packet to output based on timing.
     /// Returns (sequence, slot_index, skipped_count) - NO heap allocations.
     fn find_best_packet(&mut self, last_seq_in: u16, now: f64) -> Option<(u16, usize, u64)> {
+        if let Some(last_stashed) = self.last_stashed {
+            self.last_stashed = None;
+            return Some(last_stashed);
+        }
+
         let start_seq = if let Some(last_out) = self.last_seq_out {
             last_out.wrapping_add(1)
         } else {
@@ -837,6 +843,7 @@ impl Regulator {
         }
 
         let mut skipped = 0u64;
+        let mut first_good_skipped: Option<(u16, usize, f64)> = None;
 
         // Find the best candidate (NO allocations - just return indices)
         let mut best_candidate: Option<(u16, usize, f64)> = None;
@@ -862,11 +869,9 @@ impl Regulator {
                 }
             }
 
-            // Track skipped packets (use wrapping arithmetic)
+            // Calculate skipped packet count (recalculate for each candidate, don't accumulate)
             if let Some(last_out) = self.last_seq_out {
-                let s = seq.wrapping_sub(last_out.wrapping_add(1)) as u64;
-                skipped += s;
-                self.skipped += s;
+                skipped = seq.wrapping_sub(last_out.wrapping_add(1)) as u64;
             }
 
             // Update max latency
@@ -877,11 +882,28 @@ impl Regulator {
 
             // Check if packet meets tolerance or is the best candidate
             if timestamp + self.tolerance_ms >= now || i == 0 {
-                best_candidate = Some((seq, slot_idx, timestamp));
+                if skipped == 1 && first_good_skipped.is_some() {
+                    // special case where we are about to skip 1 good packet.
+                    // this defers latency adjustments until they are at least
+                    // 2 packets wide.
+                    self.last_stashed = Some((seq, slot_idx, 0));
+                    best_candidate = first_good_skipped;
+                    skipped = 0;
+                } else if skipped > 0 {
+                    // process a glitch to account for the skipped packets,
+                    // but stash and use this good packet on next callback.
+                    self.skipped += skipped;
+                    self.last_stashed = Some((seq, slot_idx, 0));
+                } else {
+                    best_candidate = Some((seq, slot_idx, timestamp));
+                }
                 break;
             }
 
-            self.skipped += 1;
+            // Track first good packet that was skipped
+            if first_good_skipped.is_none() {
+                first_good_skipped = Some((seq, slot_idx, timestamp));
+            }
         }
 
         // Update push stats if we found a candidate
@@ -948,14 +970,9 @@ impl Regulator {
 
         if self.auto_headroom < 0.0 {
             // Variable headroom mode
-            let glitches_allowed = if self.tolerance_ms >= fpp_duration_ms * 2.0 {
+            let glitches_allowed = 
                 ((AUTO_HEADROOM_GLITCH_TOLERANCE * self.sample_rate as f64) / self.fpp as f64)
-                    .ceil() as u64
-            } else {
-                self.skip_auto_headroom = false;
-                0
-            };
-
+                    .ceil() as u64;
             let max_headroom = (self.push_stats.long_term_max * 3.0)
                 .max(self.last_max_latency + 10.0);
 
@@ -965,9 +982,8 @@ impl Regulator {
                 } else {
                     self.skip_auto_headroom = true;
                     if self.last_max_latency > self.tolerance_ms + 1.0 {
-                        self.current_headroom = (self.last_max_latency - self.tolerance_ms)
-                            .ceil()
-                            .min(max_headroom);
+                        let headroom_increase = (self.last_max_latency - self.tolerance_ms).ceil();
+                        self.current_headroom = (self.current_headroom + headroom_increase).min(max_headroom);
                     } else {
                         self.current_headroom += 1.0;
                     }
