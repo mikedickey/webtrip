@@ -9,7 +9,7 @@
 //! ```text
 //! Client                                    Hub Server
 //!   │                                           │
-//!   │  1. WebSocket Connect (port 4464)         │
+//!   │  1. WebSocket Connect (ws://host:4464?name=ClientName)
 //!   │───────────────────────────────────────────▶
 //!   │                                           │
 //!   │  2. {"protocol":"webrtc", "version":1}    │
@@ -35,7 +35,7 @@
 //!
 //! All messages are JSON-encoded:
 //!
-//! - **Protocol Detection**: `{"protocol": "webrtc", "version": 1, "client_name": "..."}`
+//! - **Protocol Detection**: `{"protocol": "webrtc", "version": 1}` (client name is in WebSocket URL)
 //! - **SDP Offer**: `{"type": "offer", "sdp": "v=0\r\n..."}`
 //! - **SDP Answer**: `{"type": "answer", "sdp": "v=0\r\n..."}`
 //! - **ICE Candidate**: `{"type": "ice", "candidate": "...", "sdpMid": "...", "sdpMLineIndex": 0}`
@@ -86,10 +86,10 @@ pub struct SignalingMessage {
 
 impl SignalingMessage {
     /// Create a protocol detection message
-    pub fn protocol(client_name: &str) -> Self {
+    pub fn protocol() -> Self {
         Self {
             msg_type: SignalingMessageType::Protocol,
-            sdp: Some(client_name.to_string()),
+            sdp: None,
             candidate: None,
             sdp_mid: None,
             sdp_m_line_index: None,
@@ -149,11 +149,9 @@ impl SignalingMessage {
     pub fn to_json(&self) -> String {
         match &self.msg_type {
             SignalingMessageType::Protocol => {
-                let client_name = self.sdp.as_deref().unwrap_or("jacktrip-web");
                 format!(
-                    r#"{{"protocol":"webrtc","version":{},"client_name":"{}"}}"#,
-                    PROTOCOL_VERSION,
-                    escape_json_string(client_name)
+                    r#"{{"protocol":"webrtc","version":{}}}"#,
+                    PROTOCOL_VERSION
                 )
             }
             SignalingMessageType::Offer => {
@@ -347,8 +345,6 @@ pub enum HubConnectionState {
 pub struct HubSignaling {
     /// Server URL (ws://host:port or wss://host:port)
     server_url: String,
-    /// Client name for identification
-    client_name: String,
     /// WebSocket connection
     socket: Option<WebSocket>,
     /// Connection state
@@ -379,15 +375,20 @@ impl HubSignaling {
     /// * `server_host` - The hub server hostname (from studio.server_host)
     /// * `port` - The signaling port (default 4464)
     /// * `use_tls` - Whether to use secure WebSocket (wss://)
-    /// * `client_name` - Client identifier
+    /// * `client_name` - Client identifier (sent as URL query parameter), empty string for anonymous
     #[wasm_bindgen(constructor)]
     pub fn new(server_host: &str, port: u16, use_tls: bool, client_name: &str) -> Self {
         let protocol = if use_tls { "wss" } else { "ws" };
-        let server_url = format!("{}://{}:{}", protocol, server_host, port);
+        // Only include name parameter if client_name is not empty
+        let server_url = if client_name.is_empty() {
+            format!("{}://{}:{}", protocol, server_host, port)
+        } else {
+            let encoded_name = js_sys::encode_uri_component(client_name);
+            format!("{}://{}:{}?name={}", protocol, server_host, port, encoded_name)
+        };
 
         Self {
             server_url,
-            client_name: client_name.to_string(),
             socket: None,
             state: HubConnectionState::Disconnected,
             is_ready: Rc::new(RefCell::new(false)),
@@ -405,10 +406,9 @@ impl HubSignaling {
     }
 
     /// Create from a full WebSocket URL
-    pub fn from_url(url: &str, client_name: &str) -> Self {
+    pub fn from_url(url: &str, _client_name: &str) -> Self {
         Self {
             server_url: url.to_string(),
-            client_name: client_name.to_string(),
             socket: None,
             state: HubConnectionState::Disconnected,
             is_ready: Rc::new(RefCell::new(false)),
@@ -512,22 +512,21 @@ impl HubSignaling {
         self.on_message_closure = Some(on_message);
 
         // On open - send protocol handshake and flush queued messages
-        let client_name = self.client_name.clone();
         let socket_clone = ws.clone();
         let is_ready = self.is_ready.clone();
         let outgoing_queue = self.outgoing_queue.clone();
         let on_open = Closure::wrap(Box::new(move || {
             web_sys::console::debug_1(&"✅ Signaling: WebSocket connected!".into());
-            
-            // Send protocol handshake first
-            let msg = SignalingMessage::protocol(&client_name);
+
+            // Send protocol handshake first (client name already in URL)
+            let msg = SignalingMessage::protocol();
             let json = msg.to_json();
             web_sys::console::debug_1(&format!("📤 Signaling: Sending protocol handshake: {}", json).into());
             let _ = socket_clone.send_with_str(&json);
-            
+
             // Mark as ready
             *is_ready.borrow_mut() = true;
-            
+
             // Flush any queued outgoing messages
             let queued: Vec<String> = outgoing_queue.borrow_mut().drain(..).collect();
             web_sys::console::debug_1(&format!("📤 Signaling: Flushing {} queued messages", queued.len()).into());
@@ -674,10 +673,12 @@ mod tests {
 
     #[test]
     fn test_protocol_message() {
-        let msg = SignalingMessage::protocol("test-client");
+        let msg = SignalingMessage::protocol();
         let json = msg.to_json();
         assert!(json.contains(r#""protocol":"webrtc""#));
-        assert!(json.contains(r#""client_name":"test-client""#));
+        assert!(json.contains(r#""version":1"#));
+        // Client name is now in the WebSocket URL, not in the protocol message
+        assert!(!json.contains(r#""client_name""#));
     }
 
     #[test]

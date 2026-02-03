@@ -441,15 +441,18 @@ impl Transport for WebTransportImpl {
     ) -> Pin<Box<dyn Future<Output = Result<(), JsValue>> + '_>> {
         // Build WebTransport URL
         // WebTransport requires HTTPS and the /webtransport path
-        // The server expects: :path = /webtransport?name=ClientName
         let protocol = if use_tls { "https" } else { "https" }; // WebTransport always uses HTTPS
-        
-        // URL-encode the client name for safety
-        let encoded_name = js_sys::encode_uri_component(client_name);
-        let url = format!(
-            "{}://{}:{}/webtransport?name={}",
-            protocol, server, port, encoded_name
-        );
+
+        // Only include name parameter if client_name is not empty
+        let url = if client_name.is_empty() {
+            format!("{}://{}:{}/webtransport", protocol, server, port)
+        } else {
+            let encoded_name = js_sys::encode_uri_component(client_name);
+            format!(
+                "{}://{}:{}/webtransport?name={}",
+                protocol, server, port, encoded_name
+            )
+        };
 
         Box::pin(async move { self.connect_to_server(url).await })
     }

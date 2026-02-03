@@ -65,6 +65,7 @@ class WebTripApp {
   private connectionStatus!: HTMLDivElement;
   private serverHostInput!: HTMLInputElement;
   private serverPortInput!: HTMLInputElement;
+  private clientNameInput!: HTMLInputElement;
   private connectButton!: HTMLButtonElement;
   private disconnectButton!: HTMLButtonElement;
   private statsDisplay!: HTMLDivElement;
@@ -205,6 +206,19 @@ class WebTripApp {
     hostPortRow.appendChild(portGroup);
 
     card.appendChild(hostPortRow);
+
+    // Client name input
+    const clientNameGroup = this.createElement("div", "control-group");
+    const clientNameLabel = this.createElement("label", "label");
+    clientNameLabel.textContent = "Client Name (Optional)";
+    this.clientNameInput = document.createElement("input");
+    this.clientNameInput.type = "text";
+    this.clientNameInput.className = "text-input";
+    this.clientNameInput.placeholder = "Leave empty for anonymous";
+    this.clientNameInput.value = "";
+    clientNameGroup.appendChild(clientNameLabel);
+    clientNameGroup.appendChild(this.clientNameInput);
+    card.appendChild(clientNameGroup);
 
     // Transport selector
     const transportGroup = this.createElement("div", "control-group");
@@ -684,6 +698,7 @@ class WebTripApp {
 
     const port = parseInt(this.serverPortInput.value, 10) || 4464;
     const useTls = serverHost.includes("jacktrip.org"); // Use TLS for production servers
+    const clientName = this.clientNameInput.value.trim() || undefined;
 
     try {
       this.connectButton.disabled = true;
@@ -696,7 +711,8 @@ class WebTripApp {
         this.inputSelect.value || undefined,
         this.isToggleActive("agc"),
         this.isToggleActive("echo"),
-        this.isToggleActive("noise")
+        this.isToggleActive("noise"),
+        clientName
       );
 
       // Set the output device to the selected device

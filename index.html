@@ -367,6 +367,32 @@
             padding: 10px;
         }
 
+        .text-input {
+            width: 100%;
+            padding: 10px 12px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            color: var(--text-primary);
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            transition: all 0.2s ease;
+        }
+
+        .text-input:hover {
+            border-color: var(--accent);
+        }
+
+        .text-input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+
+        .text-input::placeholder {
+            color: var(--text-muted);
+        }
+
         .toggle-btn {
             display: inline-flex;
             align-items: center;

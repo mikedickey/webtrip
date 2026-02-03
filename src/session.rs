@@ -407,6 +407,7 @@ impl WebTripSession {
     /// * `auto_gain_control` - Enable AGC
     /// * `echo_cancellation` - Enable echo cancellation
     /// * `noise_suppression` - Enable noise suppression
+    /// * `client_name` - Optional client name to send in connection request
     #[wasm_bindgen(js_name = connectToStudio)]
     pub async fn connect_to_studio(
         &mut self,
@@ -417,6 +418,7 @@ impl WebTripSession {
         auto_gain_control: bool,
         echo_cancellation: bool,
         noise_suppression: bool,
+        client_name: Option<String>,
     ) -> Result<(), JsValue> {
         // Store audio capture parameters to start after connection
         self.pending_capture_params = Some(PendingCaptureParams {
@@ -476,7 +478,7 @@ impl WebTripSession {
                     &server_host,
                     port,
                     use_tls,
-                    "webtrip",
+                    client_name.as_deref().unwrap_or(""),
                 ).await?;
                 
                 Box::new(webrtc_transport)
@@ -497,7 +499,7 @@ impl WebTripSession {
                     &server_host,
                     port,
                     use_tls,
-                    "webtrip-mock",
+                    client_name.as_deref().unwrap_or(""),
                 ).await?;
                 
                 Box::new(mock_transport)
@@ -542,7 +544,7 @@ impl WebTripSession {
                     &server_host,
                     port,
                     use_tls,
-                    "webtrip-webtransport",
+                    client_name.as_deref().unwrap_or(""),
                 ).await?;
                 
                 Box::new(webtransport)
