@@ -367,13 +367,27 @@ class WebTripApp {
     outputLabel.textContent = "Output Device";
     this.outputSelect = document.createElement("select");
     this.outputSelect.className = "select";
-    this.populateDeviceOptions(this.outputSelect, outputDevices);
-    
-    // Handle output device changes
-    this.outputSelect.addEventListener("change", () => {
-      this.handleOutputDeviceChange();
-    });
-    
+
+    if (outputDevices.length > 0) {
+      this.populateDeviceOptions(this.outputSelect, outputDevices);
+      this.outputSelect.addEventListener("change", () => {
+        this.handleOutputDeviceChange();
+      });
+    } else {
+      // iOS Safari (and some other mobile browsers) do not enumerate audiooutput devices.
+      // Show a disabled placeholder so the UI isn't confusing.
+      const defaultOption = document.createElement("option");
+      defaultOption.value = "";
+      defaultOption.textContent = "System Default";
+      this.outputSelect.appendChild(defaultOption);
+      this.outputSelect.disabled = true;
+      this.outputSelect.title = "Output device selection is not supported on this browser";
+
+      const note = this.createElement("p", "device-note");
+      note.textContent = "Output routing is not available on this browser.";
+      outputGroup.appendChild(note);
+    }
+
     outputGroup.appendChild(outputLabel);
     outputGroup.appendChild(this.outputSelect);
     card.appendChild(outputGroup);
@@ -687,6 +701,14 @@ class WebTripApp {
     }
   }
 
+  /** Detect iOS / iPadOS (including iPad on iOS 13+ which reports as "Macintosh"). */
+  private isIOS(): boolean {
+    return (
+      /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+    );
+  }
+
   private async handleConnect(): Promise<void> {
     if (!this.session) return;
 
@@ -704,7 +726,12 @@ class WebTripApp {
       this.connectButton.disabled = true;
       this.connectButton.textContent = "Connecting...";
 
-      await this.session.connectToStudio(
+      // Wrap connectToStudio in a 45-second timeout so the UI never hangs forever.
+      // The most common cause on iOS is AudioContext.resume() waiting for a user gesture
+      // that never comes — the fire-and-forget fix in engine.rs prevents the hang, but
+      // the timeout is kept as a safety net for any other async path that might stall.
+      const CONNECT_TIMEOUT_MS = 45_000;
+      const connectPromise = this.session.connectToStudio(
         serverHost,
         port,
         useTls,
@@ -714,6 +741,13 @@ class WebTripApp {
         this.isToggleActive("noise"),
         clientName
       );
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("Connection timed out — check server address and network.")),
+          CONNECT_TIMEOUT_MS
+        )
+      );
+      await Promise.race([connectPromise, timeoutPromise]);
 
       // Set the output device to the selected device
       const outputDeviceId = this.outputSelect.value || undefined;
@@ -725,11 +759,56 @@ class WebTripApp {
       }
 
       this.disconnectButton.disabled = false;
+
+      // On iOS Safari, AudioContext.resume() requires a user gesture and may not have
+      // resolved yet.  If the context is still suspended, show a one-time tap banner so
+      // the user can unlock audio output without having to disconnect and reconnect.
+      if (this.isIOS() && this.session.isAudioSuspended()) {
+        this.showAudioResumePrompt();
+      }
     } catch (error) {
       console.error("Failed to connect:", error);
       this.connectButton.disabled = false;
       this.connectButton.textContent = "Connect to Studio";
       alert(`Connection failed: ${error}`);
+    }
+  }
+
+  /** Show a dismissible banner asking the user to tap to activate audio output on iOS. */
+  private showAudioResumePrompt(): void {
+    const existing = document.getElementById("ios-audio-prompt");
+    if (existing) return; // Already shown
+
+    const banner = document.createElement("div");
+    banner.id = "ios-audio-prompt";
+    banner.className = "ios-audio-prompt";
+    banner.setAttribute("role", "button");
+    banner.setAttribute("tabindex", "0");
+    banner.textContent = "Tap here to enable audio output";
+
+    const activate = async () => {
+      try {
+        if (this.session) {
+          await this.session.resumeAudio();
+        }
+      } catch {
+        // Best-effort; audio may still work via implicit unlock
+      } finally {
+        banner.remove();
+      }
+    };
+
+    banner.addEventListener("click", activate);
+    banner.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") activate();
+    });
+
+    // Insert after the status bar so it's immediately visible
+    const card = document.querySelector(".card");
+    if (card) {
+      card.insertBefore(banner, card.firstChild);
+    } else {
+      document.body.insertBefore(banner, document.body.firstChild);
     }
   }
 

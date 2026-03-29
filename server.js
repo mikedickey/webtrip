@@ -36,18 +36,16 @@ const server = http.createServer((req, res) => {
         res.end('Server Error: ' + error.code, 'utf-8');
       }
     } else {
-      // Set COOP/COEP headers for JS and HTML files
       const headers = {
-        'Content-Type': contentType
+        'Content-Type': contentType,
+        'Cross-Origin-Embedder-Policy': 'require-corp',
+        'Cross-Origin-Opener-Policy': 'same-origin',
       };
 
-      if (extname === '.js' || extname === '.html') {
-        headers['Cross-Origin-Embedder-Policy'] = 'require-corp';
-        headers['Cross-Origin-Opener-Policy'] = 'same-origin';
-      }
-
       res.writeHead(200, headers);
-      res.end(content, 'utf-8');
+
+      const isText = ['.html', '.js', '.json', '.css', '.svg'].includes(extname);
+      res.end(content, isText ? 'utf-8' : undefined);
     }
   });
 });

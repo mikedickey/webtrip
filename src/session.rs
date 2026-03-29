@@ -646,6 +646,32 @@ impl WebTripSession {
         self.local_to_network_buffer.set_streaming(false);
     }
 
+    /// Return true when the underlying AudioContext is still suspended.
+    ///
+    /// On iOS Safari the context may stay suspended after `connectToStudio` completes
+    /// because `resume()` requires a direct user-gesture activation.  The TypeScript
+    /// layer can call this after a successful connect to decide whether to show a
+    /// "Tap to enable audio" prompt.
+    #[wasm_bindgen(js_name = isAudioSuspended)]
+    pub fn is_audio_suspended(&self) -> bool {
+        self.audio_engine
+            .as_ref()
+            .map(|e| e.is_suspended())
+            .unwrap_or(false)
+    }
+
+    /// Explicitly resume the AudioContext.
+    ///
+    /// Call this from inside a synchronous user-gesture handler (e.g. a button `onclick`)
+    /// so that iOS Safari grants the audio-output activation.
+    #[wasm_bindgen(js_name = resumeAudio)]
+    pub async fn resume_audio(&self) -> Result<(), JsValue> {
+        if let Some(ref engine) = self.audio_engine {
+            engine.resume_ctx().await?;
+        }
+        Ok(())
+    }
+
     /// Check if connected to hub server
     #[wasm_bindgen(js_name = isConnected)]
     pub fn is_connected(&self) -> bool {

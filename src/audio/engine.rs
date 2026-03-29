@@ -201,9 +201,40 @@ impl AudioEngine {
         self.worklet_node = Some(worklet_node);
         self.current_stream = Some(stream);
 
-        // Resume the audio context
-        JsFuture::from(self.ctx.resume()?).await?;
+        // Resume the audio context.
+        // On iOS Safari, AudioContext.resume() returns a promise that *never* resolves when
+        // called outside an active user-gesture context (which expires ~5 s after a tap).
+        // Awaiting it would hang the entire connect flow. Instead we fire it as a background
+        // task; the context will resume either immediately (iOS 16+ where getUserMedia acts as
+        // an implicit unlock) or on the next user interaction (older iOS via resumeCtx()).
+        let resume_promise = self.ctx.resume()?;
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = JsFuture::from(resume_promise).await;
+        });
 
+        Ok(())
+    }
+
+    /// Check whether the AudioContext is still suspended (e.g. waiting for a user gesture on iOS).
+    #[wasm_bindgen(js_name = isSuspended)]
+    pub fn is_suspended(&self) -> bool {
+        // Read the `state` property via JS reflection to avoid web_sys enum binding issues.
+        let ctx_js: &JsValue = self.ctx.as_ref();
+        js_sys::Reflect::get(ctx_js, &JsValue::from_str("state"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .map(|s| s == "suspended")
+            .unwrap_or(false)
+    }
+
+    /// Explicitly resume the AudioContext.
+    ///
+    /// Must be called from within a synchronous user-gesture handler on iOS Safari so that the
+    /// browser grants the audio-output activation.  Exposed so the TypeScript layer can wire a
+    /// "Tap to enable audio" button after the connection is established.
+    #[wasm_bindgen(js_name = resumeCtx)]
+    pub async fn resume_ctx(&self) -> Result<(), JsValue> {
+        JsFuture::from(self.ctx.resume()?).await?;
         Ok(())
     }
 
