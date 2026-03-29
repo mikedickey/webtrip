@@ -34,8 +34,8 @@ const AUTO_INIT_DURATION_MS: f64 = 2000.0;
 const AUTO_INIT_VAL_FACTOR: f64 = 0.5;
 /// Window divisor for faster auto tracking
 const WINDOW_DIVISOR: usize = 8;
-/// Acceptable glitch rate before increasing headroom (0.2%)
-const AUTO_HEADROOM_GLITCH_TOLERANCE: f64 = 0.002;
+/// Acceptable glitch rate before increasing headroom (0.6%)
+const AUTO_HEADROOM_GLITCH_TOLERANCE: f64 = 0.006;
 /// Rolling window of time for auto tolerance adjustment (seconds)
 const AUTO_HISTORY_WINDOW: f64 = 60.0;
 /// EWMA smoothing factor for auto tolerance

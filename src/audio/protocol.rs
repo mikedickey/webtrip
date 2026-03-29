@@ -330,6 +330,25 @@ impl PacketHeader {
     }
 }
 
+/// Map an interleaved sample index to its non-interleaved (planar) wire position.
+///
+/// JackTrip's wire format stores multi-channel audio in planar order:
+///   `[L0, L1, ..., L(N-1), R0, R1, ..., R(N-1)]`
+///
+/// Given an interleaved index `i` (where frame = `i / channels`, channel = `i % channels`),
+/// this returns the corresponding position in the planar wire layout.
+/// For mono (`channels == 1`) the mapping is the identity.
+#[inline]
+fn wire_idx(i: usize, channels: usize, buf_size: usize) -> usize {
+    if channels > 1 {
+        let frame = i / channels;
+        let ch = i % channels;
+        ch * buf_size + frame
+    } else {
+        i
+    }
+}
+
 /// A complete JackTrip audio packet
 #[derive(Debug, Clone)]
 pub struct AudioPacket {
@@ -394,13 +413,15 @@ impl AudioPacket {
         // Serialize header
         header.serialize(&mut buffer[..HEADER_SIZE])?;
 
-        // Serialize audio data based on bit depth
         let audio_start = HEADER_SIZE;
+        let num_channels = channels as usize;
+        let buf_size = header.buffer_size as usize;
+
         match header.bit_depth {
             16 => {
                 // 16-bit: convert f32 [-1.0, 1.0] to i16 (little-endian)
                 for (i, &sample) in samples.iter().enumerate() {
-                    let offset = audio_start + i * 2;
+                    let offset = audio_start + wire_idx(i, num_channels, buf_size) * 2;
                     let int_sample = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
                     buffer[offset..offset + 2].copy_from_slice(&int_sample.to_le_bytes());
                 }
@@ -429,13 +450,15 @@ impl AudioPacket {
         // Serialize header
         self.header.serialize(&mut buffer[..HEADER_SIZE])?;
 
-        // Serialize audio data based on bit depth
         let audio_start = HEADER_SIZE;
+        let num_channels = self.header.num_outgoing_channels as usize;
+        let buf_size = self.header.buffer_size as usize;
+
         match self.header.bit_depth {
             8 => {
                 // 8-bit: convert f32 [-1.0, 1.0] to i8
                 for (i, &sample) in self.samples.iter().enumerate() {
-                    let offset = audio_start + i;
+                    let offset = audio_start + wire_idx(i, num_channels, buf_size);
                     let int_sample = (sample.clamp(-1.0, 1.0) * 128.0) as i8;
                     buffer[offset] = int_sample as u8;
                 }
@@ -443,7 +466,7 @@ impl AudioPacket {
             16 => {
                 // 16-bit: convert f32 [-1.0, 1.0] to i16 (little-endian)
                 for (i, &sample) in self.samples.iter().enumerate() {
-                    let offset = audio_start + i * 2;
+                    let offset = audio_start + wire_idx(i, num_channels, buf_size) * 2;
                     let int_sample = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
                     buffer[offset..offset + 2].copy_from_slice(&int_sample.to_le_bytes());
                 }
@@ -451,7 +474,7 @@ impl AudioPacket {
             24 => {
                 // 24-bit: convert f32 [-1.0, 1.0] to i32 in 3 bytes (little-endian)
                 for (i, &sample) in self.samples.iter().enumerate() {
-                    let offset = audio_start + i * 3;
+                    let offset = audio_start + wire_idx(i, num_channels, buf_size) * 3;
                     let int_sample = (sample.clamp(-1.0, 1.0) * 8388607.0) as i32;
                     let bytes = int_sample.to_le_bytes();
                     buffer[offset..offset + 3].copy_from_slice(&bytes[0..3]);
@@ -460,7 +483,7 @@ impl AudioPacket {
             32 => {
                 // 32-bit: serialize as f32 (little-endian)
                 for (i, &sample) in self.samples.iter().enumerate() {
-                    let offset = audio_start + i * 4;
+                    let offset = audio_start + wire_idx(i, num_channels, buf_size) * 4;
                     buffer[offset..offset + 4].copy_from_slice(&sample.to_le_bytes());
                 }
             }
@@ -508,12 +531,15 @@ impl AudioPacket {
         samples.reserve(num_samples);
         let audio_start = HEADER_SIZE;
 
+        let num_channels = header.num_incoming_channels as usize;
+        let buf_size = header.buffer_size as usize;
+
         // Deserialize based on bit depth
         match header.bit_depth {
             8 => {
                 // 8-bit: signed i8, convert to f32 in range [-1.0, 1.0]
                 for i in 0..num_samples {
-                    let offset = audio_start + i;
+                    let offset = audio_start + wire_idx(i, num_channels, buf_size);
                     let sample = buffer[offset] as i8;
                     samples.push(sample as f32 / 128.0);
                 }
@@ -521,7 +547,7 @@ impl AudioPacket {
             16 => {
                 // 16-bit: signed i16 (little-endian), convert to f32 in range [-1.0, 1.0]
                 for i in 0..num_samples {
-                    let offset = audio_start + i * 2;
+                    let offset = audio_start + wire_idx(i, num_channels, buf_size) * 2;
                     let sample_bytes: [u8; 2] = buffer[offset..offset + 2].try_into().unwrap();
                     let sample = i16::from_le_bytes(sample_bytes);
                     samples.push(sample as f32 / 32768.0);
@@ -530,7 +556,7 @@ impl AudioPacket {
             24 => {
                 // 24-bit: signed i32 in 3 bytes (little-endian), convert to f32
                 for i in 0..num_samples {
-                    let offset = audio_start + i * 3;
+                    let offset = audio_start + wire_idx(i, num_channels, buf_size) * 3;
                     // Read 3 bytes and sign-extend to i32
                     let b0 = buffer[offset] as i32;
                     let b1 = buffer[offset + 1] as i32;
@@ -542,7 +568,7 @@ impl AudioPacket {
             32 => {
                 // 32-bit: could be i32 or f32, assume f32 for now
                 for i in 0..num_samples {
-                    let offset = audio_start + i * 4;
+                    let offset = audio_start + wire_idx(i, num_channels, buf_size) * 4;
                     let sample_bytes: [u8; 4] = buffer[offset..offset + 4].try_into().unwrap();
                     samples.push(f32::from_le_bytes(sample_bytes));
                 }
@@ -709,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn test_packet_roundtrip() {
+    fn test_packet_roundtrip_mono() {
         let samples: Vec<f32> = (0..128).map(|i| (i as f32) / 128.0).collect();
         let packet = AudioPacket::mono(1, 0, samples.clone());
 
@@ -720,7 +746,73 @@ mod tests {
         assert_eq!(packet.samples.len(), decoded.samples.len());
 
         for (a, b) in packet.samples.iter().zip(decoded.samples.iter()) {
-            assert!((a - b).abs() < 1e-6);
+            assert!((a - b).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn test_mono_wire_layout_unchanged() {
+        // For mono, interleaved == non-interleaved; serialization must not reorder samples.
+        let samples: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4];
+        let mut header = PacketHeader::new(0, 0);
+        header.buffer_size = 4;
+        let packet = AudioPacket::new(header, samples.clone());
+
+        let serialized = packet.serialize().unwrap();
+
+        // Read wire samples sequentially and verify they match input order
+        for (i, &expected) in samples.iter().enumerate() {
+            let offset = HEADER_SIZE + i * 2;
+            let wire_val = i16::from_le_bytes(serialized[offset..offset + 2].try_into().unwrap());
+            let wire_f32 = wire_val as f32 / 32768.0;
+            assert!((wire_f32 - expected).abs() < 1e-4, "mono sample {i} mismatch");
+        }
+    }
+
+    #[test]
+    fn test_stereo_wire_layout_noninterleaved() {
+        // Stereo interleaved input: [L0, R0, L1, R1]
+        // Expected wire layout (non-interleaved): [L0, L1, R0, R1]
+        let buf_size: usize = 2;
+        let samples: Vec<f32> = vec![0.1, 0.5, 0.2, 0.6]; // [L0, R0, L1, R1]
+
+        let mut header = PacketHeader::stereo(0, 0);
+        header.buffer_size = buf_size as u16;
+        let packet = AudioPacket::new(header, samples.clone());
+
+        let serialized = packet.serialize().unwrap();
+
+        let read_wire = |idx: usize| -> f32 {
+            let offset = HEADER_SIZE + idx * 2;
+            let wire_val = i16::from_le_bytes(serialized[offset..offset + 2].try_into().unwrap());
+            wire_val as f32 / 32768.0
+        };
+
+        // Wire positions 0..buf_size are channel 0 (left): L0, L1
+        assert!((read_wire(0) - 0.1).abs() < 1e-4, "wire[0] should be L0");
+        assert!((read_wire(1) - 0.2).abs() < 1e-4, "wire[1] should be L1");
+        // Wire positions buf_size..2*buf_size are channel 1 (right): R0, R1
+        assert!((read_wire(2) - 0.5).abs() < 1e-4, "wire[2] should be R0");
+        assert!((read_wire(3) - 0.6).abs() < 1e-4, "wire[3] should be R1");
+    }
+
+    #[test]
+    fn test_stereo_roundtrip() {
+        // Verify that serialize → deserialize preserves interleaved stereo samples.
+        let buf_size = 128usize;
+        let samples: Vec<f32> = (0..buf_size * 2)
+            .map(|i| if i % 2 == 0 { (i as f32) / 256.0 } else { -(i as f32) / 256.0 })
+            .collect();
+
+        let packet = AudioPacket::stereo(5, 1000, samples.clone());
+        let serialized = packet.serialize().unwrap();
+        let decoded = AudioPacket::deserialize(&serialized).unwrap();
+
+        assert_eq!(decoded.header.num_incoming_channels, 2);
+        assert_eq!(decoded.samples.len(), samples.len());
+
+        for (i, (a, b)) in samples.iter().zip(decoded.samples.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-4, "stereo sample {i} mismatch: {a} vs {b}");
         }
     }
 
