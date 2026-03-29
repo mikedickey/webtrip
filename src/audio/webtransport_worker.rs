@@ -620,7 +620,7 @@ pub fn handle_worker_message(msg: JsValue) -> js_sys::Promise {
             // Post stats to main thread
             post_message_to_main(&obj);
             
-            js_sys::Promise::resolve(&obj)
+            js_sys::Promise::resolve(&JsValue::from(obj))
         }
         _ => {
             let error_msg = format!("Unknown message type: {}", msg_type);

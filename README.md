@@ -7,6 +7,15 @@ WebTrip is inspired by the popular open-source [JackTrip project](https://github
 
 For more details on the architecture and how WebTrip handles real-time audio streaming, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Prerequisites
+
+- [Rust](https://www.rust-lang.org/tools/install) (via `rustup`)
+- [Node.js](https://nodejs.org/) (via `nvm` or direct install)
+- [wasm-pack](https://rustwasm.github.io/wasm-pack/installer/) — install with:
+  ```bash
+  cargo install wasm-pack
+  ```
+
 ## Building
 
 Install dependencies:
@@ -22,7 +31,7 @@ npm run build
 Or build separately:
 ```bash
 npm run build:wasm  # Build Rust to WASM
-npm run build:ts    # Compile TypeScript UI example
+npm run build:app   # Compile TypeScript UI example
 ```
 
 ## Running

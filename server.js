@@ -1,8 +1,18 @@
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
-const PORT = 3000;
+// Parse --key and --cert arguments
+const args = process.argv.slice(2);
+let keyFile, certFile;
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === '--key' && args[i + 1]) keyFile = args[++i];
+  else if (args[i] === '--cert' && args[i + 1]) certFile = args[++i];
+}
+
+const useTLS = !!(keyFile && certFile);
+const PORT = useTLS ? 8443 : 3000;
 
 const MIME_TYPES = {
   '.html': 'text/html',
@@ -17,7 +27,7 @@ const MIME_TYPES = {
   '.ico': 'image/x-icon'
 };
 
-const server = http.createServer((req, res) => {
+const handler = (req, res) => {
   let filePath = '.' + req.url;
   if (filePath === './') {
     filePath = './index.html';
@@ -37,10 +47,13 @@ const server = http.createServer((req, res) => {
       }
     } else {
       const headers = {
-        'Content-Type': contentType,
-        'Cross-Origin-Embedder-Policy': 'require-corp',
-        'Cross-Origin-Opener-Policy': 'same-origin',
+        'Content-Type': contentType
       };
+
+      if (extname === '.js' || extname === '.html') {
+        headers['Cross-Origin-Embedder-Policy'] = 'require-corp';
+        headers['Cross-Origin-Opener-Policy'] = 'same-origin';
+      }
 
       res.writeHead(200, headers);
 
@@ -48,9 +61,14 @@ const server = http.createServer((req, res) => {
       res.end(content, isText ? 'utf-8' : undefined);
     }
   });
-});
+};
+
+const server = useTLS
+  ? https.createServer({ key: fs.readFileSync(keyFile), cert: fs.readFileSync(certFile) }, handler)
+  : http.createServer(handler);
 
 server.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}/`);
+  const proto = useTLS ? 'https' : 'http';
+  console.log(`Server running at ${proto}://localhost:${PORT}/`);
 });
 
