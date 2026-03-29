@@ -76,6 +76,7 @@ pub struct WebTransportImpl {
     // State synchronization
     connection_promise_resolve: Rc<RefCell<Option<js_sys::Function>>>,
     connection_promise_reject: Rc<RefCell<Option<js_sys::Function>>>,
+    worker_ready_resolve: Rc<RefCell<Option<js_sys::Function>>>,
 }
 
 impl WebTransportImpl {
@@ -96,6 +97,7 @@ impl WebTransportImpl {
             on_state_change: None,
             connection_promise_resolve: Rc::new(RefCell::new(None)),
             connection_promise_reject: Rc::new(RefCell::new(None)),
+            worker_ready_resolve: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -123,15 +125,19 @@ impl WebTransportImpl {
         let state_change_cb = self.on_state_change.clone();
         let connection_resolve = self.connection_promise_resolve.clone();
         let connection_reject = self.connection_promise_reject.clone();
+        let worker_ready_resolve = self.worker_ready_resolve.clone();
 
         let on_message = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
             let data = event.data();
-            
+
             // Handle string responses
             if let Some(msg) = data.as_string() {
                 match msg.as_str() {
                     "ready" => {
                         web_sys::console::log_1(&"[WebTransport] ✅ Worker reports: READY".into());
+                        if let Some(resolve) = worker_ready_resolve.borrow_mut().take() {
+                            let _ = resolve.call0(&JsValue::NULL);
+                        }
                     }
                     "connected" => {
                         web_sys::console::log_1(&"[WebTransport] ✅ Worker reports: CONNECTED".into());
@@ -367,13 +373,18 @@ impl WebTransportImpl {
         // Initialize worker with buffer pointers
         self.init_worker()?;
 
-        // Wait a bit for worker to initialize
-        let init_promise = js_sys::Promise::new(&mut |resolve, _| {
-            let _ = web_sys::window()
-                .unwrap()
-                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 100);
-        });
-        JsFuture::from(init_promise).await?;
+        // Wait for worker to signal it is ready (WASM loaded and initialized)
+        let (ready_promise, ready_resolve, _ready_reject) = {
+            let mut resolve_fn = None;
+            let mut reject_fn = None;
+            let promise = js_sys::Promise::new(&mut |resolve, reject| {
+                resolve_fn = Some(resolve);
+                reject_fn = Some(reject);
+            });
+            (promise, resolve_fn.unwrap(), reject_fn.unwrap())
+        };
+        *self.worker_ready_resolve.borrow_mut() = Some(ready_resolve);
+        JsFuture::from(ready_promise).await?;
 
         // Connect via worker
         match self.connect_worker(&server_url).await {
