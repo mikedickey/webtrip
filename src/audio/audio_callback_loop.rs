@@ -2,33 +2,16 @@
 //!
 //! Provides a timing mechanism synchronized with the audio worklet's process() callback.
 //! When the worklet processes audio, it signals via Atomics.notify, and this loop
-//! wakes up to trigger transport packet processing.
+//! wakes up via Atomics.waitAsync to trigger transport packet processing.
 //!
-//! ## Event Notification Strategy
-//!
-//! Uses Atomics.waitAsync when available for zero-CPU idle behavior (Chrome 87+, Firefox 89+, Safari 16.4+),
-//! or falls back to postMessage for older browsers (primarily Safari 15.2-16.3).
-//!
-//! **Important:** Both modes REQUIRE SharedArrayBuffer for the underlying buffer access.
-//! The postMessage fallback only affects the event notification mechanism, not the buffer itself.
-//! SharedArrayBuffer is mandatory for:
-//! - WASM linear memory (compiled with --shared-memory)
-//! - Atomic operations in RingBuffer and JitterBuffer
-//! - Cross-thread buffer synchronization
-//!
-//! The fallback provides compatibility for the ~15 month gap (Dec 2021 - Mar 2023) where
-//! Safari had SharedArrayBuffer but not yet Atomics.waitAsync.
+//! Requires Atomics.waitAsync and SharedArrayBuffer (Chrome 87+, Firefox 89+, Safari 16.4+).
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 /// Check if Atomics.waitAsync is supported by the browser
-/// 
+///
 /// Requires both Atomics.waitAsync AND SharedArrayBuffer to be available.
-/// 
-/// Note: This checks for the *optimized* event notification path. If this returns false,
-/// we fall back to postMessage notifications, but SharedArrayBuffer is still required
-/// for the actual buffer access.
 #[wasm_bindgen(js_name = hasAtomicsWaitAsync)]
 pub fn has_atomics_wait_async() -> bool {
     let global = js_sys::global();
@@ -139,28 +122,16 @@ pub fn start_audio_callback_loop(
 }
 
 /// Audio callback loop manager
-/// 
+///
 /// Manages the lifecycle of an audio-callback-driven loop.
 /// This loop is triggered whenever the audio worklet's process() callback runs,
 /// allowing transport layers to send/receive packets in sync with audio processing.
-/// 
-/// Automatically chooses between Atomics.waitAsync (optimized) and postMessage (fallback)
-/// based on browser support.
-/// 
-/// ## Browser Compatibility
-/// 
-/// - **Atomics.waitAsync mode** (preferred): Chrome 87+, Firefox 89+, Safari 16.4+
-///   - Zero CPU when idle, immediate wake-up (<0.1ms)
-/// - **postMessage mode** (fallback): Safari 15.2-16.3, Chrome 68-86
-///   - Higher CPU usage (~2-3x), still requires SharedArrayBuffer for buffers
-/// 
-/// Both modes require SharedArrayBuffer and Cross-Origin Isolation (COOP/COEP headers).
+///
+/// Uses Atomics.waitAsync for zero-CPU idle behavior and immediate wake-up (<0.1ms).
+/// Requires SharedArrayBuffer and Cross-Origin Isolation (COOP/COEP headers).
 pub struct AudioCallbackLoop {
-    /// Stop function (for Atomics.waitAsync mode)
+    /// Stop function returned by the Atomics.waitAsync loop
     stop_fn: Option<js_sys::Function>,
-    
-    /// Message handler closure (for postMessage mode)
-    message_closure: Option<Closure<dyn FnMut(web_sys::MessageEvent)>>,
 }
 
 impl AudioCallbackLoop {
@@ -168,7 +139,6 @@ impl AudioCallbackLoop {
     pub fn new() -> Self {
         Self {
             stop_fn: None,
-            message_closure: None,
         }
     }
     
@@ -193,47 +163,17 @@ impl AudioCallbackLoop {
         Ok(true)
     }
     
-    /// Start the audio callback loop with postMessage fallback
-    /// 
-    /// This is used when Atomics.waitAsync is not available (primarily Safari 15.2-16.3).
-    /// The AudioWorklet will post messages when audio is processed.
-    /// 
-    /// Note: This still requires SharedArrayBuffer for the actual buffer access - it only
-    /// changes the event notification mechanism from Atomics.waitAsync to postMessage.
-    pub fn start_with_postmessage(
-        &mut self,
-        port: &web_sys::MessagePort,
-        tick_callback: js_sys::Function,
-    ) -> Result<(), JsValue> {
-        // Set up message handler
-        let closure = Closure::wrap(Box::new(move |_event: web_sys::MessageEvent| {
-            let _ = tick_callback.call0(&JsValue::NULL);
-        }) as Box<dyn FnMut(web_sys::MessageEvent)>);
-        
-        port.set_onmessage(Some(closure.as_ref().unchecked_ref()));
-        self.message_closure = Some(closure);
-        
-        web_sys::console::debug_1(&"✅ Audio callback loop started (postMessage fallback)".into());
-        Ok(())
-    }
-    
     /// Stop the audio callback loop
     pub fn stop(&mut self) {
-        // Stop Atomics.waitAsync loop
         if let Some(stop_fn) = self.stop_fn.take() {
             let _ = stop_fn.call0(&JsValue::NULL);
-            web_sys::console::debug_1(&"Audio callback loop stopped (Atomics.waitAsync)".into());
-        }
-        
-        // Clean up postMessage handler
-        if self.message_closure.take().is_some() {
-            web_sys::console::debug_1(&"Audio callback loop stopped (postMessage)".into());
+            web_sys::console::debug_1(&"Audio callback loop stopped".into());
         }
     }
     
     /// Check if the loop is running
     pub fn is_running(&self) -> bool {
-        self.stop_fn.is_some() || self.message_closure.is_some()
+        self.stop_fn.is_some()
     }
 }
 

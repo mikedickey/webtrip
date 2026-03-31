@@ -51,29 +51,30 @@ Then point your browser at http://localhost:3000/
 
 The following features are **required** for WebTrip to function:
 - **WebAssembly with SharedArrayBuffer** - Used for WASM linear memory and atomic buffer operations between AudioWorklet and main thread
+- **Atomics.waitAsync** - Event-driven wake-up for lock-free cross-thread communication
 - **AudioWorklet API** - Low-latency audio processing
 - **MediaDevices API** - Microphone/device access (getUserMedia)
 - **Cross-Origin Isolation** - Required for SharedArrayBuffer (COOP/COEP headers)
 
-### Recommended Browser Versions (Optimized Performance)
+### Minimum Browser Versions (WebRTC DataChannels)
 
-For best performance with event-driven wake-up (`Atomics.waitAsync`):
 - **Chrome 92+** (July 2021)
+- **Edge 92+** (July 2021)
 - **Firefox 89+** (June 2021)
 - **Safari 16.4+** (March 2023)
-- **Edge 92+** (July 2021)
 
-### Minimum Browser Versions (Fallback Mode)
+### WebTransport (QUIC Datagrams)
 
-Older browsers with SharedArrayBuffer but without `Atomics.waitAsync` will work with reduced performance using `postMessage` fallback:
-- **Chrome 87-91**
-- **Safari 15.2-16.3** (primarily affects older macOS/iOS versions)
+WebTransport offers lower latency but requires newer browsers. Falls back to WebRTC when unavailable.
+- **Chrome 97+**
+- **Edge 97+**
+- **Firefox 114+**
+- **Safari 26.4+**
 
-The fallback has ~2-3x higher CPU usage but maintains full functionality.
-
-### Browser Versions Without Support
+### Unsupported Browsers
 
 WebTrip **will not work** on:
+- Browsers without `Atomics.waitAsync` (Chrome <92, Firefox <89, Safari <16.4)
 - Browsers without SharedArrayBuffer (Chrome <68, Firefox <79, Safari <15.2)
 - Browsers without AudioWorklet (Chrome <66, Firefox <76, Safari <14.1)
 - Sites without proper COOP/COEP headers

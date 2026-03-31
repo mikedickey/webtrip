@@ -128,7 +128,7 @@ impl Default for TransportConfig {
 /// To work around this, the WebRTC transport manages its own internal tick loop:
 /// - Reads from the ring buffer (audio to send)
 /// - Writes to the jitter buffer (audio received)
-/// - Uses EventLoop for efficient wake-up (Atomics.waitAsync or postMessage)
+/// - Uses Atomics.waitAsync for efficient wake-up
 ///
 /// Other transports (like WebTransport) don't need this and can run entirely in workers.
 #[wasm_bindgen]

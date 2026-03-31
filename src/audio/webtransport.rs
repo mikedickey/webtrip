@@ -43,12 +43,20 @@ use wasm_bindgen_futures::JsFuture;
 
 /// Check if WebTransport is available in the current browser
 pub fn is_webtransport_available() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
     if let Some(window) = web_sys::window() {
         js_sys::Reflect::has(&window, &JsValue::from_str("WebTransport")).unwrap_or(false)
     } else {
         // Check for worker global scope
         let global = js_sys::global();
         js_sys::Reflect::has(&global, &JsValue::from_str("WebTransport")).unwrap_or(false)
+    }
     }
 }
 
