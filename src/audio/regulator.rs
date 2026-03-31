@@ -500,7 +500,7 @@ pub struct Regulator {
     /// Uses AtomicI32 for thread-safe access between push (writer) and pop (reader) threads
     last_seq_in: AtomicI32,
     last_seq_out: Option<u16>,
-    last_stashed: Option<(u16, usize, u64)>,
+    last_stashed: Option<(u16, usize)>,
 
     // Timing (internal clock using performance.now() equivalent)
     start_time_ms: f64,
@@ -518,6 +518,7 @@ pub struct Regulator {
 
     // Statistics
     packet_count: u64,
+    plc_packet_count: u64,
     skipped: u64,
     last_skipped: u64,
     last_glitches: u64,
@@ -531,6 +532,11 @@ pub struct Regulator {
 
     // State
     last_was_glitch: bool,
+}
+
+enum PacketDecision {
+    Packet { seq: u16, slot_idx: usize },
+    ConcealSkippedPacket { skipped: u64 },
 }
 
 impl Regulator {
@@ -641,6 +647,7 @@ impl Regulator {
             auto_headroom_start_time: 6000.0,
 
             packet_count: 0,
+            plc_packet_count: 0,
             skipped: 0,
             last_skipped: 0,
             last_glitches: 0,
@@ -751,9 +758,7 @@ impl Regulator {
         let result = self.find_best_packet(last_seq_in, relative_now);
 
         match result {
-            Some((seq, slot_idx, skipped_count)) => {
-                self.pull_stats.overruns += skipped_count;
-
+            Some(PacketDecision::Packet { seq, slot_idx }) => {
                 // Deinterleave from slot directly into channel tmp buffers (NO allocation)
                 if let Some(ref slot) = self.slots[slot_idx] {
                     for (ch, channel) in self.channels.iter_mut().enumerate() {
@@ -784,6 +789,11 @@ impl Regulator {
                 self.last_seq_out = Some(seq);
                 self.packet_count += 1;
                 true
+            }
+            Some(PacketDecision::ConcealSkippedPacket { skipped }) => {
+                self.pull_stats.overruns += skipped;
+                self.output_concealment(output);
+                false
             }
             None => {
                 self.handle_underrun(output, relative_now)
@@ -828,6 +838,11 @@ impl Regulator {
         }
 
         // Good underrun - use prediction
+        self.output_concealment(output);
+        false
+    }
+
+    fn output_concealment(&mut self, output: &mut [f32]) {
         for channel in &mut self.channels {
             channel.tmp_buf.fill(0.0);
         }
@@ -842,16 +857,13 @@ impl Regulator {
                 }
             }
         }
-
-        false
     }
 
     /// Find the best packet to output based on timing.
-    /// Returns (sequence, slot_index, skipped_count) - NO heap allocations.
-    fn find_best_packet(&mut self, last_seq_in: u16, now: f64) -> Option<(u16, usize, u64)> {
-        if let Some(last_stashed) = self.last_stashed {
+    fn find_best_packet(&mut self, last_seq_in: u16, now: f64) -> Option<PacketDecision> {
+        if let Some((seq, slot_idx)) = self.last_stashed {
             self.last_stashed = None;
-            return Some(last_stashed);
+            return Some(PacketDecision::Packet { seq, slot_idx });
         }
 
         let start_seq = if let Some(last_out) = self.last_seq_out {
@@ -910,14 +922,15 @@ impl Regulator {
                     // special case where we are about to skip 1 good packet.
                     // this defers latency adjustments until they are at least
                     // 2 packets wide.
-                    self.last_stashed = Some((seq, slot_idx, 0));
+                    self.last_stashed = Some((seq, slot_idx));
                     best_candidate = first_good_skipped;
-                    skipped = 0;
                 } else if skipped > 0 {
                     // process a glitch to account for the skipped packets,
                     // but stash and use this good packet on next callback.
                     self.skipped += skipped;
-                    self.last_stashed = Some((seq, slot_idx, 0));
+                    self.last_stashed = Some((seq, slot_idx));
+                    self.update_push_stats(seq, timestamp, now);
+                    return Some(PacketDecision::ConcealSkippedPacket { skipped });
                 } else {
                     best_candidate = Some((seq, slot_idx, timestamp));
                 }
@@ -933,7 +946,7 @@ impl Regulator {
         // Update push stats if we found a candidate
         if let Some((seq, slot_idx, timestamp)) = best_candidate {
             self.update_push_stats(seq, timestamp, now);
-            return Some((seq, slot_idx, skipped));
+            return Some(PacketDecision::Packet { seq, slot_idx });
         }
 
         None
@@ -1032,7 +1045,7 @@ impl Regulator {
 
     /// Process audio with Burg algorithm for PLC.
     fn process_burg(&mut self, glitch: bool) {
-        let primed = self.packet_count > self.packets_in_past as u64;
+        let primed = self.plc_packet_count > self.packets_in_past as u64;
 
         for channel in &mut self.channels {
             // Copy real packet data
@@ -1123,6 +1136,7 @@ impl Regulator {
         }
 
         self.last_was_glitch = glitch;
+        self.plc_packet_count += 1;
     }
 
     /// Get current statistics.
@@ -1152,6 +1166,7 @@ impl Regulator {
         // until the new stream's sequence numbers caught up.
         self.last_stashed = None;
         self.packet_count = 0;
+        self.plc_packet_count = 0;
         self.skipped = 0;
         self.last_skipped = 0;
         self.last_glitches = 0;
@@ -1375,5 +1390,106 @@ mod tests {
         
         // Verify last_seq_out was set properly (should be Some value, not causing issues)
         assert!(reg.last_seq_out.is_some());
+    }
+
+    #[test]
+    fn test_burg_priming_uses_plc_iterations() {
+        let mut reg = Regulator::with_params(1, 32, 48_000, 10.0);
+        let history_packets = reg.packets_in_past;
+        let history: Vec<f32> = (0..reg.up_to_now)
+            .map(|i| (i as f32 * 0.1).sin())
+            .collect();
+
+        {
+            let channel = &mut reg.channels[0];
+            for (i, packet) in channel.predicted_past.iter_mut().enumerate() {
+                let start = i * reg.fpp;
+                let end = start + reg.fpp;
+                packet.copy_from_slice(&history[start..end]);
+            }
+        }
+
+        reg.process_burg(true);
+        assert!(
+            reg.channels[0]
+                .output_now_packet
+                .iter()
+                .all(|sample| sample.abs() < 1e-6),
+            "PLC should stay muted before the predictor is primed"
+        );
+
+        reg.plc_packet_count = history_packets as u64 + 1;
+        reg.process_burg(true);
+        assert!(
+            reg.channels[0]
+                .output_now_packet
+                .iter()
+                .any(|sample| sample.abs() > 1e-6),
+            "PLC should emit predicted audio once the PLC iteration counter is primed"
+        );
+        assert_eq!(reg.packet_count, 0);
+        assert_eq!(reg.plc_packet_count, history_packets as u64 + 2);
+    }
+
+    #[test]
+    fn test_skipped_packet_outputs_concealment_before_stashed_real_packet() {
+        let mut reg = Regulator::with_params(1, 32, 48_000, 10.0);
+        let history_packets = reg.packets_in_past;
+        let fpp_duration_ms = 1000.0 * reg.fpp as f64 / reg.sample_rate as f64;
+        let history: Vec<f32> = (0..reg.up_to_now)
+            .map(|i| (i as f32 * 0.1).sin())
+            .collect();
+        let packet = vec![0.25f32; reg.fpp];
+        let last_packet = vec![0.1f32; reg.fpp];
+        let last_seq = 10u16;
+        let good_seq = last_seq.wrapping_add(2);
+
+        {
+            let channel = &mut reg.channels[0];
+            for (i, predicted) in channel.predicted_past.iter_mut().enumerate() {
+                let start = i * reg.fpp;
+                let end = start + reg.fpp;
+                predicted.copy_from_slice(&history[start..end]);
+            }
+        }
+        reg.plc_packet_count = history_packets as u64 + 1;
+
+        reg.start_time_ms = 0.0;
+        reg.last_seq_out = Some(last_seq);
+        reg.last_seq_in.store(good_seq as i32, Ordering::Release);
+
+        if let Some(slot) = &mut reg.slots[(last_seq as usize) % NUM_SLOTS] {
+            slot.timestamp = 40.0;
+            slot.sample_count = reg.fpp;
+            slot.data[..reg.fpp].copy_from_slice(&last_packet);
+        }
+
+        if let Some(slot) = &mut reg.slots[(good_seq as usize) % NUM_SLOTS] {
+            slot.timestamp = 45.0;
+            slot.sample_count = reg.fpp;
+            slot.data[..reg.fpp].copy_from_slice(&packet);
+        }
+
+        let mut concealment = vec![0.0f32; reg.fpp];
+        let concealment_result = reg.pop_internal(&mut concealment, 50.0);
+        assert!(!concealment_result);
+        assert_eq!(reg.pull_stats.overruns, 1);
+        assert_eq!(reg.last_stashed.map(|(seq, _)| seq), Some(good_seq));
+        assert_eq!(reg.last_seq_out, Some(last_seq));
+        assert!(
+            concealment.iter().any(|sample| sample.abs() > 1e-6),
+            "skipped packets should trigger PLC output before the real packet is replayed"
+        );
+
+        let mut real_output = vec![0.0f32; reg.fpp];
+        let real_result = reg.pop_internal(&mut real_output, 50.0 + fpp_duration_ms);
+        assert!(real_result);
+        assert_eq!(reg.last_stashed, None);
+        assert_eq!(reg.last_seq_out, Some(good_seq));
+        assert_eq!(reg.packet_count, 1);
+        assert!(
+            real_output.iter().any(|sample| sample.abs() > 1e-6),
+            "the stashed real packet should be rendered on the following callback"
+        );
     }
 }

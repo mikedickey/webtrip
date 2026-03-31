@@ -109,8 +109,10 @@ impl AudioProcessor {
         // Send local audio to network (if enabled)
         self.send_local_to_network();
 
-        // Receive remote audio from network (if enabled)
-        let has_remote = self.receive_from_network();
+        // Receive remote audio from network. Fills `remote_buffer` with the regulator's
+        // output (real, Burg-predicted concealment, or intentional silence) when a network
+        // buffer is connected, or with zeros otherwise — so we can mix it unconditionally.
+        self.receive_from_network();
 
         // Generate output: mix monitor + remote audio
         let monitor_volume = self.params.monitor_volume.load(Ordering::Relaxed) as f32 / 1000.0;
@@ -118,18 +120,14 @@ impl AudioProcessor {
         
         let len = input.len().min(output.len());
         for i in 0..len {
-            let mut out_sample = 0.0;
-            
+            // Start with remote audio (zeros if no network connected)
+            let mut out_sample = self.remote_buffer[i];
+
             // Add local monitor audio (if enabled)
             if monitor_volume > 0.0 {
                 out_sample += self.gained_buffer[i] * monitor_volume;
             }
-            
-            // Add remote audio (if available)
-            if has_remote {
-                out_sample += self.remote_buffer[i];
-            }
-            
+
             // Apply output volume and clamp
             output[i] = (out_sample * output_volume).clamp(-1.0, 1.0);
         }
@@ -194,40 +192,45 @@ impl AudioProcessor {
         }
     }
 
-    /// Receive remote audio from network via jitter buffer
-    /// Returns true if valid audio was received
-    fn receive_from_network(&mut self) -> bool {
+    /// Receive remote audio from network via jitter buffer.
+    ///
+    /// Always fills `remote_buffer` with the appropriate audio for this callback:
+    /// the regulator's output (real packet, Burg-predicted concealment, or intentional
+    /// silence) when a network buffer is connected, or zeros when none is attached.
+    /// `Regulator::pop()`'s return value is informational metadata (real vs. concealed)
+    /// and must NOT gate playback — concealed audio is the entire point of jitter
+    /// buffering and must be played to avoid clicks.
+    fn receive_from_network(&mut self) {
         let Some(buffer_ptr) = self.network_to_local_buffer else {
             self.remote_buffer.fill(0.0);
-            return false;
+            return;
         };
-        
+
         let output_channels = self.params.get_output_channels();
-        
+
         if output_channels >= 2 {
             // Read stereo packet, then downmix to mono for playback
             let mono_len = self.remote_buffer.len();
             let stereo_len = mono_len * 2;
-            
+
             // Ensure stereo receive buffer is correct size
             if self.stereo_receive_buffer.len() != stereo_len {
                 self.stereo_receive_buffer.resize(stereo_len, 0.0);
             }
-            
-            // Read stereo from jitter buffer
-            let has_data = unsafe { (*buffer_ptr).pop(&mut self.stereo_receive_buffer) };
-            
+
+            // Read stereo from jitter buffer (always populates the buffer; pop()'s bool
+            // distinguishes real vs concealed but is irrelevant for mixing)
+            unsafe { (*buffer_ptr).pop(&mut self.stereo_receive_buffer) };
+
             // Downmix stereo to mono (average L+R)
             for i in 0..mono_len {
                 let left = self.stereo_receive_buffer[i * 2];
                 let right = self.stereo_receive_buffer[i * 2 + 1];
                 self.remote_buffer[i] = (left + right) * 0.5;
             }
-            
-            has_data
         } else {
             // Read mono directly
-            unsafe { (*buffer_ptr).pop(&mut self.remote_buffer) }
+            unsafe { (*buffer_ptr).pop(&mut self.remote_buffer) };
         }
     }
 }
