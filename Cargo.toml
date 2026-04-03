@@ -54,6 +54,7 @@ web-sys = { version = "0.3.83", features = [
   "Navigator",
   "Window",
   "console",
+  "CloseEvent",
   "Event",
   "ErrorEvent",
   

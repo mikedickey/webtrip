@@ -71,6 +71,7 @@ class WebTripApp {
   private statsDisplay!: HTMLDivElement;
   private toggleButtons: Map<string, HTMLButtonElement> = new Map();
   private transportSelect!: HTMLSelectElement;
+  private activeTransportId: "webrtc" | "webtransport" | "mock" = "webrtc";
 
   async init(): Promise<void> {
     // Initialize WASM module
@@ -336,6 +337,9 @@ class WebTripApp {
     }
 
     this.session.setTransportType(transportType);
+    if (actualTransport === "webrtc" || actualTransport === "webtransport" || actualTransport === "mock") {
+      this.activeTransportId = actualTransport;
+    }
     if (transportId !== "auto") {
       console.debug(`🚀 Transport changed to: ${transportId}`);
     }
@@ -719,7 +723,6 @@ class WebTripApp {
     }
 
     const port = parseInt(this.serverPortInput.value, 10) || 4464;
-    const useTls = serverHost.includes("jacktrip.org"); // Use TLS for production servers
     const clientName = this.clientNameInput.value.trim() || undefined;
 
     try {
@@ -734,7 +737,6 @@ class WebTripApp {
       const connectPromise = this.session.connectToStudio(
         serverHost,
         port,
-        useTls,
         this.inputSelect.value || undefined,
         this.isToggleActive("agc"),
         this.isToggleActive("echo"),
@@ -770,6 +772,11 @@ class WebTripApp {
       console.error("Failed to connect:", error);
       this.connectButton.disabled = false;
       this.connectButton.textContent = "Connect to Studio";
+      // Reset session state — connect_to_studio failed before storing the transport,
+      // so the session is still in "Connecting" state and needs to be reset to Idle.
+      if (this.session) {
+        this.session.disconnect();
+      }
       alert(`Connection failed: ${error}`);
     }
   }
@@ -824,7 +831,28 @@ class WebTripApp {
 
   // ==================== Status Updates ====================
 
+  private getTransportDisplayName(): string {
+    switch (this.activeTransportId) {
+      case "webrtc":
+        return "WebRTC";
+      case "webtransport":
+        return "WebTransport";
+      case "mock":
+        return "Mock";
+      default:
+        return "";
+    }
+  }
+
   private updateConnectionStatus(state: SessionState): void {
+    // Ignore stale regressions that can arrive from late transport callbacks
+    // after we've already reached connected.
+    if (
+      this.sessionState === "connected" &&
+      (state === "connecting" || state === "negotiating")
+    ) {
+      return;
+    }
     this.sessionState = state;
     const statusText = this.connectionStatus.querySelector(
       ".status-text"
@@ -847,7 +875,15 @@ class WebTripApp {
       error: "Connection Error",
     };
 
-    statusText.textContent = labels[state] || state;
+    let label = labels[state] || state;
+    if (state === "connected") {
+      const transportName = this.getTransportDisplayName();
+      if (transportName) {
+        label = `Connected (${transportName})`;
+      }
+    }
+
+    statusText.textContent = label;
 
     // Update button states
     if (state === "connected") {

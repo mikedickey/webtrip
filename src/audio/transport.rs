@@ -125,13 +125,11 @@ pub trait Transport {
     /// # Arguments
     /// * `server` - Server hostname or IP
     /// * `port` - Server port
-    /// * `use_tls` - Whether to use TLS/HTTPS
     /// * `client_name` - Client identifier
     fn connect(
         &mut self,
         server: &str,
         port: u16,
-        use_tls: bool,
         client_name: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), JsValue>> + '_>>;
 

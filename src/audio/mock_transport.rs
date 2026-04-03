@@ -341,7 +341,6 @@ impl Transport for MockTransport {
         &mut self,
         _server: &str,
         _port: u16,
-        _use_tls: bool,
         _client_name: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), JsValue>> + '_>> {
         // Mock transport doesn't need real connection - just mark as connected

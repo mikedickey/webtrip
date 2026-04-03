@@ -9,7 +9,7 @@
 //! ```text
 //! Client                                    Hub Server
 //!   │                                           │
-//!   │  1. WebSocket Connect (ws://host:4464?name=ClientName)
+//!   │  1. WebSocket Connect (wss://host:4464/webrtc?name=ClientName)
 //!   │───────────────────────────────────────────▶
 //!   │                                           │
 //!   │  2. {"protocol":"webrtc", "version":1}    │
@@ -46,7 +46,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{Event, MessageEvent, WebSocket};
+use web_sys::{CloseEvent, Event, MessageEvent, WebSocket};
 
 /// Signaling protocol version
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -343,7 +343,7 @@ pub enum HubConnectionState {
 /// Handles WebSocket connection and signaling with a JackTrip hub server.
 #[wasm_bindgen]
 pub struct HubSignaling {
-    /// Server URL (ws://host:port or wss://host:port)
+    /// Server URL (always `wss://` for hub WebRTC signaling)
     server_url: String,
     /// WebSocket connection
     socket: Option<WebSocket>,
@@ -356,7 +356,7 @@ pub struct HubSignaling {
     /// Callbacks stored as closures
     on_message_closure: Option<Closure<dyn FnMut(MessageEvent)>>,
     on_open_closure: Option<Closure<dyn FnMut()>>,
-    on_close_closure: Option<Closure<dyn FnMut()>>,
+    on_close_closure: Option<Closure<dyn FnMut(CloseEvent)>>,
     on_error_closure: Option<Closure<dyn FnMut(Event)>>,
     /// Message queue for received messages
     message_queue: Rc<RefCell<Vec<SignalingMessage>>>,
@@ -371,20 +371,20 @@ pub struct HubSignaling {
 impl HubSignaling {
     /// Create a new hub signaling client
     ///
+    /// WebRTC hub signaling always uses a TLS WebSocket (`wss://`) on the `/webrtc` path.
+    ///
     /// # Arguments
     /// * `server_host` - The hub server hostname (from studio.server_host)
     /// * `port` - The signaling port (default 4464)
-    /// * `use_tls` - Whether to use secure WebSocket (wss://)
     /// * `client_name` - Client identifier (sent as URL query parameter), empty string for anonymous
     #[wasm_bindgen(constructor)]
-    pub fn new(server_host: &str, port: u16, use_tls: bool, client_name: &str) -> Self {
-        let protocol = if use_tls { "wss" } else { "ws" };
+    pub fn new(server_host: &str, port: u16, client_name: &str) -> Self {
         // Only include name parameter if client_name is not empty
         let server_url = if client_name.is_empty() {
-            format!("{}://{}:{}", protocol, server_host, port)
+            format!("wss://{}:{}/webrtc", server_host, port)
         } else {
             let encoded_name = js_sys::encode_uri_component(client_name);
-            format!("{}://{}:{}?name={}", protocol, server_host, port, encoded_name)
+            format!("wss://{}:{}/webrtc?name={}", server_host, port, encoded_name)
         };
 
         Self {
@@ -405,10 +405,15 @@ impl HubSignaling {
         }
     }
 
-    /// Create from a full WebSocket URL
+    /// Create from a full WebSocket URL (`ws://` is upgraded to `wss://` for hub signaling)
     pub fn from_url(url: &str, _client_name: &str) -> Self {
+        let server_url = if url.starts_with("ws://") {
+            format!("wss://{}", &url[5..])
+        } else {
+            url.to_string()
+        };
         Self {
-            server_url: url.to_string(),
+            server_url,
             socket: None,
             state: HubConnectionState::Disconnected,
             is_ready: Rc::new(RefCell::new(false)),
@@ -541,12 +546,18 @@ impl HubSignaling {
 
         // On close
         let js_on_state_change = self.js_on_state_change.clone();
-        let on_close = Closure::wrap(Box::new(move || {
-            web_sys::console::warn_1(&"⚠️ Signaling: WebSocket closed".into());
+        let on_close = Closure::wrap(Box::new(move |event: CloseEvent| {
+            let code = event.code();
+            let reason = event.reason();
+            let was_clean = event.was_clean();
+            web_sys::console::warn_1(&format!("⚠️ Signaling: WebSocket closed (code={}, reason='{}', clean={})", code, reason, was_clean).into());
+            // Include the close code in the state string so callers can give specific error messages.
+            // Format: "closed:CODE" (e.g. "closed:1006")
             if let Some(ref callback) = js_on_state_change {
-                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("closed"));
+                let state_with_code = format!("closed:{}", code);
+                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&state_with_code));
             }
-        }) as Box<dyn FnMut()>);
+        }) as Box<dyn FnMut(_)>);
 
         ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
         self.on_close_closure = Some(on_close);

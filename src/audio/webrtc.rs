@@ -302,10 +302,11 @@ impl WebRtcTransport {
         &mut self,
         server: &str,
         port: u16,
-        use_tls: bool,
         client_name: &str,
     ) -> Result<(), JsValue> {
-        web_sys::console::log_1(&format!("🔌 Connecting to hub: {}:{} (TLS: {})", server, port, use_tls).into());
+        web_sys::console::log_1(
+            &format!("🔌 Connecting to hub: {}:{} (signaling: wss://.../webrtc)", server, port).into(),
+        );
         
         self.state = ConnectionState::Connecting;
         self.notify_state_change();
@@ -328,15 +329,48 @@ impl WebRtcTransport {
         let reject_for_answer = reject_rc.clone();
 
         // Create signaling client wrapped in Rc<RefCell<>> for safe shared ownership
-        let mut signaling = HubSignaling::new(server, port, use_tls, client_name);
+        let mut signaling = HubSignaling::new(server, port, client_name);
         
-        // Set up signaling state change callback to propagate WebSocket closure
+        // Set up signaling state change callback to propagate WebSocket closure.
+        // If the WebSocket closes BEFORE the SDP answer arrives (reject_rc is still Some),
+        // reject the connection promise directly so connect_to_hub returns an Err promptly.
+        // If it closes AFTER connection is established (reject_rc is None), propagate as
+        // "disconnected" for normal post-connection teardown handling.
+        //
+        // The state string from HubSignaling uses the format "closed:CODE" (e.g. "closed:1006")
+        // so we can give specific error messages — notably for code 1006 (TLS cert not trusted).
+        let server_for_err = server.to_string();
+        let port_for_err = port;
         if let Some(ref callback) = self.js_on_state_change {
             let callback_clone = callback.clone();
+            let reject_for_close = reject_rc.clone();
             let signaling_state_cb = Closure::wrap(Box::new(move |state: String| {
-                // When signaling closes/fails, propagate to transport
-                if state == "closed" || state == "error" {
-                    let _ = callback_clone.call1(&JsValue::NULL, &JsValue::from_str("disconnected"));
+                let is_closed = state.starts_with("closed") || state == "error";
+                if is_closed {
+                    if let Some(reject_fn) = reject_for_close.borrow_mut().take() {
+                        // Promise still pending — WebSocket closed before connection established.
+                        // Build an actionable error message based on the close code.
+                        let close_code: u16 = state
+                            .strip_prefix("closed:")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+
+                        let err_msg = if close_code > 0 {
+                            format!(
+                                "Could not connect to {}:{} (WebSocket closed with code {}).",
+                                server_for_err, port_for_err, close_code
+                            )
+                        } else {
+                            format!(
+                                "Could not connect to {}:{}.",
+                                server_for_err, port_for_err
+                            )
+                        };
+                        let _ = reject_fn.call1(&JsValue::NULL, &JsValue::from_str(&err_msg));
+                    } else {
+                        // Promise already resolved — connection was established and is now closing.
+                        let _ = callback_clone.call1(&JsValue::NULL, &JsValue::from_str("disconnected"));
+                    }
                 }
             }) as Box<dyn FnMut(String)>);
             
@@ -409,10 +443,14 @@ impl WebRtcTransport {
                                 let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("connected"));
                             }
                             
-                            // Resolve the promise to signal connection is complete
+                            // Resolve the promise to signal connection is complete.
+                            // Also discard the reject so signaling_state_cb knows we're past
+                            // the setup phase — any subsequent WebSocket close should propagate
+                            // as "disconnected" rather than rejecting a non-existent promise.
                             if let Some(resolve_fn) = resolve.borrow_mut().take() {
                                 let _ = resolve_fn.call0(&JsValue::NULL);
                             }
+                            reject.borrow_mut().take(); // Mark connection as established
                         }
                         Err(e) => {
                             web_sys::console::error_1(&format!("❌ Failed to handle answer: {:?}", e).into());
@@ -513,7 +551,19 @@ impl WebRtcTransport {
         // The promise will be resolved by the answer callback when the connection is ready
         // NOTE: Must wait before taking signaling so callbacks can still access it
         web_sys::console::debug_1(&"⏳ WebRTC: Waiting for connection promise to resolve...".into());
-        JsFuture::from(promise).await?;
+        match JsFuture::from(promise).await {
+            Err(e) => {
+                web_sys::console::error_1(&format!("❌ WebRTC: Connection promise rejected: {:?}", e).into());
+                // Clear the state change callback before returning so that
+                // WebRtcTransport::drop() -> close() -> notify_state_change("closed") does not
+                // fire a spurious "error" transition in the session for a connection that never
+                // succeeded. The error surfaces cleanly via the Err return value instead.
+                self.js_on_state_change = None;
+                return Err(e);
+            }
+            Ok(_) => {}
+        }
+
         web_sys::console::debug_1(&"✅ WebRTC: Connection promise resolved!".into());
         
         // NOW restore signaling back to self (after connection is complete)
@@ -931,7 +981,6 @@ impl Transport for WebRtcTransport {
         &mut self,
         server: &str,
         port: u16,
-        use_tls: bool,
         client_name: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), JsValue>> + '_>> {
         // Convert to owned strings for the async block
@@ -940,7 +989,7 @@ impl Transport for WebRtcTransport {
 
         // Call the existing connect_to_hub implementation
         Box::pin(async move {
-            self.connect_to_hub(&server, port, use_tls, &client_name).await
+            self.connect_to_hub(&server, port, &client_name).await
         })
     }
 

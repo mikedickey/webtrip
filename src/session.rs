@@ -402,7 +402,6 @@ impl WebTripSession {
     /// # Arguments
     /// * `server_host` - The hub server hostname (from studio.server_host)
     /// * `port` - The signaling port (default 4464)
-    /// * `use_tls` - Whether to use secure WebSocket (wss://)
     /// * `device_id` - Optional input device ID
     /// * `auto_gain_control` - Enable AGC
     /// * `echo_cancellation` - Enable echo cancellation
@@ -413,7 +412,6 @@ impl WebTripSession {
         &mut self,
         server_host: String,
         port: Option<u16>,
-        use_tls: Option<bool>,
         device_id: Option<String>,
         auto_gain_control: bool,
         echo_cancellation: bool,
@@ -429,7 +427,6 @@ impl WebTripSession {
         });
 
         let port = port.unwrap_or(DEFAULT_SIGNALING_PORT);
-        let use_tls = use_tls.unwrap_or(false);
 
         self.set_state(SessionState::Connecting);
 
@@ -459,7 +456,9 @@ impl WebTripSession {
                         let session_state = match state.as_str() {
                             "failed" | "disconnected" | "closed" => "error",
                             "connected" => "connected",
-                            "connecting" => "connecting",
+                            // Session already emits "connecting" before transport connect starts.
+                            // Ignore transport-level "connecting" to avoid stale callbacks
+                            // regressing the UI back to Connecting after a successful connect.
                             _ => return,
                         };
                         
@@ -477,7 +476,6 @@ impl WebTripSession {
                 webrtc_transport.connect(
                     &server_host,
                     port,
-                    use_tls,
                     client_name.as_deref().unwrap_or(""),
                 ).await?;
                 
@@ -498,7 +496,6 @@ impl WebTripSession {
                     &mut mock_transport,
                     &server_host,
                     port,
-                    use_tls,
                     client_name.as_deref().unwrap_or(""),
                 ).await?;
                 
@@ -543,7 +540,6 @@ impl WebTripSession {
                     &mut webtransport,
                     &server_host,
                     port,
-                    use_tls,
                     client_name.as_deref().unwrap_or(""),
                 ).await?;
                 

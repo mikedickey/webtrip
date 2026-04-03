@@ -455,21 +455,16 @@ impl Transport for WebTransportImpl {
         &mut self,
         server: &str,
         port: u16,
-        use_tls: bool,
         client_name: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), JsValue>> + '_>> {
-        // Build WebTransport URL
-        // WebTransport requires HTTPS and the /webtransport path
-        let protocol = if use_tls { "https" } else { "https" }; // WebTransport always uses HTTPS
-
-        // Only include name parameter if client_name is not empty
+        // Build WebTransport URL (HTTPS + /webtransport path)
         let url = if client_name.is_empty() {
-            format!("{}://{}:{}/webtransport", protocol, server, port)
+            format!("https://{}:{}/webtransport", server, port)
         } else {
             let encoded_name = js_sys::encode_uri_component(client_name);
             format!(
-                "{}://{}:{}/webtransport?name={}",
-                protocol, server, port, encoded_name
+                "https://{}:{}/webtransport?name={}",
+                server, port, encoded_name
             )
         };
 
