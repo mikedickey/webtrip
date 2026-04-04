@@ -38,6 +38,41 @@ use web_sys::{
 /// Data channel label for audio data
 const AUDIO_CHANNEL_LABEL: &str = "jacktrip-audio";
 
+/// Warm up TLS for HTTPS/WSS on the signaling origin before opening WebSocket.
+///
+/// Some Chrome versions can fail an initial `wss://` handshake unless an `https://`
+/// request has already been made to the same host/port. This best-effort probe
+/// intentionally never fails the connection flow.
+async fn preflight_signaling_tls(server: &str, port: u16) {
+    let ping_url = format!("https://{}:{}/ping", server, port);
+    web_sys::console::debug_1(
+        &format!("🌡️ WebRTC: Running signaling TLS pre-flight: {}", ping_url).into(),
+    );
+
+    if let Some(window) = web_sys::window() {
+        match JsFuture::from(window.fetch_with_str(&ping_url)).await {
+            Ok(_) => {
+                web_sys::console::debug_1(
+                    &"✅ WebRTC: Signaling TLS pre-flight completed".into(),
+                );
+            }
+            Err(err) => {
+                web_sys::console::warn_1(
+                    &format!(
+                        "⚠️ WebRTC: Signaling TLS pre-flight failed (continuing): {:?}",
+                        err
+                    )
+                    .into(),
+                );
+            }
+        }
+    } else {
+        web_sys::console::warn_1(
+            &"⚠️ WebRTC: window unavailable for signaling TLS pre-flight".into(),
+        );
+    }
+}
+
 /// Connection state
 #[wasm_bindgen]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -539,6 +574,7 @@ impl WebRtcTransport {
 
         // NOW connect signaling WebSocket (callbacks are already registered)
         if let Some(ref mut sig) = *signaling_rc.borrow_mut() {
+            preflight_signaling_tls(server, port).await;
             web_sys::console::debug_1(&"🔌 WebRTC: Starting WebSocket connection...".into());
             sig.connect()?;
             web_sys::console::debug_1(&"📤 WebRTC: Sending offer to hub...".into());
