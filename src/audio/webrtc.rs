@@ -572,9 +572,13 @@ impl WebRtcTransport {
         // Store peer connection in the shared ref for callbacks
         *peer_conn_ref.borrow_mut() = self.peer_connection.clone();
 
+        // Preflight TLS before taking any borrow so the ICE candidate callback
+        // (which immutably borrows signaling_rc) cannot fire while we hold a
+        // mutable borrow, which would cause a RefCell panic.
+        preflight_signaling_tls(server, port).await;
+
         // NOW connect signaling WebSocket (callbacks are already registered)
         if let Some(ref mut sig) = *signaling_rc.borrow_mut() {
-            preflight_signaling_tls(server, port).await;
             web_sys::console::debug_1(&"🔌 WebRTC: Starting WebSocket connection...".into());
             sig.connect()?;
             web_sys::console::debug_1(&"📤 WebRTC: Sending offer to hub...".into());
