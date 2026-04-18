@@ -29,7 +29,7 @@ const MAX_PACKET_SAMPLES: usize = 8192;
 /// Maximum auto tolerance in milliseconds
 const AUTO_MAX_MS: f64 = 250.0;
 /// Duration before auto mode kicks in
-const AUTO_INIT_DURATION_MS: f64 = 2000.0;
+const AUTO_INIT_DURATION_MS: f64 = 3000.0;
 /// Scale factor for initial tolerance during init phase
 const AUTO_INIT_VAL_FACTOR: f64 = 0.5;
 /// Window divisor for faster auto tracking
@@ -618,7 +618,7 @@ impl Regulator {
             auto_headroom,
             current_headroom: if auto_headroom < 0.0 { 0.0 } else { auto_headroom },
             skip_auto_headroom: true,
-            auto_headroom_start_time: 4000.0,
+            auto_headroom_start_time: 6000.0,
 
             packet_count: 0,
             skipped: 0,
@@ -653,6 +653,10 @@ impl Regulator {
     /// * `samples` - Interleaved audio samples
     /// * `now_ms` - Current timestamp in milliseconds
     fn push_internal(&mut self, seq_num: u16, samples: &[f32], now_ms: f64) {
+        if samples.len() > MAX_PACKET_SAMPLES {
+            return;
+        }
+
         let current = self.last_seq_in.load(Ordering::Acquire);
 
         // Initialize on first packet
@@ -955,6 +959,7 @@ impl Regulator {
 
         // Skip warmup period
         if now <= self.auto_headroom_start_time {
+            self.last_max_latency  = 0.0;  // ignore during warmup
             self.stats_max_latency = 0.0;
             self.update_headroom(0, 0);
         } else {
@@ -981,8 +986,9 @@ impl Regulator {
                     self.skip_auto_headroom = false;
                 } else {
                     self.skip_auto_headroom = true;
-                    if self.last_max_latency > self.tolerance_ms + 1.0 {
-                        let headroom_increase = (self.last_max_latency - self.tolerance_ms).ceil();
+                    if self.last_max_latency > self.tolerance_ms + 3.0 {
+                        // special case to grow headroom faster to catch up
+                        let headroom_increase = ((self.last_max_latency - self.tolerance_ms) / 2.0).ceil();
                         self.current_headroom = (self.current_headroom + headroom_increase).min(max_headroom);
                     } else {
                         self.current_headroom += 1.0;
