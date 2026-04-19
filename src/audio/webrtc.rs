@@ -258,6 +258,19 @@ impl WebRtcTransport {
         };
 
         if !self.is_connected() {
+            // The data channel has not reached the Open state yet (typically
+            // the DTLS/SCTP handshake is still in flight — most visible in
+            // Firefox when we land on the DTLS-server side of
+            // `a=setup:active`). During that window the AudioWorklet keeps
+            // writing to the ring buffer and setting `has_data_flag = 1`. If
+            // we returned without calling `ring_buffer.read()`, the flag
+            // would stay at 1, `Atomics.waitAsync` would return synchronously
+            // every iteration, and the main thread would enter a tight loop
+            // that freezes the browser. Drain the ring buffer here so the
+            // flag clears and the waitAsync loop can sleep until the channel
+            // is open.
+            let ring_buffer = unsafe { &mut *buffers.local_to_network_ptr };
+            while ring_buffer.read(&mut self.audio_to_send_buffer) {}
             return;
         }
 
@@ -267,12 +280,12 @@ impl WebRtcTransport {
         // for the lifetime of the session
         let ring_buffer = unsafe { &mut *buffers.local_to_network_ptr };
         let jitter_buffer = unsafe { &mut *buffers.network_to_local_ptr };
-        
+
         // Interleaved send/receive for better latency balance
         loop {
             let mut processed_send = false;
             let mut processed_receive = false;
-            
+
             // Try to process one send packet
             if ring_buffer.available() >= samples_needed {
                 if ring_buffer.read(&mut self.audio_to_send_buffer) {
@@ -302,7 +315,7 @@ impl WebRtcTransport {
                     }
                 }
             }
-            
+
             // Try to process one receive packet
             if let Some(data) = self.receive_queue.borrow_mut().pop_front() {
                 match AudioPacket::deserialize(&data) {
@@ -315,7 +328,7 @@ impl WebRtcTransport {
                     }
                 }
             }
-            
+
             // Exit loop if neither direction had data to process
             if !processed_send && !processed_receive {
                 break;
