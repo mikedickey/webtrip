@@ -397,6 +397,26 @@ impl TimingStats {
     fn ewma(avg: f64, current: f64) -> f64 {
         avg + AUTO_SMOOTHING_FACTOR * (current - avg)
     }
+
+    /// Reset rolling and long-term statistics state.
+    fn reset(&mut self) {
+        self.count = 0;
+        self.accumulator = 0.0;
+        self.min = f64::MAX;
+        self.max = f64::MIN;
+        self.data.fill(0.0);
+        self.last_mean = 0.0;
+        self.last_std_dev = 0.0;
+        self.last_max = 0.0;
+        self.long_term_std_dev = 0.0;
+        self.long_term_max = 0.0;
+        self.long_term_std_dev_acc = 0.0;
+        self.long_term_max_acc = 0.0;
+        self.long_term_count = 0;
+        self.last_time = 0.0;
+        self.overruns = 0;
+        self.underruns = 0;
+    }
 }
 
 // ============================================================================
@@ -1126,6 +1146,11 @@ impl Regulator {
     pub fn reset(&mut self) {
         self.last_seq_in.store(SEQ_NONE, Ordering::Release);
         self.last_seq_out = None;
+        // A stash left over from the previous connection would otherwise be
+        // returned on the first pop after reconnect, pinning `last_seq_out` to
+        // a stale sequence number and triggering thousands of spurious PLCs
+        // until the new stream's sequence numbers caught up.
+        self.last_stashed = None;
         self.packet_count = 0;
         self.skipped = 0;
         self.last_skipped = 0;
@@ -1134,16 +1159,26 @@ impl Regulator {
         self.last_max_latency = 0.0;
         self.stats_max_latency = 0.0;
         self.last_was_glitch = false;
+        self.tolerance_ms = if self.auto_mode {
+            self.fpp as f64 * AUTO_INIT_VAL_FACTOR
+        } else {
+            self.auto_headroom
+        };
+        self.current_headroom = if self.auto_headroom < 0.0 {
+            0.0
+        } else {
+            self.auto_headroom
+        };
+        self.skip_auto_headroom = true;
+        self.auto_headroom_start_time = 6000.0;
 
         // Reset timing
         self.start_time_ms = 0.0;
         self.last_pop_time_ms = 0.0;
 
-        // Reset timing stats counters
-        self.pull_stats.underruns = 0;
-        self.pull_stats.overruns = 0;
-        self.push_stats.underruns = 0;
-        self.push_stats.overruns = 0;
+        // Reset timing stats state
+        self.pull_stats.reset();
+        self.push_stats.reset();
 
         // Reset slots without deallocating
         for slot in &mut self.slots {

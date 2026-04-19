@@ -148,7 +148,15 @@ pub trait Transport {
         matches!(self.state(), TransportState::Connected)
     }
 
-    /// Close the connection
-    fn close(&mut self);
+    /// Close the connection.
+    ///
+    /// This method eagerly performs any synchronous teardown (e.g. posting a
+    /// shutdown message to a worker, scheduling a fallback timer) and returns
+    /// a future that resolves once the transport is fully torn down. Callers
+    /// that need to guarantee no further writes to the audio buffers (e.g.
+    /// before resetting a `Regulator`) must `await` the returned future. For
+    /// best-effort cleanup (e.g. in `Drop`) the future can be discarded; the
+    /// synchronous teardown has already been initiated.
+    fn close(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>>;
 }
 

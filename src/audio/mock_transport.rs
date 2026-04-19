@@ -355,18 +355,21 @@ impl Transport for MockTransport {
         self.do_tick();
     }
 
-    fn close(&mut self) {
+    fn close(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
         // Disable streaming on ring buffer
         if let Some(buffers) = self.audio_buffers {
             unsafe {
                 (*buffers.local_to_network_ptr).set_streaming(false);
             }
         }
-        
+
         self.state = TransportState::Closed;
         self.send_queue.borrow_mut().clear();
         self.receive_queue.borrow_mut().clear();
         self.notify_state_change();
+
+        // Mock transport has no async teardown; shutdown is fully synchronous.
+        Box::pin(async move {})
     }
 }
 

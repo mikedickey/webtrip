@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 WebTrip is a Rust-to-WebAssembly rewrite of JackTrip for low-latency audio collaboration in web browsers. Rust code compiles to WASM via wasm-pack; a TypeScript layer handles the UI.
 
+## Release Status Policy
+
+This project has not been released yet. Do not preserve or design for backward compatibility; prefer the simplest clean changes and avoid paying compatibility costs before first release.
+
 ## Build Commands
 
 **Always use npm scripts for building, never call wasm-pack directly** — the WASM build requires specific flags for threading support (atomics, shared memory, TLS exports).

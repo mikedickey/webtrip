@@ -577,13 +577,25 @@ impl WebTripSession {
     }
 
 
-    /// Disconnect from the hub server
-    pub fn disconnect(&mut self) {
-        // Close transport
-        if let Some(ref mut transport) = self.transport {
-            transport.close();
+    /// Disconnect from the hub server.
+    ///
+    /// This awaits full transport teardown before resetting the
+    /// network-to-local buffer. That ordering is load-bearing: the
+    /// `Regulator`'s sequence-number state is shared via a raw pointer with
+    /// the transport (for WebTransport, the worker thread writes to it), so
+    /// resetting before the transport has quiesced creates a race in which a
+    /// late `regulator.push()` from the old connection pins `last_seq_in`
+    /// high and causes the *next* connection's packets to be rejected by the
+    /// wrap-distance check. Awaiting `transport.close()` establishes the
+    /// happens-before ordering we need: for WebTransport the future only
+    /// resolves after `worker.terminate()`; for WebRTC/Mock the teardown is
+    /// fully synchronous.
+    pub async fn disconnect(&mut self) {
+        if let Some(mut transport) = self.transport.take() {
+            transport.close().await;
+            // `transport` is dropped at end of scope; its `Drop` impl is a
+            // no-op on already-closed state.
         }
-        self.transport = None;
 
         // Stop audio capture when disconnecting (this will also stop the audio callback loop)
         self.stop_capture();
@@ -591,7 +603,8 @@ impl WebTripSession {
         // Clear any pending capture parameters
         self.pending_capture_params = None;
 
-        // Reset network-to-local buffer
+        // Now that no further writes to the Regulator are possible, reset it
+        // so the next connection starts from a clean slate.
         self.network_to_local_buffer.reset();
 
         self.set_state(SessionState::Idle);
@@ -709,8 +722,12 @@ impl WebTripSession {
 
 impl Drop for WebTripSession {
     fn drop(&mut self) {
-        // Critical: Stop in correct order to ensure buffer pointers aren't used after drop
-        self.disconnect();
+        // `disconnect()` is now async and can't be awaited from Drop. Instead,
+        // best-effort teardown: drop the transport (its own Drop impl fires
+        // off the shutdown message and schedules the fallback terminate) and
+        // stop audio capture. The Regulator doesn't need to be reset in Drop
+        // because the whole session is being deallocated.
+        self.transport = None;
         self.stop_capture();
     }
 }

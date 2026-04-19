@@ -91,6 +91,10 @@ pub struct WebTransportImpl {
     connection_promise_resolve: Rc<RefCell<Option<js_sys::Function>>>,
     connection_promise_reject: Rc<RefCell<Option<js_sys::Function>>>,
     worker_ready_resolve: Rc<RefCell<Option<js_sys::Function>>>,
+    // Resolver for the Promise returned by `close()`. Fired when the worker
+    // posts "disconnected" (happy path) or when the 2s fallback timer elapses
+    // (worker hung). See the `close()` impl for details.
+    close_promise_resolve: Rc<RefCell<Option<js_sys::Function>>>,
 }
 
 impl WebTransportImpl {
@@ -112,6 +116,7 @@ impl WebTransportImpl {
             connection_promise_resolve: Rc::new(RefCell::new(None)),
             connection_promise_reject: Rc::new(RefCell::new(None)),
             worker_ready_resolve: Rc::new(RefCell::new(None)),
+            close_promise_resolve: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -140,6 +145,7 @@ impl WebTransportImpl {
         let connection_resolve = self.connection_promise_resolve.clone();
         let connection_reject = self.connection_promise_reject.clone();
         let worker_ready_resolve = self.worker_ready_resolve.clone();
+        let close_resolve = self.close_promise_resolve.clone();
         let worker_slot = self.worker.clone();
 
         let on_message = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
@@ -172,10 +178,19 @@ impl WebTransportImpl {
                         // inside the onmessage handler itself; the current
                         // invocation keeps the closure alive via its outer
                         // reference.
+                        //
+                        // Ordering is important: terminate the worker FIRST so
+                        // no further pushes to the shared Regulator can occur,
+                        // THEN resolve the close() future. The session layer
+                        // relies on this ordering to safely reset() the
+                        // Regulator after awaiting close().
                         if let Some(worker) = worker_slot.borrow_mut().take() {
                             worker.set_onmessage(None);
                             worker.set_onerror(None);
                             worker.terminate();
+                        }
+                        if let Some(resolve) = close_resolve.borrow_mut().take() {
+                            let _ = resolve.call0(&JsValue::NULL);
                         }
                         if let Some(ref callback) = state_change_cb {
                             let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("disconnected"));
@@ -498,55 +513,106 @@ impl Transport for WebTransportImpl {
         matches!(self.state, TransportState::Connected)
     }
 
-    fn close(&mut self) {
-        let worker_opt = self.worker.borrow().clone();
-        if let Some(worker) = worker_opt {
-            // Tell the worker to stop. It will send the JackTrip exit packet(s)
-            // and post "disconnected" back before going idle. The onmessage
-            // handler terminates the worker as soon as that arrives (~20 ms in
-            // practice), so the timer below is purely a safety net for the case
-            // where the worker hangs (e.g. on writer.write_with_chunk after a
-            // network loss) and never gets to post "disconnected".
-            let msg = Object::new();
-            let _ = Reflect::set(&msg, &"type".into(), &"disconnect".into());
-            let _ = worker.post_message(&msg);
+    fn close(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+        // Snapshot current state and eagerly fire off the synchronous shutdown
+        // work, then return a future that resolves once the worker is
+        // guaranteed not to issue further writes to the shared Regulator.
+        //
+        // Ordering for the happy path:
+        //   1. Post `{type:"disconnect"}` to the worker.
+        //   2. Worker's `send_loop` flushes JackTrip exit packets, then posts
+        //      `"disconnected"` back to the main thread.
+        //   3. `onmessage` handler (see `create_worker`) calls
+        //      `worker.terminate()` — after this returns, the worker thread
+        //      is dead and cannot push to the Regulator.
+        //   4. `onmessage` handler resolves the promise returned below.
+        //
+        // Fallback (worker hung for >2s): the timer below terminates the
+        // worker itself and resolves the promise. Either way, the future
+        // only resolves *after* `worker.terminate()` has run, so awaiting it
+        // establishes a happens-before relationship between any in-flight
+        // `regulator.push()` inside the worker and subsequent operations on
+        // the main thread (e.g. `Regulator::reset()`).
 
-            // Transfer ownership of the closures into the fallback callback so
-            // they stay alive long enough to receive the worker's "disconnected"
-            // message. They're dropped when the fallback fires (or when the
-            // closure itself is garbage-collected after forget() — the timer
-            // holds the only reference).
-            let worker_slot = self.worker.clone();
-            let msg_closure = self.worker_message_closure.take();
-            let err_closure = self.worker_error_closure.take();
-            let cb = Closure::wrap(Box::new(move || {
-                if let Some(worker) = worker_slot.borrow_mut().take() {
-                    web_sys::console::warn_1(
-                        &"[WebTransport] Worker did not report disconnect within 2s — force-terminating".into(),
-                    );
-                    worker.set_onmessage(None);
-                    worker.set_onerror(None);
-                    worker.terminate();
-                }
-                let _ = &msg_closure;
-                let _ = &err_closure;
-            }) as Box<dyn FnMut()>);
-            if let Some(window) = web_sys::window() {
-                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                    cb.as_ref().unchecked_ref(),
-                    2000,
+        let worker_opt = self.worker.borrow().clone();
+
+        // If there is no worker, we are already closed: return an immediately
+        // resolved future and skip the promise dance.
+        let Some(worker) = worker_opt else {
+            self.state = TransportState::Closed;
+            self.notify_state_change();
+            return Box::pin(async move {});
+        };
+
+        // Build the close promise and stash its resolver for `onmessage` and
+        // the fallback timer to invoke.
+        let (promise, resolve) = {
+            let mut resolve_fn: Option<js_sys::Function> = None;
+            let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                resolve_fn = Some(resolve);
+            });
+            (promise, resolve_fn.expect("Promise executor must provide resolve"))
+        };
+        *self.close_promise_resolve.borrow_mut() = Some(resolve);
+
+        // (1) Tell the worker to stop. It will send the JackTrip exit
+        // packet(s) and post "disconnected" back before going idle.
+        let msg = Object::new();
+        let _ = Reflect::set(&msg, &"type".into(), &"disconnect".into());
+        let _ = worker.post_message(&msg);
+
+        // (Fallback) Schedule a 2s force-terminate in case the worker hangs
+        // (e.g. `writer.write_with_chunk` stalls after a network loss) and
+        // never gets to post "disconnected".
+        //
+        // Transfer ownership of the worker-level closures into the fallback
+        // callback so they stay alive long enough to receive the worker's
+        // "disconnected" message. They're dropped when the fallback fires
+        // (or when the closure itself is garbage-collected after forget() —
+        // the timer holds the only reference).
+        let worker_slot = self.worker.clone();
+        let close_resolve = self.close_promise_resolve.clone();
+        let msg_closure = self.worker_message_closure.take();
+        let err_closure = self.worker_error_closure.take();
+        let cb = Closure::wrap(Box::new(move || {
+            if let Some(worker) = worker_slot.borrow_mut().take() {
+                web_sys::console::warn_1(
+                    &"[WebTransport] Worker did not report disconnect within 2s — force-terminating".into(),
                 );
-            } else {
-                // No window (running in a worker scope) — terminate now.
-                if let Some(worker) = self.worker.borrow_mut().take() {
-                    worker.terminate();
-                }
+                worker.set_onmessage(None);
+                worker.set_onerror(None);
+                worker.terminate();
             }
-            cb.forget();
+            if let Some(resolve) = close_resolve.borrow_mut().take() {
+                let _ = resolve.call0(&JsValue::NULL);
+            }
+            let _ = &msg_closure;
+            let _ = &err_closure;
+        }) as Box<dyn FnMut()>);
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.as_ref().unchecked_ref(),
+                2000,
+            );
+        } else {
+            // No window (running in a worker scope) — terminate now and
+            // resolve immediately.
+            if let Some(worker) = self.worker.borrow_mut().take() {
+                worker.terminate();
+            }
+            if let Some(resolve) = self.close_promise_resolve.borrow_mut().take() {
+                let _ = resolve.call0(&JsValue::NULL);
+            }
         }
+        cb.forget();
 
         self.state = TransportState::Closed;
         self.notify_state_change();
+
+        Box::pin(async move {
+            // Ignore any rejection — the resolver above only ever resolves.
+            let _ = JsFuture::from(promise).await;
+        })
     }
 }
 
@@ -558,7 +624,12 @@ impl Default for WebTransportImpl {
 
 impl Drop for WebTransportImpl {
     fn drop(&mut self) {
-        self.close();
+        // Drop can't await. Fire off the synchronous shutdown work (posting
+        // the `{type:"disconnect"}` message and scheduling the 2s fallback
+        // terminator) and discard the returned future. The JS-side timer and
+        // onmessage handler set up by `close()` complete the teardown even
+        // after this future is dropped.
+        let _ = Transport::close(self);
     }
 }
 
