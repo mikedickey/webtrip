@@ -711,9 +711,29 @@ impl Default for AudioFormat {
     }
 }
 
+/// Fixed byte length of a JackTrip control packet (and therefore an exit packet).
+pub const CONTROL_PACKET_SIZE: usize = 63;
+
+/// Builds a JackTrip exit packet: a 63-byte control packet with every byte set to `0xFF`.
+///
+/// The hub server recognizes an all-`0xFF` control packet as a graceful disconnect
+/// signal, allowing it to reclaim the client slot immediately rather than waiting for
+/// an inactivity timeout.
+pub fn make_exit_packet() -> Vec<u8> {
+    vec![0xFF; CONTROL_PACKET_SIZE]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_make_exit_packet() {
+        let pkt = make_exit_packet();
+        assert_eq!(pkt.len(), CONTROL_PACKET_SIZE);
+        assert_eq!(pkt.len(), 63);
+        assert!(pkt.iter().all(|&b| b == 0xFF));
+    }
 
     #[test]
     fn test_header_size() {

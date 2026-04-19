@@ -71,7 +71,13 @@ pub struct WebTransportImpl {
     server_url: Option<String>,
 
     // Worker management
-    worker: Option<web_sys::Worker>,
+    //
+    // `worker` is wrapped in `Rc<RefCell<_>>` so the onmessage closure can take
+    // ownership of it and terminate the worker as soon as the worker reports
+    // "disconnected" (i.e. after the send loop has flushed the JackTrip exit
+    // packets). The `close()` fallback timer also holds a clone and is a no-op
+    // if the happy path already terminated the worker.
+    worker: Rc<RefCell<Option<web_sys::Worker>>>,
     worker_message_closure: Option<Closure<dyn FnMut(web_sys::MessageEvent)>>,
     worker_error_closure: Option<Closure<dyn FnMut(web_sys::ErrorEvent)>>,
 
@@ -98,7 +104,7 @@ impl WebTransportImpl {
         Ok(Self {
             state: TransportState::Disconnected,
             server_url: None,
-            worker: None,
+            worker: Rc::new(RefCell::new(None)),
             worker_message_closure: None,
             worker_error_closure: None,
             audio_buffers: None,
@@ -134,6 +140,7 @@ impl WebTransportImpl {
         let connection_resolve = self.connection_promise_resolve.clone();
         let connection_reject = self.connection_promise_reject.clone();
         let worker_ready_resolve = self.worker_ready_resolve.clone();
+        let worker_slot = self.worker.clone();
 
         let on_message = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
             let data = event.data();
@@ -159,6 +166,17 @@ impl WebTransportImpl {
                     }
                     "disconnected" => {
                         web_sys::console::log_1(&"[WebTransport] ⚠️ Worker reports: DISCONNECTED".into());
+                        // Worker has flushed the JackTrip exit packets — tear it
+                        // down immediately so we don't wait for the close()
+                        // fallback timer. Safe to call set_onmessage(None) from
+                        // inside the onmessage handler itself; the current
+                        // invocation keeps the closure alive via its outer
+                        // reference.
+                        if let Some(worker) = worker_slot.borrow_mut().take() {
+                            worker.set_onmessage(None);
+                            worker.set_onerror(None);
+                            worker.terminate();
+                        }
                         if let Some(ref callback) = state_change_cb {
                             let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("disconnected"));
                         }
@@ -266,13 +284,13 @@ impl WebTransportImpl {
         worker.set_onerror(Some(on_error.as_ref().unchecked_ref()));
         self.worker_error_closure = Some(on_error);
 
-        self.worker = Some(worker);
+        *self.worker.borrow_mut() = Some(worker);
         Ok(())
     }
 
     /// Initialize the worker with buffer pointers
     fn init_worker(&self) -> Result<(), JsValue> {
-        let worker = self.worker.as_ref().ok_or("Worker not created")?;
+        let worker = self.worker.borrow().clone().ok_or("Worker not created")?;
         let buffers = self.audio_buffers.ok_or("Audio buffers not configured")?;
 
 
@@ -327,7 +345,7 @@ impl WebTransportImpl {
 
     /// Send connect message to worker
     async fn connect_worker(&self, server_url: &str) -> Result<(), JsValue> {
-        let worker = self.worker.as_ref().ok_or("Worker not created")?;
+        let worker = self.worker.borrow().clone().ok_or("Worker not created")?;
 
         // Create a promise that will be resolved by the message handler
         let (promise, resolve, reject) = {
@@ -374,7 +392,7 @@ impl WebTransportImpl {
         self.notify_state_change();
 
         // Create worker if needed
-        if self.worker.is_none() {
+        if self.worker.borrow().is_none() {
             self.create_worker()?;
         }
 
@@ -481,22 +499,51 @@ impl Transport for WebTransportImpl {
     }
 
     fn close(&mut self) {
-        // Send disconnect message to worker
-        if let Some(ref worker) = self.worker {
+        let worker_opt = self.worker.borrow().clone();
+        if let Some(worker) = worker_opt {
+            // Tell the worker to stop. It will send the JackTrip exit packet(s)
+            // and post "disconnected" back before going idle. The onmessage
+            // handler terminates the worker as soon as that arrives (~20 ms in
+            // practice), so the timer below is purely a safety net for the case
+            // where the worker hangs (e.g. on writer.write_with_chunk after a
+            // network loss) and never gets to post "disconnected".
             let msg = Object::new();
             let _ = Reflect::set(&msg, &"type".into(), &"disconnect".into());
             let _ = worker.post_message(&msg);
 
-            // Terminate worker
-            worker.terminate();
+            // Transfer ownership of the closures into the fallback callback so
+            // they stay alive long enough to receive the worker's "disconnected"
+            // message. They're dropped when the fallback fires (or when the
+            // closure itself is garbage-collected after forget() — the timer
+            // holds the only reference).
+            let worker_slot = self.worker.clone();
+            let msg_closure = self.worker_message_closure.take();
+            let err_closure = self.worker_error_closure.take();
+            let cb = Closure::wrap(Box::new(move || {
+                if let Some(worker) = worker_slot.borrow_mut().take() {
+                    web_sys::console::warn_1(
+                        &"[WebTransport] Worker did not report disconnect within 2s — force-terminating".into(),
+                    );
+                    worker.set_onmessage(None);
+                    worker.set_onerror(None);
+                    worker.terminate();
+                }
+                let _ = &msg_closure;
+                let _ = &err_closure;
+            }) as Box<dyn FnMut()>);
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                    cb.as_ref().unchecked_ref(),
+                    2000,
+                );
+            } else {
+                // No window (running in a worker scope) — terminate now.
+                if let Some(worker) = self.worker.borrow_mut().take() {
+                    worker.terminate();
+                }
+            }
+            cb.forget();
         }
-
-        // Clean up
-        self.worker = None;
-        
-        // Remove event handlers before dropping closures
-        self.worker_message_closure = None;
-        self.worker_error_closure = None;
 
         self.state = TransportState::Closed;
         self.notify_state_change();

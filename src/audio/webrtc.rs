@@ -17,7 +17,7 @@
 //! - No retransmissions (maxRetransmits = 0)
 //! - Binary mode (ArrayBuffer)
 
-use crate::audio::protocol::AudioPacket;
+use crate::audio::protocol::{AudioPacket, make_exit_packet};
 use crate::audio::signaling::HubSignaling;
 use crate::audio::transport::{Transport, TransportState as CommonTransportState, TransportType, AudioBufferConfig};
 use js_sys::{Array, ArrayBuffer, Object, Reflect, Uint8Array};
@@ -237,7 +237,8 @@ impl WebRtcTransport {
 
     /// Set callback for connection state changes (optional, for external monitoring)
     pub fn set_on_state_change(&mut self, callback: js_sys::Function) {
-        self.js_on_state_change = Some(callback);
+        use crate::audio::transport::Transport;
+        Transport::set_on_state_change(self, callback);
     }
 
     /// Set callback for ICE candidates (optional, for external signaling)
@@ -755,57 +756,14 @@ impl WebRtcTransport {
 
     /// Close the connection
     pub fn close(&mut self) {
-        // Disable streaming on ring buffer
-        if let Some(buffers) = self.audio_buffers {
-            unsafe {
-                (*buffers.local_to_network_ptr).set_streaming(false);
-            }
-        }
-        
-        // Disconnect signaling
-        if let Some(mut sig) = self.signaling.take() {
-            sig.disconnect();
-        }
-        
-        // Remove event handlers BEFORE dropping closures to prevent "closure invoked after being dropped" errors
-        if let Some(ref channel) = self.data_channel {
-            channel.set_onmessage(None);
-            channel.set_onopen(None);
-            channel.set_onclose(None);
-            channel.set_onerror(None);
-            channel.close();
-        }
-        
-        if let Some(ref pc) = self.peer_connection {
-            pc.set_onicecandidate(None);
-            pc.set_ondatachannel(None);
-            pc.set_oniceconnectionstatechange(None);
-            pc.close();
-        }
-        
-        // Now it's safe to drop the closures
-        self.on_message_closure = None;
-        self.on_channel_open_closure = None;
-        self.on_channel_close_closure = None;
-        self.on_ice_candidate_closure = None;
-        self.on_data_channel_closure = None;
-        
-        // Finally, take ownership to drop
-        self.data_channel = None;
-        self.peer_connection = None;
-        
-        self.state = ConnectionState::Closed;
-        self.notify_state_change();
+        use crate::audio::transport::Transport;
+        Transport::close(self);
     }
 
     /// Check if connected and ready to send
     pub fn is_connected(&self) -> bool {
-        // Check if data channel is actually open
-        if let Some(ref channel) = self.data_channel {
-            channel.ready_state() == RtcDataChannelState::Open
-        } else {
-            false
-        }
+        use crate::audio::transport::Transport;
+        Transport::is_connected(self)
     }
 
     // Private methods
@@ -1051,6 +1009,16 @@ impl Transport for WebRtcTransport {
         if let Some(buffers) = self.audio_buffers {
             unsafe {
                 (*buffers.local_to_network_ptr).set_streaming(false);
+            }
+        }
+
+        // Send two JackTrip exit packets (63-byte control packets, all 0xFF) while the
+        // data channel is still open so the hub reclaims the slot immediately.
+        if let Some(ref channel) = self.data_channel {
+            if channel.ready_state() == RtcDataChannelState::Open {
+                let exit = make_exit_packet();
+                let _ = self.send_bytes(&exit);
+                let _ = self.send_bytes(&exit);
             }
         }
         

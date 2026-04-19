@@ -517,9 +517,18 @@ impl WebTripSession {
                 if let Some(ref callback) = self.on_state_change {
                     let callback_clone = callback.clone();
                     let state_change_cb = Closure::wrap(Box::new(move |state: String| {
-                        // Map transport states to session states
+                        // Map transport states to session states.
+                        //
+                        // Note: the WebTransport worker only posts "disconnected" after a
+                        // graceful, user-initiated close (i.e. once it has finished
+                        // flushing the JackTrip exit packet). Unexpected connection
+                        // failures are reported separately as {type:"error"}, which the
+                        // WebTransport main-thread handler forwards as "failed". So
+                        // "disconnected" must NOT be treated as an error — doing so
+                        // causes the UI to flip from "Not Connected" to "Connection
+                        // Error" ~20 ms after the user clicks Disconnect.
                         let session_state = match state.as_str() {
-                            "failed" | "disconnected" => "error",
+                            "failed" => "error",
                             "connected" => "connected",
                             "connecting" => "connecting",
                             _ => return,

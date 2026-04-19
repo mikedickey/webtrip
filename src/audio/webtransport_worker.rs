@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 use crate::audio::ring_buffer::RingBuffer;
 use crate::audio::regulator::Regulator;
-use crate::audio::protocol::{AudioPacket, HEADER_SIZE};
+use crate::audio::protocol::{AudioPacket, make_exit_packet, HEADER_SIZE};
 
 /// Post a message to the main thread from the worker
 fn post_message_to_main(msg: &JsValue) {
@@ -227,11 +227,27 @@ pub async fn worker_connect(server_url: String) -> Result<(), JsValue> {
 }
 
 /// Disconnect from the server and stop all loops
+///
+/// Sets `running = false` and then wakes any thread currently sleeping in
+/// `Atomics.waitAsync` on the ring-buffer's has_data flag, so the send loop
+/// notices the shutdown immediately (µs-scale) without relying on a polling
+/// timeout.
 #[wasm_bindgen(js_name = workerDisconnect)]
 pub fn worker_disconnect() {
-    WORKER_STATE.with(|state| {
-        state.borrow().stop();
+    // Clone out the Int32Array first so we don't hold the RefCell borrow across
+    // the notify call (which also avoids lifetime issues with the inner borrow).
+    let array = WORKER_STATE.with(|state| {
+        let state = state.borrow();
+        state.stop();
+        let cloned = state.has_data_int32_array.borrow().clone();
+        cloned
     });
+    // Wake any Atomics.waitAsync sleeper on the has_data flag. The value of the
+    // flag is unchanged; we're only sending a wake-up signal so the send loop's
+    // awaited Promise resolves and it can observe running=false.
+    if let Some(array) = array {
+        let _ = js_sys::Atomics::notify(&array, 0);
+    }
 }
 
 /// Get current worker statistics
@@ -241,17 +257,21 @@ pub fn worker_get_stats() -> WebTransportWorkerStats {
 }
 
 /// Send loop: reads from RingBuffer, sends QUIC datagrams
-/// 
+///
 /// This loop runs continuously while connected, reading audio packets from
 /// the RingBuffer and sending them as unreliable QUIC datagrams via the browser's API.
-/// 
+///
 /// ## Event-Driven Wake-Up
-/// 
-/// When no data is available, the loop uses `Atomics.wait()` to sleep efficiently:
+///
+/// When no data is available, the loop sleeps via `Atomics.waitAsync()`:
 /// - AudioWorklet writes to RingBuffer and calls `Atomics.notify()`
 /// - This worker wakes up immediately (microsecond precision)
 /// - Zero CPU usage while idle
-/// - No setTimeout imprecision or 4ms minimum delays
+/// - The async wait properly yields the worker's JS event loop between
+///   iterations, so control messages (e.g. `{type:"disconnect"}`) can be
+///   dispatched promptly. `worker_disconnect()` additionally calls
+///   `Atomics.notify` on the same flag to unblock the wait on shutdown
+///   even if the AudioWorklet has stopped producing new data.
 async fn send_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(), JsValue> {
     // Get the writable datagram stream
     let datagrams = transport.borrow().datagrams();
@@ -264,10 +284,15 @@ async fn send_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(), 
             e
         })?;
 
+    // Tracks whether the loop exited due to a graceful worker_disconnect() call (as opposed
+    // to a connection error). Only a graceful exit warrants sending an exit packet.
+    let mut graceful_exit = false;
+
     loop {
         // Check if we should stop
         let running = WORKER_STATE.with(|state| state.borrow().is_running());
         if !running {
+            graceful_exit = true;
             break;
         }
 
@@ -366,32 +391,69 @@ async fn send_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(), 
                 }
             }
         } else {
-            // No data available - wait for notification from AudioWorklet
-            // The AudioWorklet calls Atomics.notify() after writing to the ring buffer
+            // No data available. Sleep until the AudioWorklet signals new data
+            // via `Atomics.notify`, or `worker_disconnect()` wakes us.
+            //
+            // We use `Atomics.waitAsync` (the async counterpart of `Atomics.wait`)
+            // to get the best of both worlds:
+            //   - µs-scale wake-up on `Atomics.notify` (same as sync `Atomics.wait`)
+            //   - Zero idle CPU usage
+            //   - The `.await` on the returned Promise properly returns `Pending`
+            //     from `poll()`, handing control back to the JS event loop so
+            //     queued macrotasks (like `onmessage` with a disconnect request)
+            //     can be delivered. A plain sync `Atomics.wait` would not yield,
+            //     starving the worker's event loop.
+            //
+            // `wait_async(array, 0, 0)` means: "sleep while array[0] == 0". When
+            // the AudioWorklet writes new data it sets the flag to 1 and calls
+            // `Atomics.notify`; `worker_disconnect()` also calls `Atomics.notify`
+            // to wake us immediately on shutdown.
             let int32_array = WORKER_STATE.with(|state| {
-                let state = state.borrow();
-                // Clone the Int32Array so we can use it outside the closure
-                let result = state.has_data_int32_array.borrow().clone();
-                result
+                state.borrow().has_data_int32_array.borrow().clone()
             });
-            
-            // Wait for Atomics.notify() from the AudioWorklet
-            // This is event-driven with microsecond precision and zero CPU usage when idle
             if let Some(array) = int32_array {
-                // Wait with a short timeout to allow responsive shutdown
-                // wait() params: array, index, expected_value, timeout_ms
-                // Returns: "ok" (notified), "not-equal" (value changed), "timed-out"
-                let _result = js_sys::Atomics::wait_with_timeout(
-                    &array,
-                    0,    // index in the Int32Array
-                    0,    // expected value (wait if flag is 0, wake when it becomes 1)
-                    1.0   // 1ms timeout for responsive shutdown (zero CPU while waiting)
-                );
-                // Note: We don't need to check the result - if we're notified or timeout,
-                // we'll loop back and try to read. The ring buffer's read() will clear
-                // the flag back to 0 if there's no more data.
+                match js_sys::Atomics::wait_async(&array, 0, 0) {
+                    Ok(result) => {
+                        // Result shape: { async: bool, value: Promise | String }.
+                        // If async=false, the value already changed — no wait needed.
+                        let is_async = Reflect::get(&result, &"async".into())
+                            .ok()
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if is_async {
+                            if let Ok(promise_val) = Reflect::get(&result, &"value".into()) {
+                                if let Ok(promise) = promise_val.dyn_into::<js_sys::Promise>() {
+                                    let _ = JsFuture::from(promise).await;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // `waitAsync` not available on this agent — should be
+                        // impossible for WebTransport-capable browsers, but fall
+                        // back to a microtask yield so we at least make progress
+                        // and don't starve the event loop.
+                        let _ = JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL)).await;
+                    }
+                }
+            } else {
+                // has_data_int32_array not initialized yet — yield and retry.
+                let _ = JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL)).await;
             }
         }
+    }
+
+    // On graceful disconnect: send two JackTrip exit packets (63-byte control packets,
+    // all 0xFF) so the hub reclaims the client slot immediately, then notify the
+    // main thread so it can terminate this worker.
+    if graceful_exit {
+        let exit_bytes = make_exit_packet();
+        let array = Uint8Array::new_with_length(exit_bytes.len() as u32);
+        array.copy_from(&exit_bytes);
+        let _ = JsFuture::from(writer.write_with_chunk(&array)).await; // best-effort
+        let _ = JsFuture::from(writer.write_with_chunk(&array)).await; // best-effort
+
+        post_message_to_main(&JsValue::from_str("disconnected"));
     }
 
     Ok(())
@@ -599,12 +661,11 @@ pub fn handle_worker_message(msg: JsValue) -> js_sys::Promise {
             })
         }
         "disconnect" => {
+            // Signal the send loop to stop. It will send the JackTrip exit packet
+            // and post "disconnected" to the main thread before returning.
             worker_disconnect();
-            
-            // Post disconnected message to main thread
-            post_message_to_main(&JsValue::from_str("disconnected"));
-            
-            js_sys::Promise::resolve(&JsValue::from_str("disconnected"))
+
+            js_sys::Promise::resolve(&JsValue::from_str("ok"))
         }
         "getStats" => {
             let stats = worker_get_stats();
