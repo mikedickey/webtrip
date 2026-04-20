@@ -185,7 +185,7 @@ class WebTripApp {
     this.serverHostInput.type = "text";
     this.serverHostInput.className = "text-input";
     this.serverHostInput.placeholder = "studio.jacktrip.org";
-    this.serverHostInput.value = "localhost.miked.io";
+    this.serverHostInput.value = window.location.hostname || "localhost";
     hostGroup.appendChild(hostLabel);
     hostGroup.appendChild(this.serverHostInput);
     hostPortRow.appendChild(hostGroup);
