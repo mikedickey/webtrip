@@ -226,3 +226,65 @@ impl Default for SampleRate {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip<T>(value: &T)
+    where
+        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+    {
+        let json = serde_json::to_string(value).expect("serialize");
+        let back: T = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(value, &back, "round-trip mismatch; json={json}");
+    }
+
+    #[test]
+    fn resource_status_variants_roundtrip_and_wire_format() {
+        for v in [
+            ResourceStatus::Starting,
+            ResourceStatus::Ready,
+            ResourceStatus::Disabled,
+            ResourceStatus::Deleting,
+        ] {
+            roundtrip(&v);
+        }
+        // PascalCase on the wire
+        assert_eq!(serde_json::to_string(&ResourceStatus::Starting).unwrap(), "\"Starting\"");
+        assert_eq!(serde_json::to_string(&ResourceStatus::Ready).unwrap(), "\"Ready\"");
+        assert_eq!(serde_json::to_string(&ResourceStatus::Disabled).unwrap(), "\"Disabled\"");
+        assert_eq!(serde_json::to_string(&ResourceStatus::Deleting).unwrap(), "\"Deleting\"");
+
+        let v: ResourceStatus = serde_json::from_str("\"Ready\"").unwrap();
+        assert_eq!(v, ResourceStatus::Ready);
+    }
+
+    #[test]
+    fn studio_type_variants_roundtrip_and_wire_format() {
+        roundtrip(&StudioType::JackTrip);
+        roundtrip(&StudioType::JackTripJamulus);
+        // JackTrip is the default Serialize name; JackTripJamulus is renamed
+        assert_eq!(serde_json::to_string(&StudioType::JackTrip).unwrap(), "\"JackTrip\"");
+        assert_eq!(
+            serde_json::to_string(&StudioType::JackTripJamulus).unwrap(),
+            "\"JackTrip+Jamulus\""
+        );
+        let v: StudioType = serde_json::from_str("\"JackTrip+Jamulus\"").unwrap();
+        assert_eq!(v, StudioType::JackTripJamulus);
+    }
+
+    #[test]
+    fn defaults_are_sensible() {
+        assert_eq!(Period::default(), Period::P128);
+        assert_eq!(QueueBuffer::default(), QueueBuffer::Q4);
+        assert_eq!(BufferStrategy::default(), BufferStrategy::Standard);
+        assert_eq!(Quality::default(), Quality::Lossless);
+        assert_eq!(Channels::default(), Channels::Stereo);
+        assert_eq!(BroadcastVisibility::default(), BroadcastVisibility::Off);
+        assert_eq!(Visibility::default(), Visibility::Private);
+        assert_eq!(ResourceStatus::default(), ResourceStatus::Starting);
+        assert_eq!(RecordingStatus::default(), RecordingStatus::Recording);
+        assert_eq!(StudioType::default(), StudioType::JackTrip);
+        assert_eq!(SampleRate::default(), SampleRate::Rate48000);
+    }
+}

@@ -8,6 +8,12 @@ For general project background see [README.md](README.md). For the threading mod
 
 This project has not been released yet. Do not preserve or design for backward compatibility; prefer the simplest clean changes and avoid paying compatibility costs before first release.
 
+## No Code Duplication
+
+**Do not duplicate code anywhere in this codebase — including test code.** Before writing any function, type, constant, or block of logic, check whether it already exists and reuse it. If the same code would appear in more than one place, extract it to a shared location first.
+
+This applies equally to test helpers, serialization utilities, fixture builders, and any other repeated patterns. When you spot existing duplication, fix it as part of the task at hand rather than leaving it in place.
+
 ## Build Commands
 
 **Always use npm scripts for building, never call wasm-pack directly** — the WASM build requires specific flags for threading support (atomics, shared memory, TLS exports).

@@ -239,3 +239,67 @@ pub struct AlsaConfig {
     pub periods: Option<i32>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use super::super::test_utils::roundtrip;
+
+    #[test]
+    fn device_fixture_known_good() {
+        // Fixture modeled after docs/api/devices.md — typical agent config payload.
+        let json = r#"{
+          "id": "dev-1",
+          "mac": "AA:BB:CC:DD:EE:FF",
+          "name": "Living Room JT",
+          "ownerId": "user-1",
+          "studioId": "studio-1",
+          "version": "2.4.0",
+          "quality": 2,
+          "inputChannels": 2,
+          "outputChannels": 2,
+          "period": 128,
+          "queueBuffer": 4,
+          "bufferStrategy": 1,
+          "captureVolume": 80,
+          "captureMute": false,
+          "playbackVolume": 70,
+          "playbackMute": false,
+          "createdAt": "2026-06-14T00:00:00Z"
+        }"#;
+        let d: Device = serde_json::from_str(json).unwrap();
+        assert_eq!(d.quality, Some(Quality::Lossless));
+        assert_eq!(d.input_channels, Some(Channels::Stereo));
+        assert_eq!(d.output_channels, Some(Channels::Stereo));
+        assert_eq!(d.period, Some(Period::P128));
+
+        let s = serde_json::to_string(&d).unwrap();
+        assert!(s.contains("\"ownerId\":"));
+        assert!(s.contains("\"inputChannels\":2"));
+        assert!(s.contains("\"captureVolume\":80"));
+    }
+
+    #[test]
+    fn device_heartbeat_renames_type_field() {
+        let h = DeviceHeartbeat {
+            mac: Some("00:11:22:33:44:55".into()),
+            version: Some("1.0".into()),
+            device_type: Some("usb-x2".into()),
+            api_prefix: Some("pref".into()),
+            api_secret: Some("sec".into()),
+            pkts_recv: Some(1000),
+            pkts_sent: Some(1001),
+            min_rtt: Some(10),
+            max_rtt: Some(30),
+            avg_rtt: Some(15),
+            stddev_rtt: Some(2),
+            latest_rtt: Some(14),
+            stats_updated_at: Some("2026-06-14T00:00:00Z".into()),
+        };
+        let s = roundtrip(&h);
+        // device_type field is serialized as "type"
+        assert!(s.contains("\"type\":\"usb-x2\""));
+        assert!(!s.contains("deviceType"));
+    }
+}
+

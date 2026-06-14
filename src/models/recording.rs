@@ -155,3 +155,78 @@ pub struct RecordingsQuota {
     pub count: Option<i32>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::test_utils::roundtrip;
+
+    #[test]
+    fn recording_metadata_fixture_known_good() {
+        // Fixture modeled after docs/api/recordings.md.
+        let json = r#"{
+          "id": "rec-1",
+          "name": "Last Night's Show",
+          "description": "Live recording",
+          "location": "https://s3.example.com/rec-1.mp4",
+          "streamId": "stream-1",
+          "serverName": "My Studio",
+          "image": "https://cdn.example.com/thumb.png",
+          "views": 42,
+          "likes": 7,
+          "startOffset": 0,
+          "status": 2,
+          "visibility": 1,
+          "createdAt": "2026-06-14T01:00:00Z",
+          "updatedAt": "2026-06-14T02:00:00Z"
+        }"#;
+        let r: RecordingMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(r.status, Some(RecordingStatus::Ready));
+        assert_eq!(r.visibility, Some(Visibility::Public));
+        assert_eq!(r.views, Some(42));
+
+        let out = serde_json::to_string(&r).unwrap();
+        assert!(out.contains("\"streamId\":"));
+        assert!(out.contains("\"startOffset\":"));
+        assert!(out.contains("\"status\":2"));
+        assert!(out.contains("\"visibility\":1"));
+    }
+
+    #[test]
+    fn personalized_recording_flattens_metadata() {
+        let p = PersonalizedRecording {
+            metadata: RecordingMetadata {
+                id: Some("r1".into()),
+                name: Some("Show".into()),
+                status: Some(RecordingStatus::Processing),
+                ..Default::default()
+            },
+            liked: Some(true),
+            following: Some(false),
+        };
+        let s = roundtrip(&p);
+        // Flatten means the metadata fields appear at the top level alongside
+        // `liked`/`following`, NOT nested under `metadata`.
+        assert!(s.contains("\"id\":\"r1\""));
+        assert!(s.contains("\"status\":1"));
+        assert!(s.contains("\"liked\":true"));
+        assert!(s.contains("\"following\":false"));
+        assert!(!s.contains("\"metadata\":"));
+    }
+
+    #[test]
+    fn server_recording_flattens_metadata() {
+        let r = ServerRecording {
+            metadata: RecordingMetadata { id: Some("r1".into()), ..Default::default() },
+            studio_id: Some("s1".into()),
+            duration: Some(360.5),
+            file_size: Some(1_234_567_890),
+            has_stems: Some(true),
+        };
+        let s = roundtrip(&r);
+        assert!(s.contains("\"studioId\":\"s1\""));
+        assert!(s.contains("\"hasStems\":true"));
+        assert!(s.contains("\"fileSize\":1234567890"));
+        assert!(!s.contains("\"metadata\":"));
+    }
+}
+

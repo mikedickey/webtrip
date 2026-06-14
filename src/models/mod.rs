@@ -39,6 +39,10 @@ pub use region::*;
 mod pagination;
 pub use pagination::*;
 
+// Shared test utilities
+#[cfg(test)]
+pub mod test_utils;
+
 // API request/response types
 mod requests;
 pub use requests::*;

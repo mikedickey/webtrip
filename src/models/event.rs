@@ -143,3 +143,35 @@ pub struct EventInfo {
     pub end_time: Option<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::test_utils::roundtrip;
+
+    #[test]
+    fn public_upcoming_event_fixture_known_good() {
+        // Fixture modeled after docs/api/events.md.
+        let json = r#"{
+          "id": "evt-1",
+          "title": "Friday Night Jam",
+          "description": "Recurring jam",
+          "streamId": "stream-1",
+          "streamName": "Studio Live",
+          "image": "https://cdn.example.com/img.png",
+          "bannerUrl": "https://cdn.example.com/banner.png",
+          "startTime": "2026-06-20T01:00:00Z",
+          "endTime": "2026-06-20T03:00:00Z",
+          "timezone": "America/Los_Angeles",
+          "recurring": true,
+          "rrule": "FREQ=WEEKLY;BYDAY=FR"
+        }"#;
+        let e: PublicUpcomingEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(e.recurring, Some(true));
+        assert_eq!(e.timezone.as_deref(), Some("America/Los_Angeles"));
+        let s = roundtrip(&e);
+        assert!(s.contains("\"streamId\":"));
+        assert!(s.contains("\"startTime\":"));
+        assert!(s.contains("\"endTime\":"));
+    }
+}
+

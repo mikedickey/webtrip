@@ -128,3 +128,24 @@ pub struct Session {
     pub duration: Option<i32>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::test_utils::roundtrip;
+
+    #[test]
+    fn message_renames_type_field() {
+        let m = Message {
+            id: Some("m1".into()),
+            sender_id: Some("u1".into()),
+            sender_name: Some("Alice".into()),
+            content: Some("hi".into()),
+            message_type: Some("text".into()),
+            created_at: Some("2026-06-14T00:00:00Z".into()),
+            read: Some(false),
+        };
+        let s = roundtrip(&m);
+        assert!(s.contains("\"type\":\"text\""));
+        assert!(!s.contains("messageType"));
+    }
+}

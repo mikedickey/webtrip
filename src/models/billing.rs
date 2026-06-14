@@ -178,3 +178,45 @@ pub struct UsageResponse {
     pub limits: Option<Plan>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn billing_info_fixture_known_good() {
+        // Fixture modeled after docs/api/billing.md.
+        let json = r#"{
+          "userId": "user-1",
+          "plan": {
+            "id": "pro",
+            "name": "Pro",
+            "price": 1999,
+            "currency": "usd",
+            "interval": "month",
+            "maxStudios": 3,
+            "maxDevices": 5,
+            "maxMusicians": 10,
+            "studioHours": 100,
+            "recordingStorageGb": 50,
+            "broadcastEnabled": true,
+            "regions": ["us-west-2", "us-east-1"],
+            "features": ["broadcast", "recording"]
+          },
+          "status": "active",
+          "stripeCustomerId": "cus_abc",
+          "periodStart": "2026-06-01T00:00:00Z",
+          "periodEnd": "2026-07-01T00:00:00Z",
+          "cancelAtPeriodEnd": false
+        }"#;
+        let b: BillingInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(b.plan.as_ref().and_then(|p| p.id.as_deref()), Some("pro"));
+        assert_eq!(b.plan.as_ref().and_then(|p| p.max_studios), Some(3));
+
+        let out = serde_json::to_string(&b).unwrap();
+        assert!(out.contains("\"userId\":"));
+        assert!(out.contains("\"stripeCustomerId\":"));
+        assert!(out.contains("\"cancelAtPeriodEnd\":"));
+        assert!(out.contains("\"recordingStorageGb\":"));
+    }
+}
+

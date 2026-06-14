@@ -85,3 +85,51 @@ pub struct InstanceType {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<u32>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn region_fixture_known_good() {
+        // Fixture modeled after the system regions endpoint described in
+        // docs/api/system.md. Region uses explicit per-field renames rather
+        // than rename_all; verify those are honoured on the wire.
+        let json = r#"{
+          "id": "gcloud-us-ut-slc",
+          "group": "Americas",
+          "provider": "gcloud",
+          "region": "us-west3",
+          "label": "USA - Salt Lake City, UT",
+          "imageId": "img-abc",
+          "armImageId": "img-arm-abc",
+          "subnetId": "sub-1",
+          "instanceTypes": [
+            {"id": "n2-highcpu-2", "family": "n2-highcpu", "vCPU": 2, "max": 4}
+          ],
+          "active": true,
+          "latitude": 40.76,
+          "longitude": -111.89,
+          "cloudHost": "https://gcloud.example.com"
+        }"#;
+        let r: Region = serde_json::from_str(json).unwrap();
+        assert_eq!(r.id.as_deref(), Some("gcloud-us-ut-slc"));
+        assert_eq!(r.instance_types.as_ref().map(|v| v.len()), Some(1));
+        assert_eq!(
+            r.instance_types.as_ref().and_then(|v| v.first()).map(|i| i.id.as_str()),
+            Some("n2-highcpu-2")
+        );
+
+        let out = serde_json::to_string(&r).unwrap();
+        assert!(out.contains("\"imageId\":"));
+        assert!(out.contains("\"armImageId\":"));
+        assert!(out.contains("\"subnetId\":"));
+        assert!(out.contains("\"instanceTypes\":"));
+        assert!(out.contains("\"cloudHost\":"));
+        assert!(out.contains("\"vCPU\":2"));
+        // Region uses field-level renames, so snake_case keys for unrenamed
+        // fields should still appear (e.g. "group", "label")
+        assert!(out.contains("\"group\":\"Americas\""));
+    }
+}
+

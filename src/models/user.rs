@@ -146,3 +146,52 @@ pub struct Notification {
     pub created_at: Option<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use super::super::test_utils::roundtrip;
+
+    #[test]
+    fn user_fixture_matches_wire_format() {
+        // Fixture modeled after docs/api/users.md (auth0-style user). Note
+        // user_id / user_metadata / app_metadata are snake_case on the wire
+        // even though the rest of the struct is camelCase.
+        let json = r#"{
+          "user_id": "auth0|abc123",
+          "name": "Ada Lovelace",
+          "nickname": "ada",
+          "picture": "https://example.com/ada.png",
+          "user_metadata": {"email": "ada@example.com", "location": "London"},
+          "app_metadata": {"plan": "pro", "admin": true}
+        }"#;
+        let u: User = serde_json::from_str(json).unwrap();
+        assert_eq!(u.user_id.as_deref(), Some("auth0|abc123"));
+        assert_eq!(u.user_metadata.as_ref().and_then(|m| m.email.as_deref()), Some("ada@example.com"));
+        assert_eq!(u.app_metadata.as_ref().and_then(|m| m.admin), Some(true));
+
+        let s = serde_json::to_string(&u).unwrap();
+        assert!(s.contains("\"user_id\":"));
+        assert!(s.contains("\"user_metadata\":"));
+        assert!(s.contains("\"app_metadata\":"));
+        assert!(!s.contains("\"userId\":"));
+    }
+
+    #[test]
+    fn notification_type_field_renames_to_type() {
+        let n = Notification {
+            id: Some("n1".into()),
+            notification_type: Some("studio_invite".into()),
+            title: Some("Welcome".into()),
+            message: Some("Hello".into()),
+            read: Some(false),
+            created_at: Some("2026-06-14T00:00:00Z".into()),
+        };
+        let s = roundtrip(&n);
+        assert!(s.contains("\"type\":\"studio_invite\""));
+        assert!(!s.contains("notificationType"));
+        let raw = r#"{"id":"x","type":"like","read":true}"#;
+        let n2: Notification = serde_json::from_str(raw).unwrap();
+        assert_eq!(n2.notification_type.as_deref(), Some("like"));
+    }
+}

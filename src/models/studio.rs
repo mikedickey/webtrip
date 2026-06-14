@@ -289,3 +289,47 @@ pub struct ServerMix {
     pub solo: Option<bool>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn studio_fixture_known_good() {
+        // Fixture modeled after docs/api/studios.md — a typical studio create response.
+        // Note the `bannerURL` (preserved casing) and `type` rename.
+        let json = r#"{
+          "id": "studio123",
+          "ownerId": "user-1",
+          "region": "us-west-2",
+          "type": "JackTrip+Jamulus",
+          "name": "My Studio",
+          "bannerURL": "https://cdn.example.com/banner.png",
+          "status": "Ready",
+          "period": 128,
+          "queueBuffer": 4,
+          "bufferStrategy": 1,
+          "sampleRate": 48000,
+          "broadcast": 2,
+          "stereo": true,
+          "public": false,
+          "createdAt": "2026-06-14T00:00:00Z"
+        }"#;
+        let s: Studio = serde_json::from_str(json).unwrap();
+        assert_eq!(s.id.as_deref(), Some("studio123"));
+        assert_eq!(s.studio_type, Some(StudioType::JackTripJamulus));
+        assert_eq!(s.status, Some(ResourceStatus::Ready));
+        assert_eq!(s.period, Some(Period::P128));
+        assert_eq!(s.queue_buffer, Some(QueueBuffer::Q4));
+        assert_eq!(s.buffer_strategy, Some(BufferStrategy::Standard));
+        assert_eq!(s.sample_rate, Some(SampleRate::Rate48000));
+        assert_eq!(s.broadcast, Some(BroadcastVisibility::Public));
+        assert_eq!(s.banner_url.as_deref(), Some("https://cdn.example.com/banner.png"));
+
+        // Wire-format check: `type` and `bannerURL` are preserved verbatim.
+        let out = serde_json::to_string(&s).unwrap();
+        assert!(out.contains("\"type\":\"JackTrip+Jamulus\""));
+        assert!(out.contains("\"bannerURL\":"));
+        assert!(out.contains("\"ownerId\":"));
+        assert!(out.contains("\"queueBuffer\":4"));
+    }
+}

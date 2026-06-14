@@ -381,3 +381,68 @@ pub struct Invoice {
     pub hosted_url: Option<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::test_utils::roundtrip;
+
+    #[test]
+    fn server_config_renames_type_to_studio_type() {
+        let c = ServerConfig {
+            studio_type: Some(super::super::StudioType::JackTripJamulus),
+            name: Some("Studio".into()),
+            server_host: Some("studio.example.com".into()),
+            server_port: Some(4464),
+            sample_rate: Some(super::super::SampleRate::Rate48000),
+            public: Some(true),
+            stereo: Some(true),
+            loopback: Some(false),
+            enabled: Some(true),
+        };
+        let s = roundtrip(&c);
+        assert!(s.contains("\"type\":\"JackTrip+Jamulus\""));
+        assert!(s.contains("\"sampleRate\":48000"));
+        assert!(s.contains("\"serverHost\":"));
+        assert!(s.contains("\"serverPort\":4464"));
+        assert!(!s.contains("studioType"));
+    }
+
+    #[test]
+    fn error_response_known_good_fixture() {
+        // Fixture modeled after docs/api/error-handling.md.
+        let json = r#"{
+          "code": "not_found",
+          "message": "Studio not found",
+          "status": 404,
+          "details": {"resource": "studio", "id": "missing"}
+        }"#;
+        let e: Error = serde_json::from_str(json).unwrap();
+        assert_eq!(e.code.as_deref(), Some("not_found"));
+        assert_eq!(e.status, Some(404));
+        assert!(e.details.is_some());
+        let s = roundtrip(&e);
+        assert!(s.contains("\"code\":\"not_found\""));
+        assert!(s.contains("\"status\":404"));
+    }
+
+    #[test]
+    fn server_with_subscription_flattens_studio() {
+        let s = ServerWithSubscription {
+            server: super::super::Studio {
+                id: Some("st1".into()),
+                name: Some("Studio".into()),
+                ..Default::default()
+            },
+            subscription: Some(super::super::Subscription {
+                id: Some("sub_1".into()),
+                status: Some("active".into()),
+                ..Default::default()
+            }),
+        };
+        let out = roundtrip(&s);
+        // Flatten means Studio fields are at top level, not nested under "server".
+        assert!(out.contains("\"id\":\"st1\""));
+        assert!(out.contains("\"subscription\":"));
+        assert!(!out.contains("\"server\":"));
+    }
+}
