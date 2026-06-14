@@ -157,3 +157,97 @@ impl DevicesApi {
         self.update_capture_volume(&studio_id, min, max).await
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use mockito;
+
+    #[tokio::test]
+    async fn test_list_devices_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/devices")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[{"id":"device1","name":"Test Device"}]"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = DevicesApi::from_client(&client);
+        let result = api.list_devices().await;
+
+        assert!(result.is_ok());
+        let devices = result.unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, Some("device1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_devices_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/devices")
+            .with_status(403)
+            .with_body("Forbidden")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = DevicesApi::from_client(&client);
+        let result = api.list_devices().await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::Http { status, .. } => assert_eq!(status, 403),
+            _ => panic!("Expected HTTP error"),
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_device_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/devices/dev123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"dev123","name":"My Device","online":true}"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = DevicesApi::from_client(&client);
+        let result = api.get_device("dev123").await;
+
+        assert!(result.is_ok());
+        let device = result.unwrap();
+        assert_eq!(device.id, Some("dev123".to_string()));
+        assert_eq!(device.name, Some("My Device".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_device_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/devices/nonexistent")
+            .with_status(404)
+            .with_body("Not Found")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = DevicesApi::from_client(&client);
+        let result = api.get_device("nonexistent").await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::Http { status, .. } => assert_eq!(status, 404),
+            _ => panic!("Expected HTTP error"),
+        }
+        mock.assert_async().await;
+    }
+}

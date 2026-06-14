@@ -314,3 +314,97 @@ impl RecordingsApi {
         self.get_recordings_quota(&user_id).await
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use mockito;
+
+    #[tokio::test]
+    async fn test_list_recordings_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/recordings")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[{"id":"rec1","name":"Test Recording"}]"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = RecordingsApi::from_client(&client);
+        let result = api.list_recordings().await;
+
+        assert!(result.is_ok());
+        let recordings = result.unwrap();
+        assert_eq!(recordings.len(), 1);
+        assert_eq!(recordings[0].id, Some("rec1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_recordings_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/recordings")
+            .with_status(500)
+            .with_body("Internal Server Error")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = RecordingsApi::from_client(&client);
+        let result = api.list_recordings().await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::Http { status, .. } => assert_eq!(status, 500),
+            _ => panic!("Expected HTTP error"),
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_recording_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/recordings/rec123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"rec123","name":"My Recording","duration":120}"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = RecordingsApi::from_client(&client);
+        let result = api.get_recording("rec123").await;
+
+        assert!(result.is_ok());
+        let recording = result.unwrap();
+        assert_eq!(recording.metadata.id, Some("rec123".to_string()));
+        assert_eq!(recording.metadata.name, Some("My Recording".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_recording_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/recordings/nonexistent")
+            .with_status(404)
+            .with_body("Not Found")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = RecordingsApi::from_client(&client);
+        let result = api.get_recording("nonexistent").await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::Http { status, .. } => assert_eq!(status, 404),
+            _ => panic!("Expected HTTP error"),
+        }
+        mock.assert_async().await;
+    }
+}

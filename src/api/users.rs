@@ -249,3 +249,99 @@ impl UsersApi {
         self.get_user_follows(&user_id, page, limit).await
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use mockito;
+
+    #[tokio::test]
+    async fn test_get_current_user_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/users/me")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"user_id":"user123","name":"Test User","nickname":"tester"}"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = UsersApi::from_client(&client);
+        let result = api.get_current_user().await;
+
+        assert!(result.is_ok());
+        let user = result.unwrap();
+        assert_eq!(user.user_id, Some("user123".to_string()));
+        assert_eq!(user.name, Some("Test User".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_current_user_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/users/me")
+            .with_status(401)
+            .with_body("Unauthorized")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = UsersApi::from_client(&client);
+        let result = api.get_current_user().await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::Http { status, .. } => assert_eq!(status, 401),
+            _ => panic!("Expected HTTP error"),
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_search_users_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/users")
+            .match_query(mockito::Matcher::UrlEncoded("q".into(), "john".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[{"user_id":"user1","name":"John Doe"}]"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = UsersApi::from_client(&client);
+        let result = api.search_users("john").await;
+
+        assert!(result.is_ok());
+        let users = result.unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].user_id, Some("user1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_search_users_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/users")
+            .match_query(mockito::Matcher::Any)
+            .with_status(400)
+            .with_body("Bad Request")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = UsersApi::from_client(&client);
+        let result = api.search_users("test").await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::Http { status, .. } => assert_eq!(status, 400),
+            _ => panic!("Expected HTTP error"),
+        }
+        mock.assert_async().await;
+    }
+}

@@ -115,3 +115,7 @@ web-sys = { version = "0.3.83", features = [
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+mockito = "1.7.2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
