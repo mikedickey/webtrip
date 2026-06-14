@@ -325,6 +325,10 @@ mod tests {
         let result = api.get_studio("nonexistent").await;
 
         assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::Http { status, .. } => assert_eq!(status, 404),
+            _ => panic!("Expected HTTP error"),
+        }
         mock.assert_async().await;
     }
 }
