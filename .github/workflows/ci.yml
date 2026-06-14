@@ -45,7 +45,7 @@ jobs:
       - name: Check whether image already exists
         id: exists
         run: |
-          docker pull "${{ steps.fingerprint.outputs.ref }}" 2>/dev/null \
+          docker manifest inspect "${{ steps.fingerprint.outputs.ref }}" 2>/dev/null \
             && echo "hit=true"  >> "$GITHUB_OUTPUT" \
             || echo "hit=false" >> "$GITHUB_OUTPUT"
 
