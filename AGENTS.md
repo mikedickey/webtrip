@@ -22,6 +22,9 @@ This project has not been released yet. Do not preserve or design for backward c
 
 - `npm run check` — Run `cargo check` with correct RUSTFLAGS and WASM target
 - `npm run test` — Run `cargo test` with correct RUSTFLAGS (runs native, not WASM)
+- `npm run test:wasm` — Run `wasm-bindgen-test` for browser-only modules (see [docs/WASM_TESTING.md](docs/WASM_TESTING.md) for details)
+
+**Note**: WASM tests require a properly configured browser environment. See the testing guide for requirements and troubleshooting.
 
 ## Architecture
 
