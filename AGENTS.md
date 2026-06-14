@@ -2,9 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project Overview
-
-WebTrip is a Rust-to-WebAssembly rewrite of JackTrip for low-latency audio collaboration in web browsers. Rust code compiles to WASM via wasm-pack; a TypeScript layer handles the UI.
+For general project background see [README.md](README.md). For the threading model, audio data flow, browser API constraints, and transport architecture see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Release Status Policy
 
@@ -27,35 +25,6 @@ This project has not been released yet. Do not preserve or design for backward c
 
 ## Architecture
 
-### Threading Model (3 threads in browser)
-
-1. **Main Thread** — WebRTC signaling, session management, UI updates, `Session.tick()` loop
-2. **AudioWorklet Thread** — Real-time DSP via `AudioProcessor`; reads/writes shared buffers
-3. **Worker Thread** — WebTransport protocol handling (dedicated web worker)
-
-All cross-thread communication uses **lock-free atomics** (no mutexes): `RingBuffer` (SPSC queue), `Regulator` (jitter buffer), and `AudioParams` (shared state).
-
-### Audio Data Flow
-
-**WebRTC** (main thread mediates):
-```
-Send: AudioWorklet → RingBuffer → Session.tick() → WebRtcTransport → DataChannel → Network
-Recv: Network → DataChannel → WebRtcTransport → Session.tick() → Regulator → AudioWorklet
-```
-
-**WebTransport** (worker thread accesses shared buffers directly):
-```
-Send: AudioWorklet → RingBuffer → Worker send_loop() → QUIC datagrams → Network
-Recv: Network → QUIC datagrams → Worker receive_loop() → Regulator → AudioWorklet
-```
-
-### Transport Layer
-
-`Transport` trait (`src/audio/transport.rs`) with three implementations:
-- **WebRtcTransport** — RTCPeerConnection + DataChannels (universal browser support)
-- **WebTransportImpl** — QUIC-based, runs on dedicated worker thread (Chrome/Edge 97+, Firefox 114+, Safari 26.4+)
-- **MockTransport** — Sine wave generator for testing without a server
-
 ### Key Modules
 
 - **`src/session.rs`** — `WebTripSession`: top-level orchestrator, connection state machine, owns shared buffers
@@ -68,18 +37,6 @@ Recv: Network → QUIC datagrams → Worker receive_loop() → Regulator → Aud
 - **`src/models/`** — Typed data models with auto-generated TypeScript types via `tsify-next`
 - **`src/app.ts`** — TypeScript UI controller, initializes WASM, binds DOM elements
 - **`src/lib.rs`** — WASM entry point, exports `init()` and public types to JavaScript
-
-### Browser Requirements
-
-All modes require SharedArrayBuffer (Cross-Origin Isolation via COOP/COEP headers, set by server.js), AudioWorklet API, and MediaDevices API.
-
-**Minimum (WebRTC DataChannels):**
-- Chrome 92+ / Edge 92+ / Firefox 89+ / Safari 16.4+
-- Requires Atomics.waitAsync, SharedArrayBuffer, AudioWorklet, MediaDevices
-
-**WebTransport (QUIC datagrams):**
-- Chrome 97+ / Edge 97+ / Firefox 114+ / Safari 26.4+
-- Falls back to WebRTC when unavailable
 
 ## Rust/WASM Specifics
 
