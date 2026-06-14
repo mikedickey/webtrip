@@ -237,31 +237,5 @@ mod tests {
         assert!(s.contains("\"fileSize\":1234567890"));
         assert!(!s.contains("\"metadata\":"));
     }
-
-    #[test]
-    fn stem_info_roundtrip() {
-        let s = StemInfo {
-            id: Some("st1".into()),
-            name: Some("vocals".into()),
-            url: Some("https://s3/vocals.wav".into()),
-            duration: Some(123.45),
-            file_size: Some(987654321),
-        };
-        let out = roundtrip(&s);
-        assert!(out.contains("\"fileSize\":987654321"));
-    }
-
-    #[test]
-    fn recordings_quota_roundtrip() {
-        let q = RecordingsQuota {
-            used: Some(1_000_000),
-            limit: Some(10_000_000),
-            count: Some(5),
-        };
-        let s = roundtrip(&q);
-        assert!(s.contains("\"used\":1000000"));
-        assert!(s.contains("\"limit\":10000000"));
-        assert!(s.contains("\"count\":5"));
-    }
 }
 

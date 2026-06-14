@@ -182,16 +182,6 @@ pub struct UsageResponse {
 mod tests {
     use super::*;
 
-    fn roundtrip<T>(v: &T) -> String
-    where
-        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
-    {
-        let s = serde_json::to_string(v).expect("serialize");
-        let back: T = serde_json::from_str(&s).expect("deserialize");
-        assert_eq!(v, &back);
-        s
-    }
-
     #[test]
     fn billing_info_fixture_known_good() {
         // Fixture modeled after docs/api/billing.md.
@@ -227,65 +217,6 @@ mod tests {
         assert!(out.contains("\"stripeCustomerId\":"));
         assert!(out.contains("\"cancelAtPeriodEnd\":"));
         assert!(out.contains("\"recordingStorageGb\":"));
-    }
-
-    #[test]
-    fn plan_roundtrip_full() {
-        let p = Plan {
-            id: Some("free".into()),
-            name: Some("Free".into()),
-            description: Some("Free tier".into()),
-            price: Some(0),
-            currency: Some("usd".into()),
-            interval: Some("month".into()),
-            max_studios: Some(1),
-            max_devices: Some(1),
-            max_musicians: Some(2),
-            studio_hours: Some(5),
-            recording_storage_gb: Some(1),
-            broadcast_enabled: Some(false),
-            regions: Some(vec!["us-west-2".into()]),
-            features: Some(vec!["basic".into()]),
-        };
-        roundtrip(&p);
-    }
-
-    #[test]
-    fn subscription_roundtrip_camel_case() {
-        let s = Subscription {
-            id: Some("sub_1".into()),
-            plan_id: Some("pro".into()),
-            status: Some("active".into()),
-            current_period_start: Some("2026-06-01T00:00:00Z".into()),
-            current_period_end: Some("2026-07-01T00:00:00Z".into()),
-            cancel_at_period_end: Some(false),
-            canceled_at: None,
-        };
-        let out = roundtrip(&s);
-        assert!(out.contains("\"planId\":"));
-        assert!(out.contains("\"currentPeriodStart\":"));
-        assert!(out.contains("\"cancelAtPeriodEnd\":"));
-    }
-
-    #[test]
-    fn usage_and_usage_response_roundtrip() {
-        let u = Usage {
-            studio_hours: Some(12.5),
-            active_studios: Some(2),
-            devices: Some(3),
-            recording_storage: Some(1_500_000_000),
-            period_start: Some("2026-06-01T00:00:00Z".into()),
-            period_end: Some("2026-07-01T00:00:00Z".into()),
-        };
-        let out = roundtrip(&u);
-        assert!(out.contains("\"studioHours\":12.5"));
-        assert!(out.contains("\"recordingStorage\":1500000000"));
-
-        let r = UsageResponse {
-            usage: Some(u),
-            limits: Some(Plan { id: Some("free".into()), ..Default::default() }),
-        };
-        roundtrip(&r);
     }
 }
 

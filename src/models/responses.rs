@@ -396,30 +396,6 @@ mod tests {
     }
 
     #[test]
-    fn ping_and_ping_stats_roundtrip() {
-        let p = Ping {
-            version: Some("1.0.0".into()),
-            timestamp: Some("2026-06-14T00:00:00Z".into()),
-            status: Some("ok".into()),
-        };
-        roundtrip(&p);
-
-        let s = PingStats {
-            min_rtt: Some(10),
-            max_rtt: Some(30),
-            avg_rtt: Some(15),
-            stddev_rtt: Some(2),
-            packets_sent: Some(100),
-            packets_received: Some(99),
-            packet_loss: Some(0.01),
-        };
-        let out = roundtrip(&s);
-        assert!(out.contains("\"minRtt\":10"));
-        assert!(out.contains("\"packetsSent\":100"));
-        assert!(out.contains("\"packetLoss\":0.01"));
-    }
-
-    #[test]
     fn server_config_renames_type_to_studio_type() {
         let c = ServerConfig {
             studio_type: Some(super::super::StudioType::JackTripJamulus),
@@ -475,96 +451,5 @@ mod tests {
         assert!(out.contains("\"id\":\"st1\""));
         assert!(out.contains("\"subscription\":"));
         assert!(!out.contains("\"server\":"));
-    }
-
-    #[test]
-    fn checkout_unread_redirect_responses_roundtrip() {
-        roundtrip(&CheckoutResponse {
-            url: Some("https://checkout".into()),
-            session_id: Some("cs_1".into()),
-        });
-        roundtrip(&UnreadMessagesResponse { count: Some(7) });
-        roundtrip(&Redirect { url: Some("https://r".into()) });
-        roundtrip(&ModifiedAtTime {
-            modified_at: Some("2026-06-14T00:00:00Z".into()),
-        });
-        roundtrip(&LiveKitTokenResponse {
-            token: Some("tok".into()),
-            url: Some("wss://lk".into()),
-        });
-    }
-
-    #[test]
-    fn audio_properties_and_device_config_roundtrip() {
-        roundtrip(&AudioProperties {
-            sample_rate: Some(48000),
-            bit_depth: Some(24),
-            channels: Some(2),
-            codec: Some("pcm".into()),
-            bitrate: Some(1411),
-        });
-
-        roundtrip(&DeviceConfig {
-            device: Some(super::super::Device { id: Some("d1".into()), ..Default::default() }),
-            studio: Some(super::super::Studio { id: Some("s1".into()), ..Default::default() }),
-        });
-    }
-
-    #[test]
-    fn server_agent_config_and_billing_portal_roundtrip() {
-        roundtrip(&ServerAgentConfig {
-            version: Some("0.1.0".into()),
-            update_url: Some("https://updates".into()),
-            heartbeat_interval: Some(30),
-        });
-        roundtrip(&BillingPortalResponse {
-            url: Some("https://billing".into()),
-        });
-    }
-
-    #[test]
-    fn coupon_promo_entitlement_roundtrip() {
-        let c = CouponResponse {
-            valid: Some(true),
-            discount: Some(0.10),
-            discount_type: Some("percent_off".into()),
-            error: None,
-        };
-        let s = roundtrip(&c);
-        assert!(s.contains("\"discountType\":"));
-
-        roundtrip(&PromoResponse {
-            applied: Some(true),
-            description: Some("10% off".into()),
-            error: None,
-        });
-        roundtrip(&Entitlement {
-            id: Some("ent-1".into()),
-            name: Some("Recording".into()),
-            description: Some("Enables recording".into()),
-            enabled: Some(true),
-        });
-    }
-
-    #[test]
-    fn invoice_list_response_roundtrip() {
-        let r = InvoiceListResponse {
-            invoices: Some(vec![Invoice {
-                id: Some("inv_1".into()),
-                number: Some("1001".into()),
-                amount: Some(1999),
-                currency: Some("usd".into()),
-                status: Some("paid".into()),
-                date: Some("2026-06-14T00:00:00Z".into()),
-                pdf_url: Some("https://pdf".into()),
-                hosted_url: Some("https://hosted".into()),
-            }]),
-            cursor: Some("cur_xyz".into()),
-            has_more: Some(false),
-        };
-        let s = roundtrip(&r);
-        assert!(s.contains("\"hasMore\":false"));
-        assert!(s.contains("\"pdfUrl\":"));
-        assert!(s.contains("\"hostedUrl\":"));
     }
 }

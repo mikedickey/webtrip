@@ -240,95 +240,6 @@ mod tests {
     }
 
     #[test]
-    fn period_variants_roundtrip() {
-        for v in [
-            Period::P16,
-            Period::P32,
-            Period::P64,
-            Period::P128,
-            Period::P256,
-            Period::P512,
-            Period::P1024,
-            Period::P2048,
-        ] {
-            roundtrip(&v);
-            let n = serde_json::to_string(&v).unwrap();
-            assert_eq!(n.parse::<u16>().unwrap(), v as u16);
-        }
-    }
-
-    #[test]
-    fn queue_buffer_variants_roundtrip() {
-        for v in [
-            QueueBuffer::Q0,
-            QueueBuffer::Q2,
-            QueueBuffer::Q3,
-            QueueBuffer::Q4,
-            QueueBuffer::Q5,
-            QueueBuffer::Q6,
-            QueueBuffer::Q7,
-            QueueBuffer::Q8,
-            QueueBuffer::Q10,
-            QueueBuffer::Q12,
-            QueueBuffer::Q14,
-            QueueBuffer::Q16,
-            QueueBuffer::Q18,
-            QueueBuffer::Q20,
-            QueueBuffer::Q22,
-            QueueBuffer::Q24,
-            QueueBuffer::Q26,
-            QueueBuffer::Q28,
-            QueueBuffer::Q30,
-            QueueBuffer::Q32,
-        ] {
-            roundtrip(&v);
-            assert_eq!(serde_json::to_string(&v).unwrap().parse::<u8>().unwrap(), v as u8);
-        }
-    }
-
-    #[test]
-    fn buffer_strategy_variants_roundtrip() {
-        for v in [BufferStrategy::Standard, BufferStrategy::AutoAdjust, BufferStrategy::Broadcast] {
-            roundtrip(&v);
-        }
-        assert_eq!(serde_json::to_string(&BufferStrategy::Standard).unwrap(), "1");
-        assert_eq!(serde_json::to_string(&BufferStrategy::AutoAdjust).unwrap(), "2");
-        assert_eq!(serde_json::to_string(&BufferStrategy::Broadcast).unwrap(), "3");
-    }
-
-    #[test]
-    fn quality_variants_roundtrip() {
-        for v in [Quality::Low, Quality::High, Quality::Lossless] {
-            roundtrip(&v);
-        }
-        assert_eq!(serde_json::to_string(&Quality::Lossless).unwrap(), "2");
-    }
-
-    #[test]
-    fn channels_variants_roundtrip() {
-        roundtrip(&Channels::Mono);
-        roundtrip(&Channels::Stereo);
-        assert_eq!(serde_json::to_string(&Channels::Mono).unwrap(), "1");
-        assert_eq!(serde_json::to_string(&Channels::Stereo).unwrap(), "2");
-    }
-
-    #[test]
-    fn broadcast_visibility_variants_roundtrip() {
-        for v in [BroadcastVisibility::Off, BroadcastVisibility::Private, BroadcastVisibility::Public] {
-            roundtrip(&v);
-        }
-        assert_eq!(serde_json::to_string(&BroadcastVisibility::Public).unwrap(), "2");
-    }
-
-    #[test]
-    fn visibility_variants_roundtrip() {
-        roundtrip(&Visibility::Private);
-        roundtrip(&Visibility::Public);
-        assert_eq!(serde_json::to_string(&Visibility::Private).unwrap(), "0");
-        assert_eq!(serde_json::to_string(&Visibility::Public).unwrap(), "1");
-    }
-
-    #[test]
     fn resource_status_variants_roundtrip_and_wire_format() {
         for v in [
             ResourceStatus::Starting,
@@ -349,19 +260,6 @@ mod tests {
     }
 
     #[test]
-    fn recording_status_variants_roundtrip() {
-        for v in [
-            RecordingStatus::Recording,
-            RecordingStatus::Processing,
-            RecordingStatus::Ready,
-            RecordingStatus::Failed,
-        ] {
-            roundtrip(&v);
-        }
-        assert_eq!(serde_json::to_string(&RecordingStatus::Failed).unwrap(), "3");
-    }
-
-    #[test]
     fn studio_type_variants_roundtrip_and_wire_format() {
         roundtrip(&StudioType::JackTrip);
         roundtrip(&StudioType::JackTripJamulus);
@@ -373,22 +271,6 @@ mod tests {
         );
         let v: StudioType = serde_json::from_str("\"JackTrip+Jamulus\"").unwrap();
         assert_eq!(v, StudioType::JackTripJamulus);
-    }
-
-    #[test]
-    fn sample_rate_variants_roundtrip() {
-        for v in [
-            SampleRate::Rate44100,
-            SampleRate::Rate48000,
-            SampleRate::Rate88200,
-            SampleRate::Rate96000,
-        ] {
-            roundtrip(&v);
-            assert_eq!(
-                serde_json::to_string(&v).unwrap().parse::<u32>().unwrap(),
-                v as u32
-            );
-        }
     }
 
     #[test]

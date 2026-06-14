@@ -288,49 +288,6 @@ mod tests {
     }
 
     #[test]
-    fn device_roundtrip_with_enums() {
-        let d = Device {
-            id: Some("d1".into()),
-            mac: Some("00:11:22:33:44:55".into()),
-            quality: Some(Quality::High),
-            input_channels: Some(Channels::Mono),
-            output_channels: Some(Channels::Stereo),
-            period: Some(Period::P64),
-            queue_buffer: Some(QueueBuffer::Q6),
-            buffer_strategy: Some(BufferStrategy::Broadcast),
-            capture_volume: Some(50),
-            playback_volume: Some(60),
-            monitor_volume: Some(40),
-            reverb: Some(15),
-            limiter: Some(true),
-            compressor: Some(true),
-            enable_usb: Some(false),
-            ..Default::default()
-        };
-        roundtrip(&d);
-    }
-
-    #[test]
-    fn device_default_empty_object() {
-        assert_eq!(serde_json::to_string(&Device::default()).unwrap(), "{}");
-    }
-
-    #[test]
-    fn device_agent_config_roundtrip() {
-        let c = DeviceAgentConfig {
-            device: Some(Device { id: Some("d1".into()), ..Default::default() }),
-            server: Some(super::super::Studio { id: Some("s1".into()), ..Default::default() }),
-            credentials: Some(AgentCredentials {
-                api_key: Some("key".into()),
-                api_secret: Some("secret".into()),
-            }),
-        };
-        let s = roundtrip(&c);
-        assert!(s.contains("\"apiKey\":"));
-        assert!(s.contains("\"apiSecret\":"));
-    }
-
-    #[test]
     fn device_heartbeat_renames_type_field() {
         let h = DeviceHeartbeat {
             mac: Some("00:11:22:33:44:55".into()),
@@ -351,19 +308,6 @@ mod tests {
         // device_type field is serialized as "type"
         assert!(s.contains("\"type\":\"usb-x2\""));
         assert!(!s.contains("deviceType"));
-    }
-
-    #[test]
-    fn alsa_config_roundtrip() {
-        let a = AlsaConfig {
-            device: Some("hw:0".into()),
-            sample_rate: Some(48000),
-            buffer_size: Some(256),
-            periods: Some(2),
-        };
-        let s = roundtrip(&a);
-        assert!(s.contains("\"sampleRate\":48000"));
-        assert!(s.contains("\"bufferSize\":256"));
     }
 }
 

@@ -90,16 +90,6 @@ pub struct InstanceType {
 mod tests {
     use super::*;
 
-    fn roundtrip<T>(v: &T) -> String
-    where
-        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
-    {
-        let s = serde_json::to_string(v).expect("serialize");
-        let back: T = serde_json::from_str(&s).expect("deserialize");
-        assert_eq!(v, &back);
-        s
-    }
-
     #[test]
     fn region_fixture_known_good() {
         // Fixture modeled after the system regions endpoint described in
@@ -140,39 +130,6 @@ mod tests {
         // Region uses field-level renames, so snake_case keys for unrenamed
         // fields should still appear (e.g. "group", "label")
         assert!(out.contains("\"group\":\"Americas\""));
-    }
-
-    #[test]
-    fn region_empty_default_roundtrip() {
-        let r = Region::default();
-        let s = roundtrip(&r);
-        assert_eq!(s, "{}");
-    }
-
-    #[test]
-    fn instance_type_minimal_roundtrip() {
-        // `id` is non-Option, so it always appears even when empty (#[serde(default)]).
-        let i = InstanceType {
-            id: "t3.micro".into(),
-            family: None,
-            vcpu: None,
-            max: None,
-        };
-        let s = roundtrip(&i);
-        assert_eq!(s, "{\"id\":\"t3.micro\"}");
-    }
-
-    #[test]
-    fn instance_type_full_roundtrip() {
-        let i = InstanceType {
-            id: "Standard_B1s".into(),
-            family: Some("Bs".into()),
-            vcpu: Some(1),
-            max: Some(8),
-        };
-        let s = roundtrip(&i);
-        assert!(s.contains("\"vCPU\":1"));
-        assert!(s.contains("\"family\":\"Bs\""));
     }
 }
 

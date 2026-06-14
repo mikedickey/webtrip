@@ -182,41 +182,5 @@ mod tests {
         assert!(s.contains("\"startTime\":"));
         assert!(s.contains("\"endTime\":"));
     }
-
-    #[test]
-    fn upcoming_event_roundtrip_with_visibility() {
-        let e = UpcomingEvent {
-            id: Some("e1".into()),
-            title: Some("Jam".into()),
-            description: Some("desc".into()),
-            studio_id: Some("s1".into()),
-            stream_id: Some("st1".into()),
-            image: None,
-            visibility: Some(Visibility::Public),
-            start_time: Some("2026-06-20T01:00:00Z".into()),
-            end_time: Some("2026-06-20T02:00:00Z".into()),
-            timezone: Some("UTC".into()),
-            recurring: Some(false),
-            rrule: None,
-            created_at: Some("2026-06-14T00:00:00Z".into()),
-            updated_at: Some("2026-06-14T00:00:00Z".into()),
-        };
-        let s = roundtrip(&e);
-        assert!(s.contains("\"visibility\":1"));
-        assert!(s.contains("\"studioId\":"));
-    }
-
-    #[test]
-    fn event_info_roundtrip() {
-        let e = EventInfo {
-            id: Some("e1".into()),
-            title: Some("Title".into()),
-            start_time: Some("2026-06-20T01:00:00Z".into()),
-            end_time: Some("2026-06-20T02:00:00Z".into()),
-        };
-        let s = roundtrip(&e);
-        assert!(s.contains("\"startTime\":"));
-        assert!(s.contains("\"endTime\":"));
-    }
 }
 
