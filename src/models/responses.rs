@@ -384,16 +384,7 @@ pub struct Invoice {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn roundtrip<T>(v: &T) -> String
-    where
-        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
-    {
-        let s = serde_json::to_string(v).expect("serialize");
-        let back: T = serde_json::from_str(&s).expect("deserialize");
-        assert_eq!(v, &back);
-        s
-    }
+    use super::super::test_utils::roundtrip;
 
     #[test]
     fn server_config_renames_type_to_studio_type() {
@@ -429,7 +420,9 @@ mod tests {
         assert_eq!(e.code.as_deref(), Some("not_found"));
         assert_eq!(e.status, Some(404));
         assert!(e.details.is_some());
-        roundtrip(&e);
+        let s = roundtrip(&e);
+        assert!(s.contains("\"code\":\"not_found\""));
+        assert!(s.contains("\"status\":404"));
     }
 
     #[test]

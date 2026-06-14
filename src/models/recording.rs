@@ -158,16 +158,7 @@ pub struct RecordingsQuota {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn roundtrip<T>(v: &T) -> String
-    where
-        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
-    {
-        let s = serde_json::to_string(v).expect("serialize");
-        let back: T = serde_json::from_str(&s).expect("deserialize");
-        assert_eq!(v, &back);
-        s
-    }
+    use super::super::test_utils::roundtrip;
 
     #[test]
     fn recording_metadata_fixture_known_good() {
