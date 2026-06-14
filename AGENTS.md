@@ -1,6 +1,4 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+# AGENTS.md
 
 For general project background see [README.md](README.md). For the threading model, audio data flow, browser API constraints, and transport architecture see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -61,30 +59,10 @@ This applies equally to test helpers, serialization utilities, fixture builders,
 - OpenAPI spec: `https://test.jacktrip.com/api/redirect/openapi`
 - API docs in `docs/api/`; architecture docs in `docs/ARCHITECTURE.md`
 
-## Cursor Cloud specific instructions
+## Environment-specific instructions
 
-This is a single web app (the WebTrip Demo). The standard commands (`npm run build`,
-`npm run check`, `npm run test`, `npm run test:wasm`, `npm run serve`) are documented
-above and in `README.md`/`docs/WASM_TESTING.md`. The toolchain (Rust nightly,
-`wasm-pack`, version-matched `wasm-bindgen-cli`, Node, a Chrome-matched `chromedriver`)
-is pre-installed in the VM image; the startup update script only runs `npm install`.
+Only read the doc for your environment; skip the others.
 
-Non-obvious caveats:
-
-- **Headless WASM tests** (`npm run test:wasm`) drive Chrome through `chromedriver`,
-  which must match the installed Google Chrome version (run `google-chrome --version`,
-  then install the matching driver from Chrome for Testing). A working `chromedriver`
-  is on `PATH` at `/usr/local/bin/chromedriver`; if `wasm-pack` cannot find it, set
-  `CHROMEDRIVER=/usr/local/bin/chromedriver`. Headless flags come from `webdriver.json`.
-- **The app requires microphone access**, and the VM has no physical microphone, so a
-  normally-launched Chrome shows only the "Microphone Access Required" error. To load
-  the full UI, launch Chrome with `--use-fake-device-for-media-stream
-  --use-fake-ui-for-media-stream` (gives a synthetic mic tone and auto-grants
-  permission). When the computer-use Chrome is already running, relaunching with these
-  flags requires first stopping the existing Chrome (it reuses a fixed user-data-dir).
-- **To exercise the audio pipeline end-to-end without a real JackTrip server**, select
-  the **Mock** transport in the Studio Connection section, then click "Connect to
-  Studio". The status becomes "Connected (Mock)" and the Regulator/Quality stats panel
-  and Level meter update live.
-- `npm run serve` listens on `http://localhost:3000` and sets the COOP/COEP headers
-  required for `SharedArrayBuffer`/threading.
+| Environment | Instructions |
+|-------------|--------------|
+| Cursor Cloud | Read [docs/CURSOR_CLOUD.md](docs/CURSOR_CLOUD.md) before running tests or opening the app in Chrome |
