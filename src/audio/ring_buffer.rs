@@ -208,4 +208,226 @@ impl Default for RingBuffer {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    /// Read the `has_data` flag through the same raw pointer JavaScript uses.
+    fn has_data_flag(rb: &RingBuffer) -> u32 {
+        let ptr = rb.get_has_data_flag_ptr() as *const AtomicU32;
+        unsafe { (*ptr).load(Ordering::Acquire) }
+    }
+
+    /// Convenience: a streaming-enabled buffer ready for writes.
+    fn streaming_buffer() -> RingBuffer {
+        let rb = RingBuffer::new();
+        rb.set_streaming(true);
+        rb
+    }
+
+    #[test]
+    fn push_pop_roundtrip_preserves_values() {
+        let mut rb = streaming_buffer();
+        let input = [0.1, -0.2, 0.3, -0.4, 0.5];
+
+        assert!(rb.write(&input));
+        assert_eq!(rb.available(), input.len() as u32);
+
+        let mut output = [0.0; 5];
+        assert!(rb.read(&mut output));
+        assert_eq!(output, input);
+        assert_eq!(rb.available(), 0);
+        assert_eq!(rb.samples_written(), input.len() as u64);
+        assert_eq!(rb.writes(), 1);
+    }
+
+    #[test]
+    fn fill_to_capacity_then_pop_all() {
+        let mut rb = streaming_buffer();
+        let input: Vec<f32> = (0..RING_BUFFER_SIZE).map(|i| i as f32).collect();
+
+        // Buffer holds exactly RING_BUFFER_SIZE samples.
+        assert!(rb.write(&input));
+        assert_eq!(rb.available(), RING_BUFFER_SIZE as u32);
+
+        // One more sample must be rejected as an overrun.
+        assert!(!rb.write(&[1.0]));
+        assert_eq!(rb.overruns(), 1);
+
+        let mut output = vec![0.0; RING_BUFFER_SIZE];
+        assert!(rb.read(&mut output));
+        assert_eq!(output, input);
+        assert_eq!(rb.available(), 0);
+    }
+
+    #[test]
+    fn wrap_around_across_boundary() {
+        let mut rb = streaming_buffer();
+
+        // Advance both positions close to the buffer boundary so the next
+        // write/read pair straddles the end of the backing Vec.
+        let pad = vec![0.0; RING_BUFFER_SIZE - 16];
+        assert!(rb.write(&pad));
+        let mut sink = vec![0.0; RING_BUFFER_SIZE - 16];
+        assert!(rb.read(&mut sink));
+        assert_eq!(rb.available(), 0);
+
+        // This 64-sample chunk wraps from the tail of the Vec back to index 0.
+        let input: Vec<f32> = (0..64).map(|i| (i as f32) * 0.01).collect();
+        assert!(rb.write(&input));
+        assert_eq!(rb.available(), 64);
+
+        let mut output = vec![0.0; 64];
+        assert!(rb.read(&mut output));
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn available_invariants_under_interleaved_push_pop() {
+        let mut rb = streaming_buffer();
+        let mut expected_used: i64 = 0;
+
+        for round in 0..1000 {
+            let write_len = (round % 7) + 1;
+            let chunk: Vec<f32> = (0..write_len).map(|i| (round + i) as f32).collect();
+            if rb.write(&chunk) {
+                expected_used += write_len as i64;
+            }
+            assert_eq!(rb.available() as i64, expected_used);
+            // available-to-write is the complement of available-to-read.
+            let writable = RING_BUFFER_SIZE as i64 - expected_used;
+            assert!(writable >= 0 && writable <= RING_BUFFER_SIZE as i64);
+
+            let read_len = (round % 5) + 1;
+            if expected_used >= read_len as i64 {
+                let mut out = vec![0.0; read_len];
+                assert!(rb.read(&mut out));
+                expected_used -= read_len as i64;
+            }
+            assert_eq!(rb.available() as i64, expected_used);
+        }
+    }
+
+    #[test]
+    fn has_data_flag_reflects_state() {
+        let mut rb = streaming_buffer();
+        assert_eq!(has_data_flag(&rb), 0);
+
+        assert!(rb.write(&[1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(has_data_flag(&rb), 1, "flag set after write");
+
+        // Partial read leaves data behind; flag stays set.
+        let mut out = [0.0; 2];
+        assert!(rb.read(&mut out));
+        assert_eq!(has_data_flag(&rb), 1, "flag set while data remains");
+
+        // Draining the rest clears the flag.
+        assert!(rb.read(&mut out));
+        assert_eq!(rb.available(), 0);
+        assert_eq!(has_data_flag(&rb), 0, "flag cleared when empty");
+    }
+
+    #[test]
+    fn write_requires_streaming() {
+        let mut rb = RingBuffer::new();
+        assert!(!rb.is_streaming());
+        assert!(!rb.write(&[1.0, 2.0]), "write rejected while not streaming");
+        assert_eq!(rb.available(), 0);
+
+        rb.set_streaming(true);
+        assert!(rb.write(&[1.0, 2.0]));
+    }
+
+    #[test]
+    fn read_with_insufficient_data_zeros_output() {
+        let mut rb = streaming_buffer();
+        assert!(rb.write(&[7.0, 8.0]));
+
+        // Asking for more than is available fails and zero-fills the output.
+        let mut out = [9.0; 4];
+        assert!(!rb.read(&mut out));
+        assert_eq!(out, [0.0; 4]);
+        // Underlying data is untouched and still readable.
+        assert_eq!(rb.available(), 2);
+        assert_eq!(has_data_flag(&rb), 0, "flag cleared when not enough data");
+    }
+
+    #[test]
+    fn clear_resets_positions() {
+        let mut rb = streaming_buffer();
+        assert!(rb.write(&[1.0, 2.0, 3.0]));
+        assert_eq!(rb.available(), 3);
+
+        rb.clear();
+        assert_eq!(rb.available(), 0);
+
+        // Buffer is usable again after clearing.
+        assert!(rb.write(&[4.0, 5.0]));
+        let mut out = [0.0; 2];
+        assert!(rb.read(&mut out));
+        assert_eq!(out, [4.0, 5.0]);
+    }
+
+    #[test]
+    fn reset_stats_zeros_counters() {
+        let mut rb = streaming_buffer();
+        let full: Vec<f32> = vec![0.0; RING_BUFFER_SIZE];
+        assert!(rb.write(&full));
+        assert!(!rb.write(&[1.0])); // force an overrun
+        assert!(rb.writes() >= 1);
+        assert!(rb.samples_written() >= 1);
+        assert_eq!(rb.overruns(), 1);
+
+        rb.reset_stats();
+        assert_eq!(rb.writes(), 0);
+        assert_eq!(rb.samples_written(), 0);
+        assert_eq!(rb.overruns(), 0);
+    }
+
+    #[test]
+    fn concurrent_producer_consumer_preserves_order() {
+        // Share one buffer across two threads via a raw pointer. This mirrors
+        // real usage where the buffer lives in a SharedArrayBuffer and the
+        // producer (worklet) and consumer (main thread) touch disjoint regions.
+        struct Shared(*mut RingBuffer);
+        unsafe impl Send for Shared {}
+
+        let mut rb = streaming_buffer();
+        let shared = Shared(&mut rb as *mut RingBuffer);
+
+        const CHUNK: usize = 128;
+        const TOTAL: usize = CHUNK * 2000;
+
+        let producer = thread::spawn(move || {
+            let rb = unsafe { &mut *shared.0 };
+            let mut next: usize = 0;
+            while next < TOTAL {
+                let chunk: Vec<f32> = (next..next + CHUNK).map(|i| i as f32).collect();
+                // Spin until there is room (consumer is draining concurrently).
+                while !rb.write(&chunk) {
+                    std::hint::spin_loop();
+                }
+                next += CHUNK;
+            }
+        });
+
+        let mut received: usize = 0;
+        let mut out = vec![0.0; CHUNK];
+        while received < TOTAL {
+            if rb.read(&mut out) {
+                for (i, &v) in out.iter().enumerate() {
+                    assert_eq!(v, (received + i) as f32, "out-of-order sample");
+                }
+                received += CHUNK;
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+
+        producer.join().unwrap();
+        assert_eq!(received, TOTAL);
+        assert_eq!(rb.available(), 0, "no samples left behind");
+    }
+}
 
