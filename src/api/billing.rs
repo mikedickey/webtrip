@@ -218,3 +218,93 @@ impl BillingApi {
         self.list_invoices(&user_id, cursor.as_deref(), limit).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockito;
+
+    #[tokio::test]
+    async fn test_get_plans_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/billing/plans")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[{"id":"basic","name":"Basic Plan","price":999}]"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = BillingApi::from_client(&client);
+        let result = api.get_plans().await;
+
+        assert!(result.is_ok());
+        let plans = result.unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].id, Some("basic".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_plans_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/billing/plans")
+            .with_status(500)
+            .with_body("Internal Server Error")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = BillingApi::from_client(&client);
+        let result = api.get_plans().await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::Http { status, .. } => assert_eq!(status, 500),
+            _ => panic!("Expected HTTP error"),
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_subscription_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/users/user123/subscription")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"sub123","planId":"pro","status":"active"}"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = BillingApi::from_client(&client);
+        let result = api.get_subscription("user123").await;
+
+        assert!(result.is_ok());
+        let subscription = result.unwrap();
+        assert_eq!(subscription.id, Some("sub123".to_string()));
+        assert_eq!(subscription.plan_id, Some("pro".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_subscription_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/users/nonexistent/subscription")
+            .with_status(404)
+            .with_body("Not Found")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = BillingApi::from_client(&client);
+        let result = api.get_subscription("nonexistent").await;
+
+        assert!(result.is_err());
+        mock.assert_async().await;
+    }
+}

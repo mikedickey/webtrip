@@ -131,3 +131,95 @@ impl SystemApi {
         self.collect_analytics(&event).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockito;
+
+    #[tokio::test]
+    async fn test_ping_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/ping")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"status":"ok","version":"1.0.0"}"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = SystemApi::from_client(&client);
+        let result = api.ping().await;
+
+        assert!(result.is_ok());
+        let ping = result.unwrap();
+        assert_eq!(ping.status, Some("ok".to_string()));
+        assert_eq!(ping.version, Some("1.0.0".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_ping_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/ping")
+            .with_status(503)
+            .with_header("content-type", "text/plain")
+            .with_body("Service Unavailable")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = SystemApi::from_client(&client);
+        let result = api.ping().await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::Http { status, .. } => assert_eq!(status, 503),
+            _ => panic!("Expected HTTP error"),
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_regions_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/regions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"us-west-1":{"label":"US West","provider":"gcloud"}}"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = SystemApi::from_client(&client);
+        let result = api.list_regions().await;
+
+        assert!(result.is_ok());
+        let regions = result.unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].id, Some("us-west-1".to_string()));
+        assert_eq!(regions[0].label, Some("US West".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_regions_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/regions")
+            .with_status(500)
+            .with_body("Internal Server Error")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = SystemApi::from_client(&client);
+        let result = api.list_regions().await;
+
+        assert!(result.is_err());
+        mock.assert_async().await;
+    }
+}

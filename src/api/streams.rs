@@ -334,3 +334,93 @@ impl StreamsApi {
         self.delete_simulcast_destination(&studio_id, &destination).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockito;
+
+    #[tokio::test]
+    async fn test_list_streams_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/streams")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[{"id":"stream1","name":"Test Stream"}]"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = StreamsApi::from_client(&client);
+        let result = api.list_streams().await;
+
+        assert!(result.is_ok());
+        let streams = result.unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].id, Some("stream1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_streams_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/streams")
+            .with_status(500)
+            .with_body("Internal Server Error")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = StreamsApi::from_client(&client);
+        let result = api.list_streams().await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::Http { status, .. } => assert_eq!(status, 500),
+            _ => panic!("Expected HTTP error"),
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_stream_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/streams/stream123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"stream123","name":"My Stream","followers":42}"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = StreamsApi::from_client(&client);
+        let result = api.get_stream("stream123").await;
+
+        assert!(result.is_ok());
+        let stream = result.unwrap();
+        assert_eq!(stream.id, Some("stream123".to_string()));
+        assert_eq!(stream.name, Some("My Stream".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_stream_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/streams/nonexistent")
+            .with_status(404)
+            .with_body("Not Found")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = StreamsApi::from_client(&client);
+        let result = api.get_stream("nonexistent").await;
+
+        assert!(result.is_err());
+        mock.assert_async().await;
+    }
+}

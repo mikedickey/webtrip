@@ -238,3 +238,93 @@ impl StudiosApi {
         self.get_session(&studio_id).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockito;
+
+    #[tokio::test]
+    async fn test_list_studios_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/studios")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[{"id":"studio1","name":"Test Studio"}]"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = StudiosApi::from_client(&client);
+        let result = api.list_studios().await;
+
+        assert!(result.is_ok());
+        let studios = result.unwrap();
+        assert_eq!(studios.len(), 1);
+        assert_eq!(studios[0].id, Some("studio1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_studios_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/studios")
+            .with_status(401)
+            .with_body("Unauthorized")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = StudiosApi::from_client(&client);
+        let result = api.list_studios().await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::Http { status, .. } => assert_eq!(status, 401),
+            _ => panic!("Expected HTTP error"),
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_studio_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/studios/studio123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"studio123","name":"My Studio","enabled":true}"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = StudiosApi::from_client(&client);
+        let result = api.get_studio("studio123").await;
+
+        assert!(result.is_ok());
+        let studio = result.unwrap();
+        assert_eq!(studio.id, Some("studio123".to_string()));
+        assert_eq!(studio.name, Some("My Studio".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_studio_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/studios/nonexistent")
+            .with_status(404)
+            .with_body("Not Found")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let api = StudiosApi::from_client(&client);
+        let result = api.get_studio("nonexistent").await;
+
+        assert!(result.is_err());
+        mock.assert_async().await;
+    }
+}
