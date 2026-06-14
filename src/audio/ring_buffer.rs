@@ -213,6 +213,12 @@ mod tests {
     use super::*;
     use std::thread;
 
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::*;
+
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_test_configure!(run_in_browser);
+
     /// Read the `has_data` flag through the same raw pointer JavaScript uses.
     fn has_data_flag(rb: &RingBuffer) -> u32 {
         let ptr = rb.get_has_data_flag_ptr() as *const AtomicU32;
@@ -436,6 +442,30 @@ mod tests {
         producer.join().unwrap();
         assert_eq!(received, TOTAL);
         assert_eq!(rb.available(), 0, "no samples left behind");
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn wasm_ringbuffer_basic_operations() {
+        let mut rb = RingBuffer::new();
+        rb.set_streaming(true);
+        
+        assert!(rb.is_streaming());
+        assert_eq!(rb.available(), 0);
+        assert_eq!(rb.writes(), 0);
+        assert_eq!(rb.samples_written(), 0);
+        assert_eq!(rb.overruns(), 0);
+        
+        let input = [0.1, -0.2, 0.3, -0.4];
+        assert!(rb.write(&input));
+        assert_eq!(rb.available(), input.len() as u32);
+        assert_eq!(rb.writes(), 1);
+        assert_eq!(rb.samples_written(), input.len() as u64);
+        
+        let mut output = [0.0; 4];
+        assert!(rb.read(&mut output));
+        assert_eq!(output, input);
+        assert_eq!(rb.available(), 0);
     }
 }
 

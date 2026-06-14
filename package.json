@@ -6,6 +6,7 @@
     "build:container": "docker build -t webtrip/webtrip-builder -f containers/build/Containerfile .",
     "check": "RUSTFLAGS='--cfg=web_sys_unstable_apis -Ctarget-feature=+atomics -Clink-args=--shared-memory -Clink-args=--max-memory=1073741824 -Clink-args=--import-memory -Clink-args=--export=__wasm_init_tls -Clink-args=--export=__tls_size -Clink-args=--export=__tls_align -Clink-args=--export=__tls_base -Clink-args=--export=__heap_base' cargo check --target wasm32-unknown-unknown -Zbuild-std=std,panic_abort",
     "test": "RUSTFLAGS='--cfg=web_sys_unstable_apis' cargo test",
+    "test:wasm": "RUSTFLAGS='--cfg=web_sys_unstable_apis' wasm-pack test --headless --chrome",
     "clean": "rm -rf dist pkg target",
     "serve": "node server.js"
   },

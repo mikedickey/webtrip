@@ -23,6 +23,11 @@ FROM debian:bookworm-slim
 ARG RUST_NIGHTLY=nightly-2026-06-13
 ARG NODE_MAJOR=22
 ARG WASM_PACK_VERSION=0.15.0
+# NOTE: WASM_BINDGEN_VERSION must stay in sync with the wasm-bindgen version in
+# Cargo.lock. wasm-pack only uses a local wasm-bindgen if its version matches
+# the one the crate links against; a mismatch makes it fall back to downloading
+# a prebuilt binary (which is linked against a newer glibc than bookworm ships).
+ARG WASM_BINDGEN_VERSION=0.2.118
 
 LABEL org.opencontainers.image.title="webtrip-build" \
       org.opencontainers.image.description="Rust nightly + wasm-pack + Node toolchain for building WebTrip" \
@@ -43,11 +48,21 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # errors. Redirecting only the caches (rather than overriding HOME) keeps
     # HOME natural, avoiding rustup's "$HOME differs from euid" warning.
     XDG_CACHE_HOME=/opt/cache \
-    npm_config_cache=/opt/cache/npm
+    npm_config_cache=/opt/cache/npm \
+    # `npm run test:wasm` drives wasm-bindgen-test through a headless browser.
+    # Point it at the apt-installed chromedriver (version-matched to chromium)
+    # so it doesn't try to download a driver that mismatches the installed
+    # browser. Headless-Chrome flags (--no-sandbox for running as root in a
+    # container, --disable-dev-shm-usage for the small /dev/shm) come from the
+    # webdriver.json at the repo root.
+    CHROMEDRIVER=/usr/bin/chromedriver
 
 # 1. OS packages: dev essentials + native build toolchain.
 #    build-essential/pkg-config are needed because `npm run test` compiles
 #    `cargo test` for the host (native), not WASM.
+#    chromium + chromium-driver provide the headless browser `npm run test:wasm`
+#    drives via wasm-bindgen-test; installing them together keeps the driver and
+#    browser versions in lockstep.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
@@ -57,6 +72,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ripgrep \
         jq \
         xz-utils \
+        chromium \
+        chromium-driver \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Node.js (repo requires >=18; install current LTS).
@@ -67,7 +84,11 @@ RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
 
 # 3. Rust nightly (pinned) via rustup, with the wasm target and rust-src.
 #    rust-src is required for the `-Zbuild-std` flag the WASM build uses.
-RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | \
+#    `umask 000` so every file rustup writes under RUSTUP_HOME/CARGO_HOME is
+#    world-writable from birth — see the note on step 6 for why we avoid a
+#    trailing `chmod -R`.
+RUN umask 000 \
+    && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | \
         sh -s -- -y --no-modify-path --profile minimal \
             --default-toolchain "${RUST_NIGHTLY}" \
             --component rust-src \
@@ -89,7 +110,18 @@ RUN set -eux; \
     rm -rf /tmp/wasm-pack*; \
     wasm-pack --version
 
-# 5. Pre-build dependencies + std into CARGO_TARGET_DIR using a stub crate.
+# 5. wasm-bindgen CLI, built from source so it links against this image's glibc.
+#    wasm-pack would otherwise download a prebuilt wasm-bindgen/test-runner on
+#    first use, and those are linked against a newer glibc than bookworm ships
+#    (fails at runtime with "GLIBC_2.3x not found"). Installing a version-matched
+#    CLI on PATH makes wasm-pack reuse it for both `build:wasm` and `test:wasm`
+#    instead of downloading. Must match Cargo.lock — see WASM_BINDGEN_VERSION.
+RUN umask 000 \
+    && cargo install wasm-bindgen-cli --version "${WASM_BINDGEN_VERSION}" --locked \
+    && wasm-bindgen --version \
+    && wasm-bindgen-test-runner --version
+
+# 6. Pre-build dependencies + std into CARGO_TARGET_DIR using a stub crate.
 #    Only the manifests are copied, so this expensive layer is cached and only
 #    re-runs when Cargo.toml/Cargo.lock change. We drive the build through the
 #    project's own npm scripts so the rustflags/build-std flags are sourced from
@@ -99,27 +131,41 @@ RUN set -eux; \
 #    Requires committed Cargo.lock + package.json (in the build context). At
 #    runtime, real source is mounted at /workspace and only the `webtrip` crate
 #    recompiles; its dependencies and std are reused from /opt/cargo-target.
+#
+#    `umask 000` makes every cache file (CARGO_TARGET_DIR, the cargo registry,
+#    XDG_CACHE_HOME) world-writable as it is created, so any uid (CI as root,
+#    agents as non-root) can reuse and extend the caches. We do this here (and in
+#    steps 3 and 5) instead of a trailing `chmod -R`: a `chmod` in its own layer
+#    only flips metadata, but OverlayFS can't represent a metadata-only change,
+#    so it copies every touched file into a new layer — that one `chmod` was the
+#    single largest layer in the image (~2.8 GB of duplicated cache trees).
 COPY Cargo.toml Cargo.lock package.json /opt/prewarm/
 RUN set -eux; \
+    umask 000; \
     mkdir -p "${XDG_CACHE_HOME}"; \
     cd /opt/prewarm; \
     mkdir -p src; \
     printf 'use wasm_bindgen::prelude::*;\n#[wasm_bindgen]\npub fn __prewarm() {}\n' > src/lib.rs; \
     npm run build:wasm; \
     npm run test; \
+    # Also warm the wasm *test*-profile dep graph. build:wasm warms the release
+    # profile (atomics + build-std) and `npm run test` warms the native host
+    # target; the wasm test build that `npm run test:wasm` runs shares fingerprints
+    # with neither, so without this every dep recompiles on first `test:wasm`.
+    # --no-run compiles without launching a browser; RUSTFLAGS must match the
+    # test:wasm npm script so the fingerprints line up.
+    RUSTFLAGS='--cfg=web_sys_unstable_apis' cargo test --no-run --target wasm32-unknown-unknown; \
     # Drop ONLY the stub's own crate artifacts, keeping cached deps + std. This
     # forces the local `webtrip` crate to rebuild from the real (mounted) source
     # at runtime — without it, cargo's mtime-based freshness check would treat
     # older-mtime mounted source as already-built and silently run stub code.
+    # One clean per profile/target the warm-up produced webtrip artifacts in:
+    # wasm release (build:wasm), wasm debug (test --no-run), native (test).
     cargo clean -p webtrip --release --target wasm32-unknown-unknown; \
+    cargo clean -p webtrip --target wasm32-unknown-unknown; \
     cargo clean -p webtrip; \
     cd /; \
     rm -rf /opt/prewarm
-
-# 6. Make the toolchain + warm caches usable by any uid. CI typically runs the
-#    container as root, but agent runtimes often pick a non-root uid; a+rwX lets
-#    either reuse and extend the cargo registry, target dir, and build caches.
-RUN chmod -R a+rwX "${CARGO_HOME}" "${RUSTUP_HOME}" "${CARGO_TARGET_DIR}" "${XDG_CACHE_HOME}"
 
 # 7. Login shells (`bash -lc ...`) re-source /etc/profile and would otherwise
 #    drop the cargo bin dir from PATH, so add it there too. ENV PATH above
