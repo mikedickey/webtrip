@@ -220,6 +220,10 @@ mod tests {
         let result = api.list_regions().await;
 
         assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::Http { status, .. } => assert_eq!(status, 500),
+            _ => panic!("Expected HTTP error"),
+        }
         mock.assert_async().await;
     }
 }
