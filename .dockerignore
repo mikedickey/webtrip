@@ -1,0 +1,8 @@
+# The base image bakes in no source, but keep the build context small/fast.
+.git
+target
+node_modules
+dist
+pkg
+*.log
+wasm-pack.log

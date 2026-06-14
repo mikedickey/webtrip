@@ -1,0 +1,130 @@
+# WebTrip build base image
+#
+# A toolchain-only base image (no source baked in) used to:
+#   - build WebTrip and run its tests in CI/CD
+#   - serve as the base for AI agent development environments
+#
+# Source is expected to be mounted/cloned into /workspace at run time.
+#
+# Build from the repo root (the build context must be the repo root so the
+# dependency pre-build can COPY Cargo.toml/Cargo.lock/package.json):
+#   podman build -t ghcr.io/mikedickey/webtrip-build:latest -f containers/build/Containerfile .
+#
+# Bump a tool without editing the file:
+#   podman build --build-arg RUST_NIGHTLY=nightly-2026-07-01 \
+#       -f containers/build/Containerfile -t webtrip-build .
+#
+# NOTE: RUST_NIGHTLY must stay in sync with rust-toolchain.toml's channel,
+# otherwise rustup will download a different nightly at build time and the
+# baked-in toolchain pin is wasted.
+
+FROM debian:bookworm-slim
+
+ARG RUST_NIGHTLY=nightly-2026-06-13
+ARG NODE_MAJOR=22
+ARG WASM_PACK_VERSION=0.15.0
+
+LABEL org.opencontainers.image.title="webtrip-build" \
+      org.opencontainers.image.description="Rust nightly + wasm-pack + Node toolchain for building WebTrip" \
+      org.opencontainers.image.source="https://github.com/mikedickey/webtrip"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH \
+    # Fixed, out-of-/workspace target dir. The dependency pre-build (step 5)
+    # populates it; runtime builds against mounted source reuse it. Do NOT
+    # override CARGO_TARGET_DIR at runtime or the warm cache is bypassed.
+    CARGO_TARGET_DIR=/opt/cargo-target \
+    # Shared, writable cache dirs so any uid (CI as root, agents as non-root)
+    # can use them. wasm-pack caches the wasm-bindgen CLI under XDG_CACHE_HOME
+    # and npm caches under npm_config_cache; without writable caches a non-root
+    # uid (whose HOME defaults to an unwritable "/") fails with permission
+    # errors. Redirecting only the caches (rather than overriding HOME) keeps
+    # HOME natural, avoiding rustup's "$HOME differs from euid" warning.
+    XDG_CACHE_HOME=/opt/cache \
+    npm_config_cache=/opt/cache/npm
+
+# 1. OS packages: dev essentials + native build toolchain.
+#    build-essential/pkg-config are needed because `npm run test` compiles
+#    `cargo test` for the host (native), not WASM.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        build-essential \
+        pkg-config \
+        ripgrep \
+        jq \
+        xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Node.js (repo requires >=18; install current LTS).
+RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version && npm --version
+
+# 3. Rust nightly (pinned) via rustup, with the wasm target and rust-src.
+#    rust-src is required for the `-Zbuild-std` flag the WASM build uses.
+RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | \
+        sh -s -- -y --no-modify-path --profile minimal \
+            --default-toolchain "${RUST_NIGHTLY}" \
+            --component rust-src \
+            --target wasm32-unknown-unknown \
+    && rustc --version && cargo --version
+
+# 4. wasm-pack (pinned, prebuilt binary — avoids a from-source compile).
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        amd64) target="x86_64-unknown-linux-musl" ;; \
+        arm64) target="aarch64-unknown-linux-musl" ;; \
+        *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    url="https://github.com/rustwasm/wasm-pack/releases/download/v${WASM_PACK_VERSION}/wasm-pack-v${WASM_PACK_VERSION}-${target}.tar.gz"; \
+    curl -fsSL "$url" -o /tmp/wasm-pack.tar.gz; \
+    tar -xzf /tmp/wasm-pack.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/wasm-pack-v${WASM_PACK_VERSION}-${target}/wasm-pack" /usr/local/bin/wasm-pack; \
+    rm -rf /tmp/wasm-pack*; \
+    wasm-pack --version
+
+# 5. Pre-build dependencies + std into CARGO_TARGET_DIR using a stub crate.
+#    Only the manifests are copied, so this expensive layer is cached and only
+#    re-runs when Cargo.toml/Cargo.lock change. We drive the build through the
+#    project's own npm scripts so the rustflags/build-std flags are sourced from
+#    package.json — guaranteeing the dependency + std fingerprints match what a
+#    real build produces (otherwise the warm cache would silently miss).
+#
+#    Requires committed Cargo.lock + package.json (in the build context). At
+#    runtime, real source is mounted at /workspace and only the `webtrip` crate
+#    recompiles; its dependencies and std are reused from /opt/cargo-target.
+COPY Cargo.toml Cargo.lock package.json /opt/prewarm/
+RUN set -eux; \
+    mkdir -p "${XDG_CACHE_HOME}"; \
+    cd /opt/prewarm; \
+    mkdir -p src; \
+    printf 'use wasm_bindgen::prelude::*;\n#[wasm_bindgen]\npub fn __prewarm() {}\n' > src/lib.rs; \
+    npm run build:wasm; \
+    npm run test; \
+    # Drop ONLY the stub's own crate artifacts, keeping cached deps + std. This
+    # forces the local `webtrip` crate to rebuild from the real (mounted) source
+    # at runtime — without it, cargo's mtime-based freshness check would treat
+    # older-mtime mounted source as already-built and silently run stub code.
+    cargo clean -p webtrip --release --target wasm32-unknown-unknown; \
+    cargo clean -p webtrip; \
+    cd /; \
+    rm -rf /opt/prewarm
+
+# 6. Make the toolchain + warm caches usable by any uid. CI typically runs the
+#    container as root, but agent runtimes often pick a non-root uid; a+rwX lets
+#    either reuse and extend the cargo registry, target dir, and build caches.
+RUN chmod -R a+rwX "${CARGO_HOME}" "${RUSTUP_HOME}" "${CARGO_TARGET_DIR}" "${XDG_CACHE_HOME}"
+
+# 7. Login shells (`bash -lc ...`) re-source /etc/profile and would otherwise
+#    drop the cargo bin dir from PATH, so add it there too. ENV PATH above
+#    already covers non-login and exec-form invocations.
+RUN printf 'export PATH=%s/bin:$PATH\n' "${CARGO_HOME}" > /etc/profile.d/rust.sh
+
+WORKDIR /workspace
+CMD ["bash"]
