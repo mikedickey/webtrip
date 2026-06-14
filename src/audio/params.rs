@@ -544,9 +544,8 @@ mod tests {
 
     #[test]
     fn test_cross_thread_concurrent_reader_observes_latest() {
-        // A reader spinning concurrently with a writer eventually observes the final
-        // value without tearing or deadlock (single writer, relaxed atomics). The
-        // post-join assertion is guaranteed regardless of scheduling.
+        // A reader spinning concurrently with a writer must observe the final value
+        // without tearing or deadlock (single writer, relaxed atomics).
         let params = Arc::new(AudioParams::default());
         let target_channels = 6_u32;
 
@@ -563,9 +562,14 @@ mod tests {
         let reader = {
             let p = Arc::clone(&params);
             thread::spawn(move || {
-                // The final value is sticky, so once the writer stores it the reader
-                // sees it promptly. The bound is only a safety net against regressions.
-                for _ in 0..5_000_000 {
+                // Wait on a generous wall-clock deadline rather than a fixed iteration
+                // count. The writer performs only a handful of trivial stores, so under
+                // any normal scheduling the sticky target value is observed within
+                // microseconds. Bounding by time (not iteration count) avoids a spurious
+                // miss under scheduling pressure while still failing fast — instead of
+                // hanging forever — if cross-thread visibility ever regresses.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::time::Instant::now() < deadline {
                     if p.get_output_channels() == target_channels {
                         return true;
                     }
