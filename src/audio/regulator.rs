@@ -1492,4 +1492,442 @@ mod tests {
             "the stashed real packet should be rendered on the following callback"
         );
     }
+
+    /// After a full push/pop cycle that accumulates state (stats, sequence
+    /// numbers, timing), `reset()` must scrub the regulator back to a
+    /// freshly-constructed state. This covers the field-by-field cleanup
+    /// required for safe stream reconnection.
+    #[test]
+    fn test_reset_clears_state_after_active_stream() {
+        let mut reg = Regulator::with_params(1, 32, 48_000, 5.0);
+        let samples = vec![0.25f32; reg.fpp];
+
+        // Drive a small stream through the regulator.
+        reg.push_internal(0, &samples, 0.0);
+        reg.push_internal(1, &samples, 2.0);
+        let mut out = vec![0.0f32; reg.fpp];
+        let _ = reg.pop_internal(&mut out, 10.0);
+        let _ = reg.pop_internal(&mut out, 12.0);
+        let _ = reg.pop_internal(&mut out, 14.0); // forces underrun -> PLC
+
+        assert!(reg.is_initialized());
+        assert!(reg.last_seq_out.is_some());
+        assert!(reg.packet_count > 0);
+        assert!(reg.pull_stats.underruns > 0);
+
+        reg.reset();
+
+        assert!(!reg.is_initialized(), "last_seq_in should be cleared");
+        assert_eq!(reg.last_seq_out, None);
+        assert_eq!(reg.last_stashed, None);
+        assert_eq!(reg.packet_count, 0);
+        assert_eq!(reg.plc_packet_count, 0);
+        assert_eq!(reg.skipped, 0);
+        assert_eq!(reg.last_skipped, 0);
+        assert_eq!(reg.last_glitches, 0);
+        assert_eq!(reg.stats_glitches, 0);
+        assert_eq!(reg.last_max_latency, 0.0);
+        assert_eq!(reg.stats_max_latency, 0.0);
+        assert!(!reg.last_was_glitch);
+        assert_eq!(reg.start_time_ms, 0.0);
+        assert_eq!(reg.last_pop_time_ms, 0.0);
+        assert_eq!(reg.pull_stats.underruns, 0);
+        assert_eq!(reg.pull_stats.overruns, 0);
+        assert_eq!(reg.push_stats.long_term_count, 0);
+        assert_eq!(reg.depth(), 0);
+
+        // Channels should be zeroed and ring write pointer should be re-centered.
+        for channel in &reg.channels {
+            assert!(channel.tmp_buf.iter().all(|s| *s == 0.0));
+            assert!(channel.real_now_packet.iter().all(|s| *s == 0.0));
+            assert!(channel.output_now_packet.iter().all(|s| *s == 0.0));
+            assert_eq!(channel.ring_wptr, channel.ring_size / 2);
+        }
+    }
+
+    /// The 7def5fc race fix: a `last_stashed` slot left from a prior connection
+    /// must be cleared by `reset()`. Otherwise the first pop after reconnect
+    /// would replay a stale packet and pin `last_seq_out` to an old sequence
+    /// number, triggering a storm of spurious PLC events while the new stream
+    /// catches up.
+    #[test]
+    fn test_reset_clears_stashed_packet_to_avoid_stale_pop() {
+        let mut reg = Regulator::with_params(1, 32, 48_000, 5.0);
+        let samples = vec![0.5f32; reg.fpp];
+
+        // Simulate a prior connection that landed with a stashed packet:
+        // primer connection seq 7, stash for "next-good" seq 9.
+        reg.last_seq_in.store(9, Ordering::Release);
+        reg.last_seq_out = Some(7);
+        reg.last_stashed = Some((9, (9usize) % NUM_SLOTS));
+        if let Some(slot) = &mut reg.slots[9 % NUM_SLOTS] {
+            slot.timestamp = 100.0;
+            slot.sample_count = reg.fpp;
+            slot.data[..reg.fpp].copy_from_slice(&samples);
+        }
+
+        reg.reset();
+
+        assert_eq!(
+            reg.last_stashed, None,
+            "stashed packet from prior connection must be cleared"
+        );
+        assert!(!reg.is_initialized());
+        assert_eq!(reg.last_seq_out, None);
+
+        // After reset, the first pop on a fresh stream should return silence
+        // (startup), not the stale stashed buffer.
+        reg.push_internal(0, &samples, 0.0);
+        let mut out = vec![0.0f32; reg.fpp];
+        let result = reg.pop_internal(&mut out, 1.0); // still inside tolerance window
+        assert!(!result, "should not replay the pre-reset stash");
+        assert!(out.iter().all(|s| *s == 0.0));
+    }
+
+    /// Once the buffer is drained, additional pops with no new input must
+    /// increment the underrun counter exactly once per call and stay below the
+    /// long-stall threshold so PLC concealment continues to run.
+    #[test]
+    fn test_underrun_counter_increments_when_no_new_packets() {
+        let mut reg = Regulator::with_params(1, 32, 48_000, 5.0);
+        let samples = vec![0.25f32; reg.fpp];
+
+        reg.push_internal(0, &samples, 0.0);
+        let mut out = vec![0.0f32; reg.fpp];
+
+        // First pop consumes the only buffered packet.
+        let r1 = reg.pop_internal(&mut out, 10.0);
+        assert!(r1, "first pop should return the real packet");
+        assert_eq!(reg.pull_stats.underruns, 0);
+
+        // Subsequent pops with no new pushes must increment the underrun
+        // counter and report concealment (returns false).
+        for i in 0..5 {
+            let pop_time = 12.0 + i as f64 * 2.0;
+            let result = reg.pop_internal(&mut out, pop_time);
+            assert!(!result, "pop {i} should be an underrun");
+        }
+        assert_eq!(reg.pull_stats.underruns, 5);
+        assert_eq!(reg.pull_stats.overruns, 0);
+    }
+
+    /// Push two packets with a 2-packet gap, then pop. The regulator should
+    /// detect the gap, emit a PLC concealment block, and bump the overrun
+    /// counter by the number of skipped packets.
+    #[test]
+    fn test_overrun_counter_increments_when_packets_skipped() {
+        let mut reg = Regulator::with_params(1, 32, 48_000, 5.0);
+        let samples = vec![0.5f32; reg.fpp];
+
+        reg.push_internal(0, &samples, 0.0);
+        let mut out = vec![0.0f32; reg.fpp];
+        let r1 = reg.pop_internal(&mut out, 10.0);
+        assert!(r1);
+        assert_eq!(reg.last_seq_out, Some(0));
+
+        // Skip seq 1, 2 — push seq 3 directly. With `skipped = 2`, the
+        // regulator should treat this as a glitch, conceal, stash, and bump
+        // overruns.
+        reg.push_internal(3, &samples, 20.0);
+        let r2 = reg.pop_internal(&mut out, 40.0);
+        assert!(!r2, "skipped-gap path returns concealment (false)");
+        assert_eq!(reg.pull_stats.overruns, 2, "overrun counter tracks skip distance");
+        assert_eq!(reg.skipped, 2, "skipped counter tracks skip distance");
+        // The good packet must have been stashed for replay on the next pop.
+        assert_eq!(reg.last_stashed.map(|(s, _)| s), Some(3));
+
+        // Next pop should consume the stashed real packet, no new overruns.
+        let overruns_before = reg.pull_stats.overruns;
+        let r3 = reg.pop_internal(&mut out, 42.0);
+        assert!(r3, "stashed packet replay should be a real-packet pop");
+        assert_eq!(reg.last_seq_out, Some(3));
+        assert_eq!(reg.pull_stats.overruns, overruns_before);
+    }
+
+    /// PLC must kick in after consecutive misses and disengage as soon as a
+    /// real packet arrives. The result boolean should reflect this transition.
+    #[test]
+    fn test_plc_engages_on_underrun_and_stops_with_real_packets() {
+        let mut reg = Regulator::with_params(1, 32, 48_000, 5.0);
+        let samples = vec![0.5f32; reg.fpp];
+
+        reg.push_internal(0, &samples, 0.0);
+        let mut out = vec![0.0f32; reg.fpp];
+        let r0 = reg.pop_internal(&mut out, 10.0);
+        assert!(r0);
+        let plc_after_first = reg.plc_packet_count;
+        let packets_after_first = reg.packet_count;
+
+        // Three consecutive underrun pops should each invoke PLC.
+        for i in 0..3 {
+            let t = 12.0 + i as f64 * 2.0;
+            let result = reg.pop_internal(&mut out, t);
+            assert!(!result, "missing packet at t={t} should produce PLC output");
+        }
+        assert_eq!(reg.pull_stats.underruns, 3);
+        assert_eq!(
+            reg.plc_packet_count,
+            plc_after_first + 3,
+            "process_burg should run for each concealed packet"
+        );
+        assert_eq!(
+            reg.packet_count, packets_after_first,
+            "packet_count must not grow while concealing"
+        );
+
+        // Real packet arrives — next pop should be real audio again.
+        reg.push_internal(1, &samples, 25.0);
+        let r_resume = reg.pop_internal(&mut out, 30.0);
+        assert!(r_resume, "PLC must disengage once a real packet is available");
+        assert_eq!(reg.last_seq_out, Some(1));
+        assert_eq!(reg.packet_count, packets_after_first + 1);
+        let underruns_after = reg.pull_stats.underruns;
+
+        // No further underruns when consumption keeps pace.
+        reg.push_internal(2, &samples, 32.0);
+        let r_next = reg.pop_internal(&mut out, 38.0);
+        assert!(r_next);
+        assert_eq!(reg.pull_stats.underruns, underruns_after);
+    }
+
+    /// `depth()` and `latency_ms()` should report the gap between the newest
+    /// pushed and most recently popped sequence numbers. Each push must grow
+    /// depth by exactly one, and the latency formula must follow from depth.
+    /// Pops drain depth monotonically until it returns to zero.
+    #[test]
+    fn test_depth_and_latency_reflect_buffered_packets() {
+        let mut reg = Regulator::with_params(2, 64, 48_000, 5.0);
+        assert_eq!(reg.depth(), 0, "depth starts at zero before first packet");
+        assert_eq!(reg.latency_ms(), 0.0);
+
+        let samples = vec![0.1f32; reg.samples_per_packet];
+
+        // Before any pop, last_seq_out is None so depth treats read == write.
+        reg.push_internal(0, &samples, 0.0);
+        reg.push_internal(1, &samples, 2.0);
+        assert_eq!(reg.depth(), 0, "with no pop, read==write so depth is zero");
+
+        // First pop sets last_seq_out; the in-flight buffer is consumed.
+        let mut out = vec![0.0f32; reg.samples_per_packet];
+        let r = reg.pop_internal(&mut out, 10.0);
+        assert!(r);
+        let seq_after_first_pop = reg.last_seq_out.expect("pop must set last_seq_out");
+
+        // Push more packets without popping — depth grows by one per push.
+        for (i, t) in (1u16..=3).zip([12.0_f64, 14.0, 16.0]) {
+            let seq = seq_after_first_pop.wrapping_add(i);
+            reg.push_internal(seq, &samples, t);
+            assert_eq!(
+                reg.depth() as u16,
+                i,
+                "depth should equal pushes-since-last-pop ({i})"
+            );
+        }
+
+        // Latency = depth * samples_per_packet / sample_rate (in ms).
+        let depth = reg.depth();
+        let expected_ms =
+            (depth as f32 * reg.samples_per_packet as f32 / reg.sample_rate as f32) * 1000.0;
+        assert!(
+            (reg.latency_ms() - expected_ms).abs() < 1e-3,
+            "latency_ms ({}) should match depth*samples/sr ({expected_ms})",
+            reg.latency_ms()
+        );
+
+        // Drain via repeated pops: depth must decrease monotonically to zero.
+        let mut prev_depth = reg.depth();
+        let mut t = 18.0_f64;
+        for _ in 0..8 {
+            if reg.depth() == 0 {
+                break;
+            }
+            let _ = reg.pop_internal(&mut out, t);
+            let new_depth = reg.depth();
+            assert!(
+                new_depth <= prev_depth,
+                "depth must not grow during a pop ({prev_depth} -> {new_depth})"
+            );
+            prev_depth = new_depth;
+            t += 2.0;
+        }
+        assert_eq!(reg.depth(), 0, "depth should reach zero after the buffer drains");
+        assert_eq!(reg.latency_ms(), 0.0);
+    }
+
+    /// `stats()` should expose tolerance, headroom, counters, and last seq
+    /// number consistently with internal state.
+    #[test]
+    fn test_stats_reflect_internal_counters_and_state() {
+        let mut reg = Regulator::with_params(1, 32, 48_000, 7.5);
+        let samples = vec![0.0f32; reg.fpp];
+        reg.push_internal(42, &samples, 0.0);
+        reg.push_internal(43, &samples, 2.0);
+
+        let mut out = vec![0.0f32; reg.fpp];
+        let _ = reg.pop_internal(&mut out, 15.0);
+        let _ = reg.pop_internal(&mut out, 17.0);
+        let _ = reg.pop_internal(&mut out, 19.0); // underrun
+
+        let s = reg.stats();
+        assert_eq!(s.tolerance_ms, reg.tolerance_ms);
+        assert_eq!(s.headroom_ms, reg.current_headroom);
+        assert_eq!(s.max_latency_ms, reg.last_max_latency);
+        assert_eq!(s.packets_received, reg.packet_count);
+        assert_eq!(s.packets_played, reg.packet_count);
+        assert_eq!(
+            s.last_seq_received, 43,
+            "last_seq_received should match the highest seq pushed"
+        );
+        let expected_glitches =
+            (reg.pull_stats.underruns + reg.pull_stats.overruns) - reg.stats_glitches;
+        assert_eq!(s.glitches, expected_glitches);
+
+        // Stats on a fresh regulator: zeroed counters, default tolerance,
+        // and last_seq_received clamped to 0 when uninitialized.
+        let fresh = Regulator::with_params(1, 32, 48_000, -1.0);
+        let fs = fresh.stats();
+        assert_eq!(fs.packets_received, 0);
+        assert_eq!(fs.packets_played, 0);
+        assert_eq!(fs.glitches, 0);
+        assert_eq!(fs.skipped, 0);
+        assert_eq!(fs.last_seq_received, 0);
+        assert_eq!(fs.tolerance_ms, fresh.tolerance_ms);
+        assert_eq!(fs.headroom_ms, fresh.current_headroom);
+    }
+
+    /// Auto mode must not adjust tolerance until `AUTO_INIT_DURATION_MS` of
+    /// relative time has elapsed, even if the underlying long-term stats look
+    /// jittery enough to demand an adjustment.
+    #[test]
+    fn test_auto_tolerance_unchanged_during_init_duration() {
+        let mut reg = Regulator::with_params(1, 32, 48_000, -1.0);
+        let initial = reg.tolerance_ms;
+        assert!(reg.auto_mode);
+
+        // Inject long-term stats that would normally drive a tolerance bump.
+        reg.push_stats.long_term_max = 100.0;
+        reg.push_stats.long_term_std_dev = 25.0;
+        reg.pull_stats.long_term_max = 50.0;
+        reg.pull_stats.long_term_std_dev = 10.0;
+
+        reg.update_tolerance(0.0);
+        reg.update_tolerance(1500.0);
+        reg.update_tolerance(AUTO_INIT_DURATION_MS - 0.1);
+        assert_eq!(
+            reg.tolerance_ms, initial,
+            "tolerance must be unchanged before AUTO_INIT_DURATION_MS"
+        );
+
+        // Once we cross the threshold the same inputs cause an update.
+        reg.update_tolerance(AUTO_INIT_DURATION_MS + 1.0);
+        assert_ne!(
+            reg.tolerance_ms, initial,
+            "tolerance should react to long-term stats after init duration"
+        );
+    }
+
+    /// Auto-mode tolerance must follow long-term stats: a noisy network should
+    /// grow tolerance, a quiet network should shrink it, both clamped within
+    /// `[fpp_duration_ms, AUTO_MAX_MS]`.
+    #[test]
+    fn test_auto_tolerance_recomputes_from_long_term_stats() {
+        let mut reg = Regulator::with_params(1, 32, 48_000, -1.0);
+        let initial = reg.tolerance_ms;
+        let fpp_duration_ms = 1000.0 * reg.fpp as f64 / reg.sample_rate as f64;
+
+        // Phase 1: jittery push, calm pull — tolerance should rise sharply.
+        reg.push_stats.long_term_max = 80.0;
+        reg.push_stats.long_term_std_dev = 20.0;
+        reg.pull_stats.long_term_max = 10.0;
+        reg.pull_stats.long_term_std_dev = 2.0;
+        reg.update_tolerance(7000.0); // past AUTO_INIT_DURATION_MS & headroom warmup
+        let after_jitter = reg.tolerance_ms;
+        assert!(
+            after_jitter > initial,
+            "tolerance must grow with long-term jitter (init={initial}, after={after_jitter})"
+        );
+        assert!(after_jitter <= AUTO_MAX_MS);
+        assert!(after_jitter >= fpp_duration_ms);
+
+        // Phase 2: calm network — tolerance should fall back down.
+        reg.push_stats.long_term_max = 3.0;
+        reg.push_stats.long_term_std_dev = 1.0;
+        reg.pull_stats.long_term_max = 2.0;
+        reg.pull_stats.long_term_std_dev = 0.5;
+        reg.update_tolerance(7100.0);
+        let after_calm = reg.tolerance_ms;
+        assert!(
+            after_calm < after_jitter,
+            "tolerance must drop when jitter subsides (jitter={after_jitter}, calm={after_calm})"
+        );
+        assert!(after_calm >= fpp_duration_ms);
+
+        // current_headroom should track the configured (positive) auto_headroom.
+        assert!((reg.current_headroom - reg.auto_headroom).abs() < 1e-9);
+    }
+
+    /// Fixed (non-auto) tolerance mode must ignore the auto-tolerance machinery
+    /// entirely, even when push/pull stats look noisy.
+    #[test]
+    fn test_fixed_tolerance_mode_does_not_auto_update() {
+        let mut reg = Regulator::with_params(1, 32, 48_000, 25.0);
+        assert!(!reg.auto_mode);
+        assert_eq!(reg.tolerance_ms, 25.0);
+
+        reg.push_stats.long_term_max = 200.0;
+        reg.push_stats.long_term_std_dev = 50.0;
+        reg.pull_stats.long_term_max = 100.0;
+        reg.pull_stats.long_term_std_dev = 20.0;
+
+        reg.update_tolerance(10_000.0);
+        assert_eq!(
+            reg.tolerance_ms, 25.0,
+            "fixed-mode tolerance must remain at the configured value"
+        );
+    }
+
+    /// `TimingStats::tick` should accumulate within a window without exposing
+    /// long-term values, then promote them on window completion. The dedicated
+    /// overrun/underrun counters must be independently mutable and reset.
+    #[test]
+    fn test_timing_stats_window_completion_records_long_term() {
+        let mut stats = TimingStats::new(48_000, 32);
+        assert!(stats.window > 0);
+
+        // Drive partial window — long-term values stay zero.
+        for _ in 0..(stats.window - 1) {
+            let updated = stats.tick(5.0, 100.0);
+            assert!(!updated, "tick before window completion must not promote");
+        }
+        assert_eq!(stats.long_term_count, 0);
+        assert_eq!(stats.long_term_max, 0.0);
+
+        // Final tick completes the window.
+        let updated = stats.tick(5.0, 200.0);
+        assert!(updated, "window-completing tick should return true");
+        assert_eq!(stats.long_term_count, 1);
+        assert!(stats.long_term_max >= 5.0);
+        assert_eq!(stats.count, 0, "window state resets after promotion");
+
+        // Out-of-range measurements should be dropped, not promoted.
+        assert!(!stats.tick(0.0, 250.0));
+        assert!(!stats.tick(-1.0, 251.0));
+        assert!(!stats.tick(20_000.0, 252.0));
+
+        // Independent overrun / underrun counters.
+        stats.overruns += 3;
+        stats.underruns += 2;
+
+        let pre_reset_long_term = stats.long_term_count;
+        assert!(pre_reset_long_term > 0);
+
+        stats.reset();
+        assert_eq!(stats.long_term_count, 0);
+        assert_eq!(stats.long_term_max, 0.0);
+        assert_eq!(stats.long_term_std_dev, 0.0);
+        assert_eq!(stats.count, 0);
+        assert_eq!(stats.overruns, 0);
+        assert_eq!(stats.underruns, 0);
+        assert_eq!(stats.last_max, 0.0);
+    }
 }
