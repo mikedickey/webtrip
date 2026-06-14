@@ -1,6 +1,4 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+# AGENTS.md
 
 For general project background see [README.md](README.md). For the threading model, audio data flow, browser API constraints, and transport architecture see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -60,3 +58,11 @@ This applies equally to test helpers, serialization utilities, fixture builders,
 - JackTrip API base: `https://test.jacktrip.com/api`
 - OpenAPI spec: `https://test.jacktrip.com/api/redirect/openapi`
 - API docs in `docs/api/`; architecture docs in `docs/ARCHITECTURE.md`
+
+## Environment-specific instructions
+
+Only read the doc for your environment; skip the others.
+
+| Environment | Instructions |
+|-------------|--------------|
+| Cursor Cloud | Read [docs/CURSOR_CLOUD.md](docs/CURSOR_CLOUD.md) before running tests or opening the app in Chrome |
