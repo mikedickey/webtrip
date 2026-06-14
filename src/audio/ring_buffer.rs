@@ -387,20 +387,27 @@ mod tests {
 
     #[test]
     fn concurrent_producer_consumer_preserves_order() {
-        // Share one buffer across two threads via a raw pointer. This mirrors
-        // real usage where the buffer lives in a SharedArrayBuffer and the
-        // producer (worklet) and consumer (main thread) touch disjoint regions.
-        struct Shared(*mut RingBuffer);
-        unsafe impl Send for Shared {}
+        // Share one buffer across two threads via a raw pointer wrapped in an
+        // `Arc<UnsafeCell<_>>`. This mirrors real usage where the buffer lives
+        // in a SharedArrayBuffer and the producer (worklet) and consumer (main
+        // thread) touch disjoint regions of it concurrently.
+        use std::cell::UnsafeCell;
+        use std::sync::Arc;
 
-        let mut rb = streaming_buffer();
-        let shared = Shared(&mut rb as *mut RingBuffer);
+        struct Shared(UnsafeCell<RingBuffer>);
+        // Safe: producer touches only the write half (write_pos + tail of buffer)
+        // and consumer touches only the read half (read_pos + head of buffer);
+        // both halves are synchronised through Acquire/Release atomics.
+        unsafe impl Sync for Shared {}
+
+        let shared = Arc::new(Shared(UnsafeCell::new(streaming_buffer())));
 
         const CHUNK: usize = 128;
         const TOTAL: usize = CHUNK * 2000;
 
+        let producer_shared = Arc::clone(&shared);
         let producer = thread::spawn(move || {
-            let rb = unsafe { &mut *shared.0 };
+            let rb = unsafe { &mut *producer_shared.0.get() };
             let mut next: usize = 0;
             while next < TOTAL {
                 let chunk: Vec<f32> = (next..next + CHUNK).map(|i| i as f32).collect();
@@ -412,6 +419,7 @@ mod tests {
             }
         });
 
+        let rb = unsafe { &mut *shared.0.get() };
         let mut received: usize = 0;
         let mut out = vec![0.0; CHUNK];
         while received < TOTAL {
