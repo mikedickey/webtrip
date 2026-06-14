@@ -128,3 +128,81 @@ pub struct Session {
     pub duration: Option<i32>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip<T>(v: &T) -> String
+    where
+        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+    {
+        let s = serde_json::to_string(v).expect("serialize");
+        let back: T = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(v, &back);
+        s
+    }
+
+    #[test]
+    fn chat_session_roundtrip_camel_case() {
+        let c = ChatSession {
+            id: Some("c1".into()),
+            room_id: Some("room-1".into()),
+            token: Some("tok".into()),
+            ws_url: Some("wss://chat".into()),
+        };
+        let s = roundtrip(&c);
+        assert!(s.contains("\"roomId\":"));
+        assert!(s.contains("\"wsUrl\":"));
+    }
+
+    #[test]
+    fn conversation_roundtrip() {
+        let c = Conversation {
+            id: Some("conv-1".into()),
+            user_id: Some("u1".into()),
+            user_name: Some("Alice".into()),
+            user_picture: Some("https://p".into()),
+            last_message: Some("hello".into()),
+            last_message_at: Some("2026-06-14T00:00:00Z".into()),
+            unread_count: Some(3),
+        };
+        let s = roundtrip(&c);
+        assert!(s.contains("\"userId\":"));
+        assert!(s.contains("\"unreadCount\":3"));
+        assert!(s.contains("\"lastMessageAt\":"));
+    }
+
+    #[test]
+    fn message_renames_type_field() {
+        let m = Message {
+            id: Some("m1".into()),
+            sender_id: Some("u1".into()),
+            sender_name: Some("Alice".into()),
+            content: Some("hi".into()),
+            message_type: Some("text".into()),
+            created_at: Some("2026-06-14T00:00:00Z".into()),
+            read: Some(false),
+        };
+        let s = roundtrip(&m);
+        assert!(s.contains("\"type\":\"text\""));
+        assert!(!s.contains("messageType"));
+    }
+
+    #[test]
+    fn session_roundtrip_camel_case() {
+        let s = Session {
+            id: Some("sess-1".into()),
+            user_id: Some("u1".into()),
+            studio_id: Some("st1".into()),
+            device_id: Some("d1".into()),
+            started_at: Some("2026-06-14T00:00:00Z".into()),
+            ended_at: None,
+            duration: Some(600),
+        };
+        let out = roundtrip(&s);
+        assert!(out.contains("\"userId\":"));
+        assert!(out.contains("\"studioId\":"));
+        assert!(out.contains("\"startedAt\":"));
+        assert!(!out.contains("\"endedAt\":"));
+    }
+}

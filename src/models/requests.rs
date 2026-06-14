@@ -232,3 +232,130 @@ pub struct PromoRequest {
     pub code: Option<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip<T>(v: &T) -> String
+    where
+        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+    {
+        let s = serde_json::to_string(v).expect("serialize");
+        let back: T = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(v, &back);
+        s
+    }
+
+    #[test]
+    fn heartbeat_request_renames_type_field() {
+        let h = HeartbeatRequest {
+            api_prefix: Some("pref".into()),
+            api_secret: Some("sec".into()),
+            mac: Some("00:11:22:33:44:55".into()),
+            version: Some("2.4.0".into()),
+            device_type: Some("usb-x2".into()),
+            pkts_recv: Some(100),
+            pkts_sent: Some(101),
+            min_rtt: Some(10),
+            max_rtt: Some(30),
+            avg_rtt: Some(15),
+            stddev_rtt: Some(2),
+            latest_rtt: Some(14),
+            stats_updated_at: Some("2026-06-14T00:00:00Z".into()),
+        };
+        let s = roundtrip(&h);
+        assert!(s.contains("\"type\":\"usb-x2\""));
+        assert!(s.contains("\"apiPrefix\":\"pref\""));
+        assert!(s.contains("\"pktsRecv\":100"));
+        assert!(s.contains("\"statsUpdatedAt\":"));
+    }
+
+    #[test]
+    fn send_message_request_renames_type_field() {
+        let m = SendMessageRequest {
+            content: Some("hello".into()),
+            message_type: Some("text".into()),
+        };
+        let s = roundtrip(&m);
+        assert!(s.contains("\"type\":\"text\""));
+        assert!(!s.contains("messageType"));
+    }
+
+    #[test]
+    fn feedback_request_roundtrip() {
+        let f = FeedbackRequest {
+            rating: Some(5),
+            comment: Some("great".into()),
+            session_id: Some("sess-1".into()),
+            audio_quality: Some(4),
+            latency: Some(5),
+            had_issues: Some(false),
+        };
+        let s = roundtrip(&f);
+        assert!(s.contains("\"sessionId\":"));
+        assert!(s.contains("\"audioQuality\":4"));
+        assert!(s.contains("\"hadIssues\":false"));
+    }
+
+    #[test]
+    fn invite_request_renames_type_field() {
+        let i = InviteRequest {
+            email: Some("a@b".into()),
+            message: Some("join us".into()),
+            invite_type: Some("email".into()),
+        };
+        let s = roundtrip(&i);
+        assert!(s.contains("\"type\":\"email\""));
+    }
+
+    #[test]
+    fn track_update_request_roundtrip() {
+        let t = TrackUpdateRequest {
+            name: Some("Bass".into()),
+            volume: Some(70),
+            pan: Some(-25),
+            mute: Some(false),
+            solo: Some(true),
+        };
+        roundtrip(&t);
+    }
+
+    #[test]
+    fn analytics_event_with_json_value() {
+        let e = AnalyticsEvent {
+            event: Some("studio_joined".into()),
+            properties: Some(serde_json::json!({"region": "us-west-2", "count": 3})),
+            user_id: Some("u1".into()),
+            anonymous_id: None,
+            timestamp: Some("2026-06-14T00:00:00Z".into()),
+        };
+        let s = roundtrip(&e);
+        assert!(s.contains("\"properties\":"));
+        assert!(s.contains("\"userId\":"));
+    }
+
+    #[test]
+    fn checkout_request_camel_case() {
+        let c = CheckoutRequest {
+            price_id: Some("price_1".into()),
+            success_url: Some("https://ok".into()),
+            cancel_url: Some("https://cancel".into()),
+            coupon: Some("PROMO".into()),
+        };
+        let s = roundtrip(&c);
+        assert!(s.contains("\"priceId\":"));
+        assert!(s.contains("\"successUrl\":"));
+        assert!(s.contains("\"cancelUrl\":"));
+    }
+
+    #[test]
+    fn modify_subscription_coupon_and_promo_roundtrip() {
+        roundtrip(&ModifySubscriptionRequest {
+            price_id: Some("price_2".into()),
+            prorate: Some(true),
+        });
+        roundtrip(&CouponRequest { code: Some("ABC".into()) });
+        roundtrip(&PromoRequest { code: Some("PROMO".into()) });
+    }
+}
+

@@ -289,3 +289,142 @@ pub struct ServerMix {
     pub solo: Option<bool>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip<T>(v: &T) -> String
+    where
+        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+    {
+        let s = serde_json::to_string(v).expect("serialize");
+        let back: T = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(v, &back);
+        s
+    }
+
+    #[test]
+    fn studio_fixture_known_good() {
+        // Fixture modeled after docs/api/studios.md — a typical studio create response.
+        // Note the `bannerURL` (preserved casing) and `type` rename.
+        let json = r#"{
+          "id": "studio123",
+          "ownerId": "user-1",
+          "region": "us-west-2",
+          "type": "JackTrip+Jamulus",
+          "name": "My Studio",
+          "bannerURL": "https://cdn.example.com/banner.png",
+          "status": "Ready",
+          "period": 128,
+          "queueBuffer": 4,
+          "bufferStrategy": 1,
+          "sampleRate": 48000,
+          "broadcast": 2,
+          "stereo": true,
+          "public": false,
+          "createdAt": "2026-06-14T00:00:00Z"
+        }"#;
+        let s: Studio = serde_json::from_str(json).unwrap();
+        assert_eq!(s.id.as_deref(), Some("studio123"));
+        assert_eq!(s.studio_type, Some(StudioType::JackTripJamulus));
+        assert_eq!(s.status, Some(ResourceStatus::Ready));
+        assert_eq!(s.period, Some(Period::P128));
+        assert_eq!(s.queue_buffer, Some(QueueBuffer::Q4));
+        assert_eq!(s.buffer_strategy, Some(BufferStrategy::Standard));
+        assert_eq!(s.sample_rate, Some(SampleRate::Rate48000));
+        assert_eq!(s.broadcast, Some(BroadcastVisibility::Public));
+        assert_eq!(s.banner_url.as_deref(), Some("https://cdn.example.com/banner.png"));
+
+        // Wire-format check: `type` and `bannerURL` are preserved verbatim.
+        let out = serde_json::to_string(&s).unwrap();
+        assert!(out.contains("\"type\":\"JackTrip+Jamulus\""));
+        assert!(out.contains("\"bannerURL\":"));
+        assert!(out.contains("\"ownerId\":"));
+        assert!(out.contains("\"queueBuffer\":4"));
+    }
+
+    #[test]
+    fn studio_roundtrip_with_enum_fields() {
+        let s = Studio {
+            id: Some("s1".into()),
+            studio_type: Some(StudioType::JackTrip),
+            status: Some(ResourceStatus::Starting),
+            period: Some(Period::P256),
+            queue_buffer: Some(QueueBuffer::Q8),
+            buffer_strategy: Some(BufferStrategy::AutoAdjust),
+            sample_rate: Some(SampleRate::Rate96000),
+            broadcast: Some(BroadcastVisibility::Private),
+            ..Default::default()
+        };
+        roundtrip(&s);
+    }
+
+    #[test]
+    fn studio_empty_default_serializes_to_empty_object() {
+        let s = Studio::default();
+        assert_eq!(serde_json::to_string(&s).unwrap(), "{}");
+    }
+
+    #[test]
+    fn access_settings_roundtrip_camel_case() {
+        let a = AccessSettings {
+            password_protected: Some(true),
+            password: Some("hunter2".into()),
+            allow_guests: Some(false),
+            max_guests: Some(0),
+            allowed_users: Some(vec!["u1".into(), "u2".into()]),
+        };
+        let s = roundtrip(&a);
+        assert!(s.contains("\"passwordProtected\":true"));
+        assert!(s.contains("\"allowGuests\":false"));
+        assert!(s.contains("\"maxGuests\":0"));
+        assert!(s.contains("\"allowedUsers\":[\"u1\",\"u2\"]"));
+    }
+
+    #[test]
+    fn mixer_and_mixer_config_roundtrip() {
+        let m = Mixer {
+            id: Some("m1".into()),
+            name: Some("Default".into()),
+            description: Some("System preset".into()),
+            branch: Some("main".into()),
+            code: Some("// sc code".into()),
+            preset: Some(true),
+        };
+        roundtrip(&m);
+
+        let cfg = MixerConfig {
+            master_volume: Some(80),
+            reverb: Some(25),
+            limiter: Some(true),
+            compressor: Some(false),
+        };
+        let s = roundtrip(&cfg);
+        assert!(s.contains("\"masterVolume\":80"));
+    }
+
+    #[test]
+    fn participant_and_server_mix_roundtrip() {
+        let p = Participant {
+            user_id: Some("u1".into()),
+            name: Some("Alice".into()),
+            device_id: Some("d1".into()),
+            muted: Some(false),
+            volume: Some(75),
+            joined_at: Some("2026-06-14T01:23:45Z".into()),
+        };
+        let s = roundtrip(&p);
+        assert!(s.contains("\"userId\":\"u1\""));
+        assert!(s.contains("\"deviceId\":\"d1\""));
+
+        let mix = ServerMix {
+            id: Some("t1".into()),
+            name: Some("Drums".into()),
+            volume: Some(60),
+            pan: Some(-25),
+            mute: Some(false),
+            solo: Some(true),
+        };
+        roundtrip(&mix);
+    }
+}

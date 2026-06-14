@@ -239,3 +239,131 @@ pub struct AlsaConfig {
     pub periods: Option<i32>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip<T>(v: &T) -> String
+    where
+        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+    {
+        let s = serde_json::to_string(v).expect("serialize");
+        let back: T = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(v, &back);
+        s
+    }
+
+    #[test]
+    fn device_fixture_known_good() {
+        // Fixture modeled after docs/api/devices.md — typical agent config payload.
+        let json = r#"{
+          "id": "dev-1",
+          "mac": "AA:BB:CC:DD:EE:FF",
+          "name": "Living Room JT",
+          "ownerId": "user-1",
+          "studioId": "studio-1",
+          "version": "2.4.0",
+          "quality": 2,
+          "inputChannels": 2,
+          "outputChannels": 2,
+          "period": 128,
+          "queueBuffer": 4,
+          "bufferStrategy": 1,
+          "captureVolume": 80,
+          "captureMute": false,
+          "playbackVolume": 70,
+          "playbackMute": false,
+          "createdAt": "2026-06-14T00:00:00Z"
+        }"#;
+        let d: Device = serde_json::from_str(json).unwrap();
+        assert_eq!(d.quality, Some(Quality::Lossless));
+        assert_eq!(d.input_channels, Some(Channels::Stereo));
+        assert_eq!(d.output_channels, Some(Channels::Stereo));
+        assert_eq!(d.period, Some(Period::P128));
+
+        let s = serde_json::to_string(&d).unwrap();
+        assert!(s.contains("\"ownerId\":"));
+        assert!(s.contains("\"inputChannels\":2"));
+        assert!(s.contains("\"captureVolume\":80"));
+    }
+
+    #[test]
+    fn device_roundtrip_with_enums() {
+        let d = Device {
+            id: Some("d1".into()),
+            mac: Some("00:11:22:33:44:55".into()),
+            quality: Some(Quality::High),
+            input_channels: Some(Channels::Mono),
+            output_channels: Some(Channels::Stereo),
+            period: Some(Period::P64),
+            queue_buffer: Some(QueueBuffer::Q6),
+            buffer_strategy: Some(BufferStrategy::Broadcast),
+            capture_volume: Some(50),
+            playback_volume: Some(60),
+            monitor_volume: Some(40),
+            reverb: Some(15),
+            limiter: Some(true),
+            compressor: Some(true),
+            enable_usb: Some(false),
+            ..Default::default()
+        };
+        roundtrip(&d);
+    }
+
+    #[test]
+    fn device_default_empty_object() {
+        assert_eq!(serde_json::to_string(&Device::default()).unwrap(), "{}");
+    }
+
+    #[test]
+    fn device_agent_config_roundtrip() {
+        let c = DeviceAgentConfig {
+            device: Some(Device { id: Some("d1".into()), ..Default::default() }),
+            server: Some(super::super::Studio { id: Some("s1".into()), ..Default::default() }),
+            credentials: Some(AgentCredentials {
+                api_key: Some("key".into()),
+                api_secret: Some("secret".into()),
+            }),
+        };
+        let s = roundtrip(&c);
+        assert!(s.contains("\"apiKey\":"));
+        assert!(s.contains("\"apiSecret\":"));
+    }
+
+    #[test]
+    fn device_heartbeat_renames_type_field() {
+        let h = DeviceHeartbeat {
+            mac: Some("00:11:22:33:44:55".into()),
+            version: Some("1.0".into()),
+            device_type: Some("usb-x2".into()),
+            api_prefix: Some("pref".into()),
+            api_secret: Some("sec".into()),
+            pkts_recv: Some(1000),
+            pkts_sent: Some(1001),
+            min_rtt: Some(10),
+            max_rtt: Some(30),
+            avg_rtt: Some(15),
+            stddev_rtt: Some(2),
+            latest_rtt: Some(14),
+            stats_updated_at: Some("2026-06-14T00:00:00Z".into()),
+        };
+        let s = roundtrip(&h);
+        // device_type field is serialized as "type"
+        assert!(s.contains("\"type\":\"usb-x2\""));
+        assert!(!s.contains("deviceType"));
+    }
+
+    #[test]
+    fn alsa_config_roundtrip() {
+        let a = AlsaConfig {
+            device: Some("hw:0".into()),
+            sample_rate: Some(48000),
+            buffer_size: Some(256),
+            periods: Some(2),
+        };
+        let s = roundtrip(&a);
+        assert!(s.contains("\"sampleRate\":48000"));
+        assert!(s.contains("\"bufferSize\":256"));
+    }
+}
+
