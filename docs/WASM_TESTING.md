@@ -37,6 +37,10 @@ This command:
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::*;
 
+// REQUIRED — without this the suite is skipped under `--chrome`. See below.
+#[cfg(target_arch = "wasm32")]
+wasm_bindgen_test_configure!(run_in_browser);
+
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen_test]
 fn my_browser_test() {
@@ -45,39 +49,25 @@ fn my_browser_test() {
 }
 ```
 
-For tests that need to run in a browser (not Node.js), add this to your test module:
+**`wasm_bindgen_test_configure!(run_in_browser);` is required, not optional.**
+`wasm-bindgen-test` defaults to running in Node.js. Since `npm run test:wasm`
+passes `--chrome`, any suite *without* this directive is silently skipped (see
+[Troubleshooting](#this-test-suite-is-only-configured-to-run-in-nodejs)).
 
-```rust
-#[cfg(target_arch = "wasm32")]
-wasm_bindgen_test_configure!(run_in_browser);
-```
+This directive applies **per test binary**, so it must appear once in:
+- each integration test file under `tests/*.rs`, and
+- each crate's unit-test build — in practice, in whichever `#[cfg(test)]` module
+  first declares `#[wasm_bindgen_test]` tests (e.g. `src/audio/ring_buffer.rs`).
+
+When adding a *new* WASM test file, remember to include it or the new suite will
+skip with no failure.
 
 ## Continuous Integration
 
-### GitHub Actions Example
-
-```yaml
-name: WASM Tests
-
-on: [push, pull_request]
-
-jobs:
-  wasm-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-      
-      - name: Install wasm-pack
-        run: cargo install wasm-pack
-      
-      - name: Install Chrome
-        uses: browser-actions/setup-chrome@latest
-      
-      - name: Run WASM tests
-        run: npm run test:wasm
-```
+WASM tests run in CI via the `build` job in `.github/workflows/ci.yml`, inside
+the toolchain container (`containers/build/Containerfile`). The browser setup
+(`chromium` + `chromium-driver`, `CHROMEDRIVER`, and the root-level
+`webdriver.json` flags) is documented at those sources.
 
 ## Limitations
 
@@ -99,6 +89,27 @@ Headless browsers may not support these headers properly. In such cases:
 - **Safari**: Limited WebTransport support
 
 ## Troubleshooting
+
+### "This test suite is only configured to run in node.js"
+
+The full message reads:
+
+```
+This test suite is only configured to run in node.js, but we're only running
+browser tests so skipping.
+```
+
+The suite was compiled and the test binary ran, but every test was skipped
+because the crate/file is missing the browser opt-in. Add this once per test
+binary:
+
+```rust
+#[cfg(target_arch = "wasm32")]
+wasm_bindgen_test_configure!(run_in_browser);
+```
+
+Note this is *per test binary* — adding it to one file does not cover the
+others. See [Writing WASM Tests](#writing-wasm-tests).
 
 ### "ChromeDriver was killed" or "HTTP 404"
 

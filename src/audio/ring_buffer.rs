@@ -216,6 +216,9 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::*;
 
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_test_configure!(run_in_browser);
+
     /// Read the `has_data` flag through the same raw pointer JavaScript uses.
     fn has_data_flag(rb: &RingBuffer) -> u32 {
         let ptr = rb.get_has_data_flag_ptr() as *const AtomicU32;
