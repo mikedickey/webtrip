@@ -92,4 +92,4 @@ jobs:
           files: lcov.info
           slug: mikedickey/webtrip
           use_oidc: true
-          fail_ci_if_error: true
+          fail_ci_if_error: false
