@@ -1,5 +1,7 @@
 # WebTrip
 
+[![codecov](https://codecov.io/gh/mikedickey/webtrip/branch/main/graph/badge.svg)](https://codecov.io/gh/mikedickey/webtrip)
+
 WebTrip is a software development toolkit for lossless, low-latency audio collaboration over the Internet. It can run entirely within any modern web browser on any popular device, avoiding the need for users to install any apps or software.
 
 WebTrip is inspired by the popular open-source [JackTrip project](https://github.com/jacktrip/jacktrip), which originated from Stanford University's Center for Computer Reserch in Music and Acoustics ([CCRMA](https://ccrma.stanford.edu/)). WebTrip envisions a complete rewrite of JackTrip's core library and command line tools using the [Rust programming language](https://rust-lang.org/), with a focus on reuse by developers.

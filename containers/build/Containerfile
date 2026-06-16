@@ -28,6 +28,7 @@ ARG WASM_PACK_VERSION=0.15.0
 # the one the crate links against; a mismatch makes it fall back to downloading
 # a prebuilt binary (which is linked against a newer glibc than bookworm ships).
 ARG WASM_BINDGEN_VERSION=0.2.118
+ARG CARGO_LLVM_COV_VERSION=0.8.7
 
 LABEL org.opencontainers.image.title="webtrip-build" \
       org.opencontainers.image.description="Rust nightly + wasm-pack + Node toolchain for building WebTrip" \
@@ -82,16 +83,18 @@ RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
     && rm -rf /var/lib/apt/lists/* \
     && node --version && npm --version
 
-# 3. Rust nightly (pinned) via rustup, with the wasm target and rust-src.
-#    rust-src is required for the `-Zbuild-std` flag the WASM build uses.
+# 3. Rust nightly (pinned) via rustup, with the wasm target, rust-src, and
+#    llvm-tools-preview. rust-src is required for the `-Zbuild-std` flag the
+#    WASM build uses; llvm-tools-preview is required by cargo-llvm-cov.
 #    `umask 000` so every file rustup writes under RUSTUP_HOME/CARGO_HOME is
-#    world-writable from birth — see the note on step 6 for why we avoid a
+#    world-writable from birth — see the note on step 7 for why we avoid a
 #    trailing `chmod -R`.
 RUN umask 000 \
     && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | \
         sh -s -- -y --no-modify-path --profile minimal \
             --default-toolchain "${RUST_NIGHTLY}" \
             --component rust-src \
+            --component llvm-tools-preview \
             --target wasm32-unknown-unknown \
     && rustc --version && cargo --version
 
@@ -121,7 +124,12 @@ RUN umask 000 \
     && wasm-bindgen --version \
     && wasm-bindgen-test-runner --version
 
-# 6. Pre-build dependencies + std into CARGO_TARGET_DIR using a stub crate.
+# 6. cargo-llvm-cov, used by `npm run coverage` in CI.
+RUN umask 000 \
+    && cargo install cargo-llvm-cov --version "${CARGO_LLVM_COV_VERSION}" --locked \
+    && cargo llvm-cov --version
+
+# 7. Pre-build dependencies + std into CARGO_TARGET_DIR using a stub crate.
 #    Only the manifests are copied, so this expensive layer is cached and only
 #    re-runs when Cargo.toml/Cargo.lock change. We drive the build through the
 #    project's own npm scripts so the rustflags/build-std flags are sourced from
@@ -135,7 +143,7 @@ RUN umask 000 \
 #    `umask 000` makes every cache file (CARGO_TARGET_DIR, the cargo registry,
 #    XDG_CACHE_HOME) world-writable as it is created, so any uid (CI as root,
 #    agents as non-root) can reuse and extend the caches. We do this here (and in
-#    steps 3 and 5) instead of a trailing `chmod -R`: a `chmod` in its own layer
+#    steps 3, 5, and 6) instead of a trailing `chmod -R`: a `chmod` in its own layer
 #    only flips metadata, but OverlayFS can't represent a metadata-only change,
 #    so it copies every touched file into a new layer — that one `chmod` was the
 #    single largest layer in the image (~2.8 GB of duplicated cache trees).
@@ -167,7 +175,7 @@ RUN set -eux; \
     cd /; \
     rm -rf /opt/prewarm
 
-# 7. Login shells (`bash -lc ...`) re-source /etc/profile and would otherwise
+# 8. Login shells (`bash -lc ...`) re-source /etc/profile and would otherwise
 #    drop the cargo bin dir from PATH, so add it there too. ENV PATH above
 #    already covers non-login and exec-form invocations.
 RUN printf 'export PATH=%s/bin:$PATH\n' "${CARGO_HOME}" > /etc/profile.d/rust.sh
