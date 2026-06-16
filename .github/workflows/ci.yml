@@ -83,7 +83,6 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run test
-      - uses: taiki-e/install-action@cargo-llvm-cov
       - run: npm run coverage
       - run: npm run test:wasm
       - uses: codecov/codecov-action@v5
