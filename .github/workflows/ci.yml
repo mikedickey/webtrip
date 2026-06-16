@@ -71,6 +71,9 @@ jobs:
     name: Build
     needs: container
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     container:
       image: ${{ needs.container.outputs.image }}
       credentials:
@@ -83,8 +86,9 @@ jobs:
       - run: npm run test
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: npm run coverage
+      - run: npm run test:wasm
       - uses: codecov/codecov-action@v5
         with:
           files: lcov.info
+          use_oidc: true
           fail_ci_if_error: true
-      - run: npm run test:wasm
