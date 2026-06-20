@@ -190,7 +190,7 @@ mod tests {
         assert!(result.is_ok());
         let events = result.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, Some("event1".to_string()));
+        assert_eq!(events[0].core.id, Some("event1".to_string()));
         mock.assert_async().await;
     }
 
@@ -234,8 +234,8 @@ mod tests {
         assert!(result.is_ok());
         let events = result.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, Some("evt123".to_string()));
-        assert_eq!(events[0].title, Some("My Event".to_string()));
+        assert_eq!(events[0].core.id, Some("evt123".to_string()));
+        assert_eq!(events[0].core.title, Some("My Event".to_string()));
         mock.assert_async().await;
     }
 

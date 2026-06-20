@@ -27,21 +27,9 @@ pub struct Ping {
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
 pub struct PingStats {
-    /// Minimum round-trip time (ms)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_rtt: Option<i32>,
-
-    /// Maximum round-trip time (ms)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_rtt: Option<i32>,
-
-    /// Average round-trip time (ms)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub avg_rtt: Option<i32>,
-
-    /// Standard deviation of RTT
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stddev_rtt: Option<i32>,
+    /// RTT statistics
+    #[serde(flatten)]
+    pub rtt: super::RttStats,
 
     /// Packets sent
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -430,7 +418,10 @@ mod tests {
         let s = ServerWithSubscription {
             server: super::super::Studio {
                 id: Some("st1".into()),
-                name: Some("Studio".into()),
+                config: super::super::ServerConfig {
+                    name: Some("Studio".into()),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             subscription: Some(super::super::Subscription {

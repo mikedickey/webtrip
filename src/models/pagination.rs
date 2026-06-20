@@ -33,15 +33,11 @@ pub struct PaginatedResponse<T> {
     pub has_prev: bool,
 }
 
-/// Paginated channels/streams response
+/// Pagination metadata shared across paginated response types.
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
-pub struct PaginatedChannels {
-    /// Channels in this page
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub items: Option<Vec<StreamInfo>>,
-
+pub struct PageMeta {
     /// Current page number
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page: Option<i32>,
@@ -65,6 +61,20 @@ pub struct PaginatedChannels {
     /// Whether there is a previous page
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_prev: Option<bool>,
+}
+
+/// Paginated channels/streams response
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct PaginatedChannels {
+    /// Channels in this page
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<StreamInfo>>,
+
+    /// Pagination metadata
+    #[serde(flatten)]
+    pub meta: PageMeta,
 }
 
 /// Paginated events response
@@ -76,29 +86,9 @@ pub struct PaginatedEvents {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub items: Option<Vec<PublicUpcomingEvent>>,
 
-    /// Current page number
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub page: Option<i32>,
-
-    /// Items per page
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<i32>,
-
-    /// Total number of items
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total: Option<i32>,
-
-    /// Total number of pages
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_pages: Option<i32>,
-
-    /// Whether there is a next page
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub has_next: Option<bool>,
-
-    /// Whether there is a previous page
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub has_prev: Option<bool>,
+    /// Pagination metadata
+    #[serde(flatten)]
+    pub meta: PageMeta,
 }
 
 /// Paginated recordings response
@@ -110,28 +100,8 @@ pub struct PaginatedRecordings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub items: Option<Vec<RecordingMetadata>>,
 
-    /// Current page number
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub page: Option<i32>,
-
-    /// Items per page
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<i32>,
-
-    /// Total number of items
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total: Option<i32>,
-
-    /// Total number of pages
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_pages: Option<i32>,
-
-    /// Whether there is a next page
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub has_next: Option<bool>,
-
-    /// Whether there is a previous page
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub has_prev: Option<bool>,
+    /// Pagination metadata
+    #[serde(flatten)]
+    pub meta: PageMeta,
 }
 

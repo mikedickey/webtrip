@@ -376,8 +376,8 @@ mod tests {
 
         assert!(result.is_ok());
         let stream = result.unwrap();
-        assert_eq!(stream.id, Some("stream123".to_string()));
-        assert_eq!(stream.name, Some("My Stream".to_string()));
+        assert_eq!(stream.base.id, Some("stream123".to_string()));
+        assert_eq!(stream.base.name, Some("My Stream".to_string()));
         mock.assert_async().await;
     }
 

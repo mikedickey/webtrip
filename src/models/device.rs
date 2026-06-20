@@ -164,57 +164,9 @@ pub struct AgentCredentials {
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceHeartbeat {
-    /// Device MAC address
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mac: Option<String>,
-
-    /// Device version
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-
-    /// Device type/overlay
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub device_type: Option<String>,
-
-    /// API key prefix
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_prefix: Option<String>,
-
-    /// API key secret
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_secret: Option<String>,
-
-    /// Packets received count
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pkts_recv: Option<i32>,
-
-    /// Packets sent count
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pkts_sent: Option<i32>,
-
-    /// Minimum round-trip time (ms)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_rtt: Option<i32>,
-
-    /// Maximum round-trip time (ms)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_rtt: Option<i32>,
-
-    /// Average round-trip time (ms)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub avg_rtt: Option<i32>,
-
-    /// Standard deviation of round-trip time
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stddev_rtt: Option<i32>,
-
-    /// Latest round-trip time (ms)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_rtt: Option<i32>,
-
-    /// Stats collection timestamp (RFC3339)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stats_updated_at: Option<String>,
+    /// Network and RTT statistics
+    #[serde(flatten)]
+    pub net: super::DeviceNetworkStats,
 }
 
 /// ALSA audio device configuration
@@ -282,19 +234,23 @@ mod tests {
     #[test]
     fn device_heartbeat_renames_type_field() {
         let h = DeviceHeartbeat {
-            mac: Some("00:11:22:33:44:55".into()),
-            version: Some("1.0".into()),
-            device_type: Some("usb-x2".into()),
-            api_prefix: Some("pref".into()),
-            api_secret: Some("sec".into()),
-            pkts_recv: Some(1000),
-            pkts_sent: Some(1001),
-            min_rtt: Some(10),
-            max_rtt: Some(30),
-            avg_rtt: Some(15),
-            stddev_rtt: Some(2),
-            latest_rtt: Some(14),
-            stats_updated_at: Some("2026-06-14T00:00:00Z".into()),
+            net: super::super::DeviceNetworkStats {
+                mac: Some("00:11:22:33:44:55".into()),
+                version: Some("1.0".into()),
+                device_type: Some("usb-x2".into()),
+                api_prefix: Some("pref".into()),
+                api_secret: Some("sec".into()),
+                pkts_recv: Some(1000),
+                pkts_sent: Some(1001),
+                rtt: super::super::RttStats {
+                    min_rtt: Some(10),
+                    max_rtt: Some(30),
+                    avg_rtt: Some(15),
+                    stddev_rtt: Some(2),
+                    latest_rtt: Some(14),
+                    stats_updated_at: Some("2026-06-14T00:00:00Z".into()),
+                },
+            },
         };
         let s = roundtrip(&h);
         // device_type field is serialized as "type"

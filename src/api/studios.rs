@@ -287,7 +287,7 @@ mod tests {
         assert!(result.is_ok());
         let studio = result.unwrap();
         assert_eq!(studio.id, Some("studio123".to_string()));
-        assert_eq!(studio.name, Some("My Studio".to_string()));
+        assert_eq!(studio.config.name, Some("My Studio".to_string()));
         mock.assert_async().await;
     }
 
