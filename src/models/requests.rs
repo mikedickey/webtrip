@@ -164,25 +164,17 @@ pub struct ModifySubscriptionRequest {
     pub prorate: Option<bool>,
 }
 
-/// Coupon redemption request
+/// Generic code request (used for coupon and promo code redemption)
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
-pub struct CouponRequest {
-    /// Coupon code to redeem
+pub struct CodeRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
 }
 
-/// Promo code request
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct PromoRequest {
-    /// Promo code to apply
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
-}
+pub type CouponRequest = CodeRequest;
+pub type PromoRequest = CodeRequest;
 
 #[cfg(test)]
 mod tests {

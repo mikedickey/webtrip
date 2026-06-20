@@ -331,11 +331,7 @@ impl Transport for MockTransport {
 
     fn set_audio_buffers(&mut self, config: AudioBufferConfig) {
         self.audio_buffers = Some(config);
-        web_sys::console::debug_1(&format!(
-            "✅ Mock: Audio buffers configured ({}ch, {} samples)", 
-            config.channels, 
-            config.buffer_size
-        ).into());
+        super::transport::log_audio_buffers_set("Mock", config.channels, config.buffer_size);
     }
 
     fn connect(

@@ -1006,11 +1006,7 @@ impl Transport for WebRtcTransport {
         let max_packet_bytes = 16 + (config.buffer_size * config.channels as usize * 4);
         self.packet_serialize_buffer.resize(max_packet_bytes, 0);
         
-        web_sys::console::debug_1(&format!(
-            "✅ WebRTC: Audio buffers configured ({}ch, {} samples)", 
-            config.channels, 
-            config.buffer_size
-        ).into());
+        super::transport::log_audio_buffers_set("WebRTC", config.channels, config.buffer_size);
     }
 
     fn set_on_state_change(&mut self, callback: js_sys::Function) {

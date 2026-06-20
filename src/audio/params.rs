@@ -6,6 +6,11 @@ pub const MIN_DB: f32 = -60.0;
 /// Maximum dB level (clipping)
 pub const MAX_DB: f32 = 0.0;
 
+#[inline]
+fn db_to_percent(db: f32) -> f32 {
+    ((db - MIN_DB) / (MAX_DB - MIN_DB) * 100.0).max(0.0).min(100.0)
+}
+
 /// Parameters shared between main thread and audio processing thread
 #[wasm_bindgen]
 pub struct AudioParams {
@@ -82,16 +87,13 @@ impl AudioParams {
     /// Maps -60dB to 0% and 0dB to 100%
     #[wasm_bindgen(js_name = getVolumeLevel)]
     pub fn get_volume_level(&self) -> f32 {
-        let db = self.get_db_level();
-        // Map dB range to percentage
-        ((db - MIN_DB) / (MAX_DB - MIN_DB) * 100.0).max(0.0).min(100.0)
+        db_to_percent(self.get_db_level())
     }
 
     /// Get the peak level as a percentage (0.0 to 100.0)
     #[wasm_bindgen(js_name = getPeakLevel)]
     pub fn get_peak_level(&self) -> f32 {
-        let db = self.get_peak_db_level();
-        ((db - MIN_DB) / (MAX_DB - MIN_DB) * 100.0).max(0.0).min(100.0)
+        db_to_percent(self.get_peak_db_level())
     }
 
     /// Set monitor volume (0.0 to 1.0)

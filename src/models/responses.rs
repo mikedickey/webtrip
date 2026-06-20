@@ -82,15 +82,15 @@ pub struct UnreadMessagesResponse {
     pub count: Option<i32>,
 }
 
-/// URL redirect response
+/// Generic URL response (used for redirects and billing portal URLs)
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
-pub struct Redirect {
-    /// Redirect URL
+pub struct UrlResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 }
+
 
 /// API error response
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -239,16 +239,6 @@ pub struct DeviceConfig {
     /// Studio settings
     #[serde(skip_serializing_if = "Option::is_none")]
     pub studio: Option<super::Studio>,
-}
-
-/// Billing portal response
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct BillingPortalResponse {
-    /// Stripe billing portal URL
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
 }
 
 /// Coupon response

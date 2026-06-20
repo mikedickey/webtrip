@@ -59,6 +59,13 @@ pub const DEFAULT_BUFFER_SIZE: u16 = 128;
 /// Default bit depth (16-bit = 16)
 pub const DEFAULT_BIT_DEPTH: u8 = 16;
 
+/// Calculate audio data size in bytes for a given buffer configuration
+fn audio_data_size(buffer_size: u16, channels: u8, bit_depth: u8) -> usize {
+    let samples = buffer_size as usize * channels as usize;
+    let bytes_per_sample = (bit_depth as usize + 7) / 8;
+    samples * bytes_per_sample
+}
+
 /// Sample rate encoding (matches JackTrip's enum)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -218,23 +225,9 @@ impl PacketHeader {
         }
     }
 
-    /// Calculate the expected audio data size in bytes for outgoing (send) packets
-    pub fn audio_data_size_out(&self) -> usize {
-        let samples = self.buffer_size as usize * self.num_outgoing_channels as usize;
-        let bytes_per_sample = (self.bit_depth as usize + 7) / 8;
-        samples * bytes_per_sample
-    }
-
-    /// Calculate the expected audio data size in bytes for incoming (receive) packets
-    pub fn audio_data_size_in(&self) -> usize {
-        let samples = self.buffer_size as usize * self.num_incoming_channels as usize;
-        let bytes_per_sample = (self.bit_depth as usize + 7) / 8;
-        samples * bytes_per_sample
-    }
-
     /// Total packet size for outgoing packets (header + audio data)
     pub fn total_packet_size_out(&self) -> usize {
-        HEADER_SIZE + self.audio_data_size_out()
+        HEADER_SIZE + audio_data_size(self.buffer_size, self.num_outgoing_channels, self.bit_depth)
     }
 
     /// Serialize header to bytes (little-endian byte order)
