@@ -225,19 +225,9 @@ impl PacketHeader {
         }
     }
 
-    /// Calculate the expected audio data size in bytes for outgoing (send) packets
-    pub fn audio_data_size_out(&self) -> usize {
-        audio_data_size(self.buffer_size, self.num_outgoing_channels, self.bit_depth)
-    }
-
-    /// Calculate the expected audio data size in bytes for incoming (receive) packets
-    pub fn audio_data_size_in(&self) -> usize {
-        audio_data_size(self.buffer_size, self.num_incoming_channels, self.bit_depth)
-    }
-
     /// Total packet size for outgoing packets (header + audio data)
     pub fn total_packet_size_out(&self) -> usize {
-        HEADER_SIZE + self.audio_data_size_out()
+        HEADER_SIZE + audio_data_size(self.buffer_size, self.num_outgoing_channels, self.bit_depth)
     }
 
     /// Serialize header to bytes (little-endian byte order)
