@@ -426,7 +426,11 @@ impl WebTransportImpl {
         let (ready_promise, ready_resolve, ready_reject) = crate::audio::make_promise();
         *self.worker_ready_resolve.borrow_mut() = Some(ready_resolve);
         *self.worker_ready_reject.borrow_mut() = Some(ready_reject);
-        JsFuture::from(ready_promise).await?;
+        if let Err(e) = JsFuture::from(ready_promise).await {
+            self.state = TransportState::Failed;
+            self.notify_state_change();
+            return Err(e);
+        }
 
         // Connect via worker
         match self.connect_worker(&server_url).await {
