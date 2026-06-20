@@ -91,6 +91,7 @@ pub struct WebTransportImpl {
     connection_promise_resolve: Rc<RefCell<Option<js_sys::Function>>>,
     connection_promise_reject: Rc<RefCell<Option<js_sys::Function>>>,
     worker_ready_resolve: Rc<RefCell<Option<js_sys::Function>>>,
+    worker_ready_reject: Rc<RefCell<Option<js_sys::Function>>>,
     // Resolver for the Promise returned by `close()`. Fired when the worker
     // posts "disconnected" (happy path) or when the 2s fallback timer elapses
     // (worker hung). See the `close()` impl for details.
@@ -116,6 +117,7 @@ impl WebTransportImpl {
             connection_promise_resolve: Rc::new(RefCell::new(None)),
             connection_promise_reject: Rc::new(RefCell::new(None)),
             worker_ready_resolve: Rc::new(RefCell::new(None)),
+            worker_ready_reject: Rc::new(RefCell::new(None)),
             close_promise_resolve: Rc::new(RefCell::new(None)),
         })
     }
@@ -145,6 +147,7 @@ impl WebTransportImpl {
         let connection_resolve = self.connection_promise_resolve.clone();
         let connection_reject = self.connection_promise_reject.clone();
         let worker_ready_resolve = self.worker_ready_resolve.clone();
+        let worker_ready_reject = self.worker_ready_reject.clone();
         let close_resolve = self.close_promise_resolve.clone();
         let worker_slot = self.worker.clone();
 
@@ -220,6 +223,10 @@ impl WebTransportImpl {
                             if let Some(ref callback) = state_change_cb {
                                 let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("failed"));
                             }
+                            // Reject startup promises if still pending
+                            if let Some(reject) = worker_ready_reject.borrow_mut().take() {
+                                let _ = reject.call1(&JsValue::NULL, &JsValue::from_str(&error));
+                            }
                             // Reject the connection promise if pending
                             if let Some(reject) = connection_reject.borrow_mut().take() {
                                 let _ = reject.call1(&JsValue::NULL, &JsValue::from_str(&error));
@@ -246,6 +253,8 @@ impl WebTransportImpl {
 
         // Set up error handler
         let state_change_cb2 = self.on_state_change.clone();
+        let onerror_ready_reject = self.worker_ready_reject.clone();
+        let onerror_connection_reject = self.connection_promise_reject.clone();
         let on_error = Closure::wrap(Box::new(move |event: web_sys::ErrorEvent| {
             web_sys::console::error_1(&"[WebTransport] Worker error event triggered".into());
             
@@ -289,10 +298,17 @@ impl WebTransportImpl {
             }
             
             let msg = msg_parts.join(" ");
-            web_sys::console::error_1(&msg.into());
+            web_sys::console::error_1(&msg.clone().into());
             
             if let Some(ref callback) = state_change_cb2 {
                 let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("failed"));
+            }
+            // Reject startup promises if still pending so callers don't hang
+            if let Some(reject) = onerror_ready_reject.borrow_mut().take() {
+                let _ = reject.call1(&JsValue::NULL, &JsValue::from_str(&msg));
+            }
+            if let Some(reject) = onerror_connection_reject.borrow_mut().take() {
+                let _ = reject.call1(&JsValue::NULL, &JsValue::from_str(&msg));
             }
         }) as Box<dyn FnMut(web_sys::ErrorEvent)>);
 
@@ -407,8 +423,9 @@ impl WebTransportImpl {
         self.init_worker()?;
 
         // Wait for worker to signal it is ready (WASM loaded and initialized)
-        let (ready_promise, ready_resolve, _ready_reject) = crate::audio::make_promise();
+        let (ready_promise, ready_resolve, ready_reject) = crate::audio::make_promise();
         *self.worker_ready_resolve.borrow_mut() = Some(ready_resolve);
+        *self.worker_ready_reject.borrow_mut() = Some(ready_reject);
         JsFuture::from(ready_promise).await?;
 
         // Connect via worker

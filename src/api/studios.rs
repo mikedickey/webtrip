@@ -212,7 +212,7 @@ impl StudiosApi {
     #[wasm_bindgen(js_name = getParticipants)]
     pub async fn get_participants_js(&self, studio_id: String) -> Result<JsValue, ApiError> {
         let participants = self.get_participants(&studio_id).await?;
-        serde_wasm_bindgen::to_value(&participants).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&participants)
     }
 
     #[wasm_bindgen(js_name = getSession)]

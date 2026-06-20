@@ -171,13 +171,13 @@ impl UsersApi {
     #[wasm_bindgen(js_name = getNotifications)]
     pub async fn get_notifications_js(&self, user_id: String) -> Result<JsValue, ApiError> {
         let notifications = self.get_notifications(&user_id).await?;
-        serde_wasm_bindgen::to_value(&notifications).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&notifications)
     }
 
     #[wasm_bindgen(js_name = getConversations)]
     pub async fn get_conversations_js(&self, user_id: String) -> Result<JsValue, ApiError> {
         let conversations = self.get_conversations(&user_id).await?;
-        serde_wasm_bindgen::to_value(&conversations).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&conversations)
     }
 
     #[wasm_bindgen(js_name = getUnreadMessagesCount)]
@@ -188,7 +188,7 @@ impl UsersApi {
     #[wasm_bindgen(js_name = getReferrals)]
     pub async fn get_referrals_js(&self, user_id: String) -> Result<JsValue, ApiError> {
         let referrals = self.get_referrals(&user_id).await?;
-        serde_wasm_bindgen::to_value(&referrals).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&referrals)
     }
 
     #[wasm_bindgen(js_name = createReferral)]

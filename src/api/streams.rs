@@ -229,7 +229,7 @@ impl StreamsApi {
     #[wasm_bindgen(js_name = getStreamConversations)]
     pub async fn get_stream_conversations_js(&self, stream_id: String) -> Result<JsValue, ApiError> {
         let conversations = self.get_stream_conversations(&stream_id).await?;
-        serde_wasm_bindgen::to_value(&conversations).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&conversations)
     }
 
     #[wasm_bindgen(js_name = getStreamConversation)]
@@ -244,7 +244,7 @@ impl StreamsApi {
     #[wasm_bindgen(js_name = getConversationMessages)]
     pub async fn get_conversation_messages_js(&self, stream_id: String, user_id: String) -> Result<JsValue, ApiError> {
         let messages = self.get_conversation_messages(&stream_id, &user_id).await?;
-        serde_wasm_bindgen::to_value(&messages).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&messages)
     }
 
     #[wasm_bindgen(js_name = sendMessage)]
@@ -292,7 +292,7 @@ impl StreamsApi {
     #[wasm_bindgen(js_name = getSimulcastDestinations)]
     pub async fn get_simulcast_destinations_js(&self, studio_id: String) -> Result<JsValue, ApiError> {
         let destinations = self.get_simulcast_destinations(&studio_id).await?;
-        serde_wasm_bindgen::to_value(&destinations).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&destinations)
     }
 
     #[wasm_bindgen(js_name = updateSimulcastDestination)]
