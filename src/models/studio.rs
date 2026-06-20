@@ -1,6 +1,6 @@
 //! Studio (virtual server) models
 
-use super::{BroadcastVisibility, BufferStrategy, Period, QueueBuffer, ResourceStatus, SampleRate, StudioType};
+use super::{BroadcastVisibility, BufferStrategy, Period, QueueBuffer, ResourceStatus, ServerConfig};
 use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 use wasm_bindgen::prelude::*;
@@ -98,41 +98,9 @@ pub struct Studio {
     // ServerConfig fields
     // =========================================================================
 
-    /// Studio type (JackTrip or JackTrip+Jamulus)
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub studio_type: Option<StudioType>,
-
-    /// Studio display name
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-
-    /// Studio hostname/IP address
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub server_host: Option<String>,
-
-    /// Studio port number
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub server_port: Option<i32>,
-
-    /// Audio sample rate in Hz (44100, 48000, 88200, 96000)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sample_rate: Option<SampleRate>,
-
-    /// Whether the studio is publicly visible
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub public: Option<bool>,
-
-    /// Whether stereo audio is enabled
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stereo: Option<bool>,
-
-    /// Whether loopback audio is enabled
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub loopback: Option<bool>,
-
-    /// Whether the studio is currently active/enabled
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
+    /// Configuration properties (type, name, serverHost, serverPort, sampleRate, public, stereo, loopback, enabled)
+    #[serde(flatten)]
+    pub config: ServerConfig,
 
     // =========================================================================
     // ServerWithSubscription fields (returned when listing studios)
@@ -316,12 +284,12 @@ mod tests {
         }"#;
         let s: Studio = serde_json::from_str(json).unwrap();
         assert_eq!(s.id.as_deref(), Some("studio123"));
-        assert_eq!(s.studio_type, Some(StudioType::JackTripJamulus));
+        assert_eq!(s.config.studio_type, Some(super::super::StudioType::JackTripJamulus));
         assert_eq!(s.status, Some(ResourceStatus::Ready));
         assert_eq!(s.period, Some(Period::P128));
         assert_eq!(s.queue_buffer, Some(QueueBuffer::Q4));
         assert_eq!(s.buffer_strategy, Some(BufferStrategy::Standard));
-        assert_eq!(s.sample_rate, Some(SampleRate::Rate48000));
+        assert_eq!(s.config.sample_rate, Some(super::super::SampleRate::Rate48000));
         assert_eq!(s.broadcast, Some(BroadcastVisibility::Public));
         assert_eq!(s.banner_url.as_deref(), Some("https://cdn.example.com/banner.png"));
 

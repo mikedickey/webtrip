@@ -226,6 +226,74 @@ impl Default for SampleRate {
     }
 }
 
+/// RTT statistics shared across heartbeat and ping types.
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct RttStats {
+    /// Minimum round-trip time (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_rtt: Option<i32>,
+
+    /// Maximum round-trip time (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_rtt: Option<i32>,
+
+    /// Average round-trip time (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_rtt: Option<i32>,
+
+    /// Standard deviation of RTT
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stddev_rtt: Option<i32>,
+
+    /// Latest round-trip time (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_rtt: Option<i32>,
+
+    /// Stats collection timestamp (RFC3339)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats_updated_at: Option<String>,
+}
+
+/// Device network statistics shared across heartbeat request types.
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceNetworkStats {
+    /// Device MAC address
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+
+    /// Device version
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+
+    /// Device type/overlay
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub device_type: Option<String>,
+
+    /// API key prefix
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_prefix: Option<String>,
+
+    /// API key secret
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_secret: Option<String>,
+
+    /// Packets received count
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pkts_recv: Option<i32>,
+
+    /// Packets sent count
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pkts_sent: Option<i32>,
+
+    /// RTT statistics
+    #[serde(flatten)]
+    pub rtt: RttStats,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

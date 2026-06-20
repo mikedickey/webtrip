@@ -44,33 +44,9 @@ pub struct StreamInfo {
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamInfoWithEngagement {
-    /// Stream ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-
-    /// Stream name
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-
-    /// Stream description
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-
-    /// Studio display name
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub server_name: Option<String>,
-
-    /// HLS metadata URL
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub meta_url: Option<String>,
-
-    /// Chat room ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chat_id: Option<String>,
-
-    /// Banner image URL
-    #[serde(rename = "bannerURL", skip_serializing_if = "Option::is_none")]
-    pub banner_url: Option<String>,
+    /// Base stream information
+    #[serde(flatten)]
+    pub base: StreamInfo,
 
     /// Number of current viewers
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -233,13 +209,15 @@ mod tests {
     #[test]
     fn stream_info_with_engagement_roundtrip() {
         let s = StreamInfoWithEngagement {
-            id: Some("s1".into()),
-            name: Some("Name".into()),
-            description: None,
-            server_name: Some("studio".into()),
-            meta_url: None,
-            chat_id: None,
-            banner_url: Some("https://b".into()),
+            base: StreamInfo {
+                id: Some("s1".into()),
+                name: Some("Name".into()),
+                description: None,
+                server_name: Some("studio".into()),
+                meta_url: None,
+                chat_id: None,
+                banner_url: Some("https://b".into()),
+            },
             viewers: Some(42),
             followers: Some(1000),
             following: Some(true),
