@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use crate::audio::params::{AudioParams, MAX_DB, MIN_DB};
+use crate::audio::params::{AudioParams, MAX_DB, MIN_DB, decode_db, decode_volume, encode_db};
 use crate::audio::regulator::Regulator;
 use crate::audio::ring_buffer::RingBuffer;
 
@@ -100,7 +100,7 @@ impl AudioProcessor {
         let current_db = Self::amplitude_to_db(rms);
         
         // Store dB level
-        let db_stored = ((current_db - MIN_DB) * 100.0) as i32;
+        let db_stored = encode_db(current_db);
         self.params.db_level.store(db_stored, Ordering::Relaxed);
 
         // Peak level tracking with hold and decay
@@ -115,8 +115,8 @@ impl AudioProcessor {
         self.receive_from_network();
 
         // Generate output: mix monitor + remote audio
-        let monitor_volume = self.params.monitor_volume.load(Ordering::Relaxed) as f32 / 1000.0;
-        let output_volume = self.params.output_volume.load(Ordering::Relaxed) as f32 / 1000.0;
+        let monitor_volume = decode_volume(self.params.monitor_volume.load(Ordering::Relaxed));
+        let output_volume  = decode_volume(self.params.output_volume.load(Ordering::Relaxed));
         
         let len = input.len().min(output.len());
         for i in 0..len {
@@ -137,8 +137,7 @@ impl AudioProcessor {
 
     /// Update peak level with hold and decay
     fn update_peak_level(&self, current_db: f32, db_stored: i32) {
-        let current_peak_stored = self.params.peak_db_level.load(Ordering::Relaxed);
-        let current_peak_db = (current_peak_stored as f32 / 100.0) + MIN_DB;
+        let current_peak_db = decode_db(self.params.peak_db_level.load(Ordering::Relaxed));
         
         if current_db >= current_peak_db {
             // New peak detected
@@ -149,8 +148,7 @@ impl AudioProcessor {
             if hold_counter > 0 {
                 self.params.peak_hold_counter.store(hold_counter - 1, Ordering::Relaxed);
             } else {
-                let decayed_db = current_peak_db - PEAK_DECAY_RATE;
-                let decayed_stored = ((decayed_db.max(MIN_DB) - MIN_DB) * 100.0) as i32;
+                let decayed_stored = encode_db((current_peak_db - PEAK_DECAY_RATE).max(MIN_DB));
                 self.params.peak_db_level.store(decayed_stored, Ordering::Relaxed);
             }
         }

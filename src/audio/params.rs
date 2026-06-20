@@ -6,6 +6,11 @@ pub const MIN_DB: f32 = -60.0;
 /// Maximum dB level (clipping)
 pub const MAX_DB: f32 = 0.0;
 
+#[inline] pub(crate) fn encode_db(db: f32) -> i32     { ((db - MIN_DB) * 100.0) as i32 }
+#[inline] pub(crate) fn decode_db(stored: i32) -> f32 { (stored as f32 / 100.0) + MIN_DB }
+#[inline] pub(crate) fn encode_volume(v: f32) -> u32   { (v * 1000.0) as u32 }
+#[inline] pub(crate) fn decode_volume(stored: u32) -> f32 { stored as f32 / 1000.0 }
+
 #[inline]
 fn db_to_percent(db: f32) -> f32 {
     ((db - MIN_DB) / (MAX_DB - MIN_DB) * 100.0).max(0.0).min(100.0)
@@ -72,15 +77,13 @@ impl AudioParams {
     /// Get the current dB level (-60.0 to 0.0)
     #[wasm_bindgen(js_name = getDbLevel)]
     pub fn get_db_level(&self) -> f32 {
-        let stored = self.db_level.load(Ordering::Relaxed);
-        (stored as f32 / 100.0) + MIN_DB
+        decode_db(self.db_level.load(Ordering::Relaxed))
     }
 
     /// Get the peak dB level (-60.0 to 0.0)
     #[wasm_bindgen(js_name = getPeakDbLevel)]
     pub fn get_peak_db_level(&self) -> f32 {
-        let stored = self.peak_db_level.load(Ordering::Relaxed);
-        (stored as f32 / 100.0) + MIN_DB
+        decode_db(self.peak_db_level.load(Ordering::Relaxed))
     }
 
     /// Get the current volume level as a percentage (0.0 to 100.0)
@@ -99,14 +102,13 @@ impl AudioParams {
     /// Set monitor volume (0.0 to 1.0)
     #[wasm_bindgen(js_name = setMonitorVolume)]
     pub fn set_monitor_volume(&self, volume: f32) {
-        let clamped = volume.clamp(0.0, 1.0);
-        self.monitor_volume.store((clamped * 1000.0) as u32, Ordering::Relaxed);
+        self.monitor_volume.store(encode_volume(volume.clamp(0.0, 1.0)), Ordering::Relaxed);
     }
 
     /// Get monitor volume (0.0 to 1.0)
     #[wasm_bindgen(js_name = getMonitorVolume)]
     pub fn get_monitor_volume(&self) -> f32 {
-        self.monitor_volume.load(Ordering::Relaxed) as f32 / 1000.0
+        decode_volume(self.monitor_volume.load(Ordering::Relaxed))
     }
 
     /// Set auto gain control
@@ -167,14 +169,13 @@ impl AudioParams {
     /// Set output volume (0.0 to 1.0)
     #[wasm_bindgen(js_name = setOutputVolume)]
     pub fn set_output_volume(&self, volume: f32) {
-        let clamped = volume.clamp(0.0, 1.0);
-        self.output_volume.store((clamped * 1000.0) as u32, Ordering::Relaxed);
+        self.output_volume.store(encode_volume(volume.clamp(0.0, 1.0)), Ordering::Relaxed);
     }
 
     /// Get output volume (0.0 to 1.0)
     #[wasm_bindgen(js_name = getOutputVolume)]
     pub fn get_output_volume(&self) -> f32 {
-        self.output_volume.load(Ordering::Relaxed) as f32 / 1000.0
+        decode_volume(self.output_volume.load(Ordering::Relaxed))
     }
 }
 
@@ -296,7 +297,7 @@ pub fn get_callback_count_from_ptr(ptr: *const AudioParams) -> u64 {
 // `db_level` / `peak_db_level` have no public setters — they are written by
 // `AudioProcessor` using the fixed-point encoding `stored = (db - MIN_DB) * 100`.
 // The tests reach the `pub(crate)` atomics directly to drive the dB getters,
-// mirroring that encoding via the `enc_db` helper below.
+// mirroring that encoding via the `encode_db` helper.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,12 +308,6 @@ mod tests {
     /// Tolerance for float comparisons. Fixed-point storage resolves to 0.01 dB
     /// (levels/gain) and 0.001 (linear volume), so 1e-4 is comfortably tight.
     const EPS: f32 = 1e-4;
-
-    /// Encode a dB value into the fixed-point representation used by
-    /// `db_level` / `peak_db_level`, mirroring `AudioProcessor`.
-    fn enc_db(db: f32) -> i32 {
-        ((db - MIN_DB) * 100.0) as i32
-    }
 
     #[test]
     fn test_default_values() {
@@ -427,24 +422,24 @@ mod tests {
     fn test_db_level_conversion_boundaries() {
         let p = AudioParams::default();
         // Silence: stored 0 decodes to MIN_DB.
-        p.db_level.store(enc_db(MIN_DB), Ordering::Relaxed);
+        p.db_level.store(encode_db(MIN_DB), Ordering::Relaxed);
         assert!((p.get_db_level() - MIN_DB).abs() < EPS);
         // Mid-scale.
-        p.db_level.store(enc_db(-30.0), Ordering::Relaxed);
+        p.db_level.store(encode_db(-30.0), Ordering::Relaxed);
         assert!((p.get_db_level() - (-30.0)).abs() < EPS);
         // Unity / full-scale: 0 dB == MAX_DB, the clipping ceiling.
-        p.db_level.store(enc_db(MAX_DB), Ordering::Relaxed);
+        p.db_level.store(encode_db(MAX_DB), Ordering::Relaxed);
         assert!((p.get_db_level() - MAX_DB).abs() < EPS);
     }
 
     #[test]
     fn test_peak_db_level_conversion_boundaries() {
         let p = AudioParams::default();
-        p.peak_db_level.store(enc_db(MIN_DB), Ordering::Relaxed);
+        p.peak_db_level.store(encode_db(MIN_DB), Ordering::Relaxed);
         assert!((p.get_peak_db_level() - MIN_DB).abs() < EPS);
-        p.peak_db_level.store(enc_db(-15.0), Ordering::Relaxed);
+        p.peak_db_level.store(encode_db(-15.0), Ordering::Relaxed);
         assert!((p.get_peak_db_level() - (-15.0)).abs() < EPS);
-        p.peak_db_level.store(enc_db(MAX_DB), Ordering::Relaxed);
+        p.peak_db_level.store(encode_db(MAX_DB), Ordering::Relaxed);
         assert!((p.get_peak_db_level() - MAX_DB).abs() < EPS);
     }
 
@@ -453,8 +448,8 @@ mod tests {
         let p = AudioParams::default();
         // -60 dB -> 0%, -30 dB -> 50%, 0 dB -> 100% for both current and peak meters.
         for (db, pct) in [(MIN_DB, 0.0_f32), (-30.0, 50.0), (MAX_DB, 100.0)] {
-            p.db_level.store(enc_db(db), Ordering::Relaxed);
-            p.peak_db_level.store(enc_db(db), Ordering::Relaxed);
+            p.db_level.store(encode_db(db), Ordering::Relaxed);
+            p.peak_db_level.store(encode_db(db), Ordering::Relaxed);
             assert!((p.get_volume_level() - pct).abs() < EPS, "{db} dB should map to {pct}%");
             assert!((p.get_peak_level() - pct).abs() < EPS, "{db} dB peak should map to {pct}%");
         }
@@ -464,13 +459,13 @@ mod tests {
     fn test_level_percentage_clamps_out_of_range() {
         let p = AudioParams::default();
         // Above 0 dB (clipping) clamps to 100%.
-        p.db_level.store(enc_db(10.0), Ordering::Relaxed);
-        p.peak_db_level.store(enc_db(10.0), Ordering::Relaxed);
+        p.db_level.store(encode_db(10.0), Ordering::Relaxed);
+        p.peak_db_level.store(encode_db(10.0), Ordering::Relaxed);
         assert!((p.get_volume_level() - 100.0).abs() < EPS);
         assert!((p.get_peak_level() - 100.0).abs() < EPS);
         // Below -60 dB clamps to 0%.
-        p.db_level.store(enc_db(-80.0), Ordering::Relaxed);
-        p.peak_db_level.store(enc_db(-80.0), Ordering::Relaxed);
+        p.db_level.store(encode_db(-80.0), Ordering::Relaxed);
+        p.peak_db_level.store(encode_db(-80.0), Ordering::Relaxed);
         assert!((p.get_volume_level() - 0.0).abs() < EPS);
         assert!((p.get_peak_level() - 0.0).abs() < EPS);
     }
@@ -484,7 +479,7 @@ mod tests {
         let p = AudioParams::default();
 
         // Tick 1: a new peak at -10 dB with a full hold counter.
-        p.peak_db_level.store(enc_db(-10.0), Ordering::Relaxed);
+        p.peak_db_level.store(encode_db(-10.0), Ordering::Relaxed);
         p.peak_hold_counter.store(3, Ordering::Relaxed);
         assert!((p.get_peak_db_level() - (-10.0)).abs() < EPS);
         assert_eq!(p.peak_hold_counter.load(Ordering::Relaxed), 3);
@@ -498,7 +493,7 @@ mod tests {
         }
 
         // Tick 5: hold expired -> a decayed peak is stored and read back.
-        p.peak_db_level.store(enc_db(-12.5), Ordering::Relaxed);
+        p.peak_db_level.store(encode_db(-12.5), Ordering::Relaxed);
         assert!((p.get_peak_db_level() - (-12.5)).abs() < EPS);
     }
 

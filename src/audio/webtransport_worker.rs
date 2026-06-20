@@ -47,6 +47,13 @@ fn post_message_to_main(msg: &JsValue) {
     let _ = global.post_message(msg);
 }
 
+fn post_error_to_main(msg: &str) {
+    let obj = Object::new();
+    let _ = Reflect::set(&obj, &"type".into(), &"error".into());
+    let _ = Reflect::set(&obj, &"error".into(), &msg.into());
+    post_message_to_main(&obj.into());
+}
+
 /// Worker state shared between message handler and transport loops
 struct WorkerState {
     /// Raw pointer to RingBuffer (send path: AudioWorklet -> Network)
@@ -375,10 +382,7 @@ async fn send_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(), 
                         });
                         
                         // Notify main thread
-                        let error_obj = Object::new();
-                        let _ = Reflect::set(&error_obj, &"type".into(), &"error".into());
-                        let _ = Reflect::set(&error_obj, &"error".into(), &"Connection lost".into());
-                        post_message_to_main(&error_obj.into());
+                        post_error_to_main("Connection lost");
                         
                         break;
                     }
@@ -578,10 +582,7 @@ async fn receive_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(
                 });
                 
                 // Notify main thread
-                let error_obj = Object::new();
-                let _ = Reflect::set(&error_obj, &"type".into(), &"error".into());
-                let _ = Reflect::set(&error_obj, &"error".into(), &"Connection lost".into());
-                post_message_to_main(&error_obj.into());
+                post_error_to_main("Connection lost");
                 
                 // For connection errors, break the loop
                 break;

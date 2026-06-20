@@ -66,7 +66,7 @@
 //! - **Manual Packet Injection**: Use `simulate_receive()` to inject specific test packets
 //! - **Queue Inspection**: Use `get_sent_packets()` to verify what was sent
 
-use super::transport::{Transport, TransportState, TransportType, AudioBufferConfig};
+use super::transport::{Transport, TransportState, TransportType, AudioBufferConfig, notify_transport_state};
 use crate::audio::protocol::{AudioPacket, PacketHeader, SampleRateCode, DEFAULT_BUFFER_SIZE, DEFAULT_SAMPLE_RATE};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -307,16 +307,7 @@ impl MockTransport {
     }
 
     fn notify_state_change(&self) {
-        if let Some(ref callback) = self.on_state_change {
-            let state_str = match self.state {
-                TransportState::Disconnected => "disconnected",
-                TransportState::Connecting => "connecting",
-                TransportState::Connected => "connected",
-                TransportState::Failed => "failed",
-                TransportState::Closed => "closed",
-            };
-            let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(state_str));
-        }
+        notify_transport_state(self.state, &self.on_state_change);
     }
 }
 
