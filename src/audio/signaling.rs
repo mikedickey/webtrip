@@ -368,7 +368,7 @@ pub struct HubSignaling {
 }
 
 impl HubSignaling {
-    /// Canonical struct initialiser — used by both `new` and `from_url`.
+    /// Canonical struct initialiser shared by `new` and `from_url`.
     fn build(server_url: String) -> Self {
         Self {
             server_url,
@@ -390,8 +390,7 @@ impl HubSignaling {
 
     /// Send a pre-serialised JSON message immediately if the socket is ready,
     /// or push it onto the outgoing queue to be flushed on open.
-    fn send_or_queue(&self, json: String) -> Result<(), JsValue> {
-        if *self.is_ready.borrow() {
+    fn send_or_queue(&self, json: String) -> Result<(), JsValue> {        if *self.is_ready.borrow() {
             let socket = self.socket.as_ref().ok_or("Not connected")?;
             socket.send_with_str(&json)?;
         } else {

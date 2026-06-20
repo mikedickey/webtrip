@@ -77,8 +77,7 @@ pub struct AudioBufferConfig {
 unsafe impl Send for AudioBufferConfig {}
 
 /// Notify a JS state-change callback with the string representation of `state`.
-///
-/// This is the single canonical implementation used by all transports.
+/// This is the single canonical implementation shared by all transports.
 pub(crate) fn notify_transport_state(state: TransportState, callback: &Option<js_sys::Function>) {
     if let Some(ref cb) = callback {
         let state_str = match state {

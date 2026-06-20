@@ -152,11 +152,8 @@ struct PendingCaptureParams {
 }
 
 /// Build a JS `Function` that maps raw transport state strings to session-level state
-/// strings and forwards them to `callback`.
-///
-/// `map_fn` receives the raw transport state string and returns either:
-/// - `Some(session_state)` — call `callback` with this string, or
-/// - `None` — silently ignore this state.
+/// strings via `map_fn` and forwards them to `callback`. Returns `None` from `map_fn`
+/// to suppress a state; return `Some(session_state)` to forward it.
 fn make_state_change_closure(
     callback: &js_sys::Function,
     map_fn: impl Fn(&str) -> Option<&'static str> + 'static,
