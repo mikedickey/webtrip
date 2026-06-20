@@ -719,5 +719,159 @@ mod tests {
         assert!(json.contains(r#"\n"#));
         assert!(!json.contains('\n'));
     }
+
+    // --- Round-trip tests for remaining message types ---
+
+    #[test]
+    fn test_answer_message_roundtrip() {
+        let sdp = "v=0\r\no=- 456 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
+        let original = SignalingMessage::answer(sdp);
+        let json = original.to_json();
+        let parsed = SignalingMessage::from_json(&json).unwrap();
+        assert_eq!(parsed.msg_type, SignalingMessageType::Answer);
+        assert_eq!(parsed.sdp.as_deref(), original.sdp.as_deref());
+    }
+
+    #[test]
+    fn test_hangup_message_roundtrip() {
+        let original = SignalingMessage::hangup();
+        let json = original.to_json();
+        let parsed = SignalingMessage::from_json(&json).unwrap();
+        assert_eq!(parsed.msg_type, SignalingMessageType::Hangup);
+        assert!(parsed.sdp.is_none());
+        assert!(parsed.candidate.is_none());
+        assert!(parsed.error.is_none());
+    }
+
+    #[test]
+    fn test_error_message_roundtrip() {
+        let error_text = "Room is full";
+        let original = SignalingMessage {
+            msg_type: SignalingMessageType::Error,
+            sdp: None,
+            candidate: None,
+            sdp_mid: None,
+            sdp_m_line_index: None,
+            error: Some(error_text.to_string()),
+        };
+        let json = original.to_json();
+        let parsed = SignalingMessage::from_json(&json).unwrap();
+        assert_eq!(parsed.msg_type, SignalingMessageType::Error);
+        assert_eq!(parsed.error.as_deref(), Some(error_text));
+    }
+
+    // --- escape_json_string edge cases ---
+
+    #[test]
+    fn test_escape_double_quotes() {
+        let escaped = super::escape_json_string(r#"say "hello""#);
+        assert_eq!(escaped, r#"say \"hello\""#);
+    }
+
+    #[test]
+    fn test_escape_backslash() {
+        // Each backslash in input should become two backslashes in output
+        let escaped = super::escape_json_string("path\\to\\file");
+        assert_eq!(escaped, "path\\\\to\\\\file");
+    }
+
+    #[test]
+    fn test_escape_control_characters() {
+        // \n, \r, \t should each become their two-character JSON sequences
+        let escaped = super::escape_json_string("line1\nline2\r\ntab\there");
+        assert_eq!(escaped, r"line1\nline2\r\ntab\there");
+    }
+
+    #[test]
+    fn test_escape_misc_control_char() {
+        // Other control characters (e.g. BEL 0x07) should become \uXXXX
+        let escaped = super::escape_json_string("\x07");
+        assert_eq!(escaped, r"\u0007");
+    }
+
+    #[test]
+    fn test_escape_unicode_multibyte() {
+        // Multi-byte UTF-8 code points are not control chars and pass through unchanged
+        let input = "こんにちは";
+        let escaped = super::escape_json_string(input);
+        assert_eq!(escaped, input);
+    }
+
+    // --- extract_string_field with realistic SDP payloads ---
+
+    #[test]
+    fn test_extract_string_field_realistic_sdp() {
+        // SDP contains colons and commas; the round-trip must preserve the full value
+        let sdp = "v=0\r\no=- 123 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE data\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n";
+        let json = SignalingMessage::offer(sdp).to_json();
+        let extracted = super::extract_string_field(&json, "sdp").unwrap();
+        assert_eq!(extracted, sdp);
+    }
+
+    #[test]
+    fn test_extract_string_field_with_escaped_chars() {
+        // Embedded double-quotes and backslashes must survive the round-trip
+        let sdp = r#"field with "quotes" and \backslash"#;
+        let json = SignalingMessage::offer(sdp).to_json();
+        let extracted = super::extract_string_field(&json, "sdp").unwrap();
+        assert_eq!(extracted, sdp);
+    }
+
+    #[test]
+    fn test_extract_string_field_missing() {
+        let json = r#"{"type":"offer"}"#;
+        let result = super::extract_string_field(json, "sdp");
+        assert!(result.is_err());
+    }
+
+    // --- extract_number_field boundary values ---
+
+    #[test]
+    fn test_extract_number_field_zero() {
+        let json = r#"{"type":"ice","candidate":"c","sdpMid":"data","sdpMLineIndex":0}"#;
+        let val = super::extract_number_field(json, "sdpMLineIndex").unwrap();
+        assert_eq!(val, 0);
+    }
+
+    #[test]
+    fn test_extract_number_field_large() {
+        let json = r#"{"type":"ice","candidate":"c","sdpMid":"data","sdpMLineIndex":65535}"#;
+        let val = super::extract_number_field(json, "sdpMLineIndex").unwrap();
+        assert_eq!(val, 65535);
+    }
+
+    #[test]
+    fn test_extract_number_field_missing() {
+        let json = r#"{"type":"ice","candidate":"c","sdpMid":"data"}"#;
+        let result = super::extract_number_field(json, "sdpMLineIndex");
+        assert!(result.is_err());
+    }
+
+    // --- from_json error handling for malformed input ---
+
+    #[test]
+    fn test_from_json_missing_type_field() {
+        let result = SignalingMessage::from_json(r#"{"sdp":"v=0"}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_json_unknown_type() {
+        let result = SignalingMessage::from_json(r#"{"type":"unknown_type"}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_json_missing_sdp_in_offer() {
+        let result = SignalingMessage::from_json(r#"{"type":"offer"}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_json_non_string_type_field() {
+        // type field is a number, not a string — extract_string_field should return Err
+        let result = SignalingMessage::from_json(r#"{"type":42}"#);
+        assert!(result.is_err());
+    }
 }
 
