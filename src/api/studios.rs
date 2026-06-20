@@ -94,15 +94,13 @@ impl StudiosApi {
     /// Send an invite for a studio
     pub async fn send_invite(&self, studio_id: &str, invite: &models::InviteRequest) -> Result<(), ApiError> {
         let path = format!("/studios/{}/invite", urlencode(studio_id));
-        let _: serde_json::Value = self.client.post(&path, invite).await?;
-        Ok(())
+        self.client.post_no_response(&path, invite).await
     }
 
     /// Submit feedback for a studio session
     pub async fn submit_feedback(&self, studio_id: &str, feedback: &models::FeedbackRequest) -> Result<(), ApiError> {
         let path = format!("/studios/{}/feedback", urlencode(studio_id));
-        let _: serde_json::Value = self.client.post(&path, feedback).await?;
-        Ok(())
+        self.client.post_no_response(&path, feedback).await
     }
 
     /// Get chat session for a studio

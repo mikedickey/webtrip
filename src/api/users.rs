@@ -2,7 +2,7 @@
 //!
 //! User profile management, preferences, and related operations.
 
-use super::{api_module_struct, to_js_value, ApiClient, ApiError, urlencode};
+use super::{api_module_struct, to_js_value, regions_from_map, PaginationQuery, ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -60,7 +60,7 @@ impl UsersApi {
     pub async fn get_user_regions(&self, user_id: &str) -> Result<Vec<models::Region>, ApiError> {
         let path = format!("/users/{}/regions", urlencode(user_id));
         let map: HashMap<String, models::Region> = self.client.get(&path).await?;
-        Ok(map.into_iter().map(|(id, mut r)| { r.id = Some(id); r }).collect())
+        Ok(regions_from_map(map))
     }
 
     /// Get a user's notifications
@@ -102,16 +102,8 @@ impl UsersApi {
     ) -> Result<models::PaginatedChannels, ApiError> {
         let path = format!("/users/{}/channels-paginated", urlencode(user_id));
         
-        #[derive(Serialize)]
-        struct Query {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            page: Option<i32>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            limit: Option<i32>,
-        }
-        
         if page.is_some() || limit.is_some() {
-            self.client.get_with_query(&path, &Query { page, limit }).await
+            self.client.get_with_query(&path, &PaginationQuery { page, limit }).await
         } else {
             self.client.get(&path).await
         }
@@ -126,16 +118,8 @@ impl UsersApi {
     ) -> Result<models::PaginatedChannels, ApiError> {
         let path = format!("/users/{}/follows-paginated", urlencode(user_id));
         
-        #[derive(Serialize)]
-        struct Query {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            page: Option<i32>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            limit: Option<i32>,
-        }
-        
         if page.is_some() || limit.is_some() {
-            self.client.get_with_query(&path, &Query { page, limit }).await
+            self.client.get_with_query(&path, &PaginationQuery { page, limit }).await
         } else {
             self.client.get(&path).await
         }

@@ -2,7 +2,7 @@
 //!
 //! JackTrip Radio recordings management.
 
-use super::{api_module_struct, to_js_value, ApiClient, ApiError, urlencode};
+use super::{api_module_struct, to_js_value, PaginationQuery, ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -93,16 +93,8 @@ impl RecordingsApi {
     ) -> Result<models::PaginatedRecordings, ApiError> {
         let path = format!("/studios/{}/recordings-paginated", urlencode(studio_id));
 
-        #[derive(Serialize)]
-        struct Query {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            page: Option<i32>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            limit: Option<i32>,
-        }
-
         if page.is_some() || limit.is_some() {
-            self.client.get_with_query(&path, &Query { page, limit }).await
+            self.client.get_with_query(&path, &PaginationQuery { page, limit }).await
         } else {
             self.client.get(&path).await
         }
@@ -160,16 +152,8 @@ impl RecordingsApi {
     ) -> Result<models::PaginatedRecordings, ApiError> {
         let path = format!("/users/{}/recordings-paginated", urlencode(user_id));
 
-        #[derive(Serialize)]
-        struct Query {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            page: Option<i32>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            limit: Option<i32>,
-        }
-
         if page.is_some() || limit.is_some() {
-            self.client.get_with_query(&path, &Query { page, limit }).await
+            self.client.get_with_query(&path, &PaginationQuery { page, limit }).await
         } else {
             self.client.get(&path).await
         }

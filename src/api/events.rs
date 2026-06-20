@@ -2,7 +2,7 @@
 //!
 //! JackTrip Radio upcoming events and broadcasts.
 
-use super::{api_module_struct, to_js_value, ApiClient, ApiError, urlencode};
+use super::{api_module_struct, to_js_value, PaginationQuery, ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -30,16 +30,8 @@ impl EventsApi {
         page: Option<i32>,
         limit: Option<i32>,
     ) -> Result<models::PaginatedEvents, ApiError> {
-        #[derive(Serialize)]
-        struct Query {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            page: Option<i32>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            limit: Option<i32>,
-        }
-
         if page.is_some() || limit.is_some() {
-            self.client.get_with_query("/events-paginated", &Query { page, limit }).await
+            self.client.get_with_query("/events-paginated", &PaginationQuery { page, limit }).await
         } else {
             self.client.get("/events-paginated").await
         }
