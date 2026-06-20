@@ -2,7 +2,7 @@
 //!
 //! Subscription and payment management.
 
-use super::{api_module_struct, to_js_value, ApiClient, ApiError, urlencode};
+use super::{to_js_value, ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -11,7 +11,6 @@ use wasm_bindgen::prelude::*;
 // Billing API
 // =============================================================================
 
-/// Billing API for subscription management
 api_module_struct!(BillingApi);
 
 // =============================================================================

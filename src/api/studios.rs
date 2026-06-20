@@ -2,7 +2,7 @@
 //!
 //! Virtual studio management, configuration, and related operations.
 
-use super::{api_module_struct, to_js_value, ApiClient, ApiError, urlencode};
+use super::{to_js_value, ApiClient, ApiError, urlencode};
 use crate::models;
 use wasm_bindgen::prelude::*;
 
@@ -10,7 +10,6 @@ use wasm_bindgen::prelude::*;
 // Studios API
 // =============================================================================
 
-/// Studios API for virtual studio management
 api_module_struct!(StudiosApi);
 
 // =============================================================================

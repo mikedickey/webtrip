@@ -2,7 +2,7 @@
 //!
 //! User profile management, preferences, and related operations.
 
-use super::{api_module_struct, to_js_value, regions_from_map, PaginationQuery, ApiClient, ApiError, urlencode};
+use super::{to_js_value, regions_from_map, PaginationQuery, ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -12,7 +12,6 @@ use wasm_bindgen::prelude::*;
 // Users API
 // =============================================================================
 
-/// Users API for profile and account management
 api_module_struct!(UsersApi);
 
 // =============================================================================

@@ -2,7 +2,7 @@
 //!
 //! JackTrip device management and configuration.
 
-use super::{api_module_struct, to_js_value, ApiClient, ApiError, urlencode};
+use super::{to_js_value, ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -11,7 +11,6 @@ use wasm_bindgen::prelude::*;
 // Devices API
 // =============================================================================
 
-/// Devices API for JackTrip hardware management
 api_module_struct!(DevicesApi);
 
 // =============================================================================

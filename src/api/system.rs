@@ -2,7 +2,7 @@
 //!
 //! Health checks, region information, analytics, and other system-level operations.
 
-use super::{api_module_struct, to_js_value, regions_from_map, ApiClient, ApiError, urlencode};
+use super::{to_js_value, regions_from_map, ApiClient, ApiError, urlencode};
 use crate::models;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
@@ -11,7 +11,6 @@ use wasm_bindgen::prelude::*;
 // System API
 // =============================================================================
 
-/// System API for health checks, regions, and analytics
 api_module_struct!(SystemApi);
 
 // =============================================================================

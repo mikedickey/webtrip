@@ -2,7 +2,7 @@
 //!
 //! JackTrip Radio live streams and channel management.
 
-use super::{api_module_struct, to_js_value, PaginationQuery, ApiClient, ApiError, urlencode};
+use super::{to_js_value, PaginationQuery, ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -11,7 +11,6 @@ use wasm_bindgen::prelude::*;
 // Streams API
 // =============================================================================
 
-/// Streams API for live broadcasts and channels
 api_module_struct!(StreamsApi);
 
 // =============================================================================

@@ -36,8 +36,6 @@ macro_rules! api_module_struct {
     };
 }
 
-pub(crate) use api_module_struct;
-
 // Re-export all API modules
 pub mod billing;
 pub mod devices;

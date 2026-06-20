@@ -2,16 +2,14 @@
 //!
 //! JackTrip Radio upcoming events and broadcasts.
 
-use super::{api_module_struct, to_js_value, PaginationQuery, ApiClient, ApiError, urlencode};
+use super::{to_js_value, PaginationQuery, ApiClient, ApiError, urlencode};
 use crate::models;
-use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
 // =============================================================================
 // Events API
 // =============================================================================
 
-/// Events API for upcoming broadcasts
 api_module_struct!(EventsApi);
 
 // =============================================================================
