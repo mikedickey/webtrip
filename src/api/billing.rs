@@ -24,7 +24,7 @@ impl BillingApi {
     }
 
     /// Get the billing portal URL
-    pub async fn get_portal(&self, user_id: &str) -> Result<models::BillingPortalResponse, ApiError> {
+    pub async fn get_portal(&self, user_id: &str) -> Result<models::UrlResponse, ApiError> {
         let path = format!("/users/{}/billing/portal", urlencode(user_id));
         self.client.get(&path).await
     }
@@ -130,7 +130,7 @@ impl BillingApi {
     }
 
     #[wasm_bindgen(js_name = getPortal)]
-    pub async fn get_portal_js(&self, user_id: String) -> Result<models::BillingPortalResponse, ApiError> {
+    pub async fn get_portal_js(&self, user_id: String) -> Result<models::UrlResponse, ApiError> {
         self.get_portal(&user_id).await
     }
 

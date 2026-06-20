@@ -103,8 +103,6 @@ pub struct UrlResponse {
     pub url: Option<String>,
 }
 
-pub type Redirect = UrlResponse;
-pub type BillingPortalResponse = UrlResponse;
 
 /// API error response
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
