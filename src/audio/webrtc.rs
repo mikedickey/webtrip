@@ -345,15 +345,7 @@ impl WebRtcTransport {
         self.notify_state_change();
 
         // Create a Promise that will resolve when connection is established
-        let (promise, resolve, reject) = {
-            let mut resolve_func = None;
-            let mut reject_func = None;
-            let promise = js_sys::Promise::new(&mut |resolve, reject_val| {
-                resolve_func = Some(resolve);
-                reject_func = Some(reject_val);
-            });
-            (promise, resolve_func.unwrap(), reject_func.unwrap())
-        };
+        let (promise, resolve, reject) = crate::audio::make_promise();
 
         // Wrap resolve/reject in Rc for sharing with closures
         let resolve_rc = Rc::new(RefCell::new(Some(resolve)));

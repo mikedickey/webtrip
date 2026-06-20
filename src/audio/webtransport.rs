@@ -363,15 +363,7 @@ impl WebTransportImpl {
         let worker = self.worker.borrow().clone().ok_or("Worker not created")?;
 
         // Create a promise that will be resolved by the message handler
-        let (promise, resolve, reject) = {
-            let mut resolve_fn = None;
-            let mut reject_fn = None;
-            let promise = js_sys::Promise::new(&mut |resolve, reject| {
-                resolve_fn = Some(resolve);
-                reject_fn = Some(reject);
-            });
-            (promise, resolve_fn.unwrap(), reject_fn.unwrap())
-        };
+        let (promise, resolve, reject) = crate::audio::make_promise();
 
         // Store resolve/reject for message handler
         *self.connection_promise_resolve.borrow_mut() = Some(resolve);
@@ -415,15 +407,7 @@ impl WebTransportImpl {
         self.init_worker()?;
 
         // Wait for worker to signal it is ready (WASM loaded and initialized)
-        let (ready_promise, ready_resolve, _ready_reject) = {
-            let mut resolve_fn = None;
-            let mut reject_fn = None;
-            let promise = js_sys::Promise::new(&mut |resolve, reject| {
-                resolve_fn = Some(resolve);
-                reject_fn = Some(reject);
-            });
-            (promise, resolve_fn.unwrap(), reject_fn.unwrap())
-        };
+        let (ready_promise, ready_resolve, _ready_reject) = crate::audio::make_promise();
         *self.worker_ready_resolve.borrow_mut() = Some(ready_resolve);
         JsFuture::from(ready_promise).await?;
 
