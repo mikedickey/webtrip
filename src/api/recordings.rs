@@ -2,7 +2,7 @@
 //!
 //! JackTrip Radio recordings management.
 
-use super::{ApiClient, ApiError, urlencode};
+use super::{api_module_struct, to_js_value, ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -12,18 +12,7 @@ use wasm_bindgen::prelude::*;
 // =============================================================================
 
 /// Recordings API for managing recorded content
-#[wasm_bindgen]
-pub struct RecordingsApi {
-    client: ApiClient,
-}
-
-impl RecordingsApi {
-    pub(crate) fn from_client(client: &ApiClient) -> Self {
-        Self {
-            client: client.clone(),
-        }
-    }
-}
+api_module_struct!(RecordingsApi);
 
 // =============================================================================
 // Rust API (primary interface)
@@ -199,15 +188,10 @@ impl RecordingsApi {
 
 #[wasm_bindgen]
 impl RecordingsApi {
-    #[wasm_bindgen(constructor)]
-    pub fn new(client: &ApiClient) -> Self {
-        Self::from_client(client)
-    }
-
     #[wasm_bindgen(js_name = listRecordings)]
     pub async fn list_recordings_js(&self) -> Result<JsValue, ApiError> {
         let recordings = self.list_recordings().await?;
-        serde_wasm_bindgen::to_value(&recordings).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&recordings)
     }
 
     #[wasm_bindgen(js_name = listRecordingsPaginated)]
@@ -228,7 +212,7 @@ impl RecordingsApi {
     #[wasm_bindgen(js_name = getSimilarRecordings)]
     pub async fn get_similar_recordings_js(&self, recording_id: String) -> Result<JsValue, ApiError> {
         let recordings = self.get_similar_recordings(&recording_id).await?;
-        serde_wasm_bindgen::to_value(&recordings).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&recordings)
     }
 
     #[wasm_bindgen(js_name = likeRecording)]
@@ -244,13 +228,13 @@ impl RecordingsApi {
     #[wasm_bindgen(js_name = getStreamRecordings)]
     pub async fn get_stream_recordings_js(&self, stream_id: String) -> Result<JsValue, ApiError> {
         let recordings = self.get_stream_recordings(&stream_id).await?;
-        serde_wasm_bindgen::to_value(&recordings).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&recordings)
     }
 
     #[wasm_bindgen(js_name = getStudioRecordings)]
     pub async fn get_studio_recordings_js(&self, studio_id: String) -> Result<JsValue, ApiError> {
         let recordings = self.get_studio_recordings(&studio_id).await?;
-        serde_wasm_bindgen::to_value(&recordings).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&recordings)
     }
 
     #[wasm_bindgen(js_name = getStudioRecordingsPaginated)]
@@ -290,13 +274,13 @@ impl RecordingsApi {
     #[wasm_bindgen(js_name = getRecordingStems)]
     pub async fn get_recording_stems_js(&self, studio_id: String, recording_id: String) -> Result<JsValue, ApiError> {
         let stems = self.get_recording_stems(&studio_id, &recording_id).await?;
-        serde_wasm_bindgen::to_value(&stems).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&stems)
     }
 
     #[wasm_bindgen(js_name = getUserRecordings)]
     pub async fn get_user_recordings_js(&self, user_id: String) -> Result<JsValue, ApiError> {
         let recordings = self.get_user_recordings(&user_id).await?;
-        serde_wasm_bindgen::to_value(&recordings).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&recordings)
     }
 
     #[wasm_bindgen(js_name = getUserRecordingsPaginated)]

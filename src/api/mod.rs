@@ -8,6 +8,36 @@ use std::collections::HashMap;
 use std::fmt;
 use wasm_bindgen::prelude::*;
 
+// Macro to generate API module struct + constructors boilerplate
+macro_rules! api_module_struct {
+    ($name:ident) => {
+        #[wasm_bindgen]
+        pub struct $name {
+            client: ApiClient,
+        }
+
+        impl $name {
+            pub(crate) fn from_client(client: &ApiClient) -> Self {
+                Self {
+                    client: client.clone(),
+                }
+            }
+        }
+
+        #[wasm_bindgen]
+        impl $name {
+            #[wasm_bindgen(constructor)]
+            pub fn new() -> Self {
+                Self {
+                    client: ApiClient::new(),
+                }
+            }
+        }
+    };
+}
+
+pub(crate) use api_module_struct;
+
 // Re-export all API modules
 pub mod billing;
 pub mod devices;
@@ -457,6 +487,11 @@ pub type ApiResult<T> = Result<T, ApiError>;
 // =============================================================================
 // Helper Functions
 // =============================================================================
+
+/// Convert a value to JsValue using serde_wasm_bindgen
+pub(crate) fn to_js_value<T: serde::Serialize>(val: &T) -> Result<JsValue, ApiError> {
+    serde_wasm_bindgen::to_value(val).map_err(|e| ApiError::Serialization(e.to_string()))
+}
 
 /// URL encode a string for use in URL paths
 pub(crate) fn urlencode<T: AsRef<str>>(s: T) -> String {

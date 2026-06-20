@@ -2,7 +2,7 @@
 //!
 //! Virtual studio management, configuration, and related operations.
 
-use super::{ApiClient, ApiError, urlencode};
+use super::{api_module_struct, to_js_value, ApiClient, ApiError, urlencode};
 use crate::models;
 use wasm_bindgen::prelude::*;
 
@@ -11,18 +11,7 @@ use wasm_bindgen::prelude::*;
 // =============================================================================
 
 /// Studios API for virtual studio management
-#[wasm_bindgen]
-pub struct StudiosApi {
-    client: ApiClient,
-}
-
-impl StudiosApi {
-    pub(crate) fn from_client(client: &ApiClient) -> Self {
-        Self {
-            client: client.clone(),
-        }
-    }
-}
+api_module_struct!(StudiosApi);
 
 // =============================================================================
 // Rust API (primary interface)
@@ -141,15 +130,10 @@ impl StudiosApi {
 
 #[wasm_bindgen]
 impl StudiosApi {
-    #[wasm_bindgen(constructor)]
-    pub fn new(client: &ApiClient) -> Self {
-        Self::from_client(client)
-    }
-
     #[wasm_bindgen(js_name = listStudios)]
     pub async fn list_studios_js(&self) -> Result<JsValue, ApiError> {
         let studios = self.list_studios().await?;
-        serde_wasm_bindgen::to_value(&studios).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&studios)
     }
 
     #[wasm_bindgen(js_name = createStudio)]
@@ -204,7 +188,7 @@ impl StudiosApi {
     #[wasm_bindgen(js_name = listMixers)]
     pub async fn list_mixers_js(&self) -> Result<JsValue, ApiError> {
         let mixers = self.list_mixers().await?;
-        serde_wasm_bindgen::to_value(&mixers).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&mixers)
     }
 
     #[wasm_bindgen(js_name = getLivekitToken)]

@@ -19,7 +19,7 @@
 
 use crate::audio::protocol::{AudioPacket, make_exit_packet};
 use crate::audio::signaling::HubSignaling;
-use crate::audio::transport::{Transport, TransportState as CommonTransportState, TransportType, AudioBufferConfig};
+use crate::audio::transport::{Transport, TransportState, TransportType, AudioBufferConfig};
 use js_sys::{Array, ArrayBuffer, Object, Reflect, Uint8Array};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -71,22 +71,6 @@ async fn preflight_signaling_tls(server: &str, port: u16) {
             &"⚠️ WebRTC: window unavailable for signaling TLS pre-flight".into(),
         );
     }
-}
-
-/// Connection state
-#[wasm_bindgen]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionState {
-    /// Not connected
-    Disconnected,
-    /// Creating offer/answer
-    Connecting,
-    /// Connected and ready to send/receive
-    Connected,
-    /// Connection failed
-    Failed,
-    /// Connection closed
-    Closed,
 }
 
 /// WebRTC transport configuration
@@ -171,7 +155,7 @@ pub struct WebRtcTransport {
     config: TransportConfig,
     peer_connection: Option<RtcPeerConnection>,
     data_channel: Option<RtcDataChannel>,
-    state: ConnectionState,
+    state: TransportState,
     /// Queue for received packets (not used when buffers are provided)
     receive_queue: Rc<RefCell<VecDeque<Vec<u8>>>>,
     /// Hub signaling client (used when connecting to JackTrip hub)
@@ -217,7 +201,7 @@ impl WebRtcTransport {
             config,
             peer_connection: None,
             data_channel: None,
-            state: ConnectionState::Disconnected,
+            state: TransportState::Disconnected,
             receive_queue: Rc::new(RefCell::new(VecDeque::with_capacity(64))),
             signaling: None,
             on_message_closure: None,
@@ -357,7 +341,7 @@ impl WebRtcTransport {
             &format!("🔌 Connecting to hub: {}:{} (signaling: wss://.../webrtc)", server, port).into(),
         );
         
-        self.state = ConnectionState::Connecting;
+        self.state = TransportState::Connecting;
         self.notify_state_change();
 
         // Create a Promise that will resolve when connection is established
@@ -456,7 +440,7 @@ impl WebRtcTransport {
         let peer_conn_for_ice = peer_conn_ref.clone();
         
         // Share connection state between self and closures
-        let shared_state = Rc::new(RefCell::new(ConnectionState::Connecting));
+        let shared_state = Rc::new(RefCell::new(TransportState::Connecting));
         let shared_state_for_answer = shared_state.clone();
         
         // Also need access to state callback
@@ -485,7 +469,7 @@ impl WebRtcTransport {
                             web_sys::console::debug_1(&"✅ WebRTC connection established".into());
                             
                             // Update shared state
-                            *state_ref.borrow_mut() = ConnectionState::Connected;
+                            *state_ref.borrow_mut() = TransportState::Connected;
                             
                             // Notify state change
                             if let Some(ref callback) = state_cb {
@@ -505,7 +489,7 @@ impl WebRtcTransport {
                             web_sys::console::error_1(&format!("❌ Failed to handle answer: {:?}", e).into());
                             
                             // Update shared state
-                            *state_ref.borrow_mut() = ConnectionState::Failed;
+                            *state_ref.borrow_mut() = TransportState::Failed;
                             
                             // Notify state change
                             if let Some(ref callback) = state_cb {
@@ -624,7 +608,7 @@ impl WebRtcTransport {
         self.signaling = signaling_rc.borrow_mut().take();
         
         // Update our state now that we're connected
-        self.state = ConnectionState::Connected;
+        self.state = TransportState::Connected;
         
         // NOTE: Do NOT start event loop here - it must be started after the transport
         // is in its final memory location (after being boxed by the session).
@@ -635,7 +619,7 @@ impl WebRtcTransport {
 
 
     /// Get current connection state
-    pub fn state(&self) -> ConnectionState {
+    pub fn state(&self) -> TransportState {
         self.state
     }
 
@@ -646,7 +630,7 @@ impl WebRtcTransport {
     pub async fn create_offer(&mut self) -> Result<String, JsValue> {
         self.create_peer_connection()?;
         self.create_data_channel()?;
-        self.state = ConnectionState::Connecting;
+        self.state = TransportState::Connecting;
         self.notify_state_change();
 
         let pc = self.peer_connection.as_ref().unwrap();
@@ -828,7 +812,7 @@ impl WebRtcTransport {
         self.data_channel = None;
         self.peer_connection = None;
 
-        self.state = ConnectionState::Closed;
+        self.state = TransportState::Closed;
         self.notify_state_change();
     }
 
@@ -981,11 +965,11 @@ impl WebRtcTransport {
     fn notify_state_change(&self) {
         if let Some(ref callback) = self.js_on_state_change {
             let state_str = match self.state {
-                ConnectionState::Disconnected => "disconnected",
-                ConnectionState::Connecting => "connecting",
-                ConnectionState::Connected => "connected",
-                ConnectionState::Failed => "failed",
-                ConnectionState::Closed => "closed",
+                TransportState::Disconnected => "disconnected",
+                TransportState::Connecting => "connecting",
+                TransportState::Connected => "connected",
+                TransportState::Failed => "failed",
+                TransportState::Closed => "closed",
             };
             let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(state_str));
         }
@@ -996,16 +980,16 @@ impl WebRtcTransport {
     /// Mark the connection as connected
     /// Call this after receiving confirmation that the data channel is open
     pub fn set_connected(&mut self) {
-        if self.state != ConnectionState::Connected {
-            self.state = ConnectionState::Connected;
+        if self.state != TransportState::Connected {
+            self.state = TransportState::Connected;
             self.notify_state_change();
         }
     }
 
     /// Mark the connection as failed
     pub fn set_failed(&mut self) {
-        if self.state != ConnectionState::Failed {
-            self.state = ConnectionState::Failed;
+        if self.state != TransportState::Failed {
+            self.state = TransportState::Failed;
             self.notify_state_change();
         }
     }
@@ -1017,14 +1001,8 @@ impl Transport for WebRtcTransport {
         TransportType::WebRTC
     }
 
-    fn state(&self) -> CommonTransportState {
-        match self.state {
-            ConnectionState::Disconnected => CommonTransportState::Disconnected,
-            ConnectionState::Connecting => CommonTransportState::Connecting,
-            ConnectionState::Connected => CommonTransportState::Connected,
-            ConnectionState::Failed => CommonTransportState::Failed,
-            ConnectionState::Closed => CommonTransportState::Closed,
-        }
+    fn state(&self) -> TransportState {
+        self.state
     }
 
     fn set_audio_buffers(&mut self, config: AudioBufferConfig) {

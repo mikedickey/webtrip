@@ -2,7 +2,7 @@
 //!
 //! User profile management, preferences, and related operations.
 
-use super::{ApiClient, ApiError, urlencode};
+use super::{api_module_struct, to_js_value, ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -13,18 +13,7 @@ use wasm_bindgen::prelude::*;
 // =============================================================================
 
 /// Users API for profile and account management
-#[wasm_bindgen]
-pub struct UsersApi {
-    client: ApiClient,
-}
-
-impl UsersApi {
-    pub(crate) fn from_client(client: &ApiClient) -> Self {
-        Self {
-            client: client.clone(),
-        }
-    }
-}
+api_module_struct!(UsersApi);
 
 // =============================================================================
 // Rust API (primary interface)
@@ -159,12 +148,6 @@ impl UsersApi {
 
 #[wasm_bindgen]
 impl UsersApi {
-    /// Create a new Users API client
-    #[wasm_bindgen(constructor)]
-    pub fn new(client: &ApiClient) -> Self {
-        Self::from_client(client)
-    }
-
     #[wasm_bindgen(js_name = getCurrentUser)]
     pub async fn get_current_user_js(&self) -> Result<models::User, ApiError> {
         self.get_current_user().await
@@ -173,7 +156,7 @@ impl UsersApi {
     #[wasm_bindgen(js_name = searchUsers)]
     pub async fn search_users_js(&self, query: String) -> Result<JsValue, ApiError> {
         let users = self.search_users(&query).await?;
-        serde_wasm_bindgen::to_value(&users).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&users)
     }
 
     #[wasm_bindgen(js_name = getUser)]
@@ -198,7 +181,7 @@ impl UsersApi {
     #[wasm_bindgen(js_name = getUserRegions)]
     pub async fn get_user_regions_js(&self, user_id: String) -> Result<JsValue, ApiError> {
         let regions = self.get_user_regions(&user_id).await?;
-        serde_wasm_bindgen::to_value(&regions).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&regions)
     }
 
     #[wasm_bindgen(js_name = getNotifications)]

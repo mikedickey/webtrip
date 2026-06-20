@@ -2,7 +2,7 @@
 //!
 //! Health checks, region information, analytics, and other system-level operations.
 
-use super::{ApiClient, ApiError, urlencode};
+use super::{api_module_struct, to_js_value, ApiClient, ApiError, urlencode};
 use crate::models;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
@@ -12,18 +12,7 @@ use wasm_bindgen::prelude::*;
 // =============================================================================
 
 /// System API for health checks, regions, and analytics
-#[wasm_bindgen]
-pub struct SystemApi {
-    client: ApiClient,
-}
-
-impl SystemApi {
-    pub(crate) fn from_client(client: &ApiClient) -> Self {
-        Self {
-            client: client.clone(),
-        }
-    }
-}
+api_module_struct!(SystemApi);
 
 // =============================================================================
 // Rust API (primary interface)
@@ -88,12 +77,6 @@ impl SystemApi {
 
 #[wasm_bindgen]
 impl SystemApi {
-    /// Create a new System API client
-    #[wasm_bindgen(constructor)]
-    pub fn new(client: &ApiClient) -> Self {
-        Self::from_client(client)
-    }
-
     /// Check system health
     #[wasm_bindgen(js_name = ping)]
     pub async fn ping_js(&self) -> Result<models::Ping, ApiError> {
@@ -116,7 +99,7 @@ impl SystemApi {
     #[wasm_bindgen(js_name = listRegions)]
     pub async fn list_regions_js(&self) -> Result<JsValue, ApiError> {
         let regions = self.list_regions().await?;
-        serde_wasm_bindgen::to_value(&regions).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&regions)
     }
 
     /// Get details for a specific region

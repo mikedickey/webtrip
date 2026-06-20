@@ -2,7 +2,7 @@
 //!
 //! JackTrip Radio upcoming events and broadcasts.
 
-use super::{ApiClient, ApiError, urlencode};
+use super::{api_module_struct, to_js_value, ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -12,18 +12,7 @@ use wasm_bindgen::prelude::*;
 // =============================================================================
 
 /// Events API for upcoming broadcasts
-#[wasm_bindgen]
-pub struct EventsApi {
-    client: ApiClient,
-}
-
-impl EventsApi {
-    pub(crate) fn from_client(client: &ApiClient) -> Self {
-        Self {
-            client: client.clone(),
-        }
-    }
-}
+api_module_struct!(EventsApi);
 
 // =============================================================================
 // Rust API (primary interface)
@@ -120,15 +109,10 @@ impl EventsApi {
 
 #[wasm_bindgen]
 impl EventsApi {
-    #[wasm_bindgen(constructor)]
-    pub fn new(client: &ApiClient) -> Self {
-        Self::from_client(client)
-    }
-
     #[wasm_bindgen(js_name = listEvents)]
     pub async fn list_events_js(&self) -> Result<JsValue, ApiError> {
         let events = self.list_events().await?;
-        serde_wasm_bindgen::to_value(&events).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&events)
     }
 
     #[wasm_bindgen(js_name = listEventsPaginated)]
@@ -143,7 +127,7 @@ impl EventsApi {
     #[wasm_bindgen(js_name = getEvent)]
     pub async fn get_event_js(&self, event_id: String) -> Result<JsValue, ApiError> {
         let events = self.get_event(&event_id).await?;
-        serde_wasm_bindgen::to_value(&events).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&events)
     }
 
     #[wasm_bindgen(js_name = getEventChannel)]
@@ -154,13 +138,13 @@ impl EventsApi {
     #[wasm_bindgen(js_name = getSimilarEvents)]
     pub async fn get_similar_events_js(&self, event_id: String) -> Result<JsValue, ApiError> {
         let events = self.get_similar_events(&event_id).await?;
-        serde_wasm_bindgen::to_value(&events).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&events)
     }
 
     #[wasm_bindgen(js_name = listStudioEvents)]
     pub async fn list_studio_events_js(&self, studio_id: String) -> Result<JsValue, ApiError> {
         let events = self.list_studio_events(&studio_id).await?;
-        serde_wasm_bindgen::to_value(&events).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&events)
     }
 
     #[wasm_bindgen(js_name = getStudioEvent)]

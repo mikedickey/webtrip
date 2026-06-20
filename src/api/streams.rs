@@ -2,7 +2,7 @@
 //!
 //! JackTrip Radio live streams and channel management.
 
-use super::{ApiClient, ApiError, urlencode};
+use super::{api_module_struct, to_js_value, ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -12,18 +12,7 @@ use wasm_bindgen::prelude::*;
 // =============================================================================
 
 /// Streams API for live broadcasts and channels
-#[wasm_bindgen]
-pub struct StreamsApi {
-    client: ApiClient,
-}
-
-impl StreamsApi {
-    pub(crate) fn from_client(client: &ApiClient) -> Self {
-        Self {
-            client: client.clone(),
-        }
-    }
-}
+api_module_struct!(StreamsApi);
 
 // =============================================================================
 // Rust API (primary interface)
@@ -198,21 +187,16 @@ impl StreamsApi {
 
 #[wasm_bindgen]
 impl StreamsApi {
-    #[wasm_bindgen(constructor)]
-    pub fn new(client: &ApiClient) -> Self {
-        Self::from_client(client)
-    }
-
     #[wasm_bindgen(js_name = listStreams)]
     pub async fn list_streams_js(&self) -> Result<JsValue, ApiError> {
         let streams = self.list_streams().await?;
-        serde_wasm_bindgen::to_value(&streams).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&streams)
     }
 
     #[wasm_bindgen(js_name = searchStreams)]
     pub async fn search_streams_js(&self, query: Option<String>) -> Result<JsValue, ApiError> {
         let streams = self.search_streams(query.as_deref()).await?;
-        serde_wasm_bindgen::to_value(&streams).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&streams)
     }
 
     #[wasm_bindgen(js_name = getStream)]
@@ -233,7 +217,7 @@ impl StreamsApi {
     #[wasm_bindgen(js_name = listChannels)]
     pub async fn list_channels_js(&self) -> Result<JsValue, ApiError> {
         let channels = self.list_channels().await?;
-        serde_wasm_bindgen::to_value(&channels).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&channels)
     }
 
     #[wasm_bindgen(js_name = listChannelsPaginated)]

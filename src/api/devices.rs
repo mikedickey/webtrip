@@ -2,7 +2,7 @@
 //!
 //! JackTrip device management and configuration.
 
-use super::{ApiClient, ApiError, urlencode};
+use super::{api_module_struct, to_js_value, ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -12,18 +12,7 @@ use wasm_bindgen::prelude::*;
 // =============================================================================
 
 /// Devices API for JackTrip hardware management
-#[wasm_bindgen]
-pub struct DevicesApi {
-    client: ApiClient,
-}
-
-impl DevicesApi {
-    pub(crate) fn from_client(client: &ApiClient) -> Self {
-        Self {
-            client: client.clone(),
-        }
-    }
-}
+api_module_struct!(DevicesApi);
 
 // =============================================================================
 // Rust API (primary interface)
@@ -101,15 +90,10 @@ impl DevicesApi {
 
 #[wasm_bindgen]
 impl DevicesApi {
-    #[wasm_bindgen(constructor)]
-    pub fn new(client: &ApiClient) -> Self {
-        Self::from_client(client)
-    }
-
     #[wasm_bindgen(js_name = listDevices)]
     pub async fn list_devices_js(&self) -> Result<JsValue, ApiError> {
         let devices = self.list_devices().await?;
-        serde_wasm_bindgen::to_value(&devices).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&devices)
     }
 
     #[wasm_bindgen(js_name = registerDevice)]
@@ -144,7 +128,7 @@ impl DevicesApi {
     #[wasm_bindgen(js_name = listStudioDevices)]
     pub async fn list_studio_devices_js(&self, studio_id: String) -> Result<JsValue, ApiError> {
         let devices = self.list_studio_devices(&studio_id).await?;
-        serde_wasm_bindgen::to_value(&devices).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&devices)
     }
 
     #[wasm_bindgen(js_name = updateCaptureVolume)]
