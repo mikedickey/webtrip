@@ -319,7 +319,14 @@ impl WebRtcTransport {
         // for the lifetime of the session.
         let ring_buffer = unsafe { &mut *buffers.local_to_network_ptr };
 
-        match tick_decision(self.is_connected(), ring_buffer.available(), samples_needed, !self.receive_queue.borrow().is_empty()) {
+        // NOTE: compute `have_receive` into a local *before* the match. Temporaries
+        // created in a match scrutinee live until the end of the match expression,
+        // so calling `self.receive_queue.borrow()` inline here would keep an
+        // immutable borrow alive across the `Process` arm and panic when the inner
+        // loop calls `self.receive_queue.borrow_mut()`.
+        let have_receive = !self.receive_queue.borrow().is_empty();
+
+        match tick_decision(self.is_connected(), ring_buffer.available(), samples_needed, have_receive) {
             TickDecision::Drain => {
                 // The data channel has not reached the Open state yet (typically
                 // the DTLS/SCTP handshake is still in flight — most visible in
