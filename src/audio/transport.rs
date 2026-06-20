@@ -76,7 +76,22 @@ pub struct AudioBufferConfig {
 // Safety: These pointers are only used by the transport layer which is single-threaded in WASM
 unsafe impl Send for AudioBufferConfig {}
 
-/// Transport trait that all implementations must implement
+/// Notify a JS state-change callback with the string representation of `state`.
+///
+/// This is the single canonical implementation used by all transports.
+pub(crate) fn notify_transport_state(state: TransportState, callback: &Option<js_sys::Function>) {
+    if let Some(ref cb) = callback {
+        let state_str = match state {
+            TransportState::Disconnected => "disconnected",
+            TransportState::Connecting => "connecting",
+            TransportState::Connected => "connected",
+            TransportState::Failed => "failed",
+            TransportState::Closed => "closed",
+        };
+        let _ = cb.call1(&wasm_bindgen::JsValue::NULL, &wasm_bindgen::JsValue::from_str(state_str));
+    }
+}
+
 /// 
 /// This is a minimal interface focused on audio packet transmission.
 /// Implementation-specific details (like WebRTC signaling and internal tick loops) 

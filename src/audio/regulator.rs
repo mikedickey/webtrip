@@ -777,14 +777,7 @@ impl Regulator {
                 self.process_burg(false);
 
                 // Interleave output
-                for (ch, channel) in self.channels.iter().enumerate() {
-                    for s in 0..self.fpp {
-                        let idx = s * self.num_channels + ch;
-                        if idx < output.len() {
-                            output[idx] = channel.output_now_packet[s];
-                        }
-                    }
-                }
+                self.interleave_output(output);
 
                 self.last_seq_out = Some(seq);
                 self.packet_count += 1;
@@ -849,6 +842,11 @@ impl Regulator {
         self.process_burg(true);
 
         // Interleave output
+        self.interleave_output(output);
+    }
+
+    /// Interleave the `output_now_packet` from each channel into the output buffer.
+    fn interleave_output(&self, output: &mut [f32]) {
         for (ch, channel) in self.channels.iter().enumerate() {
             for s in 0..self.fpp {
                 let idx = s * self.num_channels + ch;

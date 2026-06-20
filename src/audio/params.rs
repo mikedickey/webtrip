@@ -6,6 +6,34 @@ pub const MIN_DB: f32 = -60.0;
 /// Maximum dB level (clipping)
 pub const MAX_DB: f32 = 0.0;
 
+/// Encode a dB value into the fixed-point integer stored in `db_level` / `peak_db_level`.
+///
+/// Formula: `(db - MIN_DB) * 100` as i32. Does not clamp; callers are responsible.
+#[inline]
+pub(crate) fn encode_db(db: f32) -> i32 {
+    ((db - MIN_DB) * 100.0) as i32
+}
+
+/// Decode a fixed-point integer back to a dB value.
+#[inline]
+pub(crate) fn decode_db(stored: i32) -> f32 {
+    (stored as f32 / 100.0) + MIN_DB
+}
+
+/// Encode a linear volume (0.0–1.0) into the u32 stored in `output_volume` / `monitor_volume`.
+///
+/// Formula: `(volume * 1000)` as u32. Does not clamp; callers are responsible.
+#[inline]
+pub(crate) fn encode_volume(volume: f32) -> u32 {
+    (volume * 1000.0) as u32
+}
+
+/// Decode a u32 fixed-point volume back to a linear (0.0–1.0) value.
+#[inline]
+pub(crate) fn decode_volume(stored: u32) -> f32 {
+    stored as f32 / 1000.0
+}
+
 /// Parameters shared between main thread and audio processing thread
 #[wasm_bindgen]
 pub struct AudioParams {
@@ -67,15 +95,13 @@ impl AudioParams {
     /// Get the current dB level (-60.0 to 0.0)
     #[wasm_bindgen(js_name = getDbLevel)]
     pub fn get_db_level(&self) -> f32 {
-        let stored = self.db_level.load(Ordering::Relaxed);
-        (stored as f32 / 100.0) + MIN_DB
+        decode_db(self.db_level.load(Ordering::Relaxed))
     }
 
     /// Get the peak dB level (-60.0 to 0.0)
     #[wasm_bindgen(js_name = getPeakDbLevel)]
     pub fn get_peak_db_level(&self) -> f32 {
-        let stored = self.peak_db_level.load(Ordering::Relaxed);
-        (stored as f32 / 100.0) + MIN_DB
+        decode_db(self.peak_db_level.load(Ordering::Relaxed))
     }
 
     /// Get the current volume level as a percentage (0.0 to 100.0)
@@ -98,13 +124,13 @@ impl AudioParams {
     #[wasm_bindgen(js_name = setMonitorVolume)]
     pub fn set_monitor_volume(&self, volume: f32) {
         let clamped = volume.clamp(0.0, 1.0);
-        self.monitor_volume.store((clamped * 1000.0) as u32, Ordering::Relaxed);
+        self.monitor_volume.store(encode_volume(clamped), Ordering::Relaxed);
     }
 
     /// Get monitor volume (0.0 to 1.0)
     #[wasm_bindgen(js_name = getMonitorVolume)]
     pub fn get_monitor_volume(&self) -> f32 {
-        self.monitor_volume.load(Ordering::Relaxed) as f32 / 1000.0
+        decode_volume(self.monitor_volume.load(Ordering::Relaxed))
     }
 
     /// Set auto gain control
@@ -166,13 +192,13 @@ impl AudioParams {
     #[wasm_bindgen(js_name = setOutputVolume)]
     pub fn set_output_volume(&self, volume: f32) {
         let clamped = volume.clamp(0.0, 1.0);
-        self.output_volume.store((clamped * 1000.0) as u32, Ordering::Relaxed);
+        self.output_volume.store(encode_volume(clamped), Ordering::Relaxed);
     }
 
     /// Get output volume (0.0 to 1.0)
     #[wasm_bindgen(js_name = getOutputVolume)]
     pub fn get_output_volume(&self) -> f32 {
-        self.output_volume.load(Ordering::Relaxed) as f32 / 1000.0
+        decode_volume(self.output_volume.load(Ordering::Relaxed))
     }
 }
 
@@ -309,7 +335,7 @@ mod tests {
     /// Encode a dB value into the fixed-point representation used by
     /// `db_level` / `peak_db_level`, mirroring `AudioProcessor`.
     fn enc_db(db: f32) -> i32 {
-        ((db - MIN_DB) * 100.0) as i32
+        encode_db(db)
     }
 
     #[test]

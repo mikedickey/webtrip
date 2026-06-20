@@ -151,6 +151,27 @@ struct PendingCaptureParams {
     noise_suppression: bool,
 }
 
+/// Build a JS `Function` that maps raw transport state strings to session-level state
+/// strings and forwards them to `callback`.
+///
+/// `map_fn` receives the raw transport state string and returns either:
+/// - `Some(session_state)` — call `callback` with this string, or
+/// - `None` — silently ignore this state.
+fn make_state_change_closure(
+    callback: &js_sys::Function,
+    map_fn: impl Fn(&str) -> Option<&'static str> + 'static,
+) -> js_sys::Function {
+    let callback_clone = callback.clone();
+    let closure = Closure::wrap(Box::new(move |state: String| {
+        if let Some(session_state) = map_fn(state.as_str()) {
+            let _ = callback_clone.call1(&JsValue::NULL, &JsValue::from_str(session_state));
+        }
+    }) as Box<dyn FnMut(String)>);
+    let js_func = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
+    closure.forget();
+    js_func
+}
+
 #[wasm_bindgen]
 impl WebTripSession {
     /// Create a new session
@@ -450,25 +471,15 @@ impl WebTripSession {
                 // Set up state change callback BEFORE connecting
                 // This ensures the data channel and signaling handlers can use it
                 if let Some(ref callback) = self.on_state_change {
-                    let callback_clone = callback.clone();
-                    let state_change_cb = Closure::wrap(Box::new(move |state: String| {
-                        // Map transport states to session states
-                        let session_state = match state.as_str() {
-                            "failed" | "disconnected" | "closed" => "error",
-                            "connected" => "connected",
-                            // Session already emits "connecting" before transport connect starts.
-                            // Ignore transport-level "connecting" to avoid stale callbacks
-                            // regressing the UI back to Connecting after a successful connect.
-                            _ => return,
-                        };
-                        
-                        // Notify the app
-                        let _ = callback_clone.call1(&JsValue::NULL, &JsValue::from_str(session_state));
-                    }) as Box<dyn FnMut(String)>);
-                    
-                    let js_func: js_sys::Function = state_change_cb.as_ref().unchecked_ref::<js_sys::Function>().clone();
+                    let js_func = make_state_change_closure(callback, |state| match state {
+                        "failed" | "disconnected" | "closed" => Some("error"),
+                        "connected" => Some("connected"),
+                        // Session already emits "connecting" before transport connect starts.
+                        // Ignore transport-level "connecting" to avoid stale callbacks
+                        // regressing the UI back to Connecting after a successful connect.
+                        _ => None,
+                    });
                     webrtc_transport.set_on_state_change(js_func);
-                    state_change_cb.forget(); // Keep callback alive
                 }
                 
                 // Connect to hub using the unified Transport trait method
@@ -515,10 +526,7 @@ impl WebTripSession {
                 // Set up state change callback BEFORE connecting
                 // This ensures the worker's message handler can use it
                 if let Some(ref callback) = self.on_state_change {
-                    let callback_clone = callback.clone();
-                    let state_change_cb = Closure::wrap(Box::new(move |state: String| {
-                        // Map transport states to session states.
-                        //
+                    let js_func = make_state_change_closure(callback, |state| match state {
                         // Note: the WebTransport worker only posts "disconnected" after a
                         // graceful, user-initiated close (i.e. once it has finished
                         // flushing the JackTrip exit packet). Unexpected connection
@@ -527,20 +535,12 @@ impl WebTripSession {
                         // "disconnected" must NOT be treated as an error — doing so
                         // causes the UI to flip from "Not Connected" to "Connection
                         // Error" ~20 ms after the user clicks Disconnect.
-                        let session_state = match state.as_str() {
-                            "failed" => "error",
-                            "connected" => "connected",
-                            "connecting" => "connecting",
-                            _ => return,
-                        };
-                        
-                        // Notify the app
-                        let _ = callback_clone.call1(&JsValue::NULL, &JsValue::from_str(session_state));
-                    }) as Box<dyn FnMut(String)>);
-                    
-                    let js_func: js_sys::Function = state_change_cb.as_ref().unchecked_ref::<js_sys::Function>().clone();
+                        "failed" => Some("error"),
+                        "connected" => Some("connected"),
+                        "connecting" => Some("connecting"),
+                        _ => None,
+                    });
                     webtransport.set_on_state_change(js_func);
-                    state_change_cb.forget(); // Keep callback alive
                 }
                 
                 // Connect via worker thread

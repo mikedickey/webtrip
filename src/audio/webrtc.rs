@@ -19,7 +19,7 @@
 
 use crate::audio::protocol::{AudioPacket, make_exit_packet};
 use crate::audio::signaling::HubSignaling;
-use crate::audio::transport::{Transport, TransportState, TransportType, AudioBufferConfig};
+use crate::audio::transport::{Transport, TransportState, TransportType, AudioBufferConfig, notify_transport_state};
 use js_sys::{Array, ArrayBuffer, Object, Reflect, Uint8Array};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -168,7 +168,7 @@ pub struct WebRtcTransport {
     on_ice_candidate_closure: Option<Closure<dyn FnMut(web_sys::RtcPeerConnectionIceEvent)>>,
     on_data_channel_closure: Option<Closure<dyn FnMut(RtcDataChannelEvent)>>,
     /// JavaScript callbacks for external integration (optional)
-    js_on_state_change: Option<js_sys::Function>,
+    on_state_change: Option<js_sys::Function>,
     /// Callback for ICE candidates (enables external ICE handling)
     js_on_ice_candidate: Option<js_sys::Function>,
     
@@ -209,7 +209,7 @@ impl WebRtcTransport {
             on_channel_close_closure: None,
             on_ice_candidate_closure: None,
             on_data_channel_closure: None,
-            js_on_state_change: None,
+            on_state_change: None,
             js_on_ice_candidate: None,
             audio_buffers: None,
             sequence_number: 0,
@@ -272,29 +272,22 @@ impl WebRtcTransport {
 
             // Try to process one send packet
             if ring_buffer.available() >= samples_needed {
-                if ring_buffer.read(&mut self.audio_to_send_buffer) {
-                    // Serialize directly into reusable buffer
-                    match crate::audio::protocol::AudioPacket::serialize_samples_into(
-                        self.sequence_number,
-                        self.timestamp,
-                        &self.audio_to_send_buffer,
-                        buffers.channels,
-                        &mut self.packet_serialize_buffer,
-                    ) {
-                        Ok(bytes_written) => {
-                            if let Some(ref channel) = self.data_channel {
-                                if channel.ready_state() == RtcDataChannelState::Open {
-                                    let array = Uint8Array::from(&self.packet_serialize_buffer[..bytes_written]);
-                                    if let Ok(()) = channel.send_with_array_buffer_view(&array) {
-                                        self.sequence_number = self.sequence_number.wrapping_add(1);
-                                        self.timestamp += buffers.buffer_size as u64;
-                                        processed_send = true;
-                                    }
-                                }
+                if let Some(bytes_written) = crate::audio::protocol::read_and_serialize(
+                    ring_buffer,
+                    &mut self.audio_to_send_buffer,
+                    &mut self.packet_serialize_buffer,
+                    self.sequence_number,
+                    self.timestamp,
+                    buffers.channels,
+                ) {
+                    if let Some(ref channel) = self.data_channel {
+                        if channel.ready_state() == RtcDataChannelState::Open {
+                            let array = Uint8Array::from(&self.packet_serialize_buffer[..bytes_written]);
+                            if let Ok(()) = channel.send_with_array_buffer_view(&array) {
+                                self.sequence_number = self.sequence_number.wrapping_add(1);
+                                self.timestamp += buffers.buffer_size as u64;
+                                processed_send = true;
                             }
-                        }
-                        Err(e) => {
-                            web_sys::console::error_1(&format!("❌ WebRTC serialize failed: {:?}", e).into());
                         }
                     }
                 }
@@ -366,7 +359,7 @@ impl WebRtcTransport {
         // so we can give specific error messages — notably for code 1006 (TLS cert not trusted).
         let server_for_err = server.to_string();
         let port_for_err = port;
-        if let Some(ref callback) = self.js_on_state_change {
+        if let Some(ref callback) = self.on_state_change {
             let callback_clone = callback.clone();
             let reject_for_close = reject_rc.clone();
             let signaling_state_cb = Closure::wrap(Box::new(move |state: String| {
@@ -436,7 +429,7 @@ impl WebRtcTransport {
         let shared_state_for_answer = shared_state.clone();
         
         // Also need access to state callback
-        let state_callback = self.js_on_state_change.clone();
+        let state_callback = self.on_state_change.clone();
         let state_callback_for_answer = state_callback.clone();
         
         let answer_callback = Closure::wrap(Box::new(move |sdp: JsValue| {
@@ -588,7 +581,7 @@ impl WebRtcTransport {
                 // WebRtcTransport::drop() -> close() -> notify_state_change("closed") does not
                 // fire a spurious "error" transition in the session for a connection that never
                 // succeeded. The error surfaces cleanly via the Err return value instead.
-                self.js_on_state_change = None;
+                self.on_state_change = None;
                 return Err(e);
             }
             Ok(_) => {}
@@ -859,7 +852,7 @@ impl WebRtcTransport {
         // Set up data channel handler for when server creates a data channel
         // (In practice, for JackTrip we create the channel, but this handles the reverse case)
         let receive_queue = self.receive_queue.clone();
-        let js_on_state_change = self.js_on_state_change.clone();
+        let on_state_change = self.on_state_change.clone();
 
         let on_datachannel = Closure::wrap(Box::new(move |event: RtcDataChannelEvent| {
             let channel = event.channel();
@@ -884,7 +877,7 @@ impl WebRtcTransport {
             on_message.forget();
 
             // Notify state change
-            if let Some(ref callback) = js_on_state_change {
+            if let Some(ref callback) = on_state_change {
                 let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("connected"));
             }
         }) as Box<dyn FnMut(_)>);
@@ -929,11 +922,11 @@ impl WebRtcTransport {
         self.on_message_closure = Some(on_message);
 
         // Set up open handler
-        let js_on_state_change = self.js_on_state_change.clone();
+        let on_state_change = self.on_state_change.clone();
         let channel_label = channel.label();
         let on_open = Closure::wrap(Box::new(move || {
             web_sys::console::debug_1(&format!("Data channel '{}' opened!", channel_label).into());
-            if let Some(ref callback) = js_on_state_change {
+            if let Some(ref callback) = on_state_change {
                 let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("connected"));
             }
         }) as Box<dyn FnMut()>);
@@ -941,9 +934,9 @@ impl WebRtcTransport {
         self.on_channel_open_closure = Some(on_open);
 
         // Set up close handler
-        let js_on_state_change2 = self.js_on_state_change.clone();
+        let on_state_change2 = self.on_state_change.clone();
         let on_close = Closure::wrap(Box::new(move || {
-            if let Some(ref callback) = js_on_state_change2 {
+            if let Some(ref callback) = on_state_change2 {
                 let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("disconnected"));
             }
         }) as Box<dyn FnMut()>);
@@ -955,16 +948,7 @@ impl WebRtcTransport {
     }
 
     fn notify_state_change(&self) {
-        if let Some(ref callback) = self.js_on_state_change {
-            let state_str = match self.state {
-                TransportState::Disconnected => "disconnected",
-                TransportState::Connecting => "connecting",
-                TransportState::Connected => "connected",
-                TransportState::Failed => "failed",
-                TransportState::Closed => "closed",
-            };
-            let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(state_str));
-        }
+        notify_transport_state(self.state, &self.on_state_change);
     }
 }
 
@@ -1014,7 +998,7 @@ impl Transport for WebRtcTransport {
     }
 
     fn set_on_state_change(&mut self, callback: js_sys::Function) {
-        self.js_on_state_change = Some(callback);
+        self.on_state_change = Some(callback);
     }
 
     fn connect(

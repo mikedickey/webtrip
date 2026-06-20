@@ -47,6 +47,14 @@ fn post_message_to_main(msg: &JsValue) {
     let _ = global.post_message(msg);
 }
 
+/// Build a `{type:"error", error: <msg>}` object and post it to the main thread.
+fn post_error_to_main(msg: &str) {
+    let error_obj = Object::new();
+    let _ = Reflect::set(&error_obj, &"type".into(), &"error".into());
+    let _ = Reflect::set(&error_obj, &"error".into(), &msg.into());
+    post_message_to_main(&error_obj.into());
+}
+
 /// Worker state shared between message handler and transport loops
 struct WorkerState {
     /// Raw pointer to RingBuffer (send path: AudioWorklet -> Network)
@@ -312,38 +320,25 @@ async fn send_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(), 
                 return None;
             }
 
-            // Read audio samples
-            let mut audio_buffer = state.audio_buffer.borrow_mut();
-            if !ring_buffer.read(&mut audio_buffer) {
-                return None;
-            }
-
-            // Serialize packet
+            // Increment counters before the read (webtransport uses pre-increment atomics)
             let seq = state.sequence_number.fetch_add(1, Ordering::Relaxed);
             let ts = state.timestamp.fetch_add(state.buffer_size as u64, Ordering::Relaxed);
-            
+
+            let mut audio_buffer = state.audio_buffer.borrow_mut();
             let mut packet_buffer = state.packet_buffer.borrow_mut();
-            match AudioPacket::serialize_samples_into(
+            crate::audio::protocol::read_and_serialize(
+                ring_buffer,
+                &mut audio_buffer,
+                &mut packet_buffer,
                 seq,
                 ts,
-                &audio_buffer,
                 state.channels,
-                &mut packet_buffer,
-            ) {
-                Ok(bytes_written) => {
-                    // Convert to Uint8Array for browser API
-                    let array = Uint8Array::new_with_length(bytes_written as u32);
-                    array.copy_from(&packet_buffer[..bytes_written]);
-                    Some((array, bytes_written))
-                }
-                Err(e) => {
-                    web_sys::console::error_1(&format!(
-                        "[WebTransport Worker] Serialize error: {:?}",
-                        e
-                    ).into());
-                    None
-                }
-            }
+            ).map(|bytes_written| {
+                // Convert to Uint8Array for browser API
+                let array = Uint8Array::new_with_length(bytes_written as u32);
+                array.copy_from(&packet_buffer[..bytes_written]);
+                (array, bytes_written)
+            })
         });
 
         if let Some((data, data_len)) = packet_data {
@@ -375,10 +370,7 @@ async fn send_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(), 
                         });
                         
                         // Notify main thread
-                        let error_obj = Object::new();
-                        let _ = Reflect::set(&error_obj, &"type".into(), &"error".into());
-                        let _ = Reflect::set(&error_obj, &"error".into(), &"Connection lost".into());
-                        post_message_to_main(&error_obj.into());
+                        post_error_to_main("Connection lost");
                         
                         break;
                     }
@@ -578,10 +570,7 @@ async fn receive_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(
                 });
                 
                 // Notify main thread
-                let error_obj = Object::new();
-                let _ = Reflect::set(&error_obj, &"type".into(), &"error".into());
-                let _ = Reflect::set(&error_obj, &"error".into(), &"Connection lost".into());
-                post_message_to_main(&error_obj.into());
+                post_error_to_main("Connection lost");
                 
                 // For connection errors, break the loop
                 break;

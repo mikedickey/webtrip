@@ -367,6 +367,40 @@ pub struct HubSignaling {
     js_on_state_change: Option<js_sys::Function>,
 }
 
+impl HubSignaling {
+    /// Canonical struct initialiser — used by both `new` and `from_url`.
+    fn build(server_url: String) -> Self {
+        Self {
+            server_url,
+            socket: None,
+            state: HubConnectionState::Disconnected,
+            is_ready: Rc::new(RefCell::new(false)),
+            outgoing_queue: Rc::new(RefCell::new(Vec::new())),
+            on_message_closure: None,
+            on_open_closure: None,
+            on_close_closure: None,
+            on_error_closure: None,
+            message_queue: Rc::new(RefCell::new(Vec::new())),
+            js_on_answer: None,
+            js_on_ice: None,
+            js_on_error: None,
+            js_on_state_change: None,
+        }
+    }
+
+    /// Send a pre-serialised JSON message immediately if the socket is ready,
+    /// or push it onto the outgoing queue to be flushed on open.
+    fn send_or_queue(&self, json: String) -> Result<(), JsValue> {
+        if *self.is_ready.borrow() {
+            let socket = self.socket.as_ref().ok_or("Not connected")?;
+            socket.send_with_str(&json)?;
+        } else {
+            self.outgoing_queue.borrow_mut().push(json);
+        }
+        Ok(())
+    }
+}
+
 #[wasm_bindgen]
 impl HubSignaling {
     /// Create a new hub signaling client
@@ -387,22 +421,7 @@ impl HubSignaling {
             format!("wss://{}:{}/webrtc?name={}", server_host, port, encoded_name)
         };
 
-        Self {
-            server_url,
-            socket: None,
-            state: HubConnectionState::Disconnected,
-            is_ready: Rc::new(RefCell::new(false)),
-            outgoing_queue: Rc::new(RefCell::new(Vec::new())),
-            on_message_closure: None,
-            on_open_closure: None,
-            on_close_closure: None,
-            on_error_closure: None,
-            message_queue: Rc::new(RefCell::new(Vec::new())),
-            js_on_answer: None,
-            js_on_ice: None,
-            js_on_error: None,
-            js_on_state_change: None,
-        }
+        Self::build(server_url)
     }
 
     /// Create from a full WebSocket URL (`ws://` is upgraded to `wss://` for hub signaling)
@@ -412,22 +431,7 @@ impl HubSignaling {
         } else {
             url.to_string()
         };
-        Self {
-            server_url,
-            socket: None,
-            state: HubConnectionState::Disconnected,
-            is_ready: Rc::new(RefCell::new(false)),
-            outgoing_queue: Rc::new(RefCell::new(Vec::new())),
-            on_message_closure: None,
-            on_open_closure: None,
-            on_close_closure: None,
-            on_error_closure: None,
-            message_queue: Rc::new(RefCell::new(Vec::new())),
-            js_on_answer: None,
-            js_on_ice: None,
-            js_on_error: None,
-            js_on_state_change: None,
-        }
+        Self::build(server_url)
     }
 
     /// Set callback for SDP answer received
@@ -584,30 +588,14 @@ impl HubSignaling {
     /// If the WebSocket isn't ready yet, the message is queued
     pub fn send_offer(&self, sdp: &str) -> Result<(), JsValue> {
         let msg = SignalingMessage::offer(sdp);
-        let json = msg.to_json();
-        
-        if *self.is_ready.borrow() {
-            let socket = self.socket.as_ref().ok_or("Not connected")?;
-            socket.send_with_str(&json)?;
-        } else {
-            self.outgoing_queue.borrow_mut().push(json);
-        }
-        Ok(())
+        self.send_or_queue(msg.to_json())
     }
 
     /// Send an ICE candidate to the server
     /// If the WebSocket isn't ready yet, the message is queued
     pub fn send_ice_candidate(&self, candidate: &str, sdp_mid: &str, sdp_m_line_index: u16) -> Result<(), JsValue> {
         let msg = SignalingMessage::ice(candidate, sdp_mid, sdp_m_line_index);
-        let json = msg.to_json();
-        
-        if *self.is_ready.borrow() {
-            let socket = self.socket.as_ref().ok_or("Not connected")?;
-            socket.send_with_str(&json)?;
-        } else {
-            self.outgoing_queue.borrow_mut().push(json);
-        }
-        Ok(())
+        self.send_or_queue(msg.to_json())
     }
 
     /// Send a hangup message and disconnect

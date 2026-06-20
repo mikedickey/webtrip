@@ -711,7 +711,39 @@ impl Default for AudioFormat {
     }
 }
 
-/// Fixed byte length of a JackTrip control packet (and therefore an exit packet).
+/// Read one audio block from `ring` into `audio_buf` and serialise it into
+/// `packet_buf` as a JackTrip packet.
+///
+/// Returns `Some(bytes_written)` when a packet was produced, or `None` when:
+/// - the ring buffer did not have enough samples, or
+/// - the read failed, or
+/// - serialisation returned an error.
+///
+/// The caller is responsible for managing `seq` and `ts` (incrementing them
+/// after a successful call).
+pub(crate) fn read_and_serialize(
+    ring: &mut crate::audio::ring_buffer::RingBuffer,
+    audio_buf: &mut Vec<f32>,
+    packet_buf: &mut [u8],
+    seq: u16,
+    ts: u64,
+    channels: u8,
+) -> Option<usize> {
+    if !ring.read(audio_buf) {
+        return None;
+    }
+    match AudioPacket::serialize_samples_into(seq, ts, audio_buf, channels, packet_buf) {
+        Ok(bytes_written) => Some(bytes_written),
+        Err(e) => {
+            #[cfg(target_arch = "wasm32")]
+            web_sys::console::error_1(&format!("❌ serialize_samples_into failed: {:?}", e).into());
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = e;
+            None
+        }
+    }
+}
+
 pub const CONTROL_PACKET_SIZE: usize = 63;
 
 /// Builds a JackTrip exit packet: a 63-byte control packet with every byte set to `0xFF`.
