@@ -50,6 +50,7 @@ impl TransportType {
 }
 
 /// Connection state shared across all transports
+#[wasm_bindgen]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportState {
     Disconnected,

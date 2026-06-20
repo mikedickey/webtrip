@@ -23,7 +23,7 @@ pub use audio::{
     AudioFormat, AudioPacket, PacketHeader, StreamStats,
     // Transport types
     Transport, TransportType, TransportState,
-    ConnectionState, TransportConfig,
+    TransportConfig,
     WebRtcTransport,
     MockTransport, WebTransportImpl,
     // Signaling types

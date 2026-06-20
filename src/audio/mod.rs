@@ -51,7 +51,7 @@ pub use protocol::{AudioFormat, AudioPacket, PacketHeader, StreamStats};
 
 // Re-export transport types
 pub use transport::{Transport, TransportType, TransportState};
-pub use webrtc::{ConnectionState, TransportConfig, WebRtcTransport};
+pub use webrtc::{TransportConfig, WebRtcTransport};
 pub use mock_transport::{MockTransport, SineWaveConfig};
 pub use webtransport::WebTransportImpl;
 
