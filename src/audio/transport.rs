@@ -88,18 +88,26 @@ pub(crate) fn log_audio_buffers_set(transport_name: &str, channels: u8, buffer_s
     );
 }
 
+/// Map a [`TransportState`] to its canonical string representation.
+///
+/// This is the single source of truth for state names passed to JavaScript
+/// callbacks. Extracted as a pure function so it can be tested without a
+/// browser.
+pub(crate) fn transport_state_str(state: TransportState) -> &'static str {
+    match state {
+        TransportState::Disconnected => "disconnected",
+        TransportState::Connecting   => "connecting",
+        TransportState::Connected    => "connected",
+        TransportState::Failed       => "failed",
+        TransportState::Closed       => "closed",
+    }
+}
+
 /// Notify a JS state-change callback with the string representation of `state`.
 /// Shared by all three transport implementations.
 pub(crate) fn notify_transport_state(state: TransportState, callback: &Option<js_sys::Function>) {
     if let Some(ref cb) = callback {
-        let s = match state {
-            TransportState::Disconnected => "disconnected",
-            TransportState::Connecting   => "connecting",
-            TransportState::Connected    => "connected",
-            TransportState::Failed       => "failed",
-            TransportState::Closed       => "closed",
-        };
-        let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(s));
+        let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(transport_state_str(state)));
     }
 }
 
@@ -188,3 +196,84 @@ pub trait Transport {
     fn close(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>>;
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Minimal `Transport` implementation used only to exercise the default
+    // `is_connected()` method with each possible state.
+    struct StateTransport(TransportState);
+
+    impl Transport for StateTransport {
+        fn transport_type(&self) -> TransportType {
+            TransportType::Mock
+        }
+        fn state(&self) -> TransportState {
+            self.0
+        }
+        fn connect(
+            &mut self,
+            _server: &str,
+            _port: u16,
+            _client_name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), JsValue>> + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn close(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+            Box::pin(async {})
+        }
+    }
+
+    #[test]
+    fn transport_type_name_covers_all_variants() {
+        assert_eq!(TransportType::WebRTC.name(), "WebRTC Data Channels");
+        assert_eq!(TransportType::WebTransport.name(), "WebTransport (QUIC)");
+        assert_eq!(TransportType::Mock.name(), "Mock (Testing)");
+    }
+
+    #[test]
+    fn transport_type_id_covers_all_variants() {
+        assert_eq!(TransportType::WebRTC.id(), "webrtc");
+        assert_eq!(TransportType::WebTransport.id(), "webtransport");
+        assert_eq!(TransportType::Mock.id(), "mock");
+    }
+
+    #[test]
+    fn transport_type_from_id_roundtrip() {
+        for t in [TransportType::WebRTC, TransportType::WebTransport, TransportType::Mock] {
+            assert_eq!(
+                TransportType::from_id(&t.id()),
+                Some(t),
+                "from_id(id()) should be the identity for {:?}",
+                t,
+            );
+        }
+    }
+
+    #[test]
+    fn transport_type_from_id_unknown_returns_none() {
+        assert_eq!(TransportType::from_id("unknown"), None);
+        assert_eq!(TransportType::from_id(""), None);
+        // IDs are case-sensitive.
+        assert_eq!(TransportType::from_id("WebRTC"), None);
+        assert_eq!(TransportType::from_id("MOCK"), None);
+    }
+
+    #[test]
+    fn transport_state_str_covers_all_variants() {
+        assert_eq!(transport_state_str(TransportState::Disconnected), "disconnected");
+        assert_eq!(transport_state_str(TransportState::Connecting),   "connecting");
+        assert_eq!(transport_state_str(TransportState::Connected),    "connected");
+        assert_eq!(transport_state_str(TransportState::Failed),       "failed");
+        assert_eq!(transport_state_str(TransportState::Closed),       "closed");
+    }
+
+    #[test]
+    fn is_connected_true_only_for_connected_state() {
+        assert!( StateTransport(TransportState::Connected).is_connected());
+        assert!(!StateTransport(TransportState::Disconnected).is_connected());
+        assert!(!StateTransport(TransportState::Connecting).is_connected());
+        assert!(!StateTransport(TransportState::Failed).is_connected());
+        assert!(!StateTransport(TransportState::Closed).is_connected());
+    }
+}

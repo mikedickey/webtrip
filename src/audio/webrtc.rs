@@ -35,6 +35,78 @@ use web_sys::{
     RtcSdpType, RtcSessionDescriptionInit,
 };
 
+// ─── Pure logic helpers (no browser APIs) ────────────────────────────────────
+
+/// Fields extracted from an ICE-candidate JSON string.
+///
+/// The JSON format used by the JackTrip hub server is:
+/// `{"candidate":"...","sdpMid":"audio","sdpMLineIndex":0}`
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ParsedIceCandidate {
+    pub candidate: String,
+    pub sdp_mid: Option<String>,
+    pub sdp_m_line_index: Option<u16>,
+}
+
+/// Parse an ICE-candidate JSON string into its component fields.
+///
+/// Returns `None` for empty input, invalid JSON, or when the required
+/// `"candidate"` key is absent or not a string.  The `sdpMid` and
+/// `sdpMLineIndex` keys are optional and map to `None` when missing.
+///
+/// This is the single source of truth for ICE-candidate JSON parsing.
+/// The browser callback wraps this and forwards the result to `web_sys`.
+pub(crate) fn parse_ice_candidate_json(json: &str) -> Option<ParsedIceCandidate> {
+    if json.is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let candidate = v.get("candidate")?.as_str()?.to_string();
+    let sdp_mid = v.get("sdpMid").and_then(|s| s.as_str()).map(String::from);
+    let sdp_m_line_index = v
+        .get("sdpMLineIndex")
+        .and_then(|n| n.as_u64())
+        .map(|n| n as u16);
+    Some(ParsedIceCandidate { candidate, sdp_mid, sdp_m_line_index })
+}
+
+/// What the tick loop should do in a single iteration.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TickDecision {
+    /// Not connected: drain the ring buffer so `Atomics.waitAsync` can sleep.
+    Drain,
+    /// No work to do this iteration: exit the loop.
+    Idle,
+    /// At least one direction has data — attempt send and/or receive.
+    Process {
+        /// Ring buffer has enough samples to form one outgoing packet.
+        should_send: bool,
+        /// Receive queue has at least one incoming packet.
+        have_receive: bool,
+    },
+}
+
+/// Compute what the tick loop should do given the current transport state.
+///
+/// This is the pure decision kernel of `do_tick`; it takes plain integers and
+/// booleans so it can be called from native unit tests without any browser API.
+pub(crate) fn tick_decision(
+    is_connected: bool,
+    available: u32,
+    samples_needed: u32,
+    have_receive: bool,
+) -> TickDecision {
+    if !is_connected {
+        return TickDecision::Drain;
+    }
+    let should_send = available >= samples_needed;
+    if should_send || have_receive {
+        TickDecision::Process { should_send, have_receive }
+    } else {
+        TickDecision::Idle
+    }
+}
+
 /// Data channel label for audio data
 const AUDIO_CHANNEL_LABEL: &str = "jacktrip-audio";
 
@@ -235,87 +307,96 @@ impl WebRtcTransport {
     /// Called by the session layer when the audio worklet's process() callback runs.
     /// Reads from the ring buffer and writes to the jitter buffer.
     fn do_tick(&mut self) {
-        // Only process if we have buffers configured and we're connected
+        // Only process if we have buffers configured.
         let buffers = match self.audio_buffers {
             Some(config) => config,
             None => return,
         };
 
-        if !self.is_connected() {
-            // The data channel has not reached the Open state yet (typically
-            // the DTLS/SCTP handshake is still in flight — most visible in
-            // Firefox when we land on the DTLS-server side of
-            // `a=setup:active`). During that window the AudioWorklet keeps
-            // writing to the ring buffer and setting `has_data_flag = 1`. If
-            // we returned without calling `ring_buffer.read()`, the flag
-            // would stay at 1, `Atomics.waitAsync` would return synchronously
-            // every iteration, and the main thread would enter a tight loop
-            // that freezes the browser. Drain the ring buffer here so the
-            // flag clears and the waitAsync loop can sleep until the channel
-            // is open.
-            let ring_buffer = unsafe { &mut *buffers.local_to_network_ptr };
-            while ring_buffer.read(&mut self.audio_to_send_buffer) {}
-            return;
-        }
-
         let samples_needed = (buffers.buffer_size * buffers.channels as usize) as u32;
-        
+
         // Safety: We're in single-threaded WASM, and these pointers are valid
-        // for the lifetime of the session
+        // for the lifetime of the session.
         let ring_buffer = unsafe { &mut *buffers.local_to_network_ptr };
-        let jitter_buffer = unsafe { &mut *buffers.network_to_local_ptr };
 
-        // Interleaved send/receive for better latency balance
-        loop {
-            let mut processed_send = false;
-            let mut processed_receive = false;
+        match tick_decision(self.is_connected(), ring_buffer.available(), samples_needed, !self.receive_queue.borrow().is_empty()) {
+            TickDecision::Drain => {
+                // The data channel has not reached the Open state yet (typically
+                // the DTLS/SCTP handshake is still in flight — most visible in
+                // Firefox when we land on the DTLS-server side of
+                // `a=setup:active`). During that window the AudioWorklet keeps
+                // writing to the ring buffer and setting `has_data_flag = 1`. If
+                // we returned without draining, the flag would stay at 1,
+                // `Atomics.waitAsync` would return synchronously every iteration,
+                // and the main thread would enter a tight loop that freezes the
+                // browser. Drain so the flag clears and the waitAsync loop can
+                // sleep until the channel is open.
+                while ring_buffer.read(&mut self.audio_to_send_buffer) {}
+            }
+            TickDecision::Idle => {}
+            TickDecision::Process { .. } => {
+                let jitter_buffer = unsafe { &mut *buffers.network_to_local_ptr };
 
-            // Try to process one send packet
-            if ring_buffer.available() >= samples_needed {
-                if ring_buffer.read(&mut self.audio_to_send_buffer) {
-                    // Serialize directly into reusable buffer
-                    match crate::audio::protocol::AudioPacket::serialize_samples_into(
-                        self.sequence_number,
-                        self.timestamp,
-                        &self.audio_to_send_buffer,
-                        buffers.channels,
-                        &mut self.packet_serialize_buffer,
-                    ) {
-                        Ok(bytes_written) => {
-                            if let Some(ref channel) = self.data_channel {
-                                if channel.ready_state() == RtcDataChannelState::Open {
-                                    let array = Uint8Array::from(&self.packet_serialize_buffer[..bytes_written]);
-                                    if let Ok(()) = channel.send_with_array_buffer_view(&array) {
-                                        self.sequence_number = self.sequence_number.wrapping_add(1);
-                                        self.timestamp += buffers.buffer_size as u64;
-                                        processed_send = true;
+                // Interleaved send/receive for better latency balance.
+                loop {
+                    let available = ring_buffer.available();
+                    let have_receive = !self.receive_queue.borrow().is_empty();
+
+                    match tick_decision(self.is_connected(), available, samples_needed, have_receive) {
+                        TickDecision::Process { should_send, have_receive: do_receive } => {
+                            let mut processed_send = false;
+                            let mut processed_receive = false;
+
+                            if should_send {
+                                if ring_buffer.read(&mut self.audio_to_send_buffer) {
+                                    match crate::audio::protocol::AudioPacket::serialize_samples_into(
+                                        self.sequence_number,
+                                        self.timestamp,
+                                        &self.audio_to_send_buffer,
+                                        buffers.channels,
+                                        &mut self.packet_serialize_buffer,
+                                    ) {
+                                        Ok(bytes_written) => {
+                                            if let Some(ref channel) = self.data_channel {
+                                                if channel.ready_state() == RtcDataChannelState::Open {
+                                                    let array = Uint8Array::from(&self.packet_serialize_buffer[..bytes_written]);
+                                                    if let Ok(()) = channel.send_with_array_buffer_view(&array) {
+                                                        self.sequence_number = self.sequence_number.wrapping_add(1);
+                                                        self.timestamp += buffers.buffer_size as u64;
+                                                        processed_send = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            web_sys::console::error_1(&format!("❌ WebRTC serialize failed: {:?}", e).into());
+                                        }
                                     }
                                 }
                             }
+
+                            if do_receive {
+                                if let Some(data) = self.receive_queue.borrow_mut().pop_front() {
+                                    match AudioPacket::deserialize(&data) {
+                                        Ok(packet) => {
+                                            jitter_buffer.push(packet.header.sequence_number, &packet.samples);
+                                            processed_receive = true;
+                                        }
+                                        Err(e) => {
+                                            web_sys::console::error_1(&format!("❌ WebRTC failed to deserialize: {:?}", e).into());
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !processed_send && !processed_receive {
+                                break;
+                            }
                         }
-                        Err(e) => {
-                            web_sys::console::error_1(&format!("❌ WebRTC serialize failed: {:?}", e).into());
-                        }
+                        // Stop the loop when there is nothing left to do or we disconnected.
+                        _ => break,
                     }
                 }
-            }
-
-            // Try to process one receive packet
-            if let Some(data) = self.receive_queue.borrow_mut().pop_front() {
-                match AudioPacket::deserialize(&data) {
-                    Ok(packet) => {
-                        jitter_buffer.push(packet.header.sequence_number, &packet.samples);
-                        processed_receive = true;
-                    }
-                    Err(e) => {
-                        web_sys::console::error_1(&format!("❌ WebRTC failed to deserialize: {:?}", e).into());
-                    }
-                }
-            }
-
-            // Exit loop if neither direction had data to process
-            if !processed_send && !processed_receive {
-                break;
             }
         }
     }
@@ -507,33 +588,33 @@ impl WebRtcTransport {
         let ice_callback = Closure::wrap(Box::new(move |candidate_json: JsValue| {
             let json_str = candidate_json.as_string().unwrap_or_default();
             let peer_conn = peer_conn_for_ice.clone();
-            
+
             wasm_bindgen_futures::spawn_local(async move {
-                if json_str.is_empty() {
-                    return;
-                }
-                
-                // Get peer connection from shared ref
+                // Parse the candidate fields using the pure helper (testable without browser).
+                let parsed = match parse_ice_candidate_json(&json_str) {
+                    Some(p) => p,
+                    None => return,
+                };
+
                 let pc_opt = peer_conn.borrow().clone();
                 if let Some(pc) = pc_opt {
-                    match js_sys::JSON::parse(&json_str) {
-                        Ok(candidate_obj) => {
-                            let candidate_init: RtcIceCandidateInit = candidate_obj.unchecked_into();
-                            match RtcIceCandidate::new(&candidate_init) {
-                                Ok(candidate) => {
-                                    if let Err(e) = JsFuture::from(
-                                        pc.add_ice_candidate_with_opt_rtc_ice_candidate(Some(&candidate))
-                                    ).await {
-                                        web_sys::console::error_1(&format!("❌ Failed to add ICE candidate: {:?}", e).into());
-                                    }
-                                }
-                                Err(e) => {
-                                    web_sys::console::error_1(&format!("❌ Failed to create ICE candidate: {:?}", e).into());
-                                }
+                    let candidate_init = RtcIceCandidateInit::new(&parsed.candidate);
+                    if let Some(mid) = parsed.sdp_mid.as_deref() {
+                        candidate_init.set_sdp_mid(Some(mid));
+                    }
+                    if let Some(idx) = parsed.sdp_m_line_index {
+                        candidate_init.set_sdp_m_line_index(Some(idx));
+                    }
+                    match RtcIceCandidate::new(&candidate_init) {
+                        Ok(candidate) => {
+                            if let Err(e) = JsFuture::from(
+                                pc.add_ice_candidate_with_opt_rtc_ice_candidate(Some(&candidate))
+                            ).await {
+                                web_sys::console::error_1(&format!("❌ Failed to add ICE candidate: {:?}", e).into());
                             }
                         }
                         Err(e) => {
-                            web_sys::console::error_1(&format!("❌ Failed to parse ICE candidate JSON: {:?}", e).into());
+                            web_sys::console::error_1(&format!("❌ Failed to create ICE candidate: {:?}", e).into());
                         }
                     }
                 } else {
@@ -1043,5 +1124,234 @@ impl Transport for WebRtcTransport {
 impl Drop for WebRtcTransport {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::protocol::{AudioPacket, HEADER_SIZE};
+    use std::collections::VecDeque;
+
+    // ── TransportConfig ──────────────────────────────────────────────────────
+
+    #[test]
+    fn transport_config_low_latency_defaults() {
+        let cfg = TransportConfig::low_latency();
+        assert_eq!(cfg.ice_servers.len(), 2, "should have 2 default STUN servers");
+        assert!(cfg.ice_servers[0].starts_with("stun:"));
+        assert!(cfg.ice_servers[1].starts_with("stun:"));
+        assert!(cfg.unreliable, "low-latency config must be unreliable (UDP-like)");
+        assert_eq!(cfg.max_retransmits, 0, "no retransmits for low-latency");
+        assert!(!cfg.ordered, "low-latency config must be unordered");
+    }
+
+    #[test]
+    fn transport_config_new_equals_low_latency() {
+        let default_cfg = TransportConfig::new();
+        let ll_cfg = TransportConfig::low_latency();
+        assert_eq!(default_cfg.ice_servers, ll_cfg.ice_servers);
+        assert_eq!(default_cfg.unreliable, ll_cfg.unreliable);
+        assert_eq!(default_cfg.max_retransmits, ll_cfg.max_retransmits);
+        assert_eq!(default_cfg.ordered, ll_cfg.ordered);
+    }
+
+    #[test]
+    fn transport_config_add_ice_server_appends() {
+        let mut cfg = TransportConfig::low_latency();
+        let initial_count = cfg.ice_servers.len();
+        cfg.add_ice_server("stun:custom.example.com:3478".to_string());
+        assert_eq!(cfg.ice_servers.len(), initial_count + 1);
+        assert_eq!(cfg.ice_servers.last().unwrap(), "stun:custom.example.com:3478");
+    }
+
+    #[test]
+    fn transport_config_set_ice_servers_replaces_all() {
+        let mut cfg = TransportConfig::low_latency();
+        let new_servers = vec!["stun:a.example.com".to_string(), "turn:b.example.com".to_string()];
+        cfg.set_ice_servers(new_servers.clone());
+        assert_eq!(cfg.ice_servers, new_servers);
+    }
+
+    #[test]
+    fn transport_config_set_ice_servers_to_empty() {
+        let mut cfg = TransportConfig::low_latency();
+        cfg.set_ice_servers(vec![]);
+        assert!(cfg.ice_servers.is_empty());
+    }
+
+    // ── Packet serialize / deserialize (reuses AudioPacket from protocol.rs) ─
+
+    #[test]
+    fn packet_serialize_samples_into_then_deserialize_mono_roundtrip() {
+        let samples: Vec<f32> = (0..128).map(|i| i as f32 / 128.0).collect();
+        let mut buf = vec![0u8; HEADER_SIZE + 128 * 2];
+
+        let written = AudioPacket::serialize_samples_into(7, 1000, &samples, 1, &mut buf).unwrap();
+        assert_eq!(written, HEADER_SIZE + 128 * 2);
+
+        let pkt = AudioPacket::deserialize(&buf[..written]).unwrap();
+        assert_eq!(pkt.header.sequence_number, 7);
+        assert_eq!(pkt.header.timestamp, 1000);
+        assert_eq!(pkt.samples.len(), 128);
+        for (a, b) in samples.iter().zip(pkt.samples.iter()) {
+            assert!((a - b).abs() < 1e-4, "sample mismatch: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn packet_serialize_samples_into_then_deserialize_stereo_roundtrip() {
+        // Interleaved stereo: [L0, R0, L1, R1, ...]
+        let samples: Vec<f32> = (0..256).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect();
+        let channels: u8 = 2;
+        let mut buf = vec![0u8; HEADER_SIZE + 256 * 2];
+
+        let written = AudioPacket::serialize_samples_into(3, 512, &samples, channels, &mut buf).unwrap();
+        let pkt = AudioPacket::deserialize(&buf[..written]).unwrap();
+
+        assert_eq!(pkt.header.num_incoming_channels, 2);
+        assert_eq!(pkt.samples.len(), 256);
+        for (i, (a, b)) in samples.iter().zip(pkt.samples.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-4, "stereo sample {i}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn packet_serialize_samples_into_buffer_too_small_returns_error() {
+        use crate::audio::protocol::ProtocolError;
+        let samples = vec![0.0f32; 128];
+        let mut tiny_buf = vec![0u8; 4]; // way too small
+        let result = AudioPacket::serialize_samples_into(0, 0, &samples, 1, &mut tiny_buf);
+        assert_eq!(result, Err(ProtocolError::BufferTooSmall));
+    }
+
+    // ── Receive-queue FIFO behavior ───────────────────────────────────────────
+
+    #[test]
+    fn receive_queue_fifo_ordering() {
+        // The WebRtcTransport receive queue is a plain VecDeque<Vec<u8>>.
+        // Verify that the FIFO contract the transport relies on holds.
+        let mut q: VecDeque<Vec<u8>> = VecDeque::new();
+        q.push_back(vec![1, 2, 3]);
+        q.push_back(vec![4, 5, 6]);
+        q.push_back(vec![7, 8, 9]);
+
+        assert_eq!(q.pop_front(), Some(vec![1, 2, 3]));
+        assert_eq!(q.pop_front(), Some(vec![4, 5, 6]));
+        assert_eq!(q.pop_front(), Some(vec![7, 8, 9]));
+        assert_eq!(q.pop_front(), None, "queue must be empty after draining");
+    }
+
+    #[test]
+    fn receive_queue_preserves_byte_content() {
+        let payload: Vec<u8> = (0u8..=255).collect();
+        let mut q: VecDeque<Vec<u8>> = VecDeque::new();
+        q.push_back(payload.clone());
+        assert_eq!(q.pop_front().unwrap(), payload);
+    }
+
+    // ── ICE candidate JSON parsing ────────────────────────────────────────────
+
+    #[test]
+    fn parse_ice_candidate_json_full_object() {
+        let json = r#"{"candidate":"candidate:1 1 UDP 2122252543 192.168.1.1 56789 typ host","sdpMid":"audio","sdpMLineIndex":0}"#;
+        let parsed = parse_ice_candidate_json(json).unwrap();
+        assert!(parsed.candidate.starts_with("candidate:"));
+        assert_eq!(parsed.sdp_mid.as_deref(), Some("audio"));
+        assert_eq!(parsed.sdp_m_line_index, Some(0));
+    }
+
+    #[test]
+    fn parse_ice_candidate_json_optional_fields_absent() {
+        let json = r#"{"candidate":"candidate:1 1 UDP 2122252543 10.0.0.1 12345 typ host"}"#;
+        let parsed = parse_ice_candidate_json(json).unwrap();
+        assert!(parsed.candidate.contains("typ host"));
+        assert_eq!(parsed.sdp_mid, None);
+        assert_eq!(parsed.sdp_m_line_index, None);
+    }
+
+    #[test]
+    fn parse_ice_candidate_json_empty_string_returns_none() {
+        assert_eq!(parse_ice_candidate_json(""), None);
+    }
+
+    #[test]
+    fn parse_ice_candidate_json_malformed_returns_none() {
+        assert_eq!(parse_ice_candidate_json("{not valid json"), None);
+        assert_eq!(parse_ice_candidate_json("null"), None);
+        assert_eq!(parse_ice_candidate_json("[]"), None);
+    }
+
+    #[test]
+    fn parse_ice_candidate_json_missing_candidate_key_returns_none() {
+        // JSON object but no "candidate" field → must return None.
+        let json = r#"{"sdpMid":"audio","sdpMLineIndex":0}"#;
+        assert_eq!(parse_ice_candidate_json(json), None);
+    }
+
+    #[test]
+    fn parse_ice_candidate_json_non_string_candidate_returns_none() {
+        // "candidate" present but not a string → must return None.
+        let json = r#"{"candidate":42}"#;
+        assert_eq!(parse_ice_candidate_json(json), None);
+    }
+
+    // ── Tick decision logic ───────────────────────────────────────────────────
+
+    #[test]
+    fn tick_decision_drains_when_not_connected() {
+        // Regardless of how much data is available, not-connected → Drain.
+        assert_eq!(tick_decision(false, 128, 128, false), TickDecision::Drain);
+        assert_eq!(tick_decision(false, 1024, 128, true),  TickDecision::Drain);
+        assert_eq!(tick_decision(false, 0,    128, false), TickDecision::Drain);
+    }
+
+    #[test]
+    fn tick_decision_process_when_enough_samples() {
+        let decision = tick_decision(true, 128, 128, false);
+        assert_eq!(
+            decision,
+            TickDecision::Process { should_send: true, have_receive: false },
+        );
+    }
+
+    #[test]
+    fn tick_decision_idle_when_insufficient_samples_and_no_receive() {
+        // Fewer samples than needed and no pending receive → Idle.
+        assert_eq!(tick_decision(true, 64, 128, false), TickDecision::Idle);
+        assert_eq!(tick_decision(true, 0,  128, false), TickDecision::Idle);
+    }
+
+    #[test]
+    fn tick_decision_process_receive_only_when_queue_has_data() {
+        // Not enough samples to send, but receive queue has data → Process (receive only).
+        let decision = tick_decision(true, 0, 128, true);
+        assert_eq!(
+            decision,
+            TickDecision::Process { should_send: false, have_receive: true },
+        );
+    }
+
+    #[test]
+    fn tick_decision_process_both_when_send_and_receive_ready() {
+        let decision = tick_decision(true, 256, 128, true);
+        assert_eq!(
+            decision,
+            TickDecision::Process { should_send: true, have_receive: true },
+        );
+    }
+
+    #[test]
+    fn tick_decision_send_at_exact_sample_threshold() {
+        // available == samples_needed → should_send is true (not strictly greater than).
+        assert_eq!(
+            tick_decision(true, 128, 128, false),
+            TickDecision::Process { should_send: true, have_receive: false },
+        );
+        // One sample short → should_send is false.
+        assert_eq!(
+            tick_decision(true, 127, 128, false),
+            TickDecision::Idle,
+        );
     }
 }
