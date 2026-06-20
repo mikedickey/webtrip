@@ -32,7 +32,7 @@
 use wasm_bindgen::prelude::*;
 
 use crate::audio::engine::AudioEngine;
-use crate::audio::regulator::Regulator;
+use crate::audio::regulator::{Regulator, RegulatorStats};
 use crate::audio::params::AudioParams;
 use crate::audio::ring_buffer::RingBuffer;
 use crate::audio::transport::{Transport, TransportType, AudioBufferConfig};
@@ -105,6 +105,82 @@ impl SessionStats {
     }
 }
 
+
+// ============================================================================
+// Pure decision helpers (no browser APIs — fully testable with `cargo test`)
+// ============================================================================
+
+/// Returns `true` when `channels` is within the supported range [1, 8].
+pub(crate) fn is_valid_channel_count(channels: u8) -> bool {
+    channels >= 1 && channels <= 8
+}
+
+/// Returns `true` when the state transition `from → to` is permitted.
+///
+/// Legal transitions:
+/// ```text
+/// Idle        → Connecting
+/// Connecting  → Negotiating
+/// Connecting  → Connected   (e.g. Mock transport, no negotiation step)
+/// Negotiating → Connected
+/// *           → Error       (failure from any state)
+/// Error       → Idle        (reset after error)
+/// Connected   → Idle        (disconnect)
+/// Connecting  → Idle        (cancel connection)
+/// Negotiating → Idle        (cancel negotiation)
+/// ```
+pub(crate) fn is_valid_state_transition(from: SessionState, to: SessionState) -> bool {
+    use SessionState::*;
+    matches!(
+        (from, to),
+        (Idle, Connecting)
+            | (Connecting, Negotiating)
+            | (Connecting, Connected)
+            | (Negotiating, Connected)
+            | (_, Error)
+            | (Error, Idle)
+            | (Connected, Idle)
+            | (Connecting, Idle)
+            | (Negotiating, Idle)
+    )
+}
+
+/// Construct a [`SessionStats`] from its raw component values.
+///
+/// This is the single authoritative mapping point; [`WebTripSession::get_stats`]
+/// delegates here so the aggregation logic can be tested without constructing the
+/// full session (which requires a live `AudioEngine` and `Transport`).
+pub(crate) fn build_session_stats(
+    reg_stats: RegulatorStats,
+    regulator_depth: u32,
+    regulator_latency_ms: f32,
+    regulator_initialized: bool,
+    send_buffer_available: u32,
+    ring_buffer_writes: u64,
+    ring_buffer_samples_written: u64,
+    ring_buffer_overruns: u64,
+) -> SessionStats {
+    SessionStats {
+        packets_sent: 0, // TODO: Get from transport if needed
+        packets_received: reg_stats.packets_received,
+
+        send_buffer_available,
+        ring_buffer_writes,
+        ring_buffer_samples_written,
+        ring_buffer_overruns,
+
+        regulator_tolerance_ms: reg_stats.tolerance_ms,
+        regulator_headroom_ms: reg_stats.headroom_ms,
+        regulator_max_latency_ms: reg_stats.max_latency_ms,
+        regulator_depth,
+        regulator_latency_ms,
+        regulator_initialized,
+        regulator_packets_played: reg_stats.packets_played,
+        regulator_plc_count: reg_stats.glitches,
+        regulator_skipped: reg_stats.skipped,
+        regulator_last_seq: reg_stats.last_seq_received,
+    }
+}
 
 /// WebTrip Session - coordinates all audio and network components
 #[wasm_bindgen]
@@ -206,28 +282,16 @@ impl WebTripSession {
     /// Get current statistics
     pub fn get_stats(&self) -> SessionStats {
         let reg_stats = self.network_to_local_buffer.stats();
-        SessionStats {
-            packets_sent: 0, // TODO: Get from transport if needed
-            packets_received: reg_stats.packets_received,
-            
-            // Ring buffer (send path)
-            send_buffer_available: self.local_to_network_buffer.available(),
-            ring_buffer_writes: self.local_to_network_buffer.writes(),
-            ring_buffer_samples_written: self.local_to_network_buffer.samples_written(),
-            ring_buffer_overruns: self.local_to_network_buffer.overruns(),
-            
-            // Regulator (receive path with Burg PLC)
-            regulator_tolerance_ms: reg_stats.tolerance_ms,
-            regulator_headroom_ms: reg_stats.headroom_ms,
-            regulator_max_latency_ms: reg_stats.max_latency_ms,
-            regulator_depth: self.network_to_local_buffer.depth(),
-            regulator_latency_ms: self.network_to_local_buffer.latency_ms(),
-            regulator_initialized: self.network_to_local_buffer.is_initialized(),
-            regulator_packets_played: reg_stats.packets_played,
-            regulator_plc_count: reg_stats.glitches,
-            regulator_skipped: reg_stats.skipped,
-            regulator_last_seq: reg_stats.last_seq_received,
-        }
+        build_session_stats(
+            reg_stats,
+            self.network_to_local_buffer.depth(),
+            self.network_to_local_buffer.latency_ms(),
+            self.network_to_local_buffer.is_initialized(),
+            self.local_to_network_buffer.available(),
+            self.local_to_network_buffer.writes(),
+            self.local_to_network_buffer.samples_written(),
+            self.local_to_network_buffer.overruns(),
+        )
     }
 
     /// Get the ring buffer flag pointer for event-driven wake-up
@@ -243,7 +307,7 @@ impl WebTripSession {
     /// Must be called before connecting
     #[wasm_bindgen(js_name = setChannels)]
     pub fn set_channels(&mut self, channels: u8) {
-        if channels >= 1 && channels <= 8 {
+        if is_valid_channel_count(channels) {
             self.channels = channels;
             
             // Sync to AudioParams so processor knows to duplicate mono to stereo
@@ -704,19 +768,26 @@ impl WebTripSession {
 
 
     fn set_state(&mut self, state: SessionState) {
-        if self.state != state {
-            self.state = state;
+        if self.state == state {
+            return;
+        }
+        if !is_valid_state_transition(self.state, state) {
+            web_sys::console::warn_1(
+                &format!("⚠️ Invalid state transition: {:?} → {:?}", self.state, state).into(),
+            );
+            return;
+        }
+        self.state = state;
 
-            if let Some(ref callback) = self.on_state_change {
-                let state_str = match state {
-                    SessionState::Idle => "idle",
-                    SessionState::Connecting => "connecting",
-                    SessionState::Negotiating => "negotiating",
-                    SessionState::Connected => "connected",
-                    SessionState::Error => "error",
-                };
-                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(state_str));
-            }
+        if let Some(ref callback) = self.on_state_change {
+            let state_str = match state {
+                SessionState::Idle => "idle",
+                SessionState::Connecting => "connecting",
+                SessionState::Negotiating => "negotiating",
+                SessionState::Connected => "connected",
+                SessionState::Error => "error",
+            };
+            let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(state_str));
         }
     }
 }
@@ -730,5 +801,165 @@ impl Drop for WebTripSession {
         // because the whole session is being deallocated.
         self.transport = None;
         self.stop_capture();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::regulator::RegulatorStats;
+
+    // -----------------------------------------------------------------------
+    // Channel-count validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn valid_channel_counts_accepted() {
+        for ch in 1u8..=8 {
+            assert!(is_valid_channel_count(ch), "channel {ch} should be valid");
+        }
+    }
+
+    #[test]
+    fn zero_channels_rejected() {
+        assert!(!is_valid_channel_count(0));
+    }
+
+    #[test]
+    fn out_of_range_high_channels_rejected() {
+        for ch in 9u8..=255 {
+            assert!(!is_valid_channel_count(ch), "channel {ch} should be invalid");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // State-transition validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn legal_state_transitions_accepted() {
+        let legal: &[(SessionState, SessionState)] = &[
+            (SessionState::Idle, SessionState::Connecting),
+            (SessionState::Connecting, SessionState::Negotiating),
+            (SessionState::Connecting, SessionState::Connected),
+            (SessionState::Negotiating, SessionState::Connected),
+            // Error from every state
+            (SessionState::Idle, SessionState::Error),
+            (SessionState::Connecting, SessionState::Error),
+            (SessionState::Negotiating, SessionState::Error),
+            (SessionState::Connected, SessionState::Error),
+            // Reset / disconnect paths
+            (SessionState::Error, SessionState::Idle),
+            (SessionState::Connected, SessionState::Idle),
+            (SessionState::Connecting, SessionState::Idle),
+            (SessionState::Negotiating, SessionState::Idle),
+        ];
+        for &(from, to) in legal {
+            assert!(
+                is_valid_state_transition(from, to),
+                "{from:?} → {to:?} should be a legal transition"
+            );
+        }
+    }
+
+    #[test]
+    fn illegal_state_transitions_rejected() {
+        let illegal: &[(SessionState, SessionState)] = &[
+            (SessionState::Idle, SessionState::Negotiating),
+            (SessionState::Idle, SessionState::Connected),
+            (SessionState::Negotiating, SessionState::Connecting),
+            (SessionState::Connected, SessionState::Connecting),
+            (SessionState::Connected, SessionState::Negotiating),
+            (SessionState::Error, SessionState::Connecting),
+            (SessionState::Error, SessionState::Connected),
+            (SessionState::Error, SessionState::Negotiating),
+        ];
+        for &(from, to) in illegal {
+            assert!(
+                !is_valid_state_transition(from, to),
+                "{from:?} → {to:?} should be an illegal transition"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // SessionStats aggregation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stats_default_is_all_zero() {
+        let s = SessionStats::default();
+        assert_eq!(s.packets_sent, 0);
+        assert_eq!(s.packets_received, 0);
+        assert_eq!(s.send_buffer_available, 0);
+        assert_eq!(s.ring_buffer_writes, 0);
+        assert_eq!(s.ring_buffer_samples_written, 0);
+        assert_eq!(s.ring_buffer_overruns, 0);
+        assert_eq!(s.regulator_depth, 0);
+        assert!((s.regulator_latency_ms - 0.0).abs() < 1e-6);
+        assert!(!s.regulator_initialized);
+        assert_eq!(s.regulator_last_seq, 0);
+    }
+
+    #[test]
+    fn build_session_stats_maps_all_fields() {
+        let reg = RegulatorStats {
+            tolerance_ms: 12.5,
+            headroom_ms: 5.0,
+            max_latency_ms: 30.0,
+            glitches: 3,
+            skipped: 1,
+            packets_received: 1000,
+            packets_played: 997,
+            last_seq_received: 42,
+        };
+
+        let s = build_session_stats(
+            reg,
+            /* regulator_depth */ 5,
+            /* regulator_latency_ms */ 15.0,
+            /* regulator_initialized */ true,
+            /* send_buffer_available */ 128,
+            /* ring_buffer_writes */ 200,
+            /* ring_buffer_samples_written */ 25_600,
+            /* ring_buffer_overruns */ 0,
+        );
+
+        // packets_sent is always 0 (not yet tracked by transport)
+        assert_eq!(s.packets_sent, 0);
+        assert_eq!(s.packets_received, 1000);
+
+        assert!((s.regulator_tolerance_ms - 12.5).abs() < 1e-9);
+        assert!((s.regulator_headroom_ms - 5.0).abs() < 1e-9);
+        assert!((s.regulator_max_latency_ms - 30.0).abs() < 1e-9);
+        assert_eq!(s.regulator_plc_count, 3);
+        assert_eq!(s.regulator_skipped, 1);
+        assert_eq!(s.regulator_packets_played, 997);
+        assert_eq!(s.regulator_last_seq, 42);
+        assert_eq!(s.regulator_depth, 5);
+        assert!((s.regulator_latency_ms - 15.0).abs() < 1e-4);
+        assert!(s.regulator_initialized);
+
+        assert_eq!(s.send_buffer_available, 128);
+        assert_eq!(s.ring_buffer_writes, 200);
+        assert_eq!(s.ring_buffer_samples_written, 25_600);
+        assert_eq!(s.ring_buffer_overruns, 0);
+    }
+
+    #[test]
+    fn build_session_stats_zero_regulator() {
+        let s = build_session_stats(
+            RegulatorStats::default(),
+            0,
+            0.0,
+            false,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(s.packets_received, 0);
+        assert_eq!(s.regulator_depth, 0);
+        assert!(!s.regulator_initialized);
     }
 }
