@@ -525,3 +525,343 @@ pub(crate) fn to_js_value<T: serde::Serialize>(val: &T) -> Result<JsValue, ApiEr
 pub(crate) fn urlencode<T: AsRef<str>>(s: T) -> String {
     url::form_urlencoded::byte_serialize(s.as_ref().as_bytes()).collect()
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use mockito;
+    use serde::Deserialize;
+
+    /// Minimal struct for JSON deserialization tests.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct SimpleResponse {
+        value: String,
+    }
+
+    // =========================================================================
+    // ApiError::Display
+    // =========================================================================
+
+    #[test]
+    fn test_api_error_display_request() {
+        let err = ApiError::Request("connection refused".to_string());
+        assert_eq!(err.to_string(), "Request error: connection refused");
+    }
+
+    #[test]
+    fn test_api_error_display_serialization() {
+        let err = ApiError::Serialization("unexpected end of input".to_string());
+        assert_eq!(err.to_string(), "Serialization error: unexpected end of input");
+    }
+
+    #[test]
+    fn test_api_error_display_http() {
+        let err = ApiError::Http {
+            status: 404,
+            message: "Not Found".to_string(),
+            body: None,
+        };
+        assert_eq!(err.to_string(), "HTTP 404 error: Not Found");
+    }
+
+    #[test]
+    fn test_api_error_display_http_body_not_included_in_display() {
+        // The Display impl omits the body field — only status + message.
+        let err = ApiError::Http {
+            status: 500,
+            message: "Internal Server Error".to_string(),
+            body: Some("full error body text".to_string()),
+        };
+        assert_eq!(err.to_string(), "HTTP 500 error: Internal Server Error");
+    }
+
+    #[test]
+    fn test_api_error_display_config() {
+        let err = ApiError::Config("missing API key".to_string());
+        assert_eq!(err.to_string(), "Configuration error: missing API key");
+    }
+
+    // =========================================================================
+    // urlencode helper
+    // =========================================================================
+
+    #[test]
+    fn test_urlencode_simple_string_unchanged() {
+        assert_eq!(urlencode("hello"), "hello");
+    }
+
+    #[test]
+    fn test_urlencode_empty_string() {
+        assert_eq!(urlencode(""), "");
+    }
+
+    #[test]
+    fn test_urlencode_space_becomes_plus() {
+        // form_urlencoded encodes space as '+', not %20
+        assert_eq!(urlencode("hello world"), "hello+world");
+    }
+
+    #[test]
+    fn test_urlencode_reserved_slash_is_percent_encoded() {
+        assert_eq!(urlencode("foo/bar"), "foo%2Fbar");
+    }
+
+    #[test]
+    fn test_urlencode_unicode_is_percent_encoded_as_utf8() {
+        // é = U+00E9 = UTF-8 bytes 0xC3 0xA9
+        assert_eq!(urlencode("café"), "caf%C3%A9");
+    }
+
+    // =========================================================================
+    // State accessors
+    // =========================================================================
+
+    #[test]
+    fn test_default_base_url() {
+        let client = ApiClient::new();
+        assert_eq!(client.get_base_url(), DEFAULT_BASE_URL);
+    }
+
+    #[test]
+    fn test_set_base_url_and_get_base_url() {
+        let mut client = ApiClient::new();
+        client.set_base_url("https://custom.example.com/api".to_string());
+        assert_eq!(client.get_base_url(), "https://custom.example.com/api");
+    }
+
+    #[test]
+    fn test_with_base_url_constructor() {
+        let client = ApiClient::with_base_url("https://staging.example.com/api".to_string());
+        assert_eq!(client.get_base_url(), "https://staging.example.com/api");
+    }
+
+    #[test]
+    fn test_has_bearer_token_false_by_default() {
+        let client = ApiClient::new();
+        assert!(!client.has_bearer_token());
+    }
+
+    #[test]
+    fn test_set_bearer_token_makes_has_bearer_token_true() {
+        let mut client = ApiClient::new();
+        client.set_bearer_token("my-token".to_string());
+        assert!(client.has_bearer_token());
+    }
+
+    #[test]
+    fn test_clear_bearer_token_makes_has_bearer_token_false() {
+        let mut client = ApiClient::new();
+        client.set_bearer_token("my-token".to_string());
+        client.clear_bearer_token();
+        assert!(!client.has_bearer_token());
+    }
+
+    // =========================================================================
+    // Authorization header is actually sent when bearer token is set
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_bearer_token_sent_as_authorization_header() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/test")
+            .match_header("authorization", "Bearer secret-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#""ok""#)
+            .create_async()
+            .await;
+
+        let mut client = ApiClient::with_base_url(server.url());
+        client.set_bearer_token("secret-token".to_string());
+        let result: ApiResult<String> = client.get("/test").await;
+
+        assert!(result.is_ok());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_no_bearer_token_means_no_authorization_header() {
+        let mut server = mockito::Server::new_async().await;
+        // Mockito will only match (and return 200) if no Authorization header is present.
+        let mock = server
+            .mock("GET", "/test")
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#""ok""#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let result: ApiResult<String> = client.get("/test").await;
+
+        assert!(result.is_ok());
+        mock.assert_async().await;
+    }
+
+    // =========================================================================
+    // handle_response: typed success deserialization
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handle_response_deserializes_json_on_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/data")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"value":"hello"}"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let result: ApiResult<SimpleResponse> = client.get("/data").await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), SimpleResponse { value: "hello".to_string() });
+        mock.assert_async().await;
+    }
+
+    // =========================================================================
+    // handle_response: non-2xx → ApiError::Http with correct status
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handle_response_404_maps_to_http_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/data")
+            .with_status(404)
+            .with_body("resource missing")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let result: ApiResult<SimpleResponse> = client.get("/data").await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::Http { status, message, body } => {
+                assert_eq!(status, 404);
+                assert_eq!(message, "Not Found");
+                assert_eq!(body, Some("resource missing".to_string()));
+            }
+            other => panic!("Expected ApiError::Http, got {:?}", other),
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_500_maps_to_http_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/data")
+            .with_status(500)
+            .with_body(r#"{"error":"internal"}"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let result: ApiResult<SimpleResponse> = client.get("/data").await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::Http { status, .. } => assert_eq!(status, 500),
+            other => panic!("Expected ApiError::Http, got {:?}", other),
+        }
+        mock.assert_async().await;
+    }
+
+    // =========================================================================
+    // handle_response: malformed body on 2xx → ApiError::Serialization
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handle_response_malformed_json_gives_serialization_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/data")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("not valid json {{{{")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let result: ApiResult<SimpleResponse> = client.get("/data").await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::Serialization(_) => {}
+            other => panic!("Expected ApiError::Serialization, got {:?}", other),
+        }
+        mock.assert_async().await;
+    }
+
+    // =========================================================================
+    // handle_empty_response: 2xx → Ok(())
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handle_empty_response_204_returns_ok() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("DELETE", "/item/42")
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let result = client.delete("/item/42").await;
+
+        assert!(result.is_ok());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_handle_empty_response_200_also_returns_ok() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("DELETE", "/item/42")
+            .with_status(200)
+            .with_body("deleted")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let result = client.delete("/item/42").await;
+
+        assert!(result.is_ok());
+        mock.assert_async().await;
+    }
+
+    // =========================================================================
+    // handle_empty_response: error status → ApiError::Http
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handle_empty_response_403_gives_http_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("DELETE", "/item/42")
+            .with_status(403)
+            .with_body("Forbidden body")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(server.url());
+        let result = client.delete("/item/42").await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::Http { status, message, body } => {
+                assert_eq!(status, 403);
+                assert_eq!(message, "Forbidden");
+                assert_eq!(body, Some("Forbidden body".to_string()));
+            }
+            other => panic!("Expected ApiError::Http, got {:?}", other),
+        }
+        mock.assert_async().await;
+    }
+}
