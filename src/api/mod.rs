@@ -8,6 +8,34 @@ use std::collections::HashMap;
 use std::fmt;
 use wasm_bindgen::prelude::*;
 
+// Macro to generate API module struct + constructors boilerplate
+macro_rules! api_module_struct {
+    ($name:ident) => {
+        #[wasm_bindgen]
+        pub struct $name {
+            client: ApiClient,
+        }
+
+        impl $name {
+            pub(crate) fn from_client(client: &ApiClient) -> Self {
+                Self {
+                    client: client.clone(),
+                }
+            }
+        }
+
+        #[wasm_bindgen]
+        impl $name {
+            #[wasm_bindgen(constructor)]
+            pub fn new() -> Self {
+                Self {
+                    client: ApiClient::new(),
+                }
+            }
+        }
+    };
+}
+
 // Re-export all API modules
 pub mod billing;
 pub mod devices;
@@ -295,6 +323,17 @@ impl ApiClient {
         self.handle_response(response).await
     }
 
+    /// Execute a POST request with a JSON body, returning nothing
+    pub(crate) async fn post_no_response<B: Serialize>(&self, path: &str, body: &B) -> ApiResult<()> {
+        let response = self
+            .build_request(reqwest::Method::POST, path)
+            .json(body)
+            .send()
+            .await?;
+
+        self.handle_empty_response(response).await
+    }
+
     /// Execute a POST request without a body, returning a typed response
     pub(crate) async fn post_empty<T: for<'de> Deserialize<'de>>(&self, path: &str) -> ApiResult<T> {
         let response = self
@@ -457,6 +496,30 @@ pub type ApiResult<T> = Result<T, ApiError>;
 // =============================================================================
 // Helper Functions
 // =============================================================================
+
+/// Pagination query parameters
+#[derive(Serialize)]
+pub(crate) struct PaginationQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i32>,
+}
+
+/// Convert a HashMap of regions to a Vec, injecting IDs from keys
+pub(crate) fn regions_from_map(map: HashMap<String, models::Region>) -> Vec<models::Region> {
+    map.into_iter()
+        .map(|(id, mut region)| {
+            region.id = Some(id);
+            region
+        })
+        .collect()
+}
+
+/// Convert a value to JsValue using serde_wasm_bindgen
+pub(crate) fn to_js_value<T: serde::Serialize>(val: &T) -> Result<JsValue, ApiError> {
+    serde_wasm_bindgen::to_value(val).map_err(|e| ApiError::Serialization(e.to_string()))
+}
 
 /// URL encode a string for use in URL paths
 pub(crate) fn urlencode<T: AsRef<str>>(s: T) -> String {

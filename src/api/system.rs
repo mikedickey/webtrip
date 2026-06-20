@@ -2,7 +2,7 @@
 //!
 //! Health checks, region information, analytics, and other system-level operations.
 
-use super::{ApiClient, ApiError, urlencode};
+use super::{to_js_value, regions_from_map, ApiClient, ApiError, urlencode};
 use crate::models;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
@@ -11,19 +11,7 @@ use wasm_bindgen::prelude::*;
 // System API
 // =============================================================================
 
-/// System API for health checks, regions, and analytics
-#[wasm_bindgen]
-pub struct SystemApi {
-    client: ApiClient,
-}
-
-impl SystemApi {
-    pub(crate) fn from_client(client: &ApiClient) -> Self {
-        Self {
-            client: client.clone(),
-        }
-    }
-}
+api_module_struct!(SystemApi);
 
 // =============================================================================
 // Rust API (primary interface)
@@ -57,16 +45,7 @@ impl SystemApi {
     /// it to a Vec with the region ID included in each Region object.
     pub async fn list_regions(&self) -> Result<Vec<models::Region>, ApiError> {
         let map: HashMap<String, models::Region> = self.client.get("/regions").await?;
-        
-        let regions: Vec<models::Region> = map
-            .into_iter()
-            .map(|(id, mut region)| {
-                region.id = Some(id);
-                region
-            })
-            .collect();
-        
-        Ok(regions)
+        Ok(regions_from_map(map))
     }
 
     /// Get details for a specific region
@@ -77,8 +56,7 @@ impl SystemApi {
 
     /// Submit an analytics event
     pub async fn collect_analytics(&self, event: &models::AnalyticsEvent) -> Result<(), ApiError> {
-        let _: serde_json::Value = self.client.post("/collect", event).await?;
-        Ok(())
+        self.client.post_no_response("/collect", event).await
     }
 }
 
@@ -88,12 +66,6 @@ impl SystemApi {
 
 #[wasm_bindgen]
 impl SystemApi {
-    /// Create a new System API client
-    #[wasm_bindgen(constructor)]
-    pub fn new(client: &ApiClient) -> Self {
-        Self::from_client(client)
-    }
-
     /// Check system health
     #[wasm_bindgen(js_name = ping)]
     pub async fn ping_js(&self) -> Result<models::Ping, ApiError> {
@@ -116,7 +88,7 @@ impl SystemApi {
     #[wasm_bindgen(js_name = listRegions)]
     pub async fn list_regions_js(&self) -> Result<JsValue, ApiError> {
         let regions = self.list_regions().await?;
-        serde_wasm_bindgen::to_value(&regions).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&regions)
     }
 
     /// Get details for a specific region

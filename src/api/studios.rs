@@ -2,7 +2,7 @@
 //!
 //! Virtual studio management, configuration, and related operations.
 
-use super::{ApiClient, ApiError, urlencode};
+use super::{to_js_value, ApiClient, ApiError, urlencode};
 use crate::models;
 use wasm_bindgen::prelude::*;
 
@@ -10,19 +10,7 @@ use wasm_bindgen::prelude::*;
 // Studios API
 // =============================================================================
 
-/// Studios API for virtual studio management
-#[wasm_bindgen]
-pub struct StudiosApi {
-    client: ApiClient,
-}
-
-impl StudiosApi {
-    pub(crate) fn from_client(client: &ApiClient) -> Self {
-        Self {
-            client: client.clone(),
-        }
-    }
-}
+api_module_struct!(StudiosApi);
 
 // =============================================================================
 // Rust API (primary interface)
@@ -105,15 +93,13 @@ impl StudiosApi {
     /// Send an invite for a studio
     pub async fn send_invite(&self, studio_id: &str, invite: &models::InviteRequest) -> Result<(), ApiError> {
         let path = format!("/studios/{}/invite", urlencode(studio_id));
-        let _: serde_json::Value = self.client.post(&path, invite).await?;
-        Ok(())
+        self.client.post_no_response(&path, invite).await
     }
 
     /// Submit feedback for a studio session
     pub async fn submit_feedback(&self, studio_id: &str, feedback: &models::FeedbackRequest) -> Result<(), ApiError> {
         let path = format!("/studios/{}/feedback", urlencode(studio_id));
-        let _: serde_json::Value = self.client.post(&path, feedback).await?;
-        Ok(())
+        self.client.post_no_response(&path, feedback).await
     }
 
     /// Get chat session for a studio
@@ -141,15 +127,10 @@ impl StudiosApi {
 
 #[wasm_bindgen]
 impl StudiosApi {
-    #[wasm_bindgen(constructor)]
-    pub fn new(client: &ApiClient) -> Self {
-        Self::from_client(client)
-    }
-
     #[wasm_bindgen(js_name = listStudios)]
     pub async fn list_studios_js(&self) -> Result<JsValue, ApiError> {
         let studios = self.list_studios().await?;
-        serde_wasm_bindgen::to_value(&studios).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&studios)
     }
 
     #[wasm_bindgen(js_name = createStudio)]
@@ -204,7 +185,7 @@ impl StudiosApi {
     #[wasm_bindgen(js_name = listMixers)]
     pub async fn list_mixers_js(&self) -> Result<JsValue, ApiError> {
         let mixers = self.list_mixers().await?;
-        serde_wasm_bindgen::to_value(&mixers).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&mixers)
     }
 
     #[wasm_bindgen(js_name = getLivekitToken)]
@@ -230,7 +211,7 @@ impl StudiosApi {
     #[wasm_bindgen(js_name = getParticipants)]
     pub async fn get_participants_js(&self, studio_id: String) -> Result<JsValue, ApiError> {
         let participants = self.get_participants(&studio_id).await?;
-        serde_wasm_bindgen::to_value(&participants).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&participants)
     }
 
     #[wasm_bindgen(js_name = getSession)]

@@ -2,7 +2,7 @@
 //!
 //! Subscription and payment management.
 
-use super::{ApiClient, ApiError, urlencode};
+use super::{to_js_value, ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -11,19 +11,7 @@ use wasm_bindgen::prelude::*;
 // Billing API
 // =============================================================================
 
-/// Billing API for subscription management
-#[wasm_bindgen]
-pub struct BillingApi {
-    client: ApiClient,
-}
-
-impl BillingApi {
-    pub(crate) fn from_client(client: &ApiClient) -> Self {
-        Self {
-            client: client.clone(),
-        }
-    }
-}
+api_module_struct!(BillingApi);
 
 // =============================================================================
 // Rust API (primary interface)
@@ -135,15 +123,10 @@ impl BillingApi {
 
 #[wasm_bindgen]
 impl BillingApi {
-    #[wasm_bindgen(constructor)]
-    pub fn new(client: &ApiClient) -> Self {
-        Self::from_client(client)
-    }
-
     #[wasm_bindgen(js_name = getPlans)]
     pub async fn get_plans_js(&self) -> Result<JsValue, ApiError> {
         let plans = self.get_plans().await?;
-        serde_wasm_bindgen::to_value(&plans).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&plans)
     }
 
     #[wasm_bindgen(js_name = getPortal)]
@@ -196,7 +179,7 @@ impl BillingApi {
     #[wasm_bindgen(js_name = getEntitlements)]
     pub async fn get_entitlements_js(&self) -> Result<JsValue, ApiError> {
         let entitlements = self.get_entitlements().await?;
-        serde_wasm_bindgen::to_value(&entitlements).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&entitlements)
     }
 
     #[wasm_bindgen(js_name = applyPromo)]

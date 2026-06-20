@@ -2,7 +2,7 @@
 //!
 //! JackTrip Radio live streams and channel management.
 
-use super::{ApiClient, ApiError, urlencode};
+use super::{to_js_value, PaginationQuery, ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -11,19 +11,7 @@ use wasm_bindgen::prelude::*;
 // Streams API
 // =============================================================================
 
-/// Streams API for live broadcasts and channels
-#[wasm_bindgen]
-pub struct StreamsApi {
-    client: ApiClient,
-}
-
-impl StreamsApi {
-    pub(crate) fn from_client(client: &ApiClient) -> Self {
-        Self {
-            client: client.clone(),
-        }
-    }
-}
+api_module_struct!(StreamsApi);
 
 // =============================================================================
 // Rust API (primary interface)
@@ -74,16 +62,8 @@ impl StreamsApi {
         page: Option<i32>,
         limit: Option<i32>,
     ) -> Result<models::PaginatedChannels, ApiError> {
-        #[derive(Serialize)]
-        struct Query {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            page: Option<i32>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            limit: Option<i32>,
-        }
-
         if page.is_some() || limit.is_some() {
-            self.client.get_with_query("/channels-paginated", &Query { page, limit }).await
+            self.client.get_with_query("/channels-paginated", &PaginationQuery { page, limit }).await
         } else {
             self.client.get("/channels-paginated").await
         }
@@ -198,21 +178,16 @@ impl StreamsApi {
 
 #[wasm_bindgen]
 impl StreamsApi {
-    #[wasm_bindgen(constructor)]
-    pub fn new(client: &ApiClient) -> Self {
-        Self::from_client(client)
-    }
-
     #[wasm_bindgen(js_name = listStreams)]
     pub async fn list_streams_js(&self) -> Result<JsValue, ApiError> {
         let streams = self.list_streams().await?;
-        serde_wasm_bindgen::to_value(&streams).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&streams)
     }
 
     #[wasm_bindgen(js_name = searchStreams)]
     pub async fn search_streams_js(&self, query: Option<String>) -> Result<JsValue, ApiError> {
         let streams = self.search_streams(query.as_deref()).await?;
-        serde_wasm_bindgen::to_value(&streams).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&streams)
     }
 
     #[wasm_bindgen(js_name = getStream)]
@@ -233,7 +208,7 @@ impl StreamsApi {
     #[wasm_bindgen(js_name = listChannels)]
     pub async fn list_channels_js(&self) -> Result<JsValue, ApiError> {
         let channels = self.list_channels().await?;
-        serde_wasm_bindgen::to_value(&channels).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&channels)
     }
 
     #[wasm_bindgen(js_name = listChannelsPaginated)]
@@ -253,7 +228,7 @@ impl StreamsApi {
     #[wasm_bindgen(js_name = getStreamConversations)]
     pub async fn get_stream_conversations_js(&self, stream_id: String) -> Result<JsValue, ApiError> {
         let conversations = self.get_stream_conversations(&stream_id).await?;
-        serde_wasm_bindgen::to_value(&conversations).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&conversations)
     }
 
     #[wasm_bindgen(js_name = getStreamConversation)]
@@ -268,7 +243,7 @@ impl StreamsApi {
     #[wasm_bindgen(js_name = getConversationMessages)]
     pub async fn get_conversation_messages_js(&self, stream_id: String, user_id: String) -> Result<JsValue, ApiError> {
         let messages = self.get_conversation_messages(&stream_id, &user_id).await?;
-        serde_wasm_bindgen::to_value(&messages).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&messages)
     }
 
     #[wasm_bindgen(js_name = sendMessage)]
@@ -316,7 +291,7 @@ impl StreamsApi {
     #[wasm_bindgen(js_name = getSimulcastDestinations)]
     pub async fn get_simulcast_destinations_js(&self, studio_id: String) -> Result<JsValue, ApiError> {
         let destinations = self.get_simulcast_destinations(&studio_id).await?;
-        serde_wasm_bindgen::to_value(&destinations).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&destinations)
     }
 
     #[wasm_bindgen(js_name = updateSimulcastDestination)]

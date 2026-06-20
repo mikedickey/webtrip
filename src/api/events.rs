@@ -2,28 +2,15 @@
 //!
 //! JackTrip Radio upcoming events and broadcasts.
 
-use super::{ApiClient, ApiError, urlencode};
+use super::{to_js_value, PaginationQuery, ApiClient, ApiError, urlencode};
 use crate::models;
-use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
 // =============================================================================
 // Events API
 // =============================================================================
 
-/// Events API for upcoming broadcasts
-#[wasm_bindgen]
-pub struct EventsApi {
-    client: ApiClient,
-}
-
-impl EventsApi {
-    pub(crate) fn from_client(client: &ApiClient) -> Self {
-        Self {
-            client: client.clone(),
-        }
-    }
-}
+api_module_struct!(EventsApi);
 
 // =============================================================================
 // Rust API (primary interface)
@@ -41,16 +28,8 @@ impl EventsApi {
         page: Option<i32>,
         limit: Option<i32>,
     ) -> Result<models::PaginatedEvents, ApiError> {
-        #[derive(Serialize)]
-        struct Query {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            page: Option<i32>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            limit: Option<i32>,
-        }
-
         if page.is_some() || limit.is_some() {
-            self.client.get_with_query("/events-paginated", &Query { page, limit }).await
+            self.client.get_with_query("/events-paginated", &PaginationQuery { page, limit }).await
         } else {
             self.client.get("/events-paginated").await
         }
@@ -120,15 +99,10 @@ impl EventsApi {
 
 #[wasm_bindgen]
 impl EventsApi {
-    #[wasm_bindgen(constructor)]
-    pub fn new(client: &ApiClient) -> Self {
-        Self::from_client(client)
-    }
-
     #[wasm_bindgen(js_name = listEvents)]
     pub async fn list_events_js(&self) -> Result<JsValue, ApiError> {
         let events = self.list_events().await?;
-        serde_wasm_bindgen::to_value(&events).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&events)
     }
 
     #[wasm_bindgen(js_name = listEventsPaginated)]
@@ -143,7 +117,7 @@ impl EventsApi {
     #[wasm_bindgen(js_name = getEvent)]
     pub async fn get_event_js(&self, event_id: String) -> Result<JsValue, ApiError> {
         let events = self.get_event(&event_id).await?;
-        serde_wasm_bindgen::to_value(&events).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&events)
     }
 
     #[wasm_bindgen(js_name = getEventChannel)]
@@ -154,13 +128,13 @@ impl EventsApi {
     #[wasm_bindgen(js_name = getSimilarEvents)]
     pub async fn get_similar_events_js(&self, event_id: String) -> Result<JsValue, ApiError> {
         let events = self.get_similar_events(&event_id).await?;
-        serde_wasm_bindgen::to_value(&events).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&events)
     }
 
     #[wasm_bindgen(js_name = listStudioEvents)]
     pub async fn list_studio_events_js(&self, studio_id: String) -> Result<JsValue, ApiError> {
         let events = self.list_studio_events(&studio_id).await?;
-        serde_wasm_bindgen::to_value(&events).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&events)
     }
 
     #[wasm_bindgen(js_name = getStudioEvent)]

@@ -2,7 +2,7 @@
 //!
 //! User profile management, preferences, and related operations.
 
-use super::{ApiClient, ApiError, urlencode};
+use super::{to_js_value, regions_from_map, PaginationQuery, ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -12,19 +12,7 @@ use wasm_bindgen::prelude::*;
 // Users API
 // =============================================================================
 
-/// Users API for profile and account management
-#[wasm_bindgen]
-pub struct UsersApi {
-    client: ApiClient,
-}
-
-impl UsersApi {
-    pub(crate) fn from_client(client: &ApiClient) -> Self {
-        Self {
-            client: client.clone(),
-        }
-    }
-}
+api_module_struct!(UsersApi);
 
 // =============================================================================
 // Rust API (primary interface)
@@ -71,7 +59,7 @@ impl UsersApi {
     pub async fn get_user_regions(&self, user_id: &str) -> Result<Vec<models::Region>, ApiError> {
         let path = format!("/users/{}/regions", urlencode(user_id));
         let map: HashMap<String, models::Region> = self.client.get(&path).await?;
-        Ok(map.into_iter().map(|(id, mut r)| { r.id = Some(id); r }).collect())
+        Ok(regions_from_map(map))
     }
 
     /// Get a user's notifications
@@ -113,16 +101,8 @@ impl UsersApi {
     ) -> Result<models::PaginatedChannels, ApiError> {
         let path = format!("/users/{}/channels-paginated", urlencode(user_id));
         
-        #[derive(Serialize)]
-        struct Query {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            page: Option<i32>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            limit: Option<i32>,
-        }
-        
         if page.is_some() || limit.is_some() {
-            self.client.get_with_query(&path, &Query { page, limit }).await
+            self.client.get_with_query(&path, &PaginationQuery { page, limit }).await
         } else {
             self.client.get(&path).await
         }
@@ -137,16 +117,8 @@ impl UsersApi {
     ) -> Result<models::PaginatedChannels, ApiError> {
         let path = format!("/users/{}/follows-paginated", urlencode(user_id));
         
-        #[derive(Serialize)]
-        struct Query {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            page: Option<i32>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            limit: Option<i32>,
-        }
-        
         if page.is_some() || limit.is_some() {
-            self.client.get_with_query(&path, &Query { page, limit }).await
+            self.client.get_with_query(&path, &PaginationQuery { page, limit }).await
         } else {
             self.client.get(&path).await
         }
@@ -159,12 +131,6 @@ impl UsersApi {
 
 #[wasm_bindgen]
 impl UsersApi {
-    /// Create a new Users API client
-    #[wasm_bindgen(constructor)]
-    pub fn new(client: &ApiClient) -> Self {
-        Self::from_client(client)
-    }
-
     #[wasm_bindgen(js_name = getCurrentUser)]
     pub async fn get_current_user_js(&self) -> Result<models::User, ApiError> {
         self.get_current_user().await
@@ -173,7 +139,7 @@ impl UsersApi {
     #[wasm_bindgen(js_name = searchUsers)]
     pub async fn search_users_js(&self, query: String) -> Result<JsValue, ApiError> {
         let users = self.search_users(&query).await?;
-        serde_wasm_bindgen::to_value(&users).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&users)
     }
 
     #[wasm_bindgen(js_name = getUser)]
@@ -198,19 +164,19 @@ impl UsersApi {
     #[wasm_bindgen(js_name = getUserRegions)]
     pub async fn get_user_regions_js(&self, user_id: String) -> Result<JsValue, ApiError> {
         let regions = self.get_user_regions(&user_id).await?;
-        serde_wasm_bindgen::to_value(&regions).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&regions)
     }
 
     #[wasm_bindgen(js_name = getNotifications)]
     pub async fn get_notifications_js(&self, user_id: String) -> Result<JsValue, ApiError> {
         let notifications = self.get_notifications(&user_id).await?;
-        serde_wasm_bindgen::to_value(&notifications).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&notifications)
     }
 
     #[wasm_bindgen(js_name = getConversations)]
     pub async fn get_conversations_js(&self, user_id: String) -> Result<JsValue, ApiError> {
         let conversations = self.get_conversations(&user_id).await?;
-        serde_wasm_bindgen::to_value(&conversations).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&conversations)
     }
 
     #[wasm_bindgen(js_name = getUnreadMessagesCount)]
@@ -221,7 +187,7 @@ impl UsersApi {
     #[wasm_bindgen(js_name = getReferrals)]
     pub async fn get_referrals_js(&self, user_id: String) -> Result<JsValue, ApiError> {
         let referrals = self.get_referrals(&user_id).await?;
-        serde_wasm_bindgen::to_value(&referrals).map_err(|e| ApiError::Serialization(e.to_string()))
+        to_js_value(&referrals)
     }
 
     #[wasm_bindgen(js_name = createReferral)]

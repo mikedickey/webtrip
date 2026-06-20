@@ -229,15 +229,7 @@ impl Default for SampleRate {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn roundtrip<T>(value: &T)
-    where
-        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
-    {
-        let json = serde_json::to_string(value).expect("serialize");
-        let back: T = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(value, &back, "round-trip mismatch; json={json}");
-    }
+    use super::super::test_utils::roundtrip;
 
     #[test]
     fn resource_status_variants_roundtrip_and_wire_format() {

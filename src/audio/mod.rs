@@ -34,6 +34,17 @@ pub mod webtransport;
 pub mod webtransport_worker;
 pub mod signaling;
 
+// Helper function for creating a Promise with extractable resolve/reject
+pub(crate) fn make_promise() -> (js_sys::Promise, js_sys::Function, js_sys::Function) {
+    let mut resolve_fn = None;
+    let mut reject_fn = None;
+    let promise = js_sys::Promise::new(&mut |resolve, reject| {
+        resolve_fn = Some(resolve);
+        reject_fn = Some(reject);
+    });
+    (promise, resolve_fn.unwrap(), reject_fn.unwrap())
+}
+
 // Re-export core audio types
 pub use processor::AudioProcessor;
 pub use params::AudioParams;
@@ -51,7 +62,7 @@ pub use protocol::{AudioFormat, AudioPacket, PacketHeader, StreamStats};
 
 // Re-export transport types
 pub use transport::{Transport, TransportType, TransportState};
-pub use webrtc::{ConnectionState, TransportConfig, WebRtcTransport};
+pub use webrtc::{TransportConfig, WebRtcTransport};
 pub use mock_transport::{MockTransport, SineWaveConfig};
 pub use webtransport::WebTransportImpl;
 
