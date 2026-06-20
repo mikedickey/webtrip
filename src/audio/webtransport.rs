@@ -31,7 +31,7 @@
 //! - Safari / Firefox: Not yet supported (use WebRTC fallback)
 
 use crate::dependent_module;
-use super::transport::{AudioBufferConfig, Transport, TransportState, TransportType};
+use super::transport::{AudioBufferConfig, Transport, TransportState, TransportType, notify_transport_state};
 use js_sys::{Object, Reflect};
 use std::cell::RefCell;
 use std::future::Future;
@@ -452,16 +452,7 @@ impl WebTransportImpl {
     }
 
     fn notify_state_change(&self) {
-        if let Some(ref callback) = self.on_state_change {
-            let state_str = match self.state {
-                TransportState::Disconnected => "disconnected",
-                TransportState::Connecting => "connecting",
-                TransportState::Connected => "connected",
-                TransportState::Failed => "failed",
-                TransportState::Closed => "closed",
-            };
-            let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(state_str));
-        }
+        notify_transport_state(self.state, &self.on_state_change);
     }
 }
 

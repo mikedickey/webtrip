@@ -88,6 +88,21 @@ pub(crate) fn log_audio_buffers_set(transport_name: &str, channels: u8, buffer_s
     );
 }
 
+/// Notify a JS state-change callback with the string representation of `state`.
+/// Shared by all three transport implementations.
+pub(crate) fn notify_transport_state(state: TransportState, callback: &Option<js_sys::Function>) {
+    if let Some(ref cb) = callback {
+        let s = match state {
+            TransportState::Disconnected => "disconnected",
+            TransportState::Connecting   => "connecting",
+            TransportState::Connected    => "connected",
+            TransportState::Failed       => "failed",
+            TransportState::Closed       => "closed",
+        };
+        let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(s));
+    }
+}
+
 /// Transport trait that all implementations must implement
 /// 
 /// This is a minimal interface focused on audio packet transmission.
