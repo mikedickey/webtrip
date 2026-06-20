@@ -439,6 +439,7 @@ impl WebTripSession {
         };
 
         // Create the appropriate transport based on type
+        let client_name_str = client_name.as_deref().unwrap_or("");
         use crate::audio::transport::Transport;
         let transport: Box<dyn Transport> = match self.transport_type {
             TransportType::WebRTC => {
@@ -476,7 +477,7 @@ impl WebTripSession {
                 webrtc_transport.connect(
                     &server_host,
                     port,
-                    client_name.as_deref().unwrap_or(""),
+                    client_name_str,
                 ).await?;
                 
                 Box::new(webrtc_transport)
@@ -496,7 +497,7 @@ impl WebTripSession {
                     &mut mock_transport,
                     &server_host,
                     port,
-                    client_name.as_deref().unwrap_or(""),
+                    client_name_str,
                 ).await?;
                 
                 Box::new(mock_transport)
@@ -549,7 +550,7 @@ impl WebTripSession {
                     &mut webtransport,
                     &server_host,
                     port,
-                    client_name.as_deref().unwrap_or(""),
+                    client_name_str,
                 ).await?;
                 
                 Box::new(webtransport)

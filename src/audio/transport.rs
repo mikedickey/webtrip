@@ -6,6 +6,7 @@
 use std::pin::Pin;
 use std::future::Future;
 use wasm_bindgen::prelude::*;
+use web_sys;
 
 /// Transport type selection
 #[wasm_bindgen]
@@ -75,6 +76,17 @@ pub struct AudioBufferConfig {
 
 // Safety: These pointers are only used by the transport layer which is single-threaded in WASM
 unsafe impl Send for AudioBufferConfig {}
+
+/// Log that audio buffers have been configured on a transport
+pub(crate) fn log_audio_buffers_set(transport_name: &str, channels: u8, buffer_size: usize) {
+    web_sys::console::debug_1(
+        &format!(
+            "✅ {}: Audio buffers configured ({}ch, {} samples)",
+            transport_name, channels, buffer_size
+        )
+        .into(),
+    );
+}
 
 /// Transport trait that all implementations must implement
 /// 

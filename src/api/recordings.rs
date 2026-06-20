@@ -17,6 +17,10 @@ api_module_struct!(RecordingsApi);
 // Rust API (primary interface)
 // =============================================================================
 
+fn recording_like_path(recording_id: &str) -> String {
+    format!("/recordings/{}/likes", urlencode(recording_id))
+}
+
 impl RecordingsApi {
     /// List all public recordings
     pub async fn list_recordings(&self) -> Result<Vec<models::RecordingMetadata>, ApiError> {
@@ -61,14 +65,12 @@ impl RecordingsApi {
 
     /// Like a recording
     pub async fn like_recording(&self, recording_id: &str) -> Result<(), ApiError> {
-        let path = format!("/recordings/{}/likes", urlencode(recording_id));
-        self.client.post_empty_no_response(&path).await
+        self.client.post_empty_no_response(&recording_like_path(recording_id)).await
     }
 
     /// Unlike a recording
     pub async fn unlike_recording(&self, recording_id: &str) -> Result<(), ApiError> {
-        let path = format!("/recordings/{}/likes", urlencode(recording_id));
-        self.client.delete(&path).await
+        self.client.delete(&recording_like_path(recording_id)).await
     }
 
     /// Get recordings for a stream

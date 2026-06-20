@@ -476,13 +476,7 @@ impl Transport for WebTransportImpl {
 
     fn set_audio_buffers(&mut self, config: AudioBufferConfig) {
         self.audio_buffers = Some(config);
-        web_sys::console::debug_1(
-            &format!(
-                "[WebTransport] Audio buffers configured ({}ch, {} samples)",
-                config.channels, config.buffer_size
-            )
-            .into(),
-        );
+        super::transport::log_audio_buffers_set("WebTransport", config.channels, config.buffer_size);
     }
 
     fn set_on_state_change(&mut self, callback: js_sys::Function) {

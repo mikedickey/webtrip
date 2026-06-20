@@ -17,6 +17,10 @@ api_module_struct!(StreamsApi);
 // Rust API (primary interface)
 // =============================================================================
 
+fn stream_follow_path(stream_id: &str) -> String {
+    format!("/streams/{}/follow", urlencode(stream_id))
+}
+
 impl StreamsApi {
     /// List all public, active broadcasts
     pub async fn list_streams(&self) -> Result<Vec<models::StreamInfo>, ApiError> {
@@ -41,14 +45,12 @@ impl StreamsApi {
 
     /// Follow a broadcast
     pub async fn follow_stream(&self, stream_id: &str) -> Result<(), ApiError> {
-        let path = format!("/streams/{}/follow", urlencode(stream_id));
-        self.client.post_empty_no_response(&path).await
+        self.client.post_empty_no_response(&stream_follow_path(stream_id)).await
     }
 
     /// Unfollow a broadcast
     pub async fn unfollow_stream(&self, stream_id: &str) -> Result<(), ApiError> {
-        let path = format!("/streams/{}/follow", urlencode(stream_id));
-        self.client.delete(&path).await
+        self.client.delete(&stream_follow_path(stream_id)).await
     }
 
     /// List all public channels
