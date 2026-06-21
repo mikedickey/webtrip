@@ -23,7 +23,19 @@ This command:
 ### Build/test flag parity
 
 `test:wasm` compiles the test binaries with the **same** flags as
-`build:wasm`/`check`, so browser tests exercise the binary we actually ship:
+`build:wasm`/`check`/`coverage:wasm`, so browser tests exercise the binary we
+actually ship. To keep them in lockstep, the flags live in **one place** — the
+`config` block of `package.json`, exposed to each script as environment
+variables:
+
+- `$npm_package_config_web_sys_cfg` — `--cfg=web_sys_unstable_apis` (needed by
+  *every* build, native and WASM).
+- `$npm_package_config_wasm_rustflags` — the `+atomics` + shared-memory/TLS
+  linker block below (WASM only).
+
+Each script concatenates these (e.g. `coverage:wasm` appends its
+instrumentation flags on top). Edit the flags in the `config` block, not in the
+individual scripts. The flag set comprises:
 
 - `-Ctarget-feature=+atomics` (in `RUSTFLAGS`) — without it,
   `core::sync::atomic` lowers to *non-atomic* instructions on
@@ -125,6 +137,61 @@ WASM tests run in CI via the `build` job in `.github/workflows/ci.yml`, inside
 the toolchain container (`containers/build/Containerfile`). The browser setup
 (`chromium` + `chromium-driver`, `CHROMEDRIVER`, and the root-level
 `webdriver.json` flags) is documented at those sources.
+
+## Code Coverage
+
+Coverage spans the **whole** Rust surface by combining two runs:
+
+| Command | Target | Output | Covers |
+|---------|--------|--------|--------|
+| `npm run coverage` | native host | `lcov.info` | `#[test]` logic + `#[cfg(not(target_arch = "wasm32"))]` paths |
+| `npm run coverage:wasm` | `wasm32-unknown-unknown` | `lcov.wasm.info` | `#[wasm_bindgen_test]` + `#[cfg(target_arch = "wasm32")]` paths |
+
+CI runs both and uploads both files; Codecov unions them by `file:line`, so a
+line covered by *either* run counts as covered. This is why the native-only
+report previously hid the browser/transport surface: `#[cfg(target_arch =
+"wasm32")]` code is compiled *out* of the native build, so it never appeared in
+`lcov.info` at all (not even as 0%) — it was excluded from the denominator.
+
+`coverage:wasm` uses the experimental `wasm-bindgen-test` coverage path
+(see the [wasm-bindgen guide](https://wasm-bindgen.github.io/wasm-bindgen/wasm-bindgen-test/coverage.html)).
+The mechanism, encoded in the npm script:
+
+- **`-Cinstrument-coverage -Zno-profiler-runtime`** — instrument, but skip the
+  default LLVM profiler runtime; the `minicov` crate (a transitive dev-dep of
+  `wasm-bindgen-test`) provides the WASM-side runtime instead.
+- **`--cfg=wasm_bindgen_unstable_test_coverage`** — opts the test runner into
+  writing `.profraw` data out of the browser.
+- **`-Clink-args=--no-gc-sections`** — keeps coverage symbols from being
+  stripped by the linker.
+- **`CFLAGS_wasm32_unknown_unknown="-matomics -mbulk-memory"`** — `minicov`
+  compiles its runtime C via the `cc` crate; on our `+atomics` build that C must
+  be compiled with the matching wasm features or the instrumented module fails to
+  link. Required, not optional, because we build with `-Ctarget-feature=+atomics`.
+- Flags go through `CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS` (not plain
+  `RUSTFLAGS`) so host-built build scripts / proc-macros stay uninstrumented.
+
+All of the above (and the shared `web_sys`/`+atomics` blocks) live in the
+`config` section of `package.json` as the single source of truth. The build
+container (`containers/build/Containerfile`) installs `clang` for minicov's C
+runtime and pre-warms the `test:wasm` dep graph, but **not** the coverage
+profile — a test-less stub can't link the instrumented build (it lacks the
+minicov `__llvm_profile_runtime` reference a real harness provides), so
+`coverage:wasm` recompiles its deps + `std` once per CI run, as native coverage
+does.
+
+These coverage flags are layered **on top of** the same
+`+atomics`/shared-memory/TLS flags and `-Zbuild-std=std,panic_abort` that
+`test:wasm` uses (see [flag parity](#buildtest-flag-parity)) — coverage must
+instrument the *same* generated code the browser tests and the shipped build run,
+not a different, unthreaded build. `coverage:wasm` drives the run with
+`cargo llvm-cov test` (rather than `wasm-pack test`) so cargo-llvm-cov owns the
+`.profraw` → `lcov` plumbing, but the underlying runner is still
+`wasm-bindgen-test-runner`, so the browser/shared-memory harness behaves the same.
+
+Requirements (all satisfied by the toolchain container): Rust ≥ 1.87,
+`wasm-bindgen-test` ≥ 0.3.57, `llvm-tools-preview`, and a `cargo-llvm-cov` that
+drives the wasm32 target.
 
 ## Limitations
 
