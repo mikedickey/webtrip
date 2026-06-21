@@ -196,8 +196,14 @@ impl AudioProcessor {
 
         let (new_peak_db, new_hold_counter) = compute_peak_update(current_db, current_peak_db, hold_counter);
 
-        self.params.peak_db_level.store(encode_db(new_peak_db), Ordering::Relaxed);
         self.params.peak_hold_counter.store(new_hold_counter, Ordering::Relaxed);
+        // During the hold phase `compute_peak_update` returns the same f32 value it
+        // received, so `new_peak_db == current_peak_db` exactly (no arithmetic was
+        // done on it). Skipping the write avoids a decode→encode round-trip that
+        // can drift ±1 fixed-point count per frame due to f32 rounding.
+        if new_peak_db != current_peak_db {
+            self.params.peak_db_level.store(encode_db(new_peak_db), Ordering::Relaxed);
+        }
     }
 
     /// Send local audio to network via ring buffer
@@ -448,6 +454,49 @@ mod tests {
         assert!(
             (floored - MIN_DB).abs() < EPS,
             "decayed peak must not go below MIN_DB"
+        );
+    }
+
+    // --- update_peak_level integration: hold-phase must not drift -----------
+
+    /// Verify that the stored `peak_db_level` fixed-point value does not change
+    /// during the hold window.  The regression being guarded: re-encoding a
+    /// decoded f32 via `encode_db(decode_db(stored))` can drift by ±1 count
+    /// per frame due to f32 rounding (e.g. 4321/100*100 → 4320.999 → 4320).
+    #[test]
+    fn test_peak_db_level_stable_during_hold() {
+        use crate::audio::params::{AudioParams, encode_db};
+
+        let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
+        let mut processor = AudioProcessor::new(params);
+
+        // Drive a loud signal through process() to establish a peak.
+        let loud: Vec<f32> = vec![1.0; 128];
+        let mut out = vec![0.0f32; 128];
+        processor.process(&loud, &mut out);
+
+        let stored_after_peak = params.peak_db_level.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(stored_after_peak > encode_db(-60.0), "a loud signal must raise the peak");
+
+        // Now feed silence for exactly PEAK_HOLD_FRAMES callbacks.
+        // The stored fixed-point value must remain bit-for-bit identical throughout.
+        let silence: Vec<f32> = vec![0.0; 128];
+        for frame in 0..PEAK_HOLD_FRAMES {
+            processor.process(&silence, &mut out);
+            let stored = params.peak_db_level.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                stored,
+                stored_after_peak,
+                "peak_db_level drifted on hold frame {frame}: expected {stored_after_peak}, got {stored}"
+            );
+        }
+
+        // After hold expires, decay must have begun (stored value decreases).
+        processor.process(&silence, &mut out);
+        let stored_after_decay = params.peak_db_level.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            stored_after_decay < stored_after_peak,
+            "peak must start decaying after the hold window expires"
         );
     }
 
