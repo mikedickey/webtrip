@@ -12,36 +12,48 @@ use web_sys::{
     MediaStreamAudioSourceNode, MediaStreamConstraints,
 };
 
-/// Helper for building audio constraints with device ID and processing options
-struct AudioConstraintsBuilder {
+/// Resolved audio capture constraints, independent of any JS representation.
+///
+/// This is the pure core of the constraints builder: it normalizes the inputs
+/// (an empty/absent device id means "use the default device", so it collapses
+/// to `None`) and carries the processing toggles verbatim. Converting to the
+/// `getUserMedia` JS object is handled separately by [`AudioConstraints::to_js`]
+/// so the resolution logic can be unit-tested natively.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AudioConstraints {
+    /// Effective device id constraint. `None` (including when the caller passes
+    /// an empty string) selects the browser's default input device.
     device_id: Option<String>,
     auto_gain_control: bool,
     echo_cancellation: bool,
     noise_suppression: bool,
 }
 
-impl AudioConstraintsBuilder {
-    fn new(
+impl AudioConstraints {
+    /// Resolve raw caller inputs into normalized constraints.
+    fn resolve(
         device_id: Option<String>,
         auto_gain_control: bool,
         echo_cancellation: bool,
         noise_suppression: bool,
     ) -> Self {
         Self {
-            device_id,
+            device_id: device_id.filter(|s| !s.is_empty()),
             auto_gain_control,
             echo_cancellation,
             noise_suppression,
         }
     }
 
-    fn build(self) -> Result<JsValue, JsValue> {
+    /// Build the `getUserMedia` audio-constraints JS object from the resolved
+    /// constraints. Browser glue only — not exercised by native tests.
+    fn to_js(&self) -> Result<JsValue, JsValue> {
         let constraints = js_sys::Object::new();
 
-        // Set device ID if specified
-        if let Some(id) = self.device_id.filter(|s| !s.is_empty()) {
+        // Set device ID if a specific device was requested
+        if let Some(id) = &self.device_id {
             let exact_constraint = js_sys::Object::new();
-            js_sys::Reflect::set(&exact_constraint, &"exact".into(), &JsValue::from_str(&id))?;
+            js_sys::Reflect::set(&exact_constraint, &"exact".into(), &JsValue::from_str(id))?;
             js_sys::Reflect::set(&constraints, &"deviceId".into(), &exact_constraint)?;
         }
 
@@ -148,13 +160,13 @@ impl AudioEngine {
         let constraints = MediaStreamConstraints::new();
 
         // Build audio constraints
-        let audio_constraints = AudioConstraintsBuilder::new(
+        let audio_constraints = AudioConstraints::resolve(
             device_id,
             auto_gain_control,
             echo_cancellation,
             noise_suppression,
         )
-        .build()?;
+        .to_js()?;
 
         constraints.set_audio(&audio_constraints);
         constraints.set_video(&JsValue::from(false));
@@ -310,5 +322,99 @@ impl AudioEngine {
         JsFuture::from(js_sys::Promise::from(promise)).await?;
         
         Ok(())
+    }
+}
+
+// ==============================================================================
+// Tests
+// ==============================================================================
+//
+// These run on the native target via `npm run test`. They cover the pure
+// constraints core (`AudioConstraints::resolve`), which produces a plain data
+// structure and needs no browser / `web_sys` runtime. The JS-object conversion
+// (`AudioConstraints::to_js`) and the rest of the engine (`AudioContext`,
+// `getUserMedia`, worklet wiring) are browser glue, left to the WASM tests.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every combination of the three processing toggles, as
+    /// (auto_gain_control, echo_cancellation, noise_suppression).
+    const BOOL_PERMUTATIONS: [(bool, bool, bool); 8] = [
+        (false, false, false),
+        (false, false, true),
+        (false, true, false),
+        (false, true, true),
+        (true, false, false),
+        (true, false, true),
+        (true, true, false),
+        (true, true, true),
+    ];
+
+    #[test]
+    fn test_resolve_carries_all_toggle_permutations() {
+        // The device id is fixed here; the focus is that each boolean toggle is
+        // carried through verbatim for every permutation.
+        for (agc, ec, ns) in BOOL_PERMUTATIONS {
+            let resolved =
+                AudioConstraints::resolve(Some("dev-1".to_string()), agc, ec, ns);
+            assert_eq!(
+                resolved,
+                AudioConstraints {
+                    device_id: Some("dev-1".to_string()),
+                    auto_gain_control: agc,
+                    echo_cancellation: ec,
+                    noise_suppression: ns,
+                },
+                "toggles must pass through for agc={agc} ec={ec} ns={ns}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_device_id_present() {
+        let resolved =
+            AudioConstraints::resolve(Some("mic-42".to_string()), false, false, false);
+        assert_eq!(resolved.device_id.as_deref(), Some("mic-42"));
+    }
+
+    #[test]
+    fn test_resolve_device_id_absent() {
+        // `None` means "use the browser default device".
+        let resolved = AudioConstraints::resolve(None, false, false, false);
+        assert_eq!(resolved.device_id, None);
+    }
+
+    #[test]
+    fn test_resolve_empty_device_id_normalizes_to_none() {
+        // An empty string is treated the same as no device id: default device.
+        let resolved =
+            AudioConstraints::resolve(Some(String::new()), true, true, true);
+        assert_eq!(resolved.device_id, None);
+        // Toggles are unaffected by device-id normalization.
+        assert!(resolved.auto_gain_control);
+        assert!(resolved.echo_cancellation);
+        assert!(resolved.noise_suppression);
+    }
+
+    #[test]
+    fn test_resolve_full_matrix_device_id_x_toggles() {
+        // device-id present/absent (incl. empty) × every toggle permutation.
+        let device_id_cases: [(Option<String>, Option<&str>); 3] = [
+            (Some("dev-1".to_string()), Some("dev-1")),
+            (None, None),
+            (Some(String::new()), None),
+        ];
+
+        for (raw_id, expected_id) in device_id_cases {
+            for (agc, ec, ns) in BOOL_PERMUTATIONS {
+                let resolved =
+                    AudioConstraints::resolve(raw_id.clone(), agc, ec, ns);
+                assert_eq!(resolved.device_id.as_deref(), expected_id);
+                assert_eq!(resolved.auto_gain_control, agc);
+                assert_eq!(resolved.echo_cancellation, ec);
+                assert_eq!(resolved.noise_suppression, ns);
+            }
+        }
     }
 }
