@@ -13,6 +13,12 @@ pub mod models;
 mod dependent_module;
 pub mod session;
 
+// Shared scaffolding for browser (`wasm-bindgen-test`) tests. Holds the single
+// `wasm_bindgen_test_configure!(run_in_browser)` for the lib unit-test binary
+// plus reusable assertions; see `src/test_support.rs` for the convention.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod test_support;
+
 // Re-export all audio types for convenience
 pub use audio::{
     // Core audio types
