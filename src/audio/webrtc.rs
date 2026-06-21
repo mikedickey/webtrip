@@ -1361,4 +1361,110 @@ mod tests {
             TickDecision::Idle,
         );
     }
+
+    // ── Browser tests (web_sys / WebRTC) ─────────────────────────────────────
+    //
+    // These exercise the real WebRTC glue against `web_sys` types and run in
+    // headless Chrome via `npm run test:wasm`. The per-binary browser opt-in
+    // (`wasm_bindgen_test_configure!(run_in_browser)`) lives once in
+    // `crate::test_support`; here we only import the attribute and the shared
+    // `assert_valid_sdp` helper. No signaling server is required — offer/SDP and
+    // data-channel creation are entirely local.
+
+    #[cfg(target_arch = "wasm32")]
+    use crate::test_support::assert_valid_sdp;
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// Create an `RtcPeerConnection` from a `TransportConfig`'s ICE servers and
+    /// assert it starts in the expected pristine signaling/ICE state.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn webrtc_create_peer_connection_from_config() {
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+
+        transport
+            .create_peer_connection()
+            .expect("RtcPeerConnection creation should succeed");
+
+        let pc = transport
+            .peer_connection
+            .as_ref()
+            .expect("peer connection must be stored after creation");
+
+        // A freshly created peer connection (no offer/answer yet) is in the
+        // "stable" signaling state with ICE gathering not yet started.
+        assert_eq!(pc.signaling_state(), web_sys::RtcSignalingState::Stable);
+        assert_eq!(pc.ice_connection_state(), web_sys::RtcIceConnectionState::New);
+    }
+
+    /// `create_offer` must produce a well-formed SDP describing the data channel.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn webrtc_create_offer_produces_valid_sdp() {
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+
+        let sdp = transport
+            .create_offer()
+            .await
+            .expect("create_offer should succeed");
+
+        assert_valid_sdp(&sdp);
+        // The offer carries exactly one data-channel (SCTP) media section.
+        assert!(
+            sdp.lines().any(|line| line.starts_with("m=application")),
+            "data-channel offer must contain an m=application section, got:\n{sdp}"
+        );
+    }
+
+    /// A freshly created data channel reports the configured label/ordering and
+    /// starts life in the `Connecting` state (it only opens after negotiation).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn webrtc_data_channel_initial_state() {
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+
+        transport
+            .create_peer_connection()
+            .expect("peer connection creation should succeed");
+        transport
+            .create_data_channel()
+            .expect("data channel creation should succeed");
+
+        let channel = transport
+            .data_channel
+            .as_ref()
+            .expect("data channel must be stored after creation");
+
+        assert_eq!(channel.label(), AUDIO_CHANNEL_LABEL);
+        assert_eq!(channel.ready_state(), RtcDataChannelState::Connecting);
+    }
+
+    /// Parse an ICE-candidate JSON string (via the shared pure parser) and build
+    /// a real `RtcIceCandidate`, asserting the fields round-trip through web_sys.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn webrtc_parse_ice_candidate_json_into_rtc_ice_candidate() {
+        let json = r#"{"candidate":"candidate:1 1 UDP 2122252543 192.168.1.1 56789 typ host","sdpMid":"audio","sdpMLineIndex":0}"#;
+
+        // Reuse the single source of truth for ICE-candidate JSON parsing.
+        let parsed = parse_ice_candidate_json(json).expect("candidate JSON should parse");
+
+        let init = RtcIceCandidateInit::new(&parsed.candidate);
+        if let Some(mid) = parsed.sdp_mid.as_deref() {
+            init.set_sdp_mid(Some(mid));
+        }
+        if let Some(idx) = parsed.sdp_m_line_index {
+            init.set_sdp_m_line_index(Some(idx));
+        }
+
+        let candidate = RtcIceCandidate::new(&init).expect("RtcIceCandidate creation should succeed");
+
+        assert_eq!(candidate.candidate(), parsed.candidate);
+        assert_eq!(candidate.sdp_mid(), parsed.sdp_mid);
+        assert_eq!(candidate.sdp_m_line_index(), parsed.sdp_m_line_index);
+    }
 }

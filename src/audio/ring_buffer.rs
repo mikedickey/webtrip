@@ -213,11 +213,10 @@ mod tests {
     use super::*;
     use std::thread;
 
+    // Browser-test opt-in (`wasm_bindgen_test_configure!(run_in_browser)`) lives
+    // once per binary in `crate::test_support`; here we only need the attribute.
     #[cfg(target_arch = "wasm32")]
-    use wasm_bindgen_test::*;
-
-    #[cfg(target_arch = "wasm32")]
-    wasm_bindgen_test_configure!(run_in_browser);
+    use wasm_bindgen_test::wasm_bindgen_test;
 
     /// Read the `has_data` flag through the same raw pointer JavaScript uses.
     fn has_data_flag(rb: &RingBuffer) -> u32 {
