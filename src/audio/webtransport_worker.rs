@@ -38,7 +38,52 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 use crate::audio::ring_buffer::RingBuffer;
 use crate::audio::regulator::Regulator;
-use crate::audio::protocol::{AudioPacket, make_exit_packet, HEADER_SIZE};
+use crate::audio::protocol::{AudioPacket, make_exit_packet, HEADER_SIZE, ProtocolError, PacketHeader};
+
+/// Number of interleaved samples in one outgoing audio packet for the given
+/// buffer size (samples per channel) and channel count.
+///
+/// This is the threshold the send loop compares the ring buffer's fill level
+/// against. Extracted as a pure function so the framing math is the single
+/// source of truth and testable natively.
+fn samples_per_packet(buffer_size: usize, channels: u8) -> u32 {
+    (buffer_size * channels as usize) as u32
+}
+
+/// Whether the send loop should assemble and send a packet now, or sleep until
+/// more audio is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendDecision {
+    /// The ring buffer holds at least a full packet's worth of samples.
+    Process,
+    /// Not enough samples buffered yet — wait for the AudioWorklet to produce more.
+    Wait,
+}
+
+/// Decide whether the send loop should process or wait.
+///
+/// Processes as soon as the ring buffer holds at least one full packet
+/// (`available >= needed`), otherwise waits. Extracted so the "process vs wait"
+/// decision can be tested without a ring buffer or transport.
+fn send_decision(available_samples: u32, samples_needed: u32) -> SendDecision {
+    if available_samples >= samples_needed {
+        SendDecision::Process
+    } else {
+        SendDecision::Wait
+    }
+}
+
+/// Deserialize a received QUIC datagram into audio samples, returning the
+/// packet's sequence number.
+///
+/// Reuses [`AudioPacket::deserialize_into`] (the single source of truth for the
+/// JackTrip wire format) to fill `samples` and extract the sequence number that
+/// the receive loop hands to the regulator. Returns the same [`ProtocolError`]
+/// as the underlying parser for malformed or short datagrams.
+fn deserialize_datagram(data: &[u8], samples: &mut Vec<f32>) -> Result<u16, ProtocolError> {
+    let header: PacketHeader = AudioPacket::deserialize_into(data, samples)?;
+    Ok(header.sequence_number)
+}
 
 /// Post a message to the main thread from the worker
 fn post_message_to_main(msg: &JsValue) {
@@ -314,8 +359,8 @@ async fn send_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(), 
             // Safety: pointer is valid and RingBuffer uses atomics
             let ring_buffer = unsafe { &mut *state.ring_buffer_ptr };
             
-            let samples_needed = (state.buffer_size * state.channels as usize) as u32;
-            if ring_buffer.available() < samples_needed {
+            let samples_needed = samples_per_packet(state.buffer_size, state.channels);
+            if send_decision(ring_buffer.available(), samples_needed) == SendDecision::Wait {
                 return None;
             }
 
@@ -530,9 +575,9 @@ async fn receive_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(
 
                     // Deserialize packet
                     let mut samples = state.samples_buffer.borrow_mut();
-                    match AudioPacket::deserialize_into(&data, &mut samples) {
-                        Ok(header) => {
-                            regulator.push(header.sequence_number, &samples);                            
+                    match deserialize_datagram(&data, &mut samples) {
+                        Ok(sequence_number) => {
+                            regulator.push(sequence_number, &samples);                            
                         }
                         Err(e) => {
                             STATS.with(|stats| {
@@ -696,5 +741,110 @@ pub fn handle_worker_message(msg: JsValue) -> js_sys::Promise {
             
             js_sys::Promise::reject(&JsValue::from_str(&error_msg))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- samples_per_packet ---
+
+    #[test]
+    fn samples_per_packet_accounts_for_channels() {
+        assert_eq!(samples_per_packet(128, 1), 128);
+        assert_eq!(samples_per_packet(128, 2), 256);
+        assert_eq!(samples_per_packet(64, 2), 128);
+    }
+
+    // --- send_decision ("process vs wait") ---
+
+    #[test]
+    fn send_decision_processes_when_enough_samples() {
+        let needed = samples_per_packet(128, 2); // 256
+        assert_eq!(send_decision(needed, needed), SendDecision::Process);
+        assert_eq!(send_decision(needed + 1, needed), SendDecision::Process);
+    }
+
+    #[test]
+    fn send_decision_waits_when_not_enough_samples() {
+        let needed = samples_per_packet(128, 2); // 256
+        assert_eq!(send_decision(needed - 1, needed), SendDecision::Wait);
+        assert_eq!(send_decision(0, needed), SendDecision::Wait);
+    }
+
+    // --- deserialize_datagram (reuses AudioPacket wire protocol) ---
+
+    #[test]
+    fn deserialize_datagram_returns_sequence_and_samples() {
+        // Build a valid datagram using the shared AudioPacket serializer so we
+        // never duplicate the wire format here.
+        let samples: Vec<f32> = (0..128).map(|i| (i as f32) / 128.0).collect();
+        let packet = AudioPacket::mono(42, 1000, samples.clone());
+        let datagram = packet.serialize().unwrap();
+
+        let mut out = Vec::new();
+        let sequence = deserialize_datagram(&datagram, &mut out).unwrap();
+
+        assert_eq!(sequence, 42);
+        assert_eq!(out.len(), samples.len());
+        for (a, b) in samples.iter().zip(out.iter()) {
+            assert!((a - b).abs() < 1e-4, "sample mismatch: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn deserialize_datagram_stereo_sequence() {
+        let samples: Vec<f32> = (0..256).map(|i| (i as f32) / 256.0).collect();
+        let packet = AudioPacket::stereo(7, 0, samples.clone());
+        let datagram = packet.serialize().unwrap();
+
+        let mut out = Vec::new();
+        let sequence = deserialize_datagram(&datagram, &mut out).unwrap();
+
+        assert_eq!(sequence, 7);
+        assert_eq!(out.len(), samples.len());
+    }
+
+    #[test]
+    fn deserialize_datagram_rejects_short_buffer() {
+        // A datagram shorter than the 16-byte header must be rejected.
+        let mut out = Vec::new();
+        let err = deserialize_datagram(&[0u8; 4], &mut out).unwrap_err();
+        assert_eq!(err, ProtocolError::BufferTooSmall);
+    }
+
+    #[test]
+    fn deserialize_datagram_rejects_truncated_audio() {
+        // A full, valid header but with the audio payload truncated must also be
+        // rejected (header parses, but the declared samples don't fit).
+        let samples: Vec<f32> = (0..128).map(|i| (i as f32) / 128.0).collect();
+        let packet = AudioPacket::mono(1, 0, samples);
+        let datagram = packet.serialize().unwrap();
+
+        let truncated = &datagram[..HEADER_SIZE + 2];
+        let mut out = Vec::new();
+        let err = deserialize_datagram(truncated, &mut out).unwrap_err();
+        assert_eq!(err, ProtocolError::BufferTooSmall);
+    }
+
+    // --- WorkerState atomic running flag ---
+
+    #[test]
+    fn worker_state_start_stop_is_running() {
+        let state = WorkerState::new();
+        // Fresh state is not running.
+        assert!(!state.is_running());
+
+        state.start();
+        assert!(state.is_running());
+
+        state.stop();
+        assert!(!state.is_running());
+
+        // Idempotent: starting twice keeps it running.
+        state.start();
+        state.start();
+        assert!(state.is_running());
     }
 }

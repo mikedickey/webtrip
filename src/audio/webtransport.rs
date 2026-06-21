@@ -33,6 +33,7 @@
 use crate::dependent_module;
 use super::transport::{AudioBufferConfig, Transport, TransportState, TransportType, notify_transport_state};
 use js_sys::{Object, Reflect};
+use serde::Serialize;
 use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
@@ -58,6 +59,87 @@ pub fn is_webtransport_available() -> bool {
         js_sys::Reflect::has(&global, &JsValue::from_str("WebTransport")).unwrap_or(false)
     }
     }
+}
+
+/// Percent-encode `s` following JavaScript's `encodeURIComponent` semantics.
+///
+/// Every byte is escaped as `%XX` except the unreserved set
+/// `A-Z a-z 0-9 - _ . ! ~ * ' ( )`. Multi-byte UTF-8 characters are encoded
+/// byte-by-byte. This is the single source of truth for query-parameter
+/// encoding in the WebTransport connection URL, replacing the browser-only
+/// `js_sys::encode_uri_component` so the URL builder can be tested natively.
+fn encode_uri_component(s: &str) -> String {
+    fn hex(nibble: u8) -> char {
+        char::from(if nibble < 10 { b'0' + nibble } else { b'A' + (nibble - 10) })
+    }
+
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(hex(b >> 4));
+                out.push(hex(b & 0x0f));
+            }
+        }
+    }
+    out
+}
+
+/// Build the WebTransport connection URL for a hub server.
+///
+/// Produces `https://{server}:{port}/webtransport`. When `client_name` is
+/// non-empty, a percent-encoded `?name=…` query parameter is appended. This is
+/// the single source of truth for the connection URL so both the live
+/// `connect()` path and tests use identical logic.
+fn build_connection_url(server: &str, port: u16, client_name: &str) -> String {
+    if client_name.is_empty() {
+        format!("https://{}:{}/webtransport", server, port)
+    } else {
+        let encoded_name = encode_uri_component(client_name);
+        format!("https://{}:{}/webtransport?name={}", server, port, encoded_name)
+    }
+}
+
+/// Compute the absolute URL of the WASM module (`pkg/webtrip.js`) from the
+/// current page's `origin` and `pathname`.
+///
+/// The worker imports the WASM glue from a `blob:` context where relative paths
+/// don't resolve, so we resolve it against the directory of the current page
+/// (everything up to and including the last `/` in `pathname`). Extracted as a
+/// pure function so the path math can be tested without a browser.
+fn wasm_module_url(origin: &str, pathname: &str) -> String {
+    let base_path = if let Some(last_slash) = pathname.rfind('/') {
+        &pathname[..=last_slash]
+    } else {
+        "/"
+    };
+    format!("{}{}pkg/webtrip.js", origin, base_path)
+}
+
+/// Build the plain-JSON `init` message sent to the worker from the audio buffer
+/// configuration.
+///
+/// Carries only the data that can be represented as plain JSON (the message
+/// type plus buffer pointers and audio config). The browser-only fields
+/// (`wasmMemory`, `wasmUrl`) are attached separately in [`WebTransportImpl::init_worker`].
+/// Pointer/config values are stored as `f64` to match the numeric type the
+/// worker reads on the JS side. Extracted so field presence and values can be
+/// asserted natively without constructing a real `Worker`.
+fn build_worker_init_message(buffers: &AudioBufferConfig) -> serde_json::Value {
+    serde_json::json!({
+        "type": "init",
+        "ringBufferPtr": buffers.local_to_network_ptr as usize as f64,
+        "regulatorPtr": buffers.network_to_local_ptr as usize as f64,
+        "bufferSize": buffers.buffer_size as f64,
+        "channels": buffers.channels as f64,
+    })
 }
 
 /// WebTransport implementation using a dedicated Web Worker
@@ -324,50 +406,28 @@ impl WebTransportImpl {
         let worker = self.worker.borrow().clone().ok_or("Worker not created")?;
         let buffers = self.audio_buffers.ok_or("Audio buffers not configured")?;
 
+        // Build the plain-JSON init message (type + buffer pointers + config)
+        // and convert it to a JS object. `serialize_maps_as_objects(true)` is
+        // required so the JSON object becomes a plain object (whose properties
+        // the worker reads via Reflect), rather than an ES `Map`.
+        let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+        let msg: Object = build_worker_init_message(&buffers)
+            .serialize(&serializer)
+            .map_err(|e| JsValue::from_str(&format!("Failed to serialize init message: {e}")))?
+            .unchecked_into();
 
-        // Send init message with buffer pointers
-        let msg = Object::new();
-        Reflect::set(&msg, &"type".into(), &"init".into())?;
-        Reflect::set(
-            &msg,
-            &"ringBufferPtr".into(),
-            &JsValue::from_f64(buffers.local_to_network_ptr as usize as f64),
-        )?;
-        Reflect::set(
-            &msg,
-            &"regulatorPtr".into(),
-            &JsValue::from_f64(buffers.network_to_local_ptr as usize as f64),
-        )?;
-        Reflect::set(
-            &msg,
-            &"bufferSize".into(),
-            &JsValue::from_f64(buffers.buffer_size as f64),
-        )?;
-        Reflect::set(
-            &msg,
-            &"channels".into(),
-            &JsValue::from_f64(buffers.channels as f64),
-        )?;
+        // Browser-only fields that can't be represented in plain JSON:
 
-        // Also pass WASM memory for SharedArrayBuffer access
+        // Pass WASM memory for SharedArrayBuffer access.
         Reflect::set(&msg, &"wasmMemory".into(), &wasm_bindgen::memory())?;
 
-        // Pass the absolute URL to the WASM module (needed for import from blob: worker context)
-        // Construct the URL relative to the current page location
+        // Pass the absolute URL to the WASM module (needed for import from blob: worker context).
+        // Construct it relative to the current page location.
         let window = web_sys::window().ok_or("No window")?;
         let location = window.location();
         let origin = location.origin().map_err(|_| "Failed to get origin")?;
         let pathname = location.pathname().map_err(|_| "Failed to get pathname")?;
-        
-        // Get the base path (directory of the current page)
-        let base_path = if let Some(last_slash) = pathname.rfind('/') {
-            &pathname[..=last_slash]
-        } else {
-            "/"
-        };
-        
-        // Construct the absolute URL to the WASM module
-        let wasm_url = format!("{}{}pkg/webtrip.js", origin, base_path);
+        let wasm_url = wasm_module_url(&origin, &pathname);
         Reflect::set(&msg, &"wasmUrl".into(), &JsValue::from_str(&wasm_url))?;
 
         worker.post_message(&msg)?;
@@ -481,15 +541,7 @@ impl Transport for WebTransportImpl {
         client_name: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), JsValue>> + '_>> {
         // Build WebTransport URL (HTTPS + /webtransport path)
-        let url = if client_name.is_empty() {
-            format!("https://{}:{}/webtransport", server, port)
-        } else {
-            let encoded_name = js_sys::encode_uri_component(client_name);
-            format!(
-                "https://{}:{}/webtransport?name={}",
-                server, port, encoded_name
-            )
-        };
+        let url = build_connection_url(server, port, client_name);
 
         Box::pin(async move { self.connect_to_server(url).await })
     }
@@ -626,12 +678,105 @@ impl Drop for WebTransportImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::ring_buffer::RingBuffer;
+    use crate::audio::regulator::Regulator;
 
     #[test]
-    fn test_webtransport_available_check() {
-        // In non-WASM test environment, this should return false
-        // (no window object)
-        // This test mainly ensures the function doesn't panic
-        let _ = is_webtransport_available();
+    fn webtransport_unavailable_on_native() {
+        // WebTransport is a browser API; on the native (cargo test) target the
+        // detection must report unavailable.
+        assert!(!is_webtransport_available());
+    }
+
+    // --- encode_uri_component ---
+
+    #[test]
+    fn encode_uri_component_leaves_unreserved_chars() {
+        // The full JS encodeURIComponent unreserved set must pass through verbatim.
+        let unreserved = "ABCabc012-_.!~*'()";
+        assert_eq!(encode_uri_component(unreserved), unreserved);
+    }
+
+    #[test]
+    fn encode_uri_component_escapes_reserved_chars() {
+        assert_eq!(encode_uri_component("a b"), "a%20b");
+        assert_eq!(encode_uri_component("a/b?c=d&e"), "a%2Fb%3Fc%3Dd%26e");
+        // Multi-byte UTF-8 is encoded byte-by-byte (é = 0xC3 0xA9).
+        assert_eq!(encode_uri_component("é"), "%C3%A9");
+    }
+
+    // --- build_connection_url ---
+
+    #[test]
+    fn connection_url_without_name() {
+        assert_eq!(
+            build_connection_url("hub.example.com", 4464, ""),
+            "https://hub.example.com:4464/webtransport"
+        );
+    }
+
+    #[test]
+    fn connection_url_with_plain_name() {
+        assert_eq!(
+            build_connection_url("hub.example.com", 4464, "alice"),
+            "https://hub.example.com:4464/webtransport?name=alice"
+        );
+    }
+
+    #[test]
+    fn connection_url_percent_encodes_name() {
+        // Spaces and reserved characters in the client name must be encoded so
+        // the query string stays well-formed.
+        assert_eq!(
+            build_connection_url("hub.example.com", 4464, "Alice & Bob"),
+            "https://hub.example.com:4464/webtransport?name=Alice%20%26%20Bob"
+        );
+    }
+
+    // --- wasm_module_url ---
+
+    #[test]
+    fn wasm_module_url_with_directory_path() {
+        assert_eq!(
+            wasm_module_url("https://example.com", "/app/index.html"),
+            "https://example.com/app/pkg/webtrip.js"
+        );
+    }
+
+    #[test]
+    fn wasm_module_url_at_root() {
+        assert_eq!(
+            wasm_module_url("https://example.com", "/"),
+            "https://example.com/pkg/webtrip.js"
+        );
+    }
+
+    #[test]
+    fn wasm_module_url_without_slash_uses_root() {
+        // Defensive: a pathname with no slash falls back to "/".
+        assert_eq!(
+            wasm_module_url("https://example.com", "index.html"),
+            "https://example.com/pkg/webtrip.js"
+        );
+    }
+
+    // --- build_worker_init_message ---
+
+    #[test]
+    fn worker_init_message_has_expected_fields() {
+        let config = AudioBufferConfig {
+            local_to_network_ptr: 0x1000 as *mut RingBuffer,
+            network_to_local_ptr: 0x2000 as *mut Regulator,
+            buffer_size: 128,
+            channels: 2,
+        };
+
+        let msg = build_worker_init_message(&config);
+
+        assert_eq!(msg["type"], "init");
+        assert_eq!(msg["ringBufferPtr"], 0x1000 as f64);
+        assert_eq!(msg["regulatorPtr"], 0x2000 as f64);
+        assert_eq!(msg["bufferSize"], 128.0);
+        assert_eq!(msg["channels"], 2.0);
     }
 }
