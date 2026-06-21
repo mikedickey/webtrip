@@ -234,6 +234,7 @@ mod tests {
     /// On the native (`cargo test`) target there is no browser runtime, so
     /// `has_atomics_wait_async` must return `false` — confirming that the
     /// cfg guard is in place and that calling the function does not panic.
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn has_atomics_returns_false_on_native() {
         assert!(!has_atomics_wait_async());
