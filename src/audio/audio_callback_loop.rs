@@ -12,30 +12,40 @@ use wasm_bindgen::JsCast;
 /// Check if Atomics.waitAsync is supported by the browser
 ///
 /// Requires both Atomics.waitAsync AND SharedArrayBuffer to be available.
+/// Always returns `false` on non-WASM targets (native `cargo test` runs).
 #[wasm_bindgen(js_name = hasAtomicsWaitAsync)]
 pub fn has_atomics_wait_async() -> bool {
-    let global = js_sys::global();
-    
-    // Check for Atomics.waitAsync
-    let has_wait_async = if let Ok(atomics) = js_sys::Reflect::get(&global, &"Atomics".into()) {
-        if let Ok(wait_async) = js_sys::Reflect::get(&atomics, &"waitAsync".into()) {
-            !wait_async.is_undefined()
+    #[cfg(target_arch = "wasm32")]
+    {
+        let global = js_sys::global();
+
+        // Check for Atomics.waitAsync
+        let has_wait_async =
+            if let Ok(atomics) = js_sys::Reflect::get(&global, &"Atomics".into()) {
+                if let Ok(wait_async) = js_sys::Reflect::get(&atomics, &"waitAsync".into()) {
+                    !wait_async.is_undefined()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+        // Check for SharedArrayBuffer
+        let has_sab = if let Ok(sab) = js_sys::Reflect::get(&global, &"SharedArrayBuffer".into()) {
+            !sab.is_undefined()
         } else {
             false
-        }
-    } else {
+        };
+
+        // Need BOTH to be available
+        has_wait_async && has_sab
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
         false
-    };
-    
-    // Check for SharedArrayBuffer
-    let has_sab = if let Ok(sab) = js_sys::Reflect::get(&global, &"SharedArrayBuffer".into()) {
-        !sab.is_undefined()
-    } else {
-        false
-    };
-    
-    // Need BOTH to be available
-    has_wait_async && has_sab
+    }
 }
 
 /// Start an audio-callback-driven loop using Atomics.waitAsync
@@ -186,5 +196,47 @@ impl Default for AudioCallbackLoop {
 impl Drop for AudioCallbackLoop {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // AudioCallbackLoop construction and running state
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn new_loop_is_not_running() {
+        let lp = AudioCallbackLoop::new();
+        assert!(!lp.is_running());
+    }
+
+    #[test]
+    fn default_loop_is_not_running() {
+        let lp = AudioCallbackLoop::default();
+        assert!(!lp.is_running());
+    }
+
+    #[test]
+    fn stopped_loop_is_not_running() {
+        let mut lp = AudioCallbackLoop::new();
+        // stop() on a never-started loop must not panic and must leave it stopped
+        lp.stop();
+        assert!(!lp.is_running());
+    }
+
+    // -----------------------------------------------------------------------
+    // has_atomics_wait_async on the native target
+    // -----------------------------------------------------------------------
+
+    /// On the native (`cargo test`) target there is no browser runtime, so
+    /// `has_atomics_wait_async` must return `false` — confirming that the
+    /// cfg guard is in place and that calling the function does not panic.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn has_atomics_returns_false_on_native() {
+        assert!(!has_atomics_wait_async());
     }
 }
