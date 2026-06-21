@@ -417,4 +417,44 @@ mod tests {
             }
         }
     }
+
+    // ── Browser tests (web_sys / Web Audio) ──────────────────────────────────
+    //
+    // Real-browser coverage of the AudioContext bootstrap, run in headless
+    // Chrome via `npm run test:wasm`. The per-binary browser opt-in
+    // (`wasm_bindgen_test_configure!(run_in_browser)`) lives once in
+    // `crate::test_support`; here we only import the attribute. No user gesture
+    // or fake media device is needed: constructing an AudioContext (it starts
+    // suspended) and registering the worklet module both work headless.
+
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// `AudioEngine::create` must build a real `AudioContext` that reports a
+    /// plausible, positive sample rate — the bootstrap on the critical path of
+    /// every session. `create` also registers the worklet module, so this
+    /// additionally smoke-tests that path end to end.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn engine_create_reports_plausible_sample_rate() {
+        // `create` stores the params pointer but `get_sample_rate` never
+        // dereferences it, so a stack `AudioParams` kept alive for the duration
+        // of the test is sufficient.
+        let params = AudioParams::default();
+        let engine = AudioEngine::create(&params as *const AudioParams)
+            .await
+            .expect("AudioEngine::create should succeed in the browser");
+
+        let sample_rate = engine.get_sample_rate();
+        assert!(
+            sample_rate > 0.0,
+            "AudioContext sample rate must be positive, got {sample_rate}"
+        );
+        // Bound it well outside any real device rate to catch a bogus
+        // (e.g. uninitialized / mis-decoded) value while staying rate-agnostic.
+        assert!(
+            (8_000.0..=768_000.0).contains(&sample_rate),
+            "sample rate {sample_rate} is outside any plausible audio range"
+        );
+    }
 }

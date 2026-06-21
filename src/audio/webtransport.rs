@@ -688,6 +688,27 @@ mod tests {
         assert!(!is_webtransport_available());
     }
 
+    // ── Browser feature detection (web_sys) ──────────────────────────────────
+    //
+    // The real-browser counterpart to `webtransport_unavailable_on_native`,
+    // run in headless Chrome via `npm run test:wasm`. The per-binary
+    // `run_in_browser` opt-in lives once in `crate::test_support`.
+
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// Chrome (the headless test browser, v97+) exposes the `WebTransport`
+    /// global, so detection must report availability — the inverse of the
+    /// native result above.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn webtransport_available_in_browser() {
+        assert!(
+            is_webtransport_available(),
+            "WebTransport global must be present in the headless Chrome harness"
+        );
+    }
+
     // --- encode_uri_component ---
 
     #[test]

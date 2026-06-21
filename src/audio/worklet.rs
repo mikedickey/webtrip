@@ -83,3 +83,31 @@ pub fn create_worklet_node_with_flag(
     AudioWorkletNode::new_with_options(ctx, "WasmProcessor", &options)
 }
 
+// ==============================================================================
+// Tests
+// ==============================================================================
+//
+// Worklet wiring is pure browser glue, so coverage lives in `npm run test:wasm`
+// (headless Chrome). The whole module is gated on `wasm32` because there is no
+// native-testable logic here; on the native target it compiles away cleanly.
+// The per-binary `run_in_browser` opt-in lives once in `crate::test_support`.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// `register_audio_worklet` must resolve without error: `dependent_module!`
+    /// assembles `worklet.js` into a `blob:` URL (prepending the bindgen ES
+    /// import) and registers it via `AudioContext.audioWorklet.addModule`. This
+    /// covers the dependent-module Blob/URL flow that the engine relies on.
+    #[wasm_bindgen_test]
+    async fn register_audio_worklet_resolves() {
+        let ctx = AudioContext::new()
+            .expect("AudioContext creation should succeed in the browser");
+
+        register_audio_worklet(&ctx)
+            .await
+            .expect("worklet module registration via the Blob URL should resolve");
+    }
+}
+

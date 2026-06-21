@@ -239,4 +239,111 @@ mod tests {
     fn has_atomics_returns_false_on_native() {
         assert!(!has_atomics_wait_async());
     }
+
+    // ── Browser tests (web_sys / Atomics.waitAsync) ──────────────────────────
+    //
+    // Real-browser coverage run in headless Chrome via `npm run test:wasm`. The
+    // per-binary `run_in_browser` opt-in lives once in `crate::test_support`.
+    // These exercise the shared-memory build: T17 established that the
+    // `wasm-pack`/`wasm-bindgen-test` harness serves a cross-origin-isolated
+    // page with an imported shared `WebAssembly.Memory{shared:true}` (see the
+    // flag-parity section of docs/WASM_TESTING.md), so `SharedArrayBuffer` and
+    // `Atomics.notify` are available here without extra setup.
+
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// In the cross-origin-isolated harness (SharedArrayBuffer +
+    /// Atomics.waitAsync both present) detection must report support — the
+    /// inverse of the native check above.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn has_atomics_wait_async_true_in_browser() {
+        assert!(
+            has_atomics_wait_async(),
+            "shared-memory harness must expose Atomics.waitAsync + SharedArrayBuffer"
+        );
+    }
+
+    /// Smoke-test the `Atomics.waitAsync` wake-up path end to end: start the
+    /// loop sleeping on a zeroed flag in shared wasm memory, then flip the flag
+    /// and `Atomics.notify` it exactly the way the audio worklet does. The tick
+    /// callback must fire. This depends on the shared-memory build — `notify`
+    /// only works on a `SharedArrayBuffer`, which the harness supplies via the
+    /// imported shared `WebAssembly.Memory`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn audio_callback_loop_fires_on_notify() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::sync::atomic::{AtomicI32, Ordering};
+        use wasm_bindgen::closure::Closure;
+        use wasm_bindgen::JsCast;
+
+        assert!(
+            has_atomics_wait_async(),
+            "smoke test requires the shared-memory harness (Atomics.waitAsync + SAB)"
+        );
+
+        // A 4-byte-aligned flag living in wasm linear memory — the same kind of
+        // location the RingBuffer's has-data flag occupies.
+        let flag = Box::new(AtomicI32::new(0));
+        let flag_ptr = (&*flag as *const AtomicI32) as usize;
+
+        // Int32 view over the shared wasm memory for store/notify, using the
+        // same byte-offset/4 index math the loop applies internally.
+        let memory: js_sys::WebAssembly::Memory = wasm_bindgen::memory().unchecked_into();
+        let int32 = js_sys::Int32Array::new(&memory.buffer());
+        let flag_index = (flag_ptr / 4) as u32;
+
+        // Tick callback: count invocations and reset the flag to 0 so the loop
+        // sleeps again (otherwise waitAsync would return "not-equal" forever and
+        // spin). Mirrors how the real tick drains the ring buffer.
+        let count = Rc::new(Cell::new(0u32));
+        let count_for_cb = count.clone();
+        let flag_for_cb = flag_ptr;
+        let cb = Closure::wrap(Box::new(move || {
+            count_for_cb.set(count_for_cb.get() + 1);
+            // SAFETY: `flag_for_cb` points at the live `flag` AtomicI32 below,
+            // which outlives the loop (we stop the loop before dropping it).
+            unsafe {
+                (*(flag_for_cb as *const AtomicI32)).store(0, Ordering::SeqCst);
+            }
+        }) as Box<dyn FnMut()>);
+
+        let mut lp = AudioCallbackLoop::new();
+        let started = lp
+            .start_with_atomics(
+                &wasm_bindgen::memory(),
+                flag_ptr,
+                cb.as_ref().unchecked_ref::<js_sys::Function>().clone(),
+            )
+            .expect("starting the callback loop should not error");
+        assert!(started, "loop must start when Atomics.waitAsync is supported");
+        assert!(lp.is_running());
+
+        // Wake the loop the way the worklet does: set the flag non-zero, notify.
+        js_sys::Atomics::store(&int32, flag_index, 1).expect("Atomics.store");
+        js_sys::Atomics::notify(&int32, flag_index).expect("Atomics.notify");
+
+        // Hand control back to the event loop so the waitAsync continuation can
+        // run the callback before we assert.
+        crate::test_support::sleep_ms(100).await;
+
+        assert!(
+            count.get() >= 1,
+            "tick callback must fire after Atomics.notify (got {})",
+            count.get()
+        );
+
+        // Stop sets running=false and notifies; the loop exits without invoking
+        // the callback again. Drain once more, then keep `cb`/`flag` alive until
+        // teardown so the JS loop can never call a dropped closure or read freed
+        // memory.
+        lp.stop();
+        assert!(!lp.is_running());
+        crate::test_support::sleep_ms(20).await;
+        drop(cb);
+        drop(flag);
+    }
 }
