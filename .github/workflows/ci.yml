@@ -82,11 +82,16 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - run: npm ci
       - run: npm run build
-      - run: npm run test
-      - run: npm run coverage
-      - run: npm run test:wasm
+      # Each coverage run also *runs* the corresponding test suite, so it doubles
+      # as the test gate — no separate `npm run test` / `npm run test:wasm` step.
+      - run: npm run coverage        # native tests   → lcov.info
+      - run: npm run coverage:wasm   # browser tests  → lcov.wasm.info
+      # Upload both reports; Codecov unions them by file:line, so a line covered
+      # by either the native or the WASM run counts as covered. Together they
+      # span the whole Rust surface, including #[cfg(target_arch = "wasm32")]
+      # code that the native build compiles out.
       - uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
+          files: lcov.info,lcov.wasm.info
           fail_ci_if_error: true

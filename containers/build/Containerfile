@@ -61,6 +61,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # 1. OS packages: dev essentials + native build toolchain.
 #    build-essential/pkg-config are needed because `npm run test` compiles
 #    `cargo test` for the host (native), not WASM.
+#    clang is needed for `npm run coverage:wasm`: the minicov crate (the WASM
+#    coverage runtime) compiles C via the cc crate, and cc targets
+#    wasm32-unknown-unknown with clang (gcc can't emit wasm). Without it the
+#    build fails: `failed to find tool "clang"`.
 #    chromium + chromium-driver provide the headless browser `npm run test:wasm`
 #    drives via wasm-bindgen-test; installing them together keeps the driver and
 #    browser versions in lockstep.
@@ -69,6 +73,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         git \
         build-essential \
+        clang \
         pkg-config \
         ripgrep \
         jq \
@@ -156,19 +161,26 @@ RUN set -eux; \
     printf 'use wasm_bindgen::prelude::*;\n#[wasm_bindgen]\npub fn __prewarm() {}\n' > src/lib.rs; \
     npm run build:wasm; \
     npm run test; \
-    # Also warm the wasm *test*-profile dep graph. build:wasm warms the release
-    # profile (atomics + build-std) and `npm run test` warms the native host
-    # target; the wasm test build that `npm run test:wasm` runs shares fingerprints
-    # with neither, so without this every dep recompiles on first `test:wasm`.
-    # --no-run compiles without launching a browser; RUSTFLAGS must match the
-    # test:wasm npm script so the fingerprints line up.
-    RUSTFLAGS='--cfg=web_sys_unstable_apis' cargo test --no-run --target wasm32-unknown-unknown; \
+    # Warm the wasm *test*-profile dep graph (what `npm run test:wasm` builds).
+    # build:wasm warms the wasm release profile and `npm run test` warms the native
+    # host target; the wasm test build shares fingerprints with neither, so without
+    # this every dep + std recompiles on first `test:wasm`. The flags must byte-match
+    # the test:wasm npm script, so source them from package.json's `config` block
+    # (the same single source the scripts read via $npm_package_config_*) rather than
+    # re-hardcoding them. --no-run compiles without launching a browser.
+    #
+    # The `coverage`/`coverage:wasm` profiles are intentionally NOT warmed: the wasm
+    # one can't be warmed from this test-less stub (its instrumented objects need
+    # minicov's `__llvm_profile_runtime`, which only links when a real test harness
+    # references it), so it recompiles once in CI — like native coverage always has.
+    WASM_RF="$(node -p 'const c=require("./package.json").config; c.web_sys_cfg+" "+c.wasm_rustflags')"; \
+    RUSTFLAGS="$WASM_RF" cargo test --no-run --target wasm32-unknown-unknown -Zbuild-std=std,panic_abort; \
     # Drop ONLY the stub's own crate artifacts, keeping cached deps + std. This
     # forces the local `webtrip` crate to rebuild from the real (mounted) source
     # at runtime — without it, cargo's mtime-based freshness check would treat
     # older-mtime mounted source as already-built and silently run stub code.
     # One clean per profile/target the warm-up produced webtrip artifacts in:
-    # wasm release (build:wasm), wasm debug (test --no-run), native (test).
+    # wasm release (build:wasm), wasm test (test --no-run), native (test).
     cargo clean -p webtrip --release --target wasm32-unknown-unknown; \
     cargo clean -p webtrip --target wasm32-unknown-unknown; \
     cargo clean -p webtrip; \
