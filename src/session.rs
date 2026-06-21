@@ -123,6 +123,9 @@ pub(crate) fn is_valid_channel_count(channels: u8) -> bool {
 /// Connecting  → Negotiating
 /// Connecting  → Connected   (e.g. Mock transport, no negotiation step)
 /// Negotiating → Connected
+/// Connected   → Connecting  (reconnect: transport fires error directly to JS
+///                            callback, bypassing set_state, so self.state can
+///                            still be Connected when the user retries)
 /// *           → Error       (failure from any state)
 /// Error       → Idle        (reset after error)
 /// Connected   → Idle        (disconnect)
@@ -137,6 +140,7 @@ pub(crate) fn is_valid_state_transition(from: SessionState, to: SessionState) ->
             | (Connecting, Negotiating)
             | (Connecting, Connected)
             | (Negotiating, Connected)
+            | (Connected, Connecting) // reconnect after transport-level error
             | (_, Error)
             | (Error, Idle)
             | (Connected, Idle)
@@ -843,6 +847,9 @@ mod tests {
             (SessionState::Connecting, SessionState::Negotiating),
             (SessionState::Connecting, SessionState::Connected),
             (SessionState::Negotiating, SessionState::Connected),
+            // Reconnect: transport fires error directly to JS, self.state stays
+            // Connected; the next connect_to_studio must be able to proceed.
+            (SessionState::Connected, SessionState::Connecting),
             // Error from every state
             (SessionState::Idle, SessionState::Error),
             (SessionState::Connecting, SessionState::Error),
@@ -868,7 +875,6 @@ mod tests {
             (SessionState::Idle, SessionState::Negotiating),
             (SessionState::Idle, SessionState::Connected),
             (SessionState::Negotiating, SessionState::Connecting),
-            (SessionState::Connected, SessionState::Connecting),
             (SessionState::Connected, SessionState::Negotiating),
             (SessionState::Error, SessionState::Connecting),
             (SessionState::Error, SessionState::Connected),
