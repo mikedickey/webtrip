@@ -31,8 +31,17 @@ pub(crate) fn db_to_linear(db: f32) -> f32 {
 
 /// Apply `gain` to every sample in `input`, writing into `output`.
 /// Output samples are clamped to `[-1.0, 1.0]`.
-/// `output` must be at least as long as `input`.
+///
+/// # Panics
+/// Panics if `output` is shorter than `input` — a shorter output would silently
+/// drop samples, which is always a bug at the call site.
 pub(crate) fn apply_gain(input: &[f32], gain: f32, output: &mut [f32]) {
+    assert!(
+        output.len() >= input.len(),
+        "apply_gain: output buffer ({}) is shorter than input buffer ({})",
+        output.len(),
+        input.len(),
+    );
     for (out, &inp) in output.iter_mut().zip(input) {
         *out = (inp * gain).clamp(-1.0, 1.0);
     }
@@ -355,6 +364,14 @@ mod tests {
         for &s in &output {
             assert!(s.abs() < EPS, "zero gain must produce silence");
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "apply_gain: output buffer")]
+    fn test_apply_gain_panics_when_output_shorter_than_input() {
+        let input = [0.5f32; 4];
+        let mut output = [0.0f32; 3]; // shorter than input — must panic
+        apply_gain(&input, 1.0, &mut output);
     }
 
     // --- compute_rms ------------------------------------------------------------
