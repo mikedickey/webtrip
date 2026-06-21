@@ -123,6 +123,10 @@ pub(crate) fn is_valid_channel_count(channels: u8) -> bool {
 /// Connecting  → Negotiating
 /// Connecting  → Connected   (e.g. Mock transport, no negotiation step)
 /// Negotiating → Connected
+/// Idle        → Connected   (disconnect raced and reset to Idle while
+///                            connect_to_studio was awaiting transport.connect();
+///                            the connect path must still reach Connected so the
+///                            UI gets notified and transport/capture are live)
 /// Connected   → Connecting  (reconnect: transport fires error directly to JS
 ///                            callback, bypassing set_state, so self.state can
 ///                            still be Connected when the user retries)
@@ -140,6 +144,7 @@ pub(crate) fn is_valid_state_transition(from: SessionState, to: SessionState) ->
             | (Connecting, Negotiating)
             | (Connecting, Connected)
             | (Negotiating, Connected)
+            | (Idle, Connected) // disconnect raced connect; see doc comment above
             | (Connected, Connecting) // reconnect after transport-level error
             | (_, Error)
             | (Error, Idle)
@@ -847,6 +852,9 @@ mod tests {
             (SessionState::Connecting, SessionState::Negotiating),
             (SessionState::Connecting, SessionState::Connected),
             (SessionState::Negotiating, SessionState::Connected),
+            // disconnect() raced connect_to_studio() and reset to Idle; the
+            // connect path must still reach Connected so the UI is notified.
+            (SessionState::Idle, SessionState::Connected),
             // Reconnect: transport fires error directly to JS, self.state stays
             // Connected; the next connect_to_studio must be able to proceed.
             (SessionState::Connected, SessionState::Connecting),
@@ -873,7 +881,6 @@ mod tests {
     fn illegal_state_transitions_rejected() {
         let illegal: &[(SessionState, SessionState)] = &[
             (SessionState::Idle, SessionState::Negotiating),
-            (SessionState::Idle, SessionState::Connected),
             (SessionState::Negotiating, SessionState::Connecting),
             (SessionState::Connected, SessionState::Negotiating),
             (SessionState::Error, SessionState::Connecting),
