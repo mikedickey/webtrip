@@ -273,13 +273,22 @@ The test requires threading support. Either:
 - `src/audio/webrtc.rs`: WebRTC glue against `web_sys` — `RtcPeerConnection`
   creation from a `TransportConfig`, `create_offer` SDP validity, data-channel
   initial state, and ICE-candidate JSON → `RtcIceCandidate` parsing
+- `src/audio/engine.rs`: AudioContext bootstrap — `AudioEngine::create` builds a
+  real `AudioContext` reporting a plausible (>0, in-range) sample rate
+- `src/audio/worklet.rs`: worklet module registration via the `dependent_module!`
+  Blob/URL path (`register_audio_worklet` resolves against `audioWorklet.addModule`)
+- `src/audio/webtransport.rs`: `is_webtransport_available` reports `true` in the
+  headless Chrome harness (inverse of the native check)
+- `src/audio/audio_callback_loop.rs`: `has_atomics_wait_async` reports `true`
+  under the shared-memory harness, plus an end-to-end smoke test of the
+  `Atomics.waitAsync` wake-up path (set flag + `Atomics.notify` → tick fires),
+  which exercises the imported shared `WebAssembly.Memory` / `SharedArrayBuffer`
 - `src/test_support.rs`: shared browser-test scaffolding (`run_in_browser`
-  opt-in for the lib binary, `assert_valid_sdp`)
+  opt-in for the lib binary, `assert_valid_sdp`, `sleep_ms` async yield helper)
 
 ## Future Work
 
 As the test harness is established, we can add tests for:
-- `src/audio/engine.rs`: AudioContext setup / feature detection
-- `src/audio/devices.rs`: MediaDevices enumeration  
-- `src/audio/worklet.rs`: AudioWorklet communication
+- `src/audio/devices.rs`: MediaDevices enumeration (needs fake-device flags;
+  see [docs/CURSOR_CLOUD.md](CURSOR_CLOUD.md))
 - `src/session.rs`: Full session integration
