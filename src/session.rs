@@ -975,4 +975,231 @@ mod tests {
         assert_eq!(s.regulator_depth, 0);
         assert!(!s.regulator_initialized);
     }
+
+    // -----------------------------------------------------------------------
+    // Browser tests (web_sys / Web Audio + async transport lifecycle)
+    // -----------------------------------------------------------------------
+    //
+    // Real-browser coverage of the async connect/disconnect state machine and
+    // the `AudioContext`-dependent audio controls, run in headless Chrome via
+    // `npm run test:wasm`. The per-binary browser opt-in
+    // (`wasm_bindgen_test_configure!(run_in_browser)`) lives once in
+    // `crate::test_support`; here we only import the attribute + `sleep_ms`.
+    //
+    // The pure decision logic (`is_valid_channel_count`,
+    // `is_valid_state_transition`, `build_session_stats`) is covered by the
+    // native tests above (WEB-18), and `MockTransport`'s sine-wave/packet
+    // behavior by its own native tests (WEB-7); neither is re-covered here.
+    //
+    // Out of scope (a live JackTrip hub is required): the *successful* connect
+    // lifecycle of the WebRTC arm (`connect_to_studio` ~518-556) and the
+    // WebTransport arm (~578-629). Only the `MockTransport` arm is server-free,
+    // so it is the connect path exercised end-to-end below. The capture path
+    // inside connect calls `getUserMedia`; the synthetic-device Chrome flags in
+    // `webdriver.json` (`--use-fake-device-for-media-stream` /
+    // `--use-fake-ui-for-media-stream`) let it succeed headless.
+
+    #[cfg(target_arch = "wasm32")]
+    use crate::test_support::wait_until;
+    #[cfg(target_arch = "wasm32")]
+    use std::cell::RefCell;
+    #[cfg(target_arch = "wasm32")]
+    use std::rc::Rc;
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen::JsCast;
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen::closure::Closure;
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// Build an `on_state_change` callback that appends each emitted state
+    /// string to a shared log.
+    ///
+    /// Returns the shared log plus the live `Closure`, which the caller must
+    /// keep alive for as long as the session may fire the callback (dropping it
+    /// invalidates the `js_sys::Function` the session holds).
+    #[cfg(target_arch = "wasm32")]
+    fn recording_state_callback() -> (Rc<RefCell<Vec<String>>>, Closure<dyn FnMut(String)>) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let log_for_cb = log.clone();
+        let closure = Closure::wrap(Box::new(move |state: String| {
+            log_for_cb.borrow_mut().push(state);
+        }) as Box<dyn FnMut(String)>);
+        (log, closure)
+    }
+
+    /// Register a [`recording_state_callback`] on `session`, returning the
+    /// shared log and the `Closure` (kept alive by the caller).
+    #[cfg(target_arch = "wasm32")]
+    fn attach_state_log(
+        session: &mut WebTripSession,
+    ) -> (Rc<RefCell<Vec<String>>>, Closure<dyn FnMut(String)>) {
+        let (log, closure) = recording_state_callback();
+        session.set_on_state_change(closure.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        (log, closure)
+    }
+
+    /// Drive a full connect → audio-controls → disconnect cycle over the
+    /// server-free `MockTransport`.
+    ///
+    /// Asserts the `Idle → Connecting → Connected` progression (both via
+    /// `state()` and the order of the `on_state_change` callbacks), exercises
+    /// the `AudioContext`-backed `is_audio_suspended`/`resume_audio` on the
+    /// now-live engine, then tears down via `disconnect()` and asserts the
+    /// session returns to `Idle`. This runs the real async/await connect path,
+    /// `AudioEngine::create`, worklet bootstrap, and the `Atomics.waitAsync`
+    /// audio-callback loop in the browser.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_mock_connect_disconnect_lifecycle() {
+        // `params` must outlive `session` (the session holds a raw pointer to
+        // it); declaring it first means it is dropped last.
+        let params = AudioParams::default();
+        let mut session = WebTripSession::new(&params as *const AudioParams)
+            .expect("session construction should succeed");
+
+        session.set_transport_type(TransportType::Mock);
+        assert_eq!(session.get_transport_type(), TransportType::Mock);
+
+        let (log, _cb) = attach_state_log(&mut session);
+
+        assert_eq!(session.state(), SessionState::Idle);
+        assert!(!session.is_connected());
+
+        session
+            .connect_to_studio(
+                "mock-host".to_string(),
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+            )
+            .await
+            .expect("mock connect should succeed");
+
+        assert_eq!(session.state(), SessionState::Connected);
+        assert!(session.is_connected());
+
+        // The callback must have observed Idle → Connecting → Connected, in
+        // order, driven by `set_state`.
+        {
+            let states = log.borrow();
+            let connecting = states.iter().position(|s| s == "connecting");
+            let connected = states.iter().position(|s| s == "connected");
+            assert!(
+                connecting.is_some(),
+                "expected a 'connecting' callback, got {states:?}"
+            );
+            assert!(
+                connected.is_some(),
+                "expected a 'connected' callback, got {states:?}"
+            );
+            assert!(
+                connecting < connected,
+                "'connecting' must precede 'connected', got {states:?}"
+            );
+        }
+
+        // The connect created a live `AudioEngine`, so the AudioContext-backed
+        // controls now hit their engine branch. `is_audio_suspended` reads
+        // `AudioContext.state` (must not panic, returns a bool); `resume_audio`
+        // drives `AudioContext.resume()` and must resolve `Ok`.
+        let _suspended: bool = session.is_audio_suspended();
+        session
+            .resume_audio()
+            .await
+            .expect("resume_audio with a live engine should resolve");
+
+        session.disconnect().await;
+        // Wait on the actual teardown transition rather than a fixed delay:
+        // poll until the session reports `Idle` (or bail after a generous
+        // budget) so the assertion is not timing-dependent.
+        let reached_idle = wait_until(
+            || session.state() == SessionState::Idle,
+            /* timeout_ms */ 1000,
+            /* interval_ms */ 5,
+        )
+        .await;
+        assert!(
+            reached_idle,
+            "session must return to Idle after disconnect, got {:?}",
+            session.state()
+        );
+        assert!(!session.is_connected());
+        assert_eq!(
+            log.borrow().last().map(String::as_str),
+            Some("idle"),
+            "the final emitted state after disconnect must be 'idle', got {:?}",
+            log.borrow()
+        );
+    }
+
+    /// A connect with an empty host must surface an `Err` rather than report a
+    /// false `Connected`.
+    ///
+    /// Uses the default WebRTC transport: building the signaling `WebSocket`
+    /// against the resulting invalid `wss://:PORT/webrtc` URL fails without any
+    /// live server, so `connect_to_studio` returns `Err`. We assert the session
+    /// never reaches `Connected` and reports `is_connected() == false`. (The
+    /// session does advance to `Connecting` before the transport is built — the
+    /// state machine has no pre-async host validation — so we assert "did not
+    /// reach Connected", not literal state equality.)
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_connect_invalid_host_fails_without_connecting() {
+        let params = AudioParams::default();
+        let mut session = WebTripSession::new(&params as *const AudioParams)
+            .expect("session construction should succeed");
+
+        // Default transport is WebRTC; an empty host yields an invalid
+        // signaling URL that fails fast, with no live hub involved.
+        let result = session
+            .connect_to_studio(
+                String::new(),
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "connect to an empty host must return Err, got {result:?}"
+        );
+        assert_ne!(
+            session.state(),
+            SessionState::Connected,
+            "a failed connect must not leave the session reporting Connected"
+        );
+        assert!(
+            !session.is_connected(),
+            "a failed connect must not report an open transport"
+        );
+    }
+
+    /// With no engine yet created (fresh session, never connected), the
+    /// AudioContext-backed controls must take their no-engine branch:
+    /// `is_audio_suspended` returns `false` and `resume_audio` resolves `Ok`
+    /// without touching any `AudioContext`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_audio_controls_no_engine_branch() {
+        let params = AudioParams::default();
+        let session = WebTripSession::new(&params as *const AudioParams)
+            .expect("session construction should succeed");
+
+        assert!(
+            !session.is_audio_suspended(),
+            "with no engine, is_audio_suspended must report false"
+        );
+        session
+            .resume_audio()
+            .await
+            .expect("resume_audio with no engine must resolve Ok");
+    }
 }

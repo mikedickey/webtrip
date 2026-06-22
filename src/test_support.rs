@@ -36,6 +36,37 @@ pub(crate) async fn sleep_ms(ms: i32) {
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
+/// Poll `predicate` until it returns `true` or `timeout_ms` elapses, yielding
+/// to the event loop for `interval_ms` between checks.
+///
+/// Returns `true` if the predicate was satisfied within the budget, `false` on
+/// timeout. Lets an async browser test wait on an *actual* state transition
+/// (e.g. a session returning to `Idle` after teardown) instead of assuming a
+/// fixed delay. Shared so timing-dependent `sleep_ms`-then-assert patterns can
+/// be replaced with one bounded-wait implementation rather than re-rolling the
+/// loop each time.
+///
+/// A non-positive `interval_ms` is clamped to 1 ms so `elapsed` always advances
+/// toward `timeout_ms`; otherwise the loop could spin without ever timing out.
+pub(crate) async fn wait_until<F: FnMut() -> bool>(
+    mut predicate: F,
+    timeout_ms: i32,
+    interval_ms: i32,
+) -> bool {
+    let interval_ms = interval_ms.max(1);
+    let mut elapsed = 0;
+    loop {
+        if predicate() {
+            return true;
+        }
+        if elapsed >= timeout_ms {
+            return false;
+        }
+        sleep_ms(interval_ms).await;
+        elapsed += interval_ms;
+    }
+}
+
 /// Assert that an SDP blob is well-formed.
 ///
 /// A minimally valid session description is non-empty and contains the

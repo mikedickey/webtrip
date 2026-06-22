@@ -365,8 +365,12 @@ The test requires threading support. Either:
   fake-device flags above)
 - `src/test_support.rs`: shared browser-test scaffolding (`run_in_browser`
   opt-in for the lib binary, `assert_valid_sdp`, `sleep_ms` async yield helper)
-
-## Future Work
-
-As the test harness is established, we can add tests for:
-- `src/session.rs`: Full session integration
+- `src/session.rs`: the async connect/disconnect state machine over the
+  server-free `MockTransport` — a full `Idle → Connecting → Connected → Idle`
+  cycle (via `state()` and the `on_state_change` callback order), the
+  `AudioContext`-backed `is_audio_suspended`/`resume_audio` both with a live
+  engine (after a mock connect) and on the no-engine branch, plus the
+  invalid-host fast-fail path. The capture path inside connect uses
+  `getUserMedia`, enabled headless by the synthetic-device flags in
+  `webdriver.json` (`--use-fake-device-for-media-stream` /
+  `--use-fake-ui-for-media-stream`)
