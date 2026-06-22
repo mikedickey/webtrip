@@ -56,11 +56,35 @@ fallback is to drop **only** the linker/memory ABI flags from `test:wasm` while
 keeping `+atomics`/`-Zbuild-std`, and document the exact error here — never
 silently ship a build/test flag mismatch.
 
+### Fake media-device flags (required for device/capture tests)
+
+`webdriver.json` launches headless Chrome with two extra flags beyond the usual
+`--headless`/`--no-sandbox`/`--disable-dev-shm-usage`:
+
+- `--use-fake-device-for-media-stream` — gives Chrome a **synthetic** audio
+  input (a generated tone) so `enumerateDevices()` reports a real input device.
+  Without it, headless Chrome enumerates an **empty** device list and the
+  `src/audio/devices.rs` enumeration tests would have nothing to assert on.
+- `--use-fake-ui-for-media-stream` — **auto-grants** the microphone permission
+  with no user gesture, so `getUserMedia()` resolves to a `MediaStream` instead
+  of rejecting (headless Chrome has no permission UI and otherwise denies the
+  request). Granting permission is also what makes device **labels** visible in
+  `enumerateDevices()`.
+
+These let the browser tests for `get_media_devices`, `request_audio_permission`
+/`getUserMedia`, `stop_media_stream`, `enumerate_devices`, and
+`get_audio_devices` run headless. They are harmless to the other suites (no real
+hardware is touched). One headless caveat remains: even with the flags, Chrome
+does not reliably expose an audio **output** (`audiooutput`) sink, so the device
+tests assert on the input list and only validate outputs when present.
+
 ### Requirements
 
 - Chrome or Chromium browser installed
 - `wasm-pack` installed (`cargo install wasm-pack`)
 - For headless mode, ensure Chrome can run with `--no-sandbox` if on Linux
+- For the media-device tests, the fake-device flags above (already in
+  `webdriver.json`)
 
 ### Test Organization (convention)
 
@@ -283,12 +307,16 @@ The test requires threading support. Either:
   under the shared-memory harness, plus an end-to-end smoke test of the
   `Atomics.waitAsync` wake-up path (set flag + `Atomics.notify` → tick fires),
   which exercises the imported shared `WebAssembly.Memory` / `SharedArrayBuffer`
+- `src/audio/devices.rs`: MediaDevices glue around the native categorization
+  core — `get_media_devices` reaches `navigator.mediaDevices`,
+  `request_audio_permission`/`getUserMedia` resolves under the fake-device flags,
+  `stop_media_stream` ends a live stream's tracks, and `get_audio_devices`
+  returns a populated `{ inputDevices, outputDevices }` object (requires the
+  fake-device flags above)
 - `src/test_support.rs`: shared browser-test scaffolding (`run_in_browser`
   opt-in for the lib binary, `assert_valid_sdp`, `sleep_ms` async yield helper)
 
 ## Future Work
 
 As the test harness is established, we can add tests for:
-- `src/audio/devices.rs`: MediaDevices enumeration (needs fake-device flags;
-  see [docs/CURSOR_CLOUD.md](CURSOR_CLOUD.md))
 - `src/session.rs`: Full session integration
