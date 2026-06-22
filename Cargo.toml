@@ -55,6 +55,7 @@ web-sys = { version = "0.3.83", features = [
   "Window",
   "console",
   "CloseEvent",
+  "CloseEventInit",
   "Event",
   "ErrorEvent",
   
@@ -80,6 +81,7 @@ web-sys = { version = "0.3.83", features = [
   # For binary data handling
   "Crypto",
   "MessageEvent",
+  "MessageEventInit",
   
   # WebSocket for signaling
   "WebSocket",
