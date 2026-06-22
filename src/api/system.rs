@@ -107,25 +107,25 @@ impl SystemApi {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use mockito;
+    use crate::api::test_helpers::{assert_http_status, mock_api, mock_empty, mock_json};
+
+    fn api(client: &ApiClient) -> SystemApi {
+        SystemApi::from_client(client)
+    }
 
     #[tokio::test]
     async fn test_ping_success() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/ping")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"status":"ok","version":"1.0.0"}"#)
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/ping",
+            200,
+            r#"{"status":"ok","version":"1.0.0"}"#,
+        )
+        .await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = SystemApi::from_client(&client);
-        let result = api.ping().await;
-
-        assert!(result.is_ok());
-        let ping = result.unwrap();
+        let ping = api(&client).ping().await.unwrap();
         assert_eq!(ping.status, Some("ok".to_string()));
         assert_eq!(ping.version, Some("1.0.0".to_string()));
         mock.assert_async().await;
@@ -133,44 +133,74 @@ mod tests {
 
     #[tokio::test]
     async fn test_ping_error() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/ping")
-            .with_status(503)
-            .with_header("content-type", "text/plain")
-            .with_body("Service Unavailable")
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/ping", 503, "Service Unavailable").await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = SystemApi::from_client(&client);
-        let result = api.ping().await;
+        let err = api(&client).ping().await.unwrap_err();
+        assert_http_status(err, 503);
+        mock.assert_async().await;
+    }
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ApiError::Http { status, .. } => assert_eq!(status, 503),
-            _ => panic!("Expected HTTP error"),
-        }
+    #[tokio::test]
+    async fn test_get_redirect_url_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/redirect/openapi",
+            200,
+            r#""https://example.com/openapi.json""#,
+        )
+        .await;
+
+        let url = api(&client).get_redirect_url("openapi").await.unwrap();
+        assert_eq!(url, "https://example.com/openapi.json");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_redirect_url_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/redirect/missing", 404, "nope").await;
+
+        let err = api(&client).get_redirect_url("missing").await.unwrap_err();
+        assert_http_status(err, 404);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_my_ip_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/getmyip", 200, r#""203.0.113.7""#).await;
+
+        let ip = api(&client).get_my_ip().await.unwrap();
+        assert_eq!(ip, "203.0.113.7");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_my_ip_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/getmyip", 500, "boom").await;
+
+        let err = api(&client).get_my_ip().await.unwrap_err();
+        assert_http_status(err, 500);
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_list_regions_success() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/regions")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"us-west-1":{"label":"US West","provider":"gcloud"}}"#)
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/regions",
+            200,
+            r#"{"us-west-1":{"label":"US West","provider":"gcloud"}}"#,
+        )
+        .await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = SystemApi::from_client(&client);
-        let result = api.list_regions().await;
-
-        assert!(result.is_ok());
-        let regions = result.unwrap();
+        let regions = api(&client).list_regions().await.unwrap();
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].id, Some("us-west-1".to_string()));
         assert_eq!(regions[0].label, Some("US West".to_string()));
@@ -179,23 +209,60 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_regions_error() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/regions")
-            .with_status(500)
-            .with_body("Internal Server Error")
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/regions", 500, "Internal Server Error").await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = SystemApi::from_client(&client);
-        let result = api.list_regions().await;
+        let err = api(&client).list_regions().await.unwrap_err();
+        assert_http_status(err, 500);
+        mock.assert_async().await;
+    }
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ApiError::Http { status, .. } => assert_eq!(status, 500),
-            _ => panic!("Expected HTTP error"),
-        }
+    #[tokio::test]
+    async fn test_get_region_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/regions/us-east-1",
+            200,
+            r#"{"label":"US East","provider":"aws"}"#,
+        )
+        .await;
+
+        let region = api(&client).get_region("us-east-1").await.unwrap();
+        assert_eq!(region.label, Some("US East".to_string()));
+        assert_eq!(region.provider, Some("aws".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_region_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/regions/nowhere", 404, "nope").await;
+
+        let err = api(&client).get_region("nowhere").await.unwrap_err();
+        assert_http_status(err, 404);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_collect_analytics_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "POST", "/collect", 204).await;
+
+        let event = models::AnalyticsEvent::default();
+        api(&client).collect_analytics(&event).await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_collect_analytics_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "POST", "/collect", 400, "bad event").await;
+
+        let event = models::AnalyticsEvent::default();
+        let err = api(&client).collect_analytics(&event).await.unwrap_err();
+        assert_http_status(err, 400);
         mock.assert_async().await;
     }
 }

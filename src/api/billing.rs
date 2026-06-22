@@ -205,93 +205,266 @@ impl BillingApi {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use mockito;
+    use crate::api::test_helpers::{assert_http_status, mock_api, mock_json};
+
+    fn api(client: &ApiClient) -> BillingApi {
+        BillingApi::from_client(client)
+    }
 
     #[tokio::test]
     async fn test_get_plans_success() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/billing/plans")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"[{"id":"basic","name":"Basic Plan","price":999}]"#)
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/billing/plans",
+            200,
+            r#"[{"id":"basic","name":"Basic Plan","price":999}]"#,
+        )
+        .await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = BillingApi::from_client(&client);
-        let result = api.get_plans().await;
-
-        assert!(result.is_ok());
-        let plans = result.unwrap();
+        let plans = api(&client).get_plans().await.unwrap();
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].id, Some("basic".to_string()));
+        assert_eq!(plans[0].price, Some(999));
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_get_plans_error() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/billing/plans")
-            .with_status(500)
-            .with_body("Internal Server Error")
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/billing/plans", 500, "boom").await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = BillingApi::from_client(&client);
-        let result = api.get_plans().await;
+        let err = api(&client).get_plans().await.unwrap_err();
+        assert_http_status(err, 500);
+        mock.assert_async().await;
+    }
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ApiError::Http { status, .. } => assert_eq!(status, 500),
-            _ => panic!("Expected HTTP error"),
-        }
+    #[tokio::test]
+    async fn test_get_portal_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/billing/portal",
+            200,
+            r#"{"url":"https://portal.example.com"}"#,
+        )
+        .await;
+
+        let resp = api(&client).get_portal("u1").await.unwrap();
+        assert_eq!(resp.url, Some("https://portal.example.com".to_string()));
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_get_subscription_success() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/users/user123/subscription")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"id":"sub123","planId":"pro","status":"active"}"#)
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/user123/subscription",
+            200,
+            r#"{"id":"sub123","planId":"pro","status":"active"}"#,
+        )
+        .await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = BillingApi::from_client(&client);
-        let result = api.get_subscription("user123").await;
-
-        assert!(result.is_ok());
-        let subscription = result.unwrap();
-        assert_eq!(subscription.id, Some("sub123".to_string()));
-        assert_eq!(subscription.plan_id, Some("pro".to_string()));
+        let sub = api(&client).get_subscription("user123").await.unwrap();
+        assert_eq!(sub.id, Some("sub123".to_string()));
+        assert_eq!(sub.plan_id, Some("pro".to_string()));
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_get_subscription_error() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/users/nonexistent/subscription")
-            .with_status(404)
-            .with_body("Not Found")
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/users/nonexistent/subscription", 404, "nope").await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = BillingApi::from_client(&client);
-        let result = api.get_subscription("nonexistent").await;
+        let err = api(&client).get_subscription("nonexistent").await.unwrap_err();
+        assert_http_status(err, 404);
+        mock.assert_async().await;
+    }
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ApiError::Http { status, .. } => assert_eq!(status, 404),
-            _ => panic!("Expected HTTP error"),
-        }
+    #[tokio::test]
+    async fn test_create_checkout_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "POST",
+            "/users/u1/subscription/checkout",
+            200,
+            r#"{"url":"https://checkout.example.com","sessionId":"cs_1"}"#,
+        )
+        .await;
+
+        let req = models::CheckoutRequest::default();
+        let resp = api(&client).create_checkout("u1", &req).await.unwrap();
+        assert_eq!(resp.session_id, Some("cs_1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_create_checkout_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "POST", "/users/u1/subscription/checkout", 400, "bad").await;
+
+        let req = models::CheckoutRequest::default();
+        let err = api(&client).create_checkout("u1", &req).await.unwrap_err();
+        assert_http_status(err, 400);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_modify_subscription_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "PUT",
+            "/users/u1/subscription",
+            200,
+            r#"{"id":"sub1","status":"active"}"#,
+        )
+        .await;
+
+        let req = models::ModifySubscriptionRequest::default();
+        let sub = api(&client).modify_subscription("u1", &req).await.unwrap();
+        assert_eq!(sub.id, Some("sub1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_cancel_subscription_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "DELETE",
+            "/users/u1/subscription",
+            200,
+            r#"{"id":"sub1","status":"canceled"}"#,
+        )
+        .await;
+
+        let sub = api(&client).cancel_subscription("u1").await.unwrap();
+        assert_eq!(sub.status, Some("canceled".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_reactivate_subscription_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "POST",
+            "/users/u1/subscription/reactivate",
+            200,
+            r#"{"id":"sub1","status":"active"}"#,
+        )
+        .await;
+
+        let sub = api(&client).reactivate_subscription("u1").await.unwrap();
+        assert_eq!(sub.status, Some("active".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_redeem_coupon_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "POST",
+            "/users/u1/subscription/coupon",
+            200,
+            r#"{"valid":true,"discount":10.0}"#,
+        )
+        .await;
+
+        let req = models::CouponRequest::default();
+        let resp = api(&client).redeem_coupon("u1", &req).await.unwrap();
+        assert_eq!(resp.valid, Some(true));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_entitlements_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/billing/entitlements",
+            200,
+            r#"[{"id":"e1","enabled":true}]"#,
+        )
+        .await;
+
+        let result = api(&client).get_entitlements().await.unwrap();
+        assert_eq!(result[0].id, Some("e1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_apply_promo_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "POST",
+            "/users/u1/subscription/promo",
+            200,
+            r#"{"applied":true,"description":"50% off"}"#,
+        )
+        .await;
+
+        let req = models::PromoRequest::default();
+        let resp = api(&client).apply_promo("u1", &req).await.unwrap();
+        assert_eq!(resp.applied, Some(true));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_apply_promo_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "POST", "/users/u1/subscription/promo", 422, "invalid").await;
+
+        let req = models::PromoRequest::default();
+        let err = api(&client).apply_promo("u1", &req).await.unwrap_err();
+        assert_http_status(err, 422);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_invoices_with_params() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/invoices",
+            200,
+            r#"{"invoices":[{"id":"inv1"}],"hasMore":true,"cursor":"next"}"#,
+        )
+        .await;
+
+        let result = api(&client)
+            .list_invoices("u1", Some("abc"), Some(10))
+            .await
+            .unwrap();
+        assert_eq!(result.invoices.unwrap().len(), 1);
+        assert_eq!(result.has_more, Some(true));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_invoices_no_params() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/invoices",
+            200,
+            r#"{"invoices":[]}"#,
+        )
+        .await;
+
+        let result = api(&client).list_invoices("u1", None, None).await.unwrap();
+        assert_eq!(result.invoices.unwrap().len(), 0);
         mock.assert_async().await;
     }
 }

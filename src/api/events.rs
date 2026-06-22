@@ -170,94 +170,233 @@ impl EventsApi {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use mockito;
+    use crate::api::test_helpers::{assert_http_status, mock_api, mock_empty, mock_json};
+
+    fn api(client: &ApiClient) -> EventsApi {
+        EventsApi::from_client(client)
+    }
 
     #[tokio::test]
     async fn test_list_events_success() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/events")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"[{"id":"event1","name":"Test Event"}]"#)
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/events",
+            200,
+            r#"[{"id":"event1","title":"Test Event"}]"#,
+        )
+        .await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = EventsApi::from_client(&client);
-        let result = api.list_events().await;
-
-        assert!(result.is_ok());
-        let events = result.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].core.id, Some("event1".to_string()));
+        let result = api(&client).list_events().await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].core.id, Some("event1".to_string()));
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_list_events_error() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/events")
-            .with_status(500)
-            .with_body("Internal Server Error")
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/events", 500, "boom").await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = EventsApi::from_client(&client);
-        let result = api.list_events().await;
+        let err = api(&client).list_events().await.unwrap_err();
+        assert_http_status(err, 500);
+        mock.assert_async().await;
+    }
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ApiError::Http { status, .. } => assert_eq!(status, 500),
-            _ => panic!("Expected HTTP error"),
-        }
+    #[tokio::test]
+    async fn test_list_events_paginated_with_params() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/events-paginated",
+            200,
+            r#"{"items":[{"id":"e1"}],"page":2}"#,
+        )
+        .await;
+
+        let result = api(&client)
+            .list_events_paginated(Some(2), Some(10))
+            .await
+            .unwrap();
+        assert_eq!(result.items.unwrap().len(), 1);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_events_paginated_no_params() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/events-paginated",
+            200,
+            r#"{"items":[]}"#,
+        )
+        .await;
+
+        let result = api(&client).list_events_paginated(None, None).await.unwrap();
+        assert_eq!(result.items.unwrap().len(), 0);
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_get_event_success() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/events/evt123")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"[{"id":"evt123","title":"My Event","startTime":"2024-01-01T00:00:00Z"}]"#)
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/events/evt123",
+            200,
+            r#"[{"id":"evt123","title":"My Event","startTime":"2024-01-01T00:00:00Z"}]"#,
+        )
+        .await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = EventsApi::from_client(&client);
-        let result = api.get_event("evt123").await;
-
-        assert!(result.is_ok());
-        let events = result.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].core.id, Some("evt123".to_string()));
-        assert_eq!(events[0].core.title, Some("My Event".to_string()));
+        let result = api(&client).get_event("evt123").await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].core.id, Some("evt123".to_string()));
+        assert_eq!(result[0].core.title, Some("My Event".to_string()));
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_get_event_error() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/events/nonexistent")
-            .with_status(404)
-            .with_body("Not Found")
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/events/nonexistent", 404, "nope").await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = EventsApi::from_client(&client);
-        let result = api.get_event("nonexistent").await;
+        let err = api(&client).get_event("nonexistent").await.unwrap_err();
+        assert_http_status(err, 404);
+        mock.assert_async().await;
+    }
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ApiError::Http { status, .. } => assert_eq!(status, 404),
-            _ => panic!("Expected HTTP error"),
-        }
+    #[tokio::test]
+    async fn test_get_event_channel() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/events/evt1/channel",
+            200,
+            r#"{"id":"chan1","name":"Channel One"}"#,
+        )
+        .await;
+
+        let channel = api(&client).get_event_channel("evt1").await.unwrap();
+        assert_eq!(channel.id, Some("chan1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_similar_events() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/events/evt1/similar",
+            200,
+            r#"[{"id":"evt2"}]"#,
+        )
+        .await;
+
+        let result = api(&client).get_similar_events("evt1").await.unwrap();
+        assert_eq!(result[0].core.id, Some("evt2".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_studio_events() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/st1/events",
+            200,
+            r#"[{"id":"evt1","studioId":"st1"}]"#,
+        )
+        .await;
+
+        let result = api(&client).list_studio_events("st1").await.unwrap();
+        assert_eq!(result[0].studio_id, Some("st1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_studio_event() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/st1/events/evt1",
+            200,
+            r#"{"id":"evt1","studioId":"st1"}"#,
+        )
+        .await;
+
+        let event = api(&client).get_studio_event("st1", "evt1").await.unwrap();
+        assert_eq!(event.core.id, Some("evt1".to_string()));
+        assert_eq!(event.studio_id, Some("st1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_create_studio_event() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "POST",
+            "/studios/st1/events",
+            200,
+            r#"{"id":"evt1"}"#,
+        )
+        .await;
+
+        let body = models::UpcomingEvent::default();
+        let event = api(&client).create_studio_event("st1", &body).await.unwrap();
+        assert_eq!(event.core.id, Some("evt1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_studio_event() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "PUT",
+            "/studios/st1/events/evt1",
+            200,
+            r#"{"id":"evt1","title":"updated"}"#,
+        )
+        .await;
+
+        let body = models::UpcomingEvent::default();
+        let event = api(&client)
+            .update_studio_event("st1", "evt1", &body)
+            .await
+            .unwrap();
+        assert_eq!(event.core.title, Some("updated".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_studio_event() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "DELETE", "/studios/st1/events/evt1", 204).await;
+
+        api(&client).delete_studio_event("st1", "evt1").await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_studio_event_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "DELETE", "/studios/st1/events/evt1", 404).await;
+
+        let err = api(&client)
+            .delete_studio_event("st1", "evt1")
+            .await
+            .unwrap_err();
+        assert_http_status(err, 404);
         mock.assert_async().await;
     }
 }

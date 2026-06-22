@@ -223,69 +223,72 @@ impl StudiosApi {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use mockito;
+    use crate::api::test_helpers::{assert_http_status, mock_api, mock_empty, mock_json};
+
+    fn api(client: &ApiClient) -> StudiosApi {
+        StudiosApi::from_client(client)
+    }
 
     #[tokio::test]
     async fn test_list_studios_success() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/studios")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"[{"id":"studio1","name":"Test Studio"}]"#)
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios",
+            200,
+            r#"[{"id":"studio1","name":"Test Studio"}]"#,
+        )
+        .await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = StudiosApi::from_client(&client);
-        let result = api.list_studios().await;
-
-        assert!(result.is_ok());
-        let studios = result.unwrap();
-        assert_eq!(studios.len(), 1);
-        assert_eq!(studios[0].id, Some("studio1".to_string()));
+        let result = api(&client).list_studios().await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, Some("studio1".to_string()));
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_list_studios_error() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/studios")
-            .with_status(401)
-            .with_body("Unauthorized")
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/studios", 401, "Unauthorized").await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = StudiosApi::from_client(&client);
-        let result = api.list_studios().await;
+        let err = api(&client).list_studios().await.unwrap_err();
+        assert_http_status(err, 401);
+        mock.assert_async().await;
+    }
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ApiError::Http { status, .. } => assert_eq!(status, 401),
-            _ => panic!("Expected HTTP error"),
-        }
+    #[tokio::test]
+    async fn test_create_studio_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "POST",
+            "/studios",
+            200,
+            r#"{"id":"new1","name":"Created"}"#,
+        )
+        .await;
+
+        let body = models::Studio::default();
+        let studio = api(&client).create_studio(&body).await.unwrap();
+        assert_eq!(studio.id, Some("new1".to_string()));
+        assert_eq!(studio.config.name, Some("Created".to_string()));
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_get_studio_success() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/studios/studio123")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"id":"studio123","name":"My Studio","enabled":true}"#)
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/studio123",
+            200,
+            r#"{"id":"studio123","name":"My Studio","enabled":true}"#,
+        )
+        .await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = StudiosApi::from_client(&client);
-        let result = api.get_studio("studio123").await;
-
-        assert!(result.is_ok());
-        let studio = result.unwrap();
+        let studio = api(&client).get_studio("studio123").await.unwrap();
         assert_eq!(studio.id, Some("studio123".to_string()));
         assert_eq!(studio.config.name, Some("My Studio".to_string()));
         mock.assert_async().await;
@@ -293,23 +296,246 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_studio_error() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/studios/nonexistent")
-            .with_status(404)
-            .with_body("Not Found")
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/studios/nonexistent", 404, "Not Found").await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = StudiosApi::from_client(&client);
-        let result = api.get_studio("nonexistent").await;
+        let err = api(&client).get_studio("nonexistent").await.unwrap_err();
+        assert_http_status(err, 404);
+        mock.assert_async().await;
+    }
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ApiError::Http { status, .. } => assert_eq!(status, 404),
-            _ => panic!("Expected HTTP error"),
-        }
+    #[tokio::test]
+    async fn test_update_studio_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "PUT",
+            "/studios/st1",
+            200,
+            r#"{"id":"st1","name":"Updated"}"#,
+        )
+        .await;
+
+        let body = models::Studio::default();
+        let studio = api(&client).update_studio("st1", &body).await.unwrap();
+        assert_eq!(studio.config.name, Some("Updated".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_studio_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "DELETE", "/studios/st1", 204).await;
+
+        api(&client).delete_studio("st1").await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_studio_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "DELETE", "/studios/st1", 403).await;
+
+        let err = api(&client).delete_studio("st1").await.unwrap_err();
+        assert_http_status(err, 403);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_extend_studio_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "POST",
+            "/studios/st1/extend",
+            200,
+            r#"{"id":"st1","expiresAt":"2030-01-01T00:00:00Z"}"#,
+        )
+        .await;
+
+        let studio = api(&client).extend_studio("st1").await.unwrap();
+        assert_eq!(studio.expires_at, Some("2030-01-01T00:00:00Z".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_access_settings_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/st1/access",
+            200,
+            r#"{"passwordProtected":true,"maxGuests":5}"#,
+        )
+        .await;
+
+        let settings = api(&client).get_access_settings("st1").await.unwrap();
+        assert_eq!(settings.password_protected, Some(true));
+        assert_eq!(settings.max_guests, Some(5));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_access_settings_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "PUT",
+            "/studios/st1/access",
+            200,
+            r#"{"allowGuests":false}"#,
+        )
+        .await;
+
+        let body = models::AccessSettings::default();
+        let settings = api(&client).update_access_settings("st1", &body).await.unwrap();
+        assert_eq!(settings.allow_guests, Some(false));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_mixer_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/st1/mixer",
+            200,
+            r#"{"id":"m1","name":"Main"}"#,
+        )
+        .await;
+
+        let mixer = api(&client).get_mixer("st1").await.unwrap();
+        assert_eq!(mixer.id, Some("m1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_mixer_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "PUT",
+            "/studios/st1/mixer",
+            200,
+            r#"{"id":"m1","name":"Tweaked"}"#,
+        )
+        .await;
+
+        let body = models::Mixer::default();
+        let mixer = api(&client).update_mixer("st1", &body).await.unwrap();
+        assert_eq!(mixer.name, Some("Tweaked".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_mixers_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/mixers", 200, r#"[{"id":"m1"}]"#).await;
+
+        let result = api(&client).list_mixers().await.unwrap();
+        assert_eq!(result[0].id, Some("m1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_livekit_token_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "POST",
+            "/studios/st1/lktoken",
+            200,
+            r#"{"token":"tok123","url":"wss://lk"}"#,
+        )
+        .await;
+
+        let resp = api(&client).get_livekit_token("st1").await.unwrap();
+        assert_eq!(resp.token, Some("tok123".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_send_invite_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "POST", "/studios/st1/invite", 204).await;
+
+        let body = models::InviteRequest::default();
+        api(&client).send_invite("st1", &body).await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_submit_feedback_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "POST", "/studios/st1/feedback", 204).await;
+
+        let body = models::FeedbackRequest::default();
+        api(&client).submit_feedback("st1", &body).await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/st1/chat/chat1",
+            200,
+            r#"{"id":"chat1","roomId":"r1"}"#,
+        )
+        .await;
+
+        let chat = api(&client).get_chat("st1", "chat1").await.unwrap();
+        assert_eq!(chat.id, Some("chat1".to_string()));
+        assert_eq!(chat.room_id, Some("r1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_participants_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/st1/participants",
+            200,
+            r#"[{"userId":"u1","name":"Alice"}]"#,
+        )
+        .await;
+
+        let result = api(&client).get_participants("st1").await.unwrap();
+        assert_eq!(result[0].user_id, Some("u1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_session_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/st1/session",
+            200,
+            r#"{"id":"sess1","studioId":"st1"}"#,
+        )
+        .await;
+
+        let session = api(&client).get_session("st1").await.unwrap();
+        assert_eq!(session.id, Some("sess1".to_string()));
+        assert_eq!(session.studio_id, Some("st1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_session_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/studios/st1/session", 500, "boom").await;
+
+        let err = api(&client).get_session("st1").await.unwrap_err();
+        assert_http_status(err, 500);
         mock.assert_async().await;
     }
 }

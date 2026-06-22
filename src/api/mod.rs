@@ -49,6 +49,9 @@ pub mod users;
 // Re-export models from the existing models module
 pub use crate::models;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod test_helpers;
+
 /// Default timeout in milliseconds (10 seconds)
 pub const DEFAULT_TIMEOUT_MS: u32 = 10_000;
 
