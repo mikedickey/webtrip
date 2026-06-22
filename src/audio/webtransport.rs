@@ -709,6 +709,98 @@ mod tests {
         );
     }
 
+    // ── Worker creation / lifecycle (web_sys) ────────────────────────────────
+    //
+    // These exercise the browser-only Worker setup that the pure-logic tests
+    // above can't reach. `create_worker` and `init_worker` are private, but
+    // these inline tests live in a child module of `webtransport`, so they call
+    // them directly without widening production visibility. The live
+    // `connect()`/`connect_to_server()` path needs a real HTTP/3 server and is
+    // intentionally not covered here.
+
+    /// Terminate and detach a freshly-created test worker so the async
+    /// module-load failure inherent to the test harness (the worker imports the
+    /// bindgen module from a `blob:` context) can't fire callbacks after the
+    /// test, and so `Drop`'s `close()` short-circuits instead of arming a 2s
+    /// fallback timer.
+    #[cfg(target_arch = "wasm32")]
+    fn teardown_worker(transport: &WebTransportImpl) {
+        if let Some(worker) = transport.worker.borrow_mut().take() {
+            worker.set_onmessage(None);
+            worker.set_onerror(None);
+            worker.terminate();
+        }
+    }
+
+    /// `create_worker()` must build a `web_sys::Worker` via the `dependent_module!`
+    /// Blob-URL flow and register both the `onmessage` and `onerror` closures on
+    /// it (retaining them on the struct so they outlive the call).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn create_worker_builds_worker_and_registers_handlers() {
+        let mut transport = WebTransportImpl::new()
+            .expect("WebTransportImpl construction should succeed in the browser");
+
+        transport
+            .create_worker()
+            .expect("create_worker should build the Worker via the Blob-URL flow");
+
+        {
+            let worker_ref = transport.worker.borrow();
+            let worker = worker_ref
+                .as_ref()
+                .expect("worker must be stored after create_worker");
+            assert!(
+                worker.onmessage().is_some(),
+                "onmessage handler must be registered on the worker"
+            );
+            assert!(
+                worker.onerror().is_some(),
+                "onerror handler must be registered on the worker"
+            );
+        }
+        assert!(
+            transport.worker_message_closure.is_some(),
+            "message closure must be retained to stay alive"
+        );
+        assert!(
+            transport.worker_error_closure.is_some(),
+            "error closure must be retained to stay alive"
+        );
+
+        teardown_worker(&transport);
+    }
+
+    /// `init_worker()` must serialize the init message (Reflect-set of
+    /// `wasmMemory`/`wasmUrl` on top of the plain-JSON buffer config) and post
+    /// it to the worker without panicking. `post_message` can't be intercepted,
+    /// so this asserts structure/no-panic only.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn init_worker_builds_and_posts_message() {
+        let mut transport = WebTransportImpl::new()
+            .expect("WebTransportImpl construction should succeed in the browser");
+        transport
+            .create_worker()
+            .expect("create_worker should succeed");
+
+        // Minimal buffer config: the pointers are only serialized into the
+        // postMessage payload here (never dereferenced on the main thread), so
+        // dummy non-null addresses are sufficient.
+        transport.audio_buffers = Some(AudioBufferConfig {
+            local_to_network_ptr: 0x1000 as *mut RingBuffer,
+            network_to_local_ptr: 0x2000 as *mut Regulator,
+            buffer_size: 128,
+            channels: 2,
+        });
+
+        transport
+            .init_worker()
+            .expect("init_worker should build and post the init message");
+
+        teardown_worker(&transport);
+    }
+
     // --- encode_uri_component ---
 
     #[test]

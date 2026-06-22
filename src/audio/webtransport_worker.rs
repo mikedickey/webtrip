@@ -847,4 +847,126 @@ mod tests {
         state.start();
         assert!(state.is_running());
     }
+
+    // ── Browser tests (worker-side #[wasm_bindgen] entry points) ──────────────
+    //
+    // These call the worker entry points directly in headless Chrome via
+    // `npm run test:wasm`. The per-binary `run_in_browser` opt-in lives once in
+    // `crate::test_support`. `post_message_to_main()` is private and can't be
+    // spied on (and in the test's window context its DedicatedWorkerGlobalScope
+    // post is a swallowed no-op), so routing is asserted via each entry point's
+    // returned `Promise`/value. The server-dependent paths — `worker_connect()`,
+    // `send_loop()`, `receive_loop()` — need a live HTTP/3 server and the
+    // shared-memory ring-buffer harness, so they are intentionally not covered.
+
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// Build a plain JS message object (`{ key: value, … }`) for the worker
+    /// entry points, mirroring the postMessage payloads the main thread sends.
+    #[cfg(target_arch = "wasm32")]
+    fn worker_message(fields: &[(&str, JsValue)]) -> JsValue {
+        let obj = Object::new();
+        for (key, value) in fields {
+            Reflect::set(&obj, &(*key).into(), value).expect("Reflect::set on a fresh object");
+        }
+        obj.into()
+    }
+
+    /// `worker_init()` followed by `worker_get_stats()` returns zeroed stats —
+    /// proves init ran and left the counters at their defaults (no packets have
+    /// flowed). Null buffer pointers are safe: `configure()` guards the
+    /// `Int32Array` setup on a null ring-buffer pointer and the loops never run.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn worker_init_then_stats_are_zeroed() {
+        worker_init(0, 0, 128, 2);
+
+        let stats = worker_get_stats();
+        assert_eq!(stats.packets_sent, 0);
+        assert_eq!(stats.packets_received, 0);
+        assert_eq!(stats.bytes_sent, 0);
+        assert_eq!(stats.bytes_received, 0);
+        assert_eq!(stats.send_errors, 0);
+        assert_eq!(stats.receive_errors, 0);
+    }
+
+    /// `handle_worker_message()` with an `"init"` payload routes to `worker_init`
+    /// and resolves its `Promise` with `"ready"`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn handle_worker_message_init_resolves_ready() {
+        let msg = worker_message(&[
+            ("type", JsValue::from_str("init")),
+            ("ringBufferPtr", JsValue::from_f64(0.0)),
+            ("regulatorPtr", JsValue::from_f64(0.0)),
+            ("bufferSize", JsValue::from_f64(128.0)),
+            ("channels", JsValue::from_f64(2.0)),
+        ]);
+
+        let result = JsFuture::from(handle_worker_message(msg))
+            .await
+            .expect("init message routing should resolve");
+        assert_eq!(result.as_string().as_deref(), Some("ready"));
+    }
+
+    /// `handle_worker_message()` with a `"getStats"` payload routes to
+    /// `worker_get_stats` and resolves with the stats object (zeroed here).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn handle_worker_message_get_stats_resolves_stats_object() {
+        worker_init(0, 0, 128, 2);
+
+        let msg = worker_message(&[("type", JsValue::from_str("getStats"))]);
+        let result = JsFuture::from(handle_worker_message(msg))
+            .await
+            .expect("getStats message routing should resolve");
+
+        assert_eq!(
+            Reflect::get(&result, &"type".into())
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("stats")
+        );
+        assert_eq!(
+            Reflect::get(&result, &"packetsSent".into()).unwrap().as_f64(),
+            Some(0.0)
+        );
+        assert_eq!(
+            Reflect::get(&result, &"packetsReceived".into()).unwrap().as_f64(),
+            Some(0.0)
+        );
+    }
+
+    /// `handle_worker_message()` with a `"disconnect"` payload routes to
+    /// `worker_disconnect` and resolves with `"ok"`. With null buffers the
+    /// `has_data` `Int32Array` is `None`, so the `Atomics.notify` is skipped.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn handle_worker_message_disconnect_resolves_ok() {
+        worker_init(0, 0, 128, 2);
+
+        let msg = worker_message(&[("type", JsValue::from_str("disconnect"))]);
+        let result = JsFuture::from(handle_worker_message(msg))
+            .await
+            .expect("disconnect message routing should resolve");
+        assert_eq!(result.as_string().as_deref(), Some("ok"));
+    }
+
+    /// An unrecognized message type rejects the returned `Promise` with a
+    /// descriptive error rather than silently succeeding.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn handle_worker_message_unknown_type_rejects() {
+        let msg = worker_message(&[("type", JsValue::from_str("bogus"))]);
+
+        let err = JsFuture::from(handle_worker_message(msg))
+            .await
+            .expect_err("an unknown message type must reject");
+        assert!(
+            err.as_string().unwrap_or_default().contains("Unknown message type"),
+            "rejection should describe the unknown message type, got: {err:?}"
+        );
+    }
 }
