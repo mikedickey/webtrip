@@ -287,93 +287,366 @@ impl RecordingsApi {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use mockito;
+    use crate::api::test_helpers::{assert_http_status, mock_api, mock_empty, mock_json};
+
+    fn api(client: &ApiClient) -> RecordingsApi {
+        RecordingsApi::from_client(client)
+    }
 
     #[tokio::test]
     async fn test_list_recordings_success() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/recordings")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"[{"id":"rec1","name":"Test Recording"}]"#)
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/recordings",
+            200,
+            r#"[{"id":"rec1","name":"Test Recording"}]"#,
+        )
+        .await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = RecordingsApi::from_client(&client);
-        let result = api.list_recordings().await;
-
-        assert!(result.is_ok());
-        let recordings = result.unwrap();
-        assert_eq!(recordings.len(), 1);
-        assert_eq!(recordings[0].id, Some("rec1".to_string()));
+        let result = api(&client).list_recordings().await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, Some("rec1".to_string()));
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_list_recordings_error() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/recordings")
-            .with_status(500)
-            .with_body("Internal Server Error")
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/recordings", 500, "boom").await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = RecordingsApi::from_client(&client);
-        let result = api.list_recordings().await;
+        let err = api(&client).list_recordings().await.unwrap_err();
+        assert_http_status(err, 500);
+        mock.assert_async().await;
+    }
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ApiError::Http { status, .. } => assert_eq!(status, 500),
-            _ => panic!("Expected HTTP error"),
-        }
+    #[tokio::test]
+    async fn test_list_recordings_paginated_with_params() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/recordings-paginated",
+            200,
+            r#"{"items":[{"id":"rec1"}],"page":2}"#,
+        )
+        .await;
+
+        let result = api(&client)
+            .list_recordings_paginated(Some(2), Some(10), Some(true))
+            .await
+            .unwrap();
+        assert_eq!(result.items.unwrap().len(), 1);
+        assert_eq!(result.meta.page, Some(2));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_recordings_paginated_no_params() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/recordings-paginated",
+            200,
+            r#"{"items":[]}"#,
+        )
+        .await;
+
+        let result = api(&client)
+            .list_recordings_paginated(None, None, None)
+            .await
+            .unwrap();
+        assert!(result.items.unwrap().is_empty());
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_get_recording_success() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/recordings/rec123")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"id":"rec123","name":"My Recording","duration":120}"#)
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/recordings/rec123",
+            200,
+            r#"{"id":"rec123","name":"My Recording","liked":true}"#,
+        )
+        .await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = RecordingsApi::from_client(&client);
-        let result = api.get_recording("rec123").await;
-
-        assert!(result.is_ok());
-        let recording = result.unwrap();
+        let recording = api(&client).get_recording("rec123").await.unwrap();
         assert_eq!(recording.metadata.id, Some("rec123".to_string()));
         assert_eq!(recording.metadata.name, Some("My Recording".to_string()));
+        assert_eq!(recording.liked, Some(true));
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_get_recording_error() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/recordings/nonexistent")
-            .with_status(404)
-            .with_body("Not Found")
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/recordings/nonexistent", 404, "nope").await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = RecordingsApi::from_client(&client);
-        let result = api.get_recording("nonexistent").await;
+        let err = api(&client).get_recording("nonexistent").await.unwrap_err();
+        assert_http_status(err, 404);
+        mock.assert_async().await;
+    }
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ApiError::Http { status, .. } => assert_eq!(status, 404),
-            _ => panic!("Expected HTTP error"),
-        }
+    #[tokio::test]
+    async fn test_get_similar_recordings() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/recordings/rec1/similar",
+            200,
+            r#"[{"id":"rec2"}]"#,
+        )
+        .await;
+
+        let result = api(&client).get_similar_recordings("rec1").await.unwrap();
+        assert_eq!(result[0].id, Some("rec2".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_like_recording() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "POST", "/recordings/rec1/likes", 204).await;
+
+        api(&client).like_recording("rec1").await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_unlike_recording() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "DELETE", "/recordings/rec1/likes", 204).await;
+
+        api(&client).unlike_recording("rec1").await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_stream_recordings() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/streams/s1/recordings",
+            200,
+            r#"[{"id":"rec1"}]"#,
+        )
+        .await;
+
+        let result = api(&client).get_stream_recordings("s1").await.unwrap();
+        assert_eq!(result[0].id, Some("rec1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_studio_recordings() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/st1/recordings",
+            200,
+            r#"[{"id":"rec1","studioId":"st1"}]"#,
+        )
+        .await;
+
+        let result = api(&client).get_studio_recordings("st1").await.unwrap();
+        assert_eq!(result[0].studio_id, Some("st1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_studio_recordings_paginated_with_params() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/st1/recordings-paginated",
+            200,
+            r#"{"items":[{"id":"rec1"}],"page":3}"#,
+        )
+        .await;
+
+        let result = api(&client)
+            .get_studio_recordings_paginated("st1", Some(3), Some(5))
+            .await
+            .unwrap();
+        assert_eq!(result.meta.page, Some(3));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_studio_recordings_paginated_no_params() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/st1/recordings-paginated",
+            200,
+            r#"{"items":[]}"#,
+        )
+        .await;
+
+        let result = api(&client)
+            .get_studio_recordings_paginated("st1", None, None)
+            .await
+            .unwrap();
+        assert!(result.items.unwrap().is_empty());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_studio_recording() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/st1/recordings/rec1",
+            200,
+            r#"{"id":"rec1","hasStems":true}"#,
+        )
+        .await;
+
+        let rec = api(&client).get_studio_recording("st1", "rec1").await.unwrap();
+        assert_eq!(rec.metadata.id, Some("rec1".to_string()));
+        assert_eq!(rec.has_stems, Some(true));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_studio_recording() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "PUT",
+            "/studios/st1/recordings/rec1",
+            200,
+            r#"{"id":"rec1","name":"updated"}"#,
+        )
+        .await;
+
+        let body = models::RecordingMetadata::default();
+        let rec = api(&client)
+            .update_studio_recording("st1", "rec1", &body)
+            .await
+            .unwrap();
+        assert_eq!(rec.metadata.name, Some("updated".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_studio_recording() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "DELETE", "/studios/st1/recordings/rec1", 204).await;
+
+        api(&client).delete_studio_recording("st1", "rec1").await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_recording_stems() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/st1/recordings/rec1/stems",
+            200,
+            r#"[{"id":"stem1","name":"vocals"}]"#,
+        )
+        .await;
+
+        let result = api(&client).get_recording_stems("st1", "rec1").await.unwrap();
+        assert_eq!(result[0].name, Some("vocals".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_user_recordings() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/recordings",
+            200,
+            r#"[{"id":"rec1"}]"#,
+        )
+        .await;
+
+        let result = api(&client).get_user_recordings("u1").await.unwrap();
+        assert_eq!(result[0].metadata.id, Some("rec1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_user_recordings_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/users/u1/recordings", 403, "forbidden").await;
+
+        let err = api(&client).get_user_recordings("u1").await.unwrap_err();
+        assert_http_status(err, 403);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_user_recordings_paginated_with_params() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/recordings-paginated",
+            200,
+            r#"{"items":[{"id":"rec1"}],"page":1}"#,
+        )
+        .await;
+
+        let result = api(&client)
+            .get_user_recordings_paginated("u1", Some(1), Some(20))
+            .await
+            .unwrap();
+        assert_eq!(result.items.unwrap().len(), 1);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_user_recordings_paginated_no_params() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/recordings-paginated",
+            200,
+            r#"{"items":[]}"#,
+        )
+        .await;
+
+        let result = api(&client)
+            .get_user_recordings_paginated("u1", None, None)
+            .await
+            .unwrap();
+        assert!(result.items.unwrap().is_empty());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_recordings_quota() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/recordings/quota",
+            200,
+            r#"{"used":1000,"limit":5000,"count":3}"#,
+        )
+        .await;
+
+        let quota = api(&client).get_recordings_quota("u1").await.unwrap();
+        assert_eq!(quota.used, Some(1000));
+        assert_eq!(quota.count, Some(3));
         mock.assert_async().await;
     }
 }

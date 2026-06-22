@@ -144,69 +144,82 @@ impl DevicesApi {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use mockito;
+    use crate::api::test_helpers::{assert_http_status, mock_api, mock_empty, mock_json};
+
+    fn api(client: &ApiClient) -> DevicesApi {
+        DevicesApi::from_client(client)
+    }
 
     #[tokio::test]
     async fn test_list_devices_success() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/devices")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"[{"id":"device1","name":"Test Device"}]"#)
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/devices",
+            200,
+            r#"[{"id":"device1","name":"Test Device"}]"#,
+        )
+        .await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = DevicesApi::from_client(&client);
-        let result = api.list_devices().await;
-
-        assert!(result.is_ok());
-        let devices = result.unwrap();
-        assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].id, Some("device1".to_string()));
+        let result = api(&client).list_devices().await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, Some("device1".to_string()));
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_list_devices_error() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/devices")
-            .with_status(403)
-            .with_body("Forbidden")
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/devices", 403, "Forbidden").await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = DevicesApi::from_client(&client);
-        let result = api.list_devices().await;
+        let err = api(&client).list_devices().await.unwrap_err();
+        assert_http_status(err, 403);
+        mock.assert_async().await;
+    }
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ApiError::Http { status, .. } => assert_eq!(status, 403),
-            _ => panic!("Expected HTTP error"),
-        }
+    #[tokio::test]
+    async fn test_register_device_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "POST",
+            "/devices",
+            200,
+            r#"{"id":"dev123","name":"New Device"}"#,
+        )
+        .await;
+
+        let body = models::Device::default();
+        let device = api(&client).register_device(&body).await.unwrap();
+        assert_eq!(device.id, Some("dev123".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_register_device_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "POST", "/devices", 400, "bad").await;
+
+        let body = models::Device::default();
+        let err = api(&client).register_device(&body).await.unwrap_err();
+        assert_http_status(err, 400);
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_get_device_success() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/devices/dev123")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"id":"dev123","name":"My Device","online":true}"#)
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/devices/dev123",
+            200,
+            r#"{"id":"dev123","name":"My Device"}"#,
+        )
+        .await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = DevicesApi::from_client(&client);
-        let result = api.get_device("dev123").await;
-
-        assert!(result.is_ok());
-        let device = result.unwrap();
+        let device = api(&client).get_device("dev123").await.unwrap();
         assert_eq!(device.id, Some("dev123".to_string()));
         assert_eq!(device.name, Some("My Device".to_string()));
         mock.assert_async().await;
@@ -214,23 +227,120 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_device_error() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/devices/nonexistent")
-            .with_status(404)
-            .with_body("Not Found")
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/devices/nonexistent", 404, "Not Found").await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = DevicesApi::from_client(&client);
-        let result = api.get_device("nonexistent").await;
+        let err = api(&client).get_device("nonexistent").await.unwrap_err();
+        assert_http_status(err, 404);
+        mock.assert_async().await;
+    }
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ApiError::Http { status, .. } => assert_eq!(status, 404),
-            _ => panic!("Expected HTTP error"),
-        }
+    #[tokio::test]
+    async fn test_update_device_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "PUT",
+            "/devices/dev123",
+            200,
+            r#"{"id":"dev123","name":"Renamed"}"#,
+        )
+        .await;
+
+        let body = models::Device::default();
+        let device = api(&client).update_device("dev123", &body).await.unwrap();
+        assert_eq!(device.name, Some("Renamed".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_device_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "DELETE", "/devices/dev123", 204).await;
+
+        api(&client).delete_device("dev123").await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_device_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "DELETE", "/devices/dev123", 404).await;
+
+        let err = api(&client).delete_device("dev123").await.unwrap_err();
+        assert_http_status(err, 404);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_send_heartbeat_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "POST",
+            "/devices/dev123/heartbeat",
+            200,
+            r#"{"device":{"id":"dev123"}}"#,
+        )
+        .await;
+
+        let body = models::HeartbeatRequest::default();
+        let config = api(&client).send_heartbeat("dev123", &body).await.unwrap();
+        assert_eq!(config.device.unwrap().id, Some("dev123".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_studio_devices_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/st1/devices",
+            200,
+            r#"[{"id":"dev1"}]"#,
+        )
+        .await;
+
+        let result = api(&client).list_studio_devices("st1").await.unwrap();
+        assert_eq!(result[0].id, Some("dev1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_capture_volume_with_params() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "PUT", "/studios/st1/captureVolume", 204).await;
+
+        api(&client)
+            .update_capture_volume("st1", Some(0), Some(100))
+            .await
+            .unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_capture_volume_without_params() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "PUT", "/studios/st1/captureVolume", 204).await;
+
+        api(&client)
+            .update_capture_volume("st1", None, None)
+            .await
+            .unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_capture_volume_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "PUT", "/studios/st1/captureVolume", 403).await;
+
+        let err = api(&client)
+            .update_capture_volume("st1", Some(0), Some(100))
+            .await
+            .unwrap_err();
+        assert_http_status(err, 403);
         mock.assert_async().await;
     }
 }

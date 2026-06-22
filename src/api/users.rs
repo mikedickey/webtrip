@@ -219,25 +219,25 @@ impl UsersApi {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use mockito;
+    use crate::api::test_helpers::{assert_http_status, mock_api, mock_empty, mock_json};
+
+    fn api(client: &ApiClient) -> UsersApi {
+        UsersApi::from_client(client)
+    }
 
     #[tokio::test]
     async fn test_get_current_user_success() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/users/me")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"user_id":"user123","name":"Test User","nickname":"tester"}"#)
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/me",
+            200,
+            r#"{"user_id":"user123","name":"Test User","nickname":"tester"}"#,
+        )
+        .await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = UsersApi::from_client(&client);
-        let result = api.get_current_user().await;
-
-        assert!(result.is_ok());
-        let user = result.unwrap();
+        let user = api(&client).get_current_user().await.unwrap();
         assert_eq!(user.user_id, Some("user123".to_string()));
         assert_eq!(user.name, Some("Test User".to_string()));
         mock.assert_async().await;
@@ -245,44 +245,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_current_user_error() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/users/me")
-            .with_status(401)
-            .with_body("Unauthorized")
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/users/me", 401, "Unauthorized").await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = UsersApi::from_client(&client);
-        let result = api.get_current_user().await;
-
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ApiError::Http { status, .. } => assert_eq!(status, 401),
-            _ => panic!("Expected HTTP error"),
-        }
+        let err = api(&client).get_current_user().await.unwrap_err();
+        assert_http_status(err, 401);
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_search_users_success() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/users")
-            .match_query(mockito::Matcher::UrlEncoded("q".into(), "john".into()))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"[{"user_id":"user1","name":"John Doe"}]"#)
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users",
+            200,
+            r#"[{"user_id":"user1","name":"John Doe"}]"#,
+        )
+        .await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = UsersApi::from_client(&client);
-        let result = api.search_users("john").await;
-
-        assert!(result.is_ok());
-        let users = result.unwrap();
+        let users = api(&client).search_users("john").await.unwrap();
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].user_id, Some("user1".to_string()));
         mock.assert_async().await;
@@ -290,24 +273,262 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_users_error() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/users")
-            .match_query(mockito::Matcher::Any)
-            .with_status(400)
-            .with_body("Bad Request")
-            .create_async()
-            .await;
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/users", 400, "Bad Request").await;
 
-        let client = ApiClient::with_base_url(server.url());
-        let api = UsersApi::from_client(&client);
-        let result = api.search_users("test").await;
+        let err = api(&client).search_users("test").await.unwrap_err();
+        assert_http_status(err, 400);
+        mock.assert_async().await;
+    }
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ApiError::Http { status, .. } => assert_eq!(status, 400),
-            _ => panic!("Expected HTTP error"),
-        }
+    #[tokio::test]
+    async fn test_get_user_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1",
+            200,
+            r#"{"user_id":"u1","name":"Alice"}"#,
+        )
+        .await;
+
+        let user = api(&client).get_user("u1").await.unwrap();
+        assert_eq!(user.user_id, Some("u1".to_string()));
+        assert_eq!(user.name, Some("Alice".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_user_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/users/missing", 404, "nope").await;
+
+        let err = api(&client).get_user("missing").await.unwrap_err();
+        assert_http_status(err, 404);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_user_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "PUT",
+            "/users/u1",
+            200,
+            r#"{"name":"Updated","bio":"hello"}"#,
+        )
+        .await;
+
+        let metadata = models::UserMetadata {
+            name: Some("Updated".to_string()),
+            ..Default::default()
+        };
+        let result = api(&client).update_user("u1", &metadata).await.unwrap();
+        assert_eq!(result.name, Some("Updated".to_string()));
+        assert_eq!(result.bio, Some("hello".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_user_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "DELETE", "/users/u1", 204).await;
+
+        api(&client).delete_user("u1").await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_user_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "DELETE", "/users/u1", 403).await;
+
+        let err = api(&client).delete_user("u1").await.unwrap_err();
+        assert_http_status(err, 403);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_user_regions_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/regions",
+            200,
+            r#"{"gcloud-us-ut-slc":{"label":"USA - Salt Lake City, UT"}}"#,
+        )
+        .await;
+
+        let regions = api(&client).get_user_regions("u1").await.unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].id, Some("gcloud-us-ut-slc".to_string()));
+        assert_eq!(regions[0].label, Some("USA - Salt Lake City, UT".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_notifications_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/notifications",
+            200,
+            r#"[{"id":"n1","title":"Hi"}]"#,
+        )
+        .await;
+
+        let result = api(&client).get_notifications("u1").await.unwrap();
+        assert_eq!(result[0].id, Some("n1".to_string()));
+        assert_eq!(result[0].title, Some("Hi".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_conversations_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/conversations",
+            200,
+            r#"[{"id":"conv1","userId":"u2"}]"#,
+        )
+        .await;
+
+        let result = api(&client).get_conversations("u1").await.unwrap();
+        assert_eq!(result[0].id, Some("conv1".to_string()));
+        assert_eq!(result[0].user_id, Some("u2".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_unread_messages_count_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/unread-messages",
+            200,
+            r#"{"count":7}"#,
+        )
+        .await;
+
+        let result = api(&client).get_unread_messages_count("u1").await.unwrap();
+        assert_eq!(result.count, Some(7));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_referrals_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/referrals",
+            200,
+            r#"[{"id":"r1","code":"ABC"}]"#,
+        )
+        .await;
+
+        let result = api(&client).get_referrals("u1").await.unwrap();
+        assert_eq!(result[0].id, Some("r1".to_string()));
+        assert_eq!(result[0].code, Some("ABC".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_create_referral_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "POST",
+            "/users/u1/referrals",
+            200,
+            r#"{"id":"r2","code":"NEW"}"#,
+        )
+        .await;
+
+        let referral = api(&client).create_referral("u1").await.unwrap();
+        assert_eq!(referral.id, Some("r2".to_string()));
+        assert_eq!(referral.code, Some("NEW".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_user_channels_with_params() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/channels-paginated",
+            200,
+            r#"{"items":[{"id":"c1"}],"page":2}"#,
+        )
+        .await;
+
+        let result = api(&client)
+            .get_user_channels("u1", Some(2), Some(10))
+            .await
+            .unwrap();
+        assert_eq!(result.items.unwrap().len(), 1);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_user_channels_no_params() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/channels-paginated",
+            200,
+            r#"{"items":[]}"#,
+        )
+        .await;
+
+        let result = api(&client).get_user_channels("u1", None, None).await.unwrap();
+        assert_eq!(result.items.unwrap().len(), 0);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_user_follows_with_params() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/follows-paginated",
+            200,
+            r#"{"items":[{"id":"c1"}],"page":1}"#,
+        )
+        .await;
+
+        let result = api(&client)
+            .get_user_follows("u1", Some(1), None)
+            .await
+            .unwrap();
+        assert_eq!(result.items.unwrap().len(), 1);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_user_follows_no_params() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/follows-paginated",
+            200,
+            r#"{"items":[]}"#,
+        )
+        .await;
+
+        let result = api(&client).get_user_follows("u1", None, None).await.unwrap();
+        assert_eq!(result.items.unwrap().len(), 0);
         mock.assert_async().await;
     }
 }
