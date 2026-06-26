@@ -193,6 +193,56 @@ Requirements (all satisfied by the toolchain container): Rust ≥ 1.87,
 `wasm-bindgen-test` ≥ 0.3.57, `llvm-tools-preview`, and a `cargo-llvm-cov` that
 drives the wasm32 target.
 
+## Local setup (macOS)
+
+CI runs everything inside the toolchain container, which already has the tools
+below. On a local macOS checkout, `npm run test:wasm` and `npm run coverage:wasm`
+need three things the system doesn't provide by default. Both scripts route
+through [`scripts/wasm-browser-env.sh`](../scripts/wasm-browser-env.sh), which
+auto-configures what it can and otherwise **fails fast with the exact fix** — so
+in practice you only act when it tells you to. The wrapper is a no-op in CI (the
+container already satisfies every check). What it handles:
+
+1. **A wasm-capable `clang` (coverage only).** `minicov` (the WASM coverage
+   runtime) compiles C to `wasm32` via the `cc` crate, and Apple's
+   `/usr/bin/clang` has no `wasm32` target. Install Homebrew LLVM once:
+
+   ```sh
+   brew install llvm
+   ```
+
+   The wrapper auto-prepends `$(brew --prefix llvm)/bin` to `PATH` when present;
+   you do **not** need to edit your shell profile.
+
+2. **A `wasm-bindgen-cli` matching the pin (coverage only).** `coverage:wasm`
+   uses the `wasm-bindgen-test-runner` from `PATH`; it must equal the
+   `wasm-bindgen` version pinned in `Cargo.lock`. The wrapper validates this by
+   reading that pin from `Cargo.lock` directly. If the wrapper reports a
+   mismatch, run the command it prints, e.g.:
+
+   ```sh
+   cargo install wasm-bindgen-cli --version 0.2.118 --locked
+   ```
+
+3. **A `chromedriver` matching your installed Chrome (both scripts).** `wasm-pack`
+   otherwise auto-downloads a driver whose major version may not match Chrome;
+   the mismatched driver is then `SIGKILL`ed at session start (symptom:
+   `driver status: signal: 9 (SIGKILL)` / `http status: 404`). Install a matching
+   driver and the wrapper will pick it up from `~/.local/bin/chromedriver`
+   (or set `CHROMEDRIVER` yourself):
+
+   ```sh
+   # read the installed Chrome's major version (e.g. 126)
+   major=$("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version | grep -oE '[0-9]+' | head -1)
+   # install a matching driver; it prints the path it wrote
+   npx @puppeteer/browsers install "chromedriver@$major"
+   # copy that driver to where the wrapper looks (create the dir first)
+   mkdir -p ~/.local/bin
+   cp chromedriver/*/chromedriver-mac-*/chromedriver ~/.local/bin/chromedriver
+   ```
+
+   When Chrome later auto-updates to a new major version, refresh that driver.
+
 ## Limitations
 
 ### SharedArrayBuffer / shared-memory Requirements
