@@ -837,6 +837,94 @@ mod tests {
         );
     }
 
+    // ── State surface + teardown (web_sys) ───────────────────────────────────
+    //
+    // `WebTransportImpl::new()` only succeeds where the `WebTransport` global
+    // exists, so these run in headless Chrome. They mirror the transport
+    // state-surface assertions (initial state, `state()`, `is_connected()`
+    // with no worker, `set_audio_buffers` storage) and the server-free `close()`
+    // teardown — none of which need a live HTTP/3 server. The live
+    // `connect()`/`connect_to_server()`/worker loops remain out of scope.
+
+    /// A freshly constructed transport starts `Disconnected`, reports
+    /// `is_connected() == false`, and holds no server URL, audio buffers, or
+    /// worker until a connection is attempted.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn new_starts_disconnected_with_no_worker() {
+        let transport = WebTransportImpl::new()
+            .expect("WebTransportImpl construction should succeed in the browser");
+
+        assert_eq!(transport.state(), TransportState::Disconnected);
+        assert!(!transport.is_connected(), "a fresh transport must not be connected");
+        assert!(transport.server_url.is_none(), "no server URL before connect");
+        assert!(transport.audio_buffers.is_none(), "no audio buffers before set_audio_buffers");
+        assert!(transport.worker.borrow().is_none(), "no worker until connect");
+    }
+
+    /// `set_audio_buffers()` stores the supplied configuration (the worker, not
+    /// the main-thread shim, sizes the actual packet buffers from it). Null
+    /// buffer pointers are safe: they are only stored, never dereferenced (no
+    /// worker is created).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn set_audio_buffers_stores_config() {
+        let mut transport = WebTransportImpl::new()
+            .expect("WebTransportImpl construction should succeed in the browser");
+
+        transport.set_audio_buffers(AudioBufferConfig {
+            local_to_network_ptr: std::ptr::null_mut::<RingBuffer>(),
+            network_to_local_ptr: std::ptr::null_mut::<Regulator>(),
+            buffer_size: 256,
+            channels: 1,
+        });
+
+        let cfg = transport.audio_buffers.expect("config must be stored");
+        assert_eq!(cfg.buffer_size, 256);
+        assert_eq!(cfg.channels, 1);
+    }
+
+    /// `close()` on a never-connected instance (no worker ever created) takes
+    /// the early-return path: it marks the transport `Closed` and returns an
+    /// already-resolved future, with nothing to terminate.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn close_without_worker_resolves_immediately_and_marks_closed() {
+        let mut transport = WebTransportImpl::new()
+            .expect("WebTransportImpl construction should succeed in the browser");
+
+        Transport::close(&mut transport).await;
+
+        assert_eq!(transport.state(), TransportState::Closed);
+        assert!(!transport.is_connected());
+        assert!(transport.worker.borrow().is_none());
+    }
+
+    /// `close()` with a worker present but never connected exercises the full
+    /// teardown path: it posts `{type:"disconnect"}` and arms the 2s fallback
+    /// timer. With no live worker ever posting `"disconnected"`, the returned
+    /// future resolves only once that timer fires and force-terminates the
+    /// worker — proving teardown completes cleanly without a live server.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn close_with_worker_tears_down_via_fallback_timer() {
+        let mut transport = WebTransportImpl::new()
+            .expect("WebTransportImpl construction should succeed in the browser");
+
+        transport
+            .create_worker()
+            .expect("create_worker should build the Worker via the Blob-URL flow");
+        assert!(transport.worker.borrow().is_some(), "worker must exist before close");
+
+        Transport::close(&mut transport).await;
+
+        assert_eq!(transport.state(), TransportState::Closed);
+        assert!(
+            transport.worker.borrow().is_none(),
+            "the fallback timer must terminate and clear the worker"
+        );
+    }
+
     // --- encode_uri_component ---
 
     #[test]
