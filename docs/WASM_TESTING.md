@@ -280,8 +280,10 @@ The test requires threading support. Either:
 - `src/audio/webtransport.rs`: `is_webtransport_available` reports `true` in the
   headless Chrome harness (inverse of the native check); `create_worker` builds
   a `web_sys::Worker` via the `dependent_module!` Blob-URL flow and registers the
-  `onmessage`/`onerror` closures; `init_worker` serializes and posts the init
-  message without panicking (live `connect()` needs an HTTP/3 server — skipped)
+  `onmessage`/`onerror` closures; `build_init_message` (the assembly behind
+  `init_worker`) layers the browser-only `wasmMemory` (a `WebAssembly.Memory`)
+  and `wasmUrl` (the bindgen glue URL) onto the plain-JSON buffer config (live
+  `connect()` needs an HTTP/3 server — skipped)
 - `src/audio/webtransport_worker.rs`: worker-side `#[wasm_bindgen]` entry points
   called directly — `worker_init`+`worker_get_stats` (zeroed stats prove init
   ran) and `handle_worker_message` routing for `init`/`getStats`/`disconnect`

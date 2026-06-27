@@ -929,14 +929,23 @@ mod tests {
                 .as_deref(),
             Some("stats")
         );
-        assert_eq!(
-            Reflect::get(&result, &"packetsSent".into()).unwrap().as_f64(),
-            Some(0.0)
-        );
-        assert_eq!(
-            Reflect::get(&result, &"packetsReceived".into()).unwrap().as_f64(),
-            Some(0.0)
-        );
+        // Assert every numeric field of the JS stats mapping (not just a subset)
+        // so a regression in any single `Reflect::set` in the getStats route is
+        // caught. All are zero because no packets have flowed.
+        for field in [
+            "packetsSent",
+            "packetsReceived",
+            "bytesSent",
+            "bytesReceived",
+            "sendErrors",
+            "receiveErrors",
+        ] {
+            assert_eq!(
+                Reflect::get(&result, &field.into()).unwrap().as_f64(),
+                Some(0.0),
+                "stats field {field} should be present and zeroed"
+            );
+        }
     }
 
     /// `handle_worker_message()` with a `"disconnect"` payload routes to
