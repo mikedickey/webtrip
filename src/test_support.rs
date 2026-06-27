@@ -67,6 +67,27 @@ pub(crate) async fn wait_until<F: FnMut() -> bool>(
     }
 }
 
+/// Build an `on_state_change` callback that appends each emitted state string
+/// to a shared log.
+///
+/// Returns the shared log plus the live `Closure`, which the caller must keep
+/// alive for as long as the producer may fire the callback (dropping it
+/// invalidates the `js_sys::Function` derived from it). Shared so any browser
+/// test that needs to observe a sequence of state-change strings (session
+/// connect/disconnect lifecycle, transport state surface, …) reuses one
+/// implementation rather than re-rolling the closure-plus-log dance.
+pub(crate) fn recording_state_callback() -> (
+    std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    wasm_bindgen::closure::Closure<dyn FnMut(String)>,
+) {
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let log_for_cb = log.clone();
+    let closure = wasm_bindgen::closure::Closure::wrap(Box::new(move |state: String| {
+        log_for_cb.borrow_mut().push(state);
+    }) as Box<dyn FnMut(String)>);
+    (log, closure)
+}
+
 /// Assert that an SDP blob is well-formed.
 ///
 /// A minimally valid session description is non-empty and contains the

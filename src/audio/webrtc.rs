@@ -1138,7 +1138,6 @@ impl Drop for WebRtcTransport {
 mod tests {
     use super::*;
     use crate::audio::protocol::{AudioPacket, HEADER_SIZE};
-    use std::collections::VecDeque;
 
     // ── TransportConfig ──────────────────────────────────────────────────────
 
@@ -1232,29 +1231,40 @@ mod tests {
         assert_eq!(result, Err(ProtocolError::BufferTooSmall));
     }
 
-    // ── Receive-queue FIFO behavior ───────────────────────────────────────────
+    // ── Receive-queue wrappers (receive_bytes / has_pending_data / pending_count) ─
 
     #[test]
-    fn receive_queue_fifo_ordering() {
-        // The WebRtcTransport receive queue is a plain VecDeque<Vec<u8>>.
-        // Verify that the FIFO contract the transport relies on holds.
-        let mut q: VecDeque<Vec<u8>> = VecDeque::new();
-        q.push_back(vec![1, 2, 3]);
-        q.push_back(vec![4, 5, 6]);
-        q.push_back(vec![7, 8, 9]);
+    fn receive_queue_wrappers_fifo_and_counts() {
+        // Drive the transport's own receive-queue accessors rather than a bare
+        // `VecDeque`, so the `receive_bytes` / `has_pending_data` /
+        // `pending_count` wrappers are actually covered.
+        let transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
 
-        assert_eq!(q.pop_front(), Some(vec![1, 2, 3]));
-        assert_eq!(q.pop_front(), Some(vec![4, 5, 6]));
-        assert_eq!(q.pop_front(), Some(vec![7, 8, 9]));
-        assert_eq!(q.pop_front(), None, "queue must be empty after draining");
-    }
+        // Empty to start.
+        assert!(!transport.has_pending_data());
+        assert_eq!(transport.pending_count(), 0);
+        assert_eq!(transport.receive_bytes(), None);
 
-    #[test]
-    fn receive_queue_preserves_byte_content() {
-        let payload: Vec<u8> = (0u8..=255).collect();
-        let mut q: VecDeque<Vec<u8>> = VecDeque::new();
-        q.push_back(payload.clone());
-        assert_eq!(q.pop_front().unwrap(), payload);
+        // The data-channel message handlers push raw bytes onto this queue; the
+        // tests stand in for that by enqueuing directly (no live peer needed).
+        let first: Vec<u8> = vec![1, 2, 3];
+        let second: Vec<u8> = (0u8..=255).collect();
+        transport.receive_queue.borrow_mut().push_back(first.clone());
+        transport.receive_queue.borrow_mut().push_back(second.clone());
+
+        assert!(transport.has_pending_data());
+        assert_eq!(transport.pending_count(), 2);
+
+        // FIFO order and exact byte content round-trip through the accessors.
+        assert_eq!(transport.receive_bytes(), Some(first));
+        assert_eq!(transport.pending_count(), 1);
+        assert_eq!(transport.receive_bytes(), Some(second));
+
+        // Drained again.
+        assert!(!transport.has_pending_data());
+        assert_eq!(transport.pending_count(), 0);
+        assert_eq!(transport.receive_bytes(), None);
     }
 
     // ── ICE candidate JSON parsing ────────────────────────────────────────────
@@ -1368,13 +1378,49 @@ mod tests {
     // headless Chrome via `npm run test:wasm`. The per-binary browser opt-in
     // (`wasm_bindgen_test_configure!(run_in_browser)`) lives once in
     // `crate::test_support`; here we only import the attribute and the shared
-    // `assert_valid_sdp` helper. No signaling server is required — offer/SDP and
-    // data-channel creation are entirely local.
+    // `assert_valid_sdp` / `recording_state_callback` helpers. No signaling
+    // server is required — construction, the `Transport` state surface, and the
+    // tick loop's `Drain` path are all reachable without a live peer.
+    //
+    // Out of scope (a live JackTrip hub/peer is required — skipped here):
+    // `connect_to_hub`, `create_data_channel`'s open/close handlers firing,
+    // `handle_answer`, `add_ice_candidate`, `send_bytes`, and the `do_tick`
+    // `Process` arm together with the `Idle` arm — all of which need an *Open*
+    // `RtcDataChannel` (so `is_connected()` returns `true`), which only happens
+    // after a full DTLS/SCTP handshake with a remote peer. With no channel,
+    // `is_connected()` is `false`, so every `do_tick` below takes the `Drain`
+    // arm. (The pure `Process`/`Idle` decisions are covered by the native
+    // `tick_decision_*` tests above; the live arms are mirrored as out-of-scope
+    // the same way WEB-38 documented the session's server-bound connect arms.)
 
     #[cfg(target_arch = "wasm32")]
-    use crate::test_support::assert_valid_sdp;
+    use crate::audio::regulator::Regulator;
+    #[cfg(target_arch = "wasm32")]
+    use crate::audio::ring_buffer::RingBuffer;
+    #[cfg(target_arch = "wasm32")]
+    use crate::test_support::{assert_valid_sdp, recording_state_callback};
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// Build an [`AudioBufferConfig`] pointing at the caller-owned `ring` and
+    /// `reg`. The returned config holds raw pointers with no borrow lifetime, so
+    /// the caller must keep both buffers alive for as long as the transport may
+    /// dereference them (i.e. across any `tick`). Shared by the `do_tick` tests
+    /// so the pointer-wiring is written once.
+    #[cfg(target_arch = "wasm32")]
+    fn buffer_config(
+        ring: &mut RingBuffer,
+        reg: &mut Regulator,
+        buffer_size: usize,
+        channels: u8,
+    ) -> AudioBufferConfig {
+        AudioBufferConfig {
+            local_to_network_ptr: ring as *mut RingBuffer,
+            network_to_local_ptr: reg as *mut Regulator,
+            buffer_size,
+            channels,
+        }
+    }
 
     /// Create an `RtcPeerConnection` from a `TransportConfig`'s ICE servers and
     /// assert it starts in the expected pristine signaling/ICE state.
@@ -1466,5 +1512,183 @@ mod tests {
         assert_eq!(candidate.candidate(), parsed.candidate);
         assert_eq!(candidate.sdp_mid(), parsed.sdp_mid);
         assert_eq!(candidate.sdp_m_line_index(), parsed.sdp_m_line_index);
+    }
+
+    // ── Transport state surface (Category A) ─────────────────────────────────
+
+    /// A freshly constructed transport reports the expected pristine state via
+    /// the `Transport` trait: `Disconnected`, `WebRTC`, and — with no data
+    /// channel — `is_connected() == false` (the `else` arm of the readiness
+    /// check).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn webrtc_transport_state_surface_initial() {
+        let transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+
+        assert_eq!(Transport::state(&transport), TransportState::Disconnected);
+        assert_eq!(Transport::transport_type(&transport), TransportType::WebRTC);
+        // No data channel was created, so the channel-readiness check is false.
+        assert!(!Transport::is_connected(&transport));
+    }
+
+    /// `set_connected()` transitions to `Connected` and fires the registered
+    /// state-change callback exactly once; a second call is idempotent (state
+    /// already `Connected`, so no further notification).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn webrtc_set_connected_notifies_once_then_idempotent() {
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+
+        let (log, cb) = recording_state_callback();
+        Transport::set_on_state_change(
+            &mut transport,
+            cb.as_ref().unchecked_ref::<js_sys::Function>().clone(),
+        );
+
+        transport.set_connected();
+        assert_eq!(Transport::state(&transport), TransportState::Connected);
+        assert_eq!(log.borrow().as_slice(), ["connected"]);
+
+        // Already Connected → no state change and therefore no second callback.
+        transport.set_connected();
+        assert_eq!(Transport::state(&transport), TransportState::Connected);
+        assert_eq!(
+            log.borrow().as_slice(),
+            ["connected"],
+            "set_connected must be idempotent (no duplicate notification)"
+        );
+    }
+
+    /// `set_failed()` transitions to `Failed` and fires the callback exactly
+    /// once; a second call is idempotent.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn webrtc_set_failed_notifies_once_then_idempotent() {
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+
+        let (log, cb) = recording_state_callback();
+        Transport::set_on_state_change(
+            &mut transport,
+            cb.as_ref().unchecked_ref::<js_sys::Function>().clone(),
+        );
+
+        transport.set_failed();
+        assert_eq!(Transport::state(&transport), TransportState::Failed);
+        assert_eq!(log.borrow().as_slice(), ["failed"]);
+
+        // Already Failed → no state change and therefore no second callback.
+        transport.set_failed();
+        assert_eq!(Transport::state(&transport), TransportState::Failed);
+        assert_eq!(
+            log.borrow().as_slice(),
+            ["failed"],
+            "set_failed must be idempotent (no duplicate notification)"
+        );
+    }
+
+    /// `set_audio_buffers()` must resize the internal scratch buffers to match
+    /// the configured `buffer_size`/`channels`: `audio_to_send_buffer` to one
+    /// packet's worth of samples and `packet_serialize_buffer` to the 16-byte
+    /// header plus 4 bytes per sample.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn webrtc_set_audio_buffers_resizes_internal_buffers() {
+        // Pick non-default dimensions so the resize is observable (construction
+        // pre-sizes for 128 samples × 2 channels).
+        let buffer_size = 256usize;
+        let channels = 2u8;
+        let samples_per_packet = buffer_size * channels as usize;
+
+        let mut ring = RingBuffer::new();
+        let mut reg = Regulator::new();
+        let config = buffer_config(&mut ring, &mut reg, buffer_size, channels);
+
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+        Transport::set_audio_buffers(&mut transport, config);
+
+        assert_eq!(
+            transport.audio_to_send_buffer.len(),
+            samples_per_packet,
+            "audio_to_send_buffer must hold one packet of interleaved samples"
+        );
+        assert_eq!(
+            transport.packet_serialize_buffer.len(),
+            HEADER_SIZE + samples_per_packet * 4,
+            "packet_serialize_buffer must hold the 16-byte header plus 4 bytes/sample"
+        );
+    }
+
+    // ── do_tick non-Process branches (Drain / no-op) ─────────────────────────
+
+    /// With data queued and no data channel (`is_connected() == false`), a tick
+    /// takes the `Drain` arm: it empties the ring buffer (so the `Atomics`
+    /// has-data flag clears and the main thread can sleep) without sending and
+    /// without panicking.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn webrtc_do_tick_drains_ring_buffer_when_disconnected() {
+        let buffer_size = 128usize;
+        let channels = 2u8;
+        let samples_per_packet = buffer_size * channels as usize;
+
+        let mut ring = RingBuffer::new();
+        ring.set_streaming(true);
+        // Queue three packets' worth of audio (an exact multiple of the packet
+        // size, so the drain loop consumes all of it).
+        let chunk = vec![0.25f32; samples_per_packet];
+        for _ in 0..3 {
+            assert!(ring.write(&chunk), "ring buffer write should succeed");
+        }
+        assert_eq!(ring.available(), (samples_per_packet * 3) as u32);
+        assert_eq!(ring.has_data_flag(), 1, "flag set while data is queued");
+
+        let mut reg = Regulator::new();
+        let config = buffer_config(&mut ring, &mut reg, buffer_size, channels);
+
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+        Transport::set_audio_buffers(&mut transport, config);
+
+        // No data channel → not connected → the Drain arm runs.
+        assert!(!Transport::is_connected(&transport));
+        transport.tick();
+
+        assert_eq!(ring.available(), 0, "Drain must empty the ring buffer");
+        assert_eq!(
+            ring.has_data_flag(),
+            0,
+            "Drain must clear the has-data flag so waitAsync can sleep"
+        );
+    }
+
+    /// With no queued data and no data channel, a tick is a harmless no-op: the
+    /// `Drain` arm's read loop exits immediately (the literal `Idle` arm needs
+    /// an Open channel — see the out-of-scope note above), leaving the buffer
+    /// untouched and not panicking.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn webrtc_do_tick_noop_when_disconnected_and_empty() {
+        let buffer_size = 128usize;
+        let channels = 2u8;
+
+        let mut ring = RingBuffer::new();
+        let mut reg = Regulator::new();
+        let config = buffer_config(&mut ring, &mut reg, buffer_size, channels);
+
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+        Transport::set_audio_buffers(&mut transport, config);
+
+        assert!(!Transport::is_connected(&transport));
+        assert_eq!(ring.available(), 0);
+
+        transport.tick();
+
+        assert_eq!(ring.available(), 0, "an empty tick must not change the buffer");
+        assert_eq!(ring.has_data_flag(), 0);
     }
 }

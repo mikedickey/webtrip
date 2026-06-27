@@ -209,6 +209,20 @@ impl Default for RingBuffer {
 }
 
 #[cfg(test)]
+impl RingBuffer {
+    /// Read the `has_data` flag through the same raw pointer JavaScript uses
+    /// for `Atomics.waitAsync`.
+    ///
+    /// Shared by the ring-buffer tests and any transport test (e.g. the WebRTC
+    /// `Drain` path) that must assert the anti-busy-loop flag clears once the
+    /// buffer is drained, so the flag-read incantation lives in one place.
+    pub(crate) fn has_data_flag(&self) -> u32 {
+        let ptr = self.get_has_data_flag_ptr() as *const AtomicU32;
+        unsafe { (*ptr).load(Ordering::Acquire) }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::thread;
@@ -217,12 +231,6 @@ mod tests {
     // once per binary in `crate::test_support`; here we only need the attribute.
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;
-
-    /// Read the `has_data` flag through the same raw pointer JavaScript uses.
-    fn has_data_flag(rb: &RingBuffer) -> u32 {
-        let ptr = rb.get_has_data_flag_ptr() as *const AtomicU32;
-        unsafe { (*ptr).load(Ordering::Acquire) }
-    }
 
     /// Convenience: a streaming-enabled buffer ready for writes.
     fn streaming_buffer() -> RingBuffer {
@@ -317,20 +325,20 @@ mod tests {
     #[test]
     fn has_data_flag_reflects_state() {
         let mut rb = streaming_buffer();
-        assert_eq!(has_data_flag(&rb), 0);
+        assert_eq!(rb.has_data_flag(), 0);
 
         assert!(rb.write(&[1.0, 2.0, 3.0, 4.0]));
-        assert_eq!(has_data_flag(&rb), 1, "flag set after write");
+        assert_eq!(rb.has_data_flag(), 1, "flag set after write");
 
         // Partial read leaves data behind; flag stays set.
         let mut out = [0.0; 2];
         assert!(rb.read(&mut out));
-        assert_eq!(has_data_flag(&rb), 1, "flag set while data remains");
+        assert_eq!(rb.has_data_flag(), 1, "flag set while data remains");
 
         // Draining the rest clears the flag.
         assert!(rb.read(&mut out));
         assert_eq!(rb.available(), 0);
-        assert_eq!(has_data_flag(&rb), 0, "flag cleared when empty");
+        assert_eq!(rb.has_data_flag(), 0, "flag cleared when empty");
     }
 
     #[test]
@@ -355,7 +363,7 @@ mod tests {
         assert_eq!(out, [0.0; 4]);
         // Underlying data is untouched and still readable.
         assert_eq!(rb.available(), 2);
-        assert_eq!(has_data_flag(&rb), 0, "flag cleared when not enough data");
+        assert_eq!(rb.has_data_flag(), 0, "flag cleared when not enough data");
     }
 
     #[test]
