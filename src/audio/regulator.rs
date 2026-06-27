@@ -1923,4 +1923,152 @@ mod tests {
         assert_eq!(stats.underruns, 0);
         assert_eq!(stats.last_max, 0.0);
     }
+
+    /// `calc_auto()` returns the `AUTO_MAX_MS` ceiling whenever either long-term
+    /// component is still zero, and otherwise `std_dev + max.min(AUTO_MAX_MS)`.
+    /// The early-return guard and the clamped non-zero branch are exercised
+    /// directly, since the auto-tolerance integration tests only ever feed it
+    /// non-zero stats.
+    #[test]
+    fn test_timing_stats_calc_auto_zero_and_nonzero_branches() {
+        let mut stats = TimingStats::new(48_000, 32);
+
+        // Fresh stats: both long-term values are zero -> early-return ceiling.
+        assert_eq!(stats.long_term_std_dev, 0.0);
+        assert_eq!(stats.long_term_max, 0.0);
+        assert_eq!(stats.calc_auto(), AUTO_MAX_MS);
+
+        // Either component being zero alone still trips the guard.
+        stats.long_term_std_dev = 0.0;
+        stats.long_term_max = 40.0;
+        assert_eq!(stats.calc_auto(), AUTO_MAX_MS);
+
+        stats.long_term_std_dev = 10.0;
+        stats.long_term_max = 0.0;
+        assert_eq!(stats.calc_auto(), AUTO_MAX_MS);
+
+        // Non-zero case returns std_dev + max (max below the cap is unchanged).
+        stats.long_term_std_dev = 12.0;
+        stats.long_term_max = 40.0;
+        assert_eq!(stats.calc_auto(), 12.0 + 40.0);
+
+        // A max above the cap is clamped to AUTO_MAX_MS before adding std_dev.
+        stats.long_term_std_dev = 5.0;
+        stats.long_term_max = AUTO_MAX_MS + 100.0;
+        assert_eq!(stats.calc_auto(), 5.0 + AUTO_MAX_MS);
+    }
+
+    /// `ewma()` is a fixed point when current equals the running average, and
+    /// repeated steps toward a higher target converge upward to it without
+    /// overshooting.
+    #[test]
+    fn test_timing_stats_ewma_fixed_point_and_convergence() {
+        // Fixed point: ewma(x, x) == x for any x.
+        for &x in &[0.0, 1.5, 42.0, AUTO_MAX_MS] {
+            assert_eq!(TimingStats::ewma(x, x), x);
+        }
+
+        // A single step matches the closed-form and moves toward (not past) the
+        // target.
+        let (avg, current) = (10.0, 20.0);
+        let stepped = TimingStats::ewma(avg, current);
+        assert!((stepped - (avg + AUTO_SMOOTHING_FACTOR * (current - avg))).abs() < 1e-12);
+        assert!(stepped > avg && stepped < current);
+
+        // Repeated calls with a constant higher target converge upward to it.
+        let target = 100.0;
+        let mut converging = 0.0;
+        for _ in 0..200_000 {
+            converging = TimingStats::ewma(converging, target);
+        }
+        assert!(
+            converging > target - 1e-6 && converging <= target,
+            "ewma should converge toward the target, got {converging}"
+        );
+    }
+
+    /// After the simple-average startup region ends
+    /// (`long_term_count > WINDOW_DIVISOR * AUTO_HISTORY_WINDOW`), a completed
+    /// window must fold its statistics into the long-term values via `ewma`
+    /// rather than the running mean.
+    #[test]
+    fn test_timing_stats_long_term_uses_ewma_after_startup() {
+        let mut stats = TimingStats::new(48_000, 32);
+        let window = stats.window;
+
+        // Jump past the startup region so the next completed window takes the
+        // EWMA branch instead of the simple-average branch.
+        let threshold = WINDOW_DIVISOR * AUTO_HISTORY_WINDOW as usize;
+        stats.long_term_count = threshold + 1;
+        let prev_std_dev = 7.0;
+        let prev_max = 30.0;
+        stats.long_term_std_dev = prev_std_dev;
+        stats.long_term_max = prev_max;
+
+        // Feed a full window of a constant elapsed value: the window's std_dev
+        // is exactly 0 and its max equals that constant.
+        let elapsed = 9.0;
+        let mut completed = false;
+        for i in 0..window {
+            completed = stats.tick(elapsed, 100.0 + i as f64);
+        }
+        assert!(completed, "feeding `window` samples must complete a window");
+
+        let expected_std_dev = TimingStats::ewma(prev_std_dev, 0.0);
+        let expected_max = TimingStats::ewma(prev_max, elapsed);
+        assert!(
+            (stats.long_term_std_dev - expected_std_dev).abs() < 1e-9,
+            "long_term_std_dev should follow EWMA ({}, expected {expected_std_dev})",
+            stats.long_term_std_dev
+        );
+        assert!(
+            (stats.long_term_max - expected_max).abs() < 1e-9,
+            "long_term_max should follow EWMA ({}, expected {expected_max})",
+            stats.long_term_max
+        );
+    }
+
+    /// `depth()` uses `wrapping_sub`, so a read pointer near the top of the
+    /// u16 range with a write pointer that has wrapped past `u16::MAX` must
+    /// still report the small forward distance. `latency_ms()` then follows
+    /// from that depth for a known packet format.
+    #[test]
+    fn test_depth_and_latency_handle_u16_wraparound() {
+        let mut reg = Regulator::with_params(1, 128, 48_000, 5.0);
+
+        // Write pointer wrapped around (now 2); read pointer near the top.
+        let read: u16 = u16::MAX - 1; // 65534
+        let write: u16 = 2;
+        reg.last_seq_in.store(write as i32, Ordering::Release);
+        reg.last_seq_out = Some(read);
+
+        // 65534 -> 65535 -> 0 -> 1 -> 2 is a forward distance of 4 packets.
+        assert_eq!(reg.depth(), write.wrapping_sub(read) as u32);
+        assert_eq!(reg.depth(), 4);
+
+        // latency = (depth * samples_per_packet / sample_rate) * 1000.
+        // 4 * 128 / 48000 * 1000 ≈ 10.6667 ms.
+        let expected_ms = (4.0_f32 * 128.0 / 48_000.0) * 1000.0;
+        assert!(
+            (reg.latency_ms() - expected_ms).abs() < 1e-3,
+            "latency_ms ({}) should follow from the wrapped depth ({expected_ms})",
+            reg.latency_ms()
+        );
+    }
+
+    /// The trivial configuration getters must reflect the values the regulator
+    /// was constructed with, including the auto-mode initial tolerance derived
+    /// from `fpp * AUTO_INIT_VAL_FACTOR`.
+    #[test]
+    fn test_config_getters_reflect_constructed_values() {
+        let fixed = Regulator::with_params(2, 256, 44_100, 18.0);
+        assert_eq!(fixed.channels(), 2);
+        assert_eq!(fixed.fpp(), 256);
+        assert_eq!(fixed.tolerance_ms(), 18.0);
+
+        let auto = Regulator::with_params(1, 64, 48_000, -1.0);
+        assert_eq!(auto.channels(), 1);
+        assert_eq!(auto.fpp(), 64);
+        assert_eq!(auto.tolerance_ms(), 64.0 * AUTO_INIT_VAL_FACTOR);
+    }
 }
