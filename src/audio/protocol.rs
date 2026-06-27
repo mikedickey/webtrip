@@ -837,6 +837,169 @@ mod tests {
     }
 
     #[test]
+    fn test_sample_rate_from_hz_all_rates_and_fallback() {
+        // Every mapped rate must map to the matching variant and round-trip via to_hz().
+        let mapped = [
+            (22050u32, SampleRateCode::Sr22050),
+            (32000, SampleRateCode::Sr32000),
+            (44100, SampleRateCode::Sr44100),
+            (48000, SampleRateCode::Sr48000),
+            (88200, SampleRateCode::Sr88200),
+            (96000, SampleRateCode::Sr96000),
+            (192000, SampleRateCode::Sr192000),
+        ];
+        for (hz, code) in mapped {
+            assert_eq!(SampleRateCode::from_hz(hz), code, "from_hz({hz})");
+            assert_eq!(code.to_hz(), hz, "to_hz round-trip for {hz}");
+        }
+
+        // Unknown rates fall back to the 48 kHz default.
+        assert_eq!(SampleRateCode::from_hz(11025), SampleRateCode::Sr48000);
+        assert_eq!(SampleRateCode::from_hz(0), SampleRateCode::Sr48000);
+    }
+
+    #[test]
+    fn test_sample_rate_from_byte_all_bytes_and_fallback() {
+        let expected = [
+            SampleRateCode::Sr22050,
+            SampleRateCode::Sr32000,
+            SampleRateCode::Sr44100,
+            SampleRateCode::Sr48000,
+            SampleRateCode::Sr88200,
+            SampleRateCode::Sr96000,
+            SampleRateCode::Sr192000,
+        ];
+        for (b, code) in expected.iter().enumerate() {
+            assert_eq!(SampleRateCode::from_byte(b as u8), *code, "from_byte({b})");
+        }
+
+        // Out-of-range bytes fall back to the 48 kHz default.
+        assert_eq!(SampleRateCode::from_byte(7), SampleRateCode::Sr48000);
+        assert_eq!(SampleRateCode::from_byte(255), SampleRateCode::Sr48000);
+    }
+
+    #[test]
+    fn test_audio_data_size_across_depths_and_channels() {
+        // payload = buffer_size * channels * ceil(bit_depth / 8)
+        assert_eq!(audio_data_size(128, 1, 8), 128);
+        assert_eq!(audio_data_size(128, 1, 16), 256);
+        assert_eq!(audio_data_size(128, 1, 24), 384);
+        assert_eq!(audio_data_size(128, 1, 32), 512);
+
+        assert_eq!(audio_data_size(64, 2, 16), 256);
+        assert_eq!(audio_data_size(32, 8, 24), 768);
+    }
+
+    #[test]
+    fn test_audio_data_size_matches_serialize_samples_into() {
+        // serialize_samples_into is 16-bit only; the bytes it writes minus the
+        // header must equal audio_data_size for the same configuration.
+        for (channels, frames) in [(1u8, 128usize), (2, 64)] {
+            let samples = vec![0.0f32; frames * channels as usize];
+            let buf_size = frames as u16;
+            let expected_audio = audio_data_size(buf_size, channels, 16);
+
+            let mut buffer = vec![0u8; HEADER_SIZE + expected_audio];
+            let written = AudioPacket::serialize_samples_into(0, 0, &samples, channels, &mut buffer)
+                .unwrap();
+
+            assert_eq!(written - HEADER_SIZE, expected_audio, "channels={channels}");
+        }
+    }
+
+    #[test]
+    fn test_audio_data_size_matches_serialize_into_all_depths() {
+        // Cross-check audio_data_size against the full serialize path for every
+        // supported bit depth rather than re-deriving the wire layout.
+        let buf_size: u16 = 16;
+        let channels: u8 = 2;
+        let samples = vec![0.0f32; buf_size as usize * channels as usize];
+
+        for bit_depth in [8u8, 16, 24, 32] {
+            let mut header = PacketHeader::stereo(0, 0);
+            header.buffer_size = buf_size;
+            header.bit_depth = bit_depth;
+            let packet = AudioPacket::new(header, samples.clone());
+
+            let serialized = packet.serialize().unwrap();
+            let expected_audio = audio_data_size(buf_size, channels, bit_depth);
+
+            assert_eq!(
+                serialized.len() - HEADER_SIZE,
+                expected_audio,
+                "bit_depth={bit_depth}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wire_idx_mono_is_identity() {
+        let buf_size = 8;
+        for i in 0..buf_size {
+            assert_eq!(wire_idx(i, 1, buf_size), i, "mono index {i}");
+        }
+    }
+
+    #[test]
+    fn test_wire_idx_stereo_interleaving() {
+        // Interleaved input [L0, R0, L1, R1] (channels=2, buf_size=2) maps to the
+        // planar wire layout [L0, L1, R0, R1].
+        let buf_size = 2;
+        assert_eq!(wire_idx(0, 2, buf_size), 0); // L0 -> wire[0]
+        assert_eq!(wire_idx(1, 2, buf_size), 2); // R0 -> wire[2]
+        assert_eq!(wire_idx(2, 2, buf_size), 1); // L1 -> wire[1]
+        assert_eq!(wire_idx(3, 2, buf_size), 3); // R1 -> wire[3]
+    }
+
+    #[test]
+    fn test_packet_loss_percent() {
+        // No packets seen yet -> avoid divide-by-zero, report 0%.
+        let stats = StreamStats::new();
+        assert_eq!(stats.packet_loss_percent(), 0.0);
+
+        // 1 lost out of 100 total -> 1%.
+        let mut normal = StreamStats::new();
+        normal.packets_received = 99;
+        normal.packets_lost = 1;
+        assert!((normal.packet_loss_percent() - 1.0).abs() < 1e-6);
+
+        // Every packet lost -> 100%.
+        let mut total_loss = StreamStats::new();
+        total_loss.packets_received = 0;
+        total_loss.packets_lost = 10;
+        assert!((total_loss.packet_loss_percent() - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_audio_format_helpers() {
+        // mono: 48000 Hz, 1 ch, 128-sample buffer, 16-bit
+        let mono = AudioFormat::mono();
+        assert_eq!(mono.samples_per_second(), 48000);
+        assert_eq!(mono.bytes_per_second(), 96000); // 48000 * 1 * 2
+        assert!((mono.buffer_duration_ms() - (128.0 / 48000.0 * 1000.0)).abs() < 1e-6);
+        assert!((mono.packets_per_second() - 375.0).abs() < 1e-6); // 48000 / 128
+
+        // stereo: 48000 Hz, 2 ch, 128-sample buffer, 16-bit
+        let stereo = AudioFormat::stereo();
+        assert_eq!(stereo.samples_per_second(), 96000);
+        assert_eq!(stereo.bytes_per_second(), 192000); // 96000 * 2
+        assert!((stereo.buffer_duration_ms() - (128.0 / 48000.0 * 1000.0)).abs() < 1e-6);
+        assert!((stereo.packets_per_second() - 375.0).abs() < 1e-6);
+
+        // Non-default format: 44100 Hz, 2 ch, 256-sample buffer, 24-bit
+        let custom = AudioFormat {
+            sample_rate: 44100,
+            channels: 2,
+            buffer_size: 256,
+            bit_depth: 24,
+        };
+        assert_eq!(custom.samples_per_second(), 88200); // 44100 * 2
+        assert_eq!(custom.bytes_per_second(), 264600); // 88200 * 3
+        assert!((custom.buffer_duration_ms() - (256.0 / 44100.0 * 1000.0)).abs() < 1e-6);
+        assert!((custom.packets_per_second() - (44100.0 / 256.0)).abs() < 1e-6);
+    }
+
+    #[test]
     fn test_outgoing_channels_encoding_symmetric() {
         // Symmetric case: outgoing = incoming should encode to 0
         let mut header = PacketHeader::new(1, 0);
