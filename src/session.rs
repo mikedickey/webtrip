@@ -1000,7 +1000,7 @@ mod tests {
     // `--use-fake-ui-for-media-stream`) let it succeed headless.
 
     #[cfg(target_arch = "wasm32")]
-    use crate::test_support::wait_until;
+    use crate::test_support::{recording_state_callback, wait_until};
     #[cfg(target_arch = "wasm32")]
     use std::cell::RefCell;
     #[cfg(target_arch = "wasm32")]
@@ -1011,22 +1011,6 @@ mod tests {
     use wasm_bindgen::closure::Closure;
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;
-
-    /// Build an `on_state_change` callback that appends each emitted state
-    /// string to a shared log.
-    ///
-    /// Returns the shared log plus the live `Closure`, which the caller must
-    /// keep alive for as long as the session may fire the callback (dropping it
-    /// invalidates the `js_sys::Function` the session holds).
-    #[cfg(target_arch = "wasm32")]
-    fn recording_state_callback() -> (Rc<RefCell<Vec<String>>>, Closure<dyn FnMut(String)>) {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let log_for_cb = log.clone();
-        let closure = Closure::wrap(Box::new(move |state: String| {
-            log_for_cb.borrow_mut().push(state);
-        }) as Box<dyn FnMut(String)>);
-        (log, closure)
-    }
 
     /// Register a [`recording_state_callback`] on `session`, returning the
     /// shared log and the `Closure` (kept alive by the caller).
