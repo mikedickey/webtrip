@@ -440,7 +440,7 @@ mod tests {
             "GET",
             "/channels-paginated",
             200,
-            r#"{"items":[{"id":"c1"}],"page":2}"#,
+            r#"{"_meta":{"total":1,"pages":1,"current":2,"count":1,"limit":10},"results":[{"id":"c1"}]}"#,
         )
         .await;
 
@@ -448,7 +448,8 @@ mod tests {
             .list_channels_paginated(Some(2), Some(10))
             .await
             .unwrap();
-        assert_eq!(result.items.unwrap().len(), 1);
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.meta.current, 2);
         mock.assert_async().await;
     }
 
@@ -460,12 +461,12 @@ mod tests {
             "GET",
             "/channels-paginated",
             200,
-            r#"{"items":[]}"#,
+            r#"{"_meta":{"total":0,"pages":0,"current":1,"count":0,"limit":10},"results":[]}"#,
         )
         .await;
 
         let result = api(&client).list_channels_paginated(None, None).await.unwrap();
-        assert_eq!(result.items.unwrap().len(), 0);
+        assert_eq!(result.results.len(), 0);
         mock.assert_async().await;
     }
 

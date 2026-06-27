@@ -82,16 +82,6 @@ pub struct UnreadMessagesResponse {
     pub count: Option<i32>,
 }
 
-/// Generic URL response (used for redirects and billing portal URLs)
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct UrlResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-}
-
-
 /// API error response
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
@@ -114,40 +104,28 @@ pub struct Error {
     pub details: Option<serde_json::Value>,
 }
 
-/// Timestamp response for modified resources
+/// Shared creation and update timestamp model
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
 pub struct ModifiedAtTime {
-    /// Modification timestamp (RFC3339)
+    /// RFC3339-formatted creation timestamp
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub modified_at: Option<String>,
+    pub created_at: Option<String>,
+
+    /// RFC3339-formatted timestamp of most recent update
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 }
 
-/// Audio properties for a track/stream
+/// Redirect response (e.g. billing portal / checkout URLs, `/redirect/{ext}`)
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
-pub struct AudioProperties {
-    /// Sample rate (Hz)
+pub struct Redirect {
+    /// Redirect URL
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sample_rate: Option<i32>,
-
-    /// Bit depth
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bit_depth: Option<i32>,
-
-    /// Number of channels
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub channels: Option<i32>,
-
-    /// Codec name
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub codec: Option<String>,
-
-    /// Bitrate in kbps
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bitrate: Option<i32>,
+    pub redirect: Option<String>,
 }
 
 /// Server configuration (returned with studios)
@@ -195,168 +173,28 @@ pub struct ServerConfig {
     pub enabled: Option<bool>,
 }
 
-/// Server agent configuration
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct ServerAgentConfig {
-    /// Agent version
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-
-    /// Update URL
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub update_url: Option<String>,
-
-    /// Heartbeat interval in seconds
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub heartbeat_interval: Option<i32>,
-}
-
-/// Server with subscription information
+/// Server with the authenticated user's relationship to it.
+///
+/// Spec composes this as `Server` + `{admin, owner, subStatus}`.
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerWithSubscription {
-    /// Server/Studio information
+    /// Server/studio information
     #[serde(flatten)]
-    pub server: super::Studio,
+    pub server: super::Server,
 
-    /// Subscription information
+    /// Whether the user is an admin of this studio
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub subscription: Option<super::Subscription>,
-}
+    pub admin: Option<bool>,
 
-/// Device configuration (internal)
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct DeviceConfig {
-    /// Device settings
+    /// Whether the user is the creator/owner of this studio
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub device: Option<super::Device>,
+    pub owner: Option<bool>,
 
-    /// Studio settings
+    /// Studio subscription status ("Active" | "Deleted")
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub studio: Option<super::Studio>,
-}
-
-/// Coupon response
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct CouponResponse {
-    /// Whether the coupon was valid
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub valid: Option<bool>,
-
-    /// Discount amount (percentage or fixed)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub discount: Option<f64>,
-
-    /// Discount type (percent_off, amount_off)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub discount_type: Option<String>,
-
-    /// Error message if invalid
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// Promo code response
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct PromoResponse {
-    /// Whether the promo was applied
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub applied: Option<bool>,
-
-    /// Description of the promo
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-
-    /// Error message if not applied
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// Entitlement/feature flag
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct Entitlement {
-    /// Entitlement ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-
-    /// Display name
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-
-    /// Description
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-
-    /// Whether it's enabled
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-}
-
-/// Invoice list response
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct InvoiceListResponse {
-    /// List of invoices
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub invoices: Option<Vec<Invoice>>,
-
-    /// Cursor for pagination
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
-
-    /// Whether there are more results
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub has_more: Option<bool>,
-}
-
-/// Invoice
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct Invoice {
-    /// Invoice ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-
-    /// Invoice number
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub number: Option<String>,
-
-    /// Amount in cents
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub amount: Option<i64>,
-
-    /// Currency code
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub currency: Option<String>,
-
-    /// Invoice status
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-
-    /// Invoice date (RFC3339)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub date: Option<String>,
-
-    /// PDF download URL
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pdf_url: Option<String>,
-
-    /// Hosted invoice URL
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hosted_url: Option<String>,
+    pub sub_status: Option<String>,
 }
 
 #[cfg(test)]
@@ -404,26 +242,20 @@ mod tests {
     }
 
     #[test]
-    fn server_with_subscription_flattens_studio() {
+    fn server_with_subscription_flattens_server() {
         let s = ServerWithSubscription {
-            server: super::super::Studio {
+            server: super::super::Server {
                 id: Some("st1".into()),
-                config: super::super::ServerConfig {
-                    name: Some("Studio".into()),
-                    ..Default::default()
-                },
                 ..Default::default()
             },
-            subscription: Some(super::super::Subscription {
-                id: Some("sub_1".into()),
-                status: Some("active".into()),
-                ..Default::default()
-            }),
+            admin: Some(true),
+            owner: Some(false),
+            sub_status: Some("Active".into()),
         };
         let out = roundtrip(&s);
-        // Flatten means Studio fields are at top level, not nested under "server".
+        // Flatten means Server fields are at top level, not nested under "server".
         assert!(out.contains("\"id\":\"st1\""));
-        assert!(out.contains("\"subscription\":"));
+        assert!(out.contains("\"subStatus\":\"Active\""));
         assert!(!out.contains("\"server\":"));
     }
 }

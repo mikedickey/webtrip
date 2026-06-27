@@ -111,30 +111,33 @@ pub struct ServerRecording {
     pub has_stems: Option<bool>,
 }
 
-/// Recording stem (individual track) information
+/// Stem track summary returned by
+/// `GET /studios/{studioId}/recordings/{recordingId}/stems`.
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
-pub struct StemInfo {
-    /// Stem ID
+pub struct StemSummary {
+    /// List of stem client tracks
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    pub clients: Option<Vec<StemClient>>,
+}
 
-    /// Stem name (typically participant name)
+/// A single stem client track within a [`StemSummary`].
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct StemClient {
+    /// Client track ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<i32>,
+
+    /// Client track display name
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
-    /// Audio file URL
+    /// Stem filename in storage
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-
-    /// Duration in seconds
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration: Option<f64>,
-
-    /// File size in bytes
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file_size: Option<i64>,
+    pub filename: Option<String>,
 }
 
 /// User recordings storage quota
@@ -227,6 +230,26 @@ mod tests {
         assert!(s.contains("\"hasStems\":true"));
         assert!(s.contains("\"fileSize\":1234567890"));
         assert!(!s.contains("\"metadata\":"));
+    }
+
+    #[test]
+    fn stem_summary_fixture_known_good() {
+        let json = r#"{
+          "clients": [
+            {"id": 1, "name": "vocals", "filename": "stem-1.wav"},
+            {"id": 2, "name": "guitar", "filename": "stem-2.wav"}
+          ]
+        }"#;
+        let s: StemSummary = serde_json::from_str(json).unwrap();
+        let clients = s.clients.as_ref().expect("clients present");
+        assert_eq!(clients.len(), 2);
+        assert_eq!(clients[0].id, Some(1));
+        assert_eq!(clients[0].name.as_deref(), Some("vocals"));
+        assert_eq!(clients[1].filename.as_deref(), Some("stem-2.wav"));
+
+        let out = roundtrip(&s);
+        assert!(out.contains("\"clients\":"));
+        assert!(out.contains("\"filename\":"));
     }
 }
 

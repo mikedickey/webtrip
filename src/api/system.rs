@@ -2,7 +2,7 @@
 //!
 //! Health checks, region information, analytics, and other system-level operations.
 
-use super::{to_js_value, regions_from_map, ApiClient, ApiError, urlencode};
+use super::{to_js_value, ApiClient, ApiError, urlencode};
 use crate::models;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
@@ -41,11 +41,9 @@ impl SystemApi {
 
     /// List all available cloud regions
     ///
-    /// Returns a Vec of regions with IDs. The API returns a map, but we convert
-    /// it to a Vec with the region ID included in each Region object.
-    pub async fn list_regions(&self) -> Result<Vec<models::Region>, ApiError> {
-        let map: HashMap<String, models::Region> = self.client.get("/regions").await?;
-        Ok(regions_from_map(map))
+    /// `GET /regions` returns a map of region identifier → [`models::Region`].
+    pub async fn list_regions(&self) -> Result<HashMap<String, models::Region>, ApiError> {
+        self.client.get("/regions").await
     }
 
     /// Get details for a specific region
@@ -202,8 +200,8 @@ mod tests {
 
         let regions = api(&client).list_regions().await.unwrap();
         assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0].id, Some("us-west-1".to_string()));
-        assert_eq!(regions[0].label, Some("US West".to_string()));
+        let region = regions.get("us-west-1").expect("region present");
+        assert_eq!(region.label, Some("US West".to_string()));
         mock.assert_async().await;
     }
 

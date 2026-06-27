@@ -11,11 +11,6 @@ use wasm_bindgen::prelude::*;
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 pub struct Region {
-    /// Region identifier (e.g., "azure-ae-dubai", "gcloud-us-ut-slc")
-    /// This is the key from the API response map, added during conversion.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-
     /// Geographic group (e.g., "Americas", "Europe", "Asia", "Oceania", "Africa")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
@@ -96,7 +91,6 @@ mod tests {
         // docs/api/system.md. Region uses explicit per-field renames rather
         // than rename_all; verify those are honoured on the wire.
         let json = r#"{
-          "id": "gcloud-us-ut-slc",
           "group": "Americas",
           "provider": "gcloud",
           "region": "us-west3",
@@ -113,7 +107,7 @@ mod tests {
           "cloudHost": "https://gcloud.example.com"
         }"#;
         let r: Region = serde_json::from_str(json).unwrap();
-        assert_eq!(r.id.as_deref(), Some("gcloud-us-ut-slc"));
+        assert_eq!(r.region.as_deref(), Some("us-west3"));
         assert_eq!(r.instance_types.as_ref().map(|v| v.len()), Some(1));
         assert_eq!(
             r.instance_types.as_ref().and_then(|v| v.first()).map(|i| i.id.as_str()),

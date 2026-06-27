@@ -138,7 +138,7 @@ pub struct DeviceAgentConfig {
 
     /// Server/studio configuration
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub server: Option<super::Studio>,
+    pub server: Option<super::Server>,
 
     /// Agent credentials
     #[serde(skip_serializing_if = "Option::is_none")]
