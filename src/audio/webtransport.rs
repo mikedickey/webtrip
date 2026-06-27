@@ -401,9 +401,16 @@ impl WebTransportImpl {
         Ok(())
     }
 
-    /// Initialize the worker with buffer pointers
-    fn init_worker(&self) -> Result<(), JsValue> {
-        let worker = self.worker.borrow().clone().ok_or("Worker not created")?;
+    /// Assemble the `init` message that gets posted to the worker.
+    ///
+    /// Merges the plain-JSON buffer config (from [`build_worker_init_message`])
+    /// with the two browser-only fields that can't be represented in JSON:
+    /// `wasmMemory` (for SharedArrayBuffer access) and `wasmUrl` (the absolute
+    /// URL the blob: worker imports the WASM glue from). Split out from
+    /// [`init_worker`] so the assembled message — including those two
+    /// browser-only fields — can be inspected in tests without posting to (or
+    /// even creating) a real worker.
+    fn build_init_message(&self) -> Result<Object, JsValue> {
         let buffers = self.audio_buffers.ok_or("Audio buffers not configured")?;
 
         // Build the plain-JSON init message (type + buffer pointers + config)
@@ -430,6 +437,13 @@ impl WebTransportImpl {
         let wasm_url = wasm_module_url(&origin, &pathname);
         Reflect::set(&msg, &"wasmUrl".into(), &JsValue::from_str(&wasm_url))?;
 
+        Ok(msg)
+    }
+
+    /// Initialize the worker with buffer pointers
+    fn init_worker(&self) -> Result<(), JsValue> {
+        let worker = self.worker.borrow().clone().ok_or("Worker not created")?;
+        let msg = self.build_init_message()?;
         worker.post_message(&msg)?;
         Ok(())
     }
@@ -706,6 +720,120 @@ mod tests {
         assert!(
             is_webtransport_available(),
             "WebTransport global must be present in the headless Chrome harness"
+        );
+    }
+
+    // ── Worker creation / lifecycle (web_sys) ────────────────────────────────
+    //
+    // These exercise the browser-only Worker setup that the pure-logic tests
+    // above can't reach. `create_worker` and `init_worker` are private, but
+    // these inline tests live in a child module of `webtransport`, so they call
+    // them directly without widening production visibility. The live
+    // `connect()`/`connect_to_server()` path needs a real HTTP/3 server and is
+    // intentionally not covered here.
+
+    /// Terminate and detach a freshly-created test worker so the async
+    /// module-load failure inherent to the test harness (the worker imports the
+    /// bindgen module from a `blob:` context) can't fire callbacks after the
+    /// test, and so `Drop`'s `close()` short-circuits instead of arming a 2s
+    /// fallback timer.
+    #[cfg(target_arch = "wasm32")]
+    fn teardown_worker(transport: &WebTransportImpl) {
+        if let Some(worker) = transport.worker.borrow_mut().take() {
+            worker.set_onmessage(None);
+            worker.set_onerror(None);
+            worker.terminate();
+        }
+    }
+
+    /// `create_worker()` must build a `web_sys::Worker` via the `dependent_module!`
+    /// Blob-URL flow and register both the `onmessage` and `onerror` closures on
+    /// it (retaining them on the struct so they outlive the call).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn create_worker_builds_worker_and_registers_handlers() {
+        let mut transport = WebTransportImpl::new()
+            .expect("WebTransportImpl construction should succeed in the browser");
+
+        transport
+            .create_worker()
+            .expect("create_worker should build the Worker via the Blob-URL flow");
+
+        {
+            let worker_ref = transport.worker.borrow();
+            let worker = worker_ref
+                .as_ref()
+                .expect("worker must be stored after create_worker");
+            assert!(
+                worker.onmessage().is_some(),
+                "onmessage handler must be registered on the worker"
+            );
+            assert!(
+                worker.onerror().is_some(),
+                "onerror handler must be registered on the worker"
+            );
+        }
+        assert!(
+            transport.worker_message_closure.is_some(),
+            "message closure must be retained to stay alive"
+        );
+        assert!(
+            transport.worker_error_closure.is_some(),
+            "error closure must be retained to stay alive"
+        );
+
+        teardown_worker(&transport);
+    }
+
+    /// The init message that `init_worker()` posts must carry the two
+    /// browser-only fields layered on top of the plain-JSON buffer config:
+    /// `wasmMemory` (the module's `WebAssembly.Memory`) and `wasmUrl` (resolving
+    /// to the bindgen glue). Asserting the assembled message directly via
+    /// [`WebTransportImpl::build_init_message`] catches a typo in either
+    /// `Reflect::set` key — which a no-panic-only smoke test would miss — and
+    /// avoids posting to (or creating) a real worker, so no buffer pointers are
+    /// ever dereferenced. The plain-JSON fields themselves are covered natively
+    /// by `worker_init_message_has_expected_fields`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn init_message_includes_browser_only_fields() {
+        let mut transport = WebTransportImpl::new()
+            .expect("WebTransportImpl construction should succeed in the browser");
+
+        // Null buffer pointers: they are only serialized as numbers into the
+        // message and never dereferenced (no worker is created or posted to).
+        transport.audio_buffers = Some(AudioBufferConfig {
+            local_to_network_ptr: std::ptr::null_mut::<RingBuffer>(),
+            network_to_local_ptr: std::ptr::null_mut::<Regulator>(),
+            buffer_size: 128,
+            channels: 2,
+        });
+
+        let msg = transport
+            .build_init_message()
+            .expect("init message assembly should succeed in the browser");
+
+        // Carried through from the plain-JSON payload.
+        assert_eq!(
+            Reflect::get(&msg, &"type".into()).unwrap().as_string().as_deref(),
+            Some("init")
+        );
+
+        // Browser-only field 1: wasmMemory must be the module's WebAssembly.Memory.
+        let wasm_memory = Reflect::get(&msg, &"wasmMemory".into()).unwrap();
+        assert!(
+            wasm_memory.is_instance_of::<js_sys::WebAssembly::Memory>(),
+            "wasmMemory must be a WebAssembly.Memory instance"
+        );
+
+        // Browser-only field 2: wasmUrl must resolve to the bindgen glue module.
+        let wasm_url = Reflect::get(&msg, &"wasmUrl".into())
+            .unwrap()
+            .as_string()
+            .unwrap_or_default();
+        assert!(
+            wasm_url.ends_with("pkg/webtrip.js"),
+            "wasmUrl must point at the bindgen glue, got: {wasm_url}"
         );
     }
 

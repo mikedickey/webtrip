@@ -352,7 +352,17 @@ The test requires threading support. Either:
 - `src/audio/worklet.rs`: worklet module registration via the `dependent_module!`
   Blob/URL path (`register_audio_worklet` resolves against `audioWorklet.addModule`)
 - `src/audio/webtransport.rs`: `is_webtransport_available` reports `true` in the
-  headless Chrome harness (inverse of the native check)
+  headless Chrome harness (inverse of the native check); `create_worker` builds
+  a `web_sys::Worker` via the `dependent_module!` Blob-URL flow and registers the
+  `onmessage`/`onerror` closures; `build_init_message` (the assembly behind
+  `init_worker`) layers the browser-only `wasmMemory` (a `WebAssembly.Memory`)
+  and `wasmUrl` (the bindgen glue URL) onto the plain-JSON buffer config (live
+  `connect()` needs an HTTP/3 server — skipped)
+- `src/audio/webtransport_worker.rs`: worker-side `#[wasm_bindgen]` entry points
+  called directly — `worker_init`+`worker_get_stats` (zeroed stats prove init
+  ran) and `handle_worker_message` routing for `init`/`getStats`/`disconnect`
+  (resolves) plus an unknown type (rejects). The server-dependent
+  `worker_connect`/`send_loop`/`receive_loop` paths are intentionally not covered
 - `src/audio/audio_callback_loop.rs`: `has_atomics_wait_async` reports `true`
   under the shared-memory harness, plus an end-to-end smoke test of the
   `Atomics.waitAsync` wake-up path (set flag + `Atomics.notify` → tick fires),
