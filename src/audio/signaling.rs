@@ -1150,7 +1150,18 @@ mod tests {
         sig.connect().expect("connect");
         let ws = sig.socket.clone().unwrap();
 
-        dispatch_text_message(&ws, r#"{"type":"error","message":"Room is full"}"#);
+        // Build the payload via to_json() so this test exercises the same wire
+        // format as the rest of the module rather than a hand-written literal.
+        let error_json = SignalingMessage {
+            msg_type: SignalingMessageType::Error,
+            sdp: None,
+            candidate: None,
+            sdp_mid: None,
+            sdp_m_line_index: None,
+            error: Some("Room is full".to_string()),
+        }
+        .to_json();
+        dispatch_text_message(&ws, &error_json);
 
         assert_eq!(*errors.borrow(), vec!["Room is full".to_string()]);
     }
