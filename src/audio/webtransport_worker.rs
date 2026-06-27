@@ -171,6 +171,13 @@ impl WorkerState {
             };
             
             *self.has_data_int32_array.borrow_mut() = Some(int32_array);
+        } else {
+            // No ring buffer: drop any cached view so it always tracks the
+            // current ring buffer. Otherwise a re-`configure()` with a null
+            // pointer would leave a stale `Int32Array` pointing at a buffer
+            // that's no longer valid, which `worker_disconnect()` would then
+            // `Atomics.notify` on.
+            *self.has_data_int32_array.borrow_mut() = None;
         }
     }
 
@@ -1067,9 +1074,15 @@ mod tests {
         worker_disconnect();
         assert!(!WORKER_STATE.with(|s| s.borrow().is_running()));
 
-        // Reset the shared state's pointers back to null before the backing
-        // buffers drop, so no later test can observe dangling pointers.
+        // Reset the shared state back to null pointers before the backing
+        // buffers drop, so no later test can observe dangling pointers or
+        // notify on a stale `Int32Array`. `configure()` with a null ring
+        // buffer also clears the cached has_data view.
         WORKER_STATE.with(|state| state.borrow_mut().configure(0, 0, 128, 2));
+        assert!(
+            WORKER_STATE.with(|s| s.borrow().has_data_int32_array.borrow().is_none()),
+            "re-configure with a null ring buffer must clear the cached has_data view"
+        );
         drop(ring);
         drop(regulator);
     }
