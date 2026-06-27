@@ -978,4 +978,110 @@ mod tests {
             "rejection should describe the unknown message type, got: {err:?}"
         );
     }
+
+    // ── Server-free worker config / lifecycle (web_sys) ──────────────────────
+    //
+    // These cover the slices of `configure()`/`worker_disconnect()`/
+    // `post_error_to_main()` that the T20 routing tests (which only ever pass
+    // null buffer pointers) leave unhit, without touching the server-bound
+    // loops. The T20 init test exercises `configure()` only on the *null*
+    // ring-buffer branch (so the `has_data` Int32Array setup is skipped); the
+    // tests here use a *real* `RingBuffer`/`Regulator` so the non-null branch
+    // and the buffer sizing/pointer-storage are actually asserted. The live
+    // `worker_connect`/`send_loop`/`receive_loop` paths still need an HTTP/3
+    // server and stay out of scope.
+
+    /// `configure()` with a real (non-null) ring buffer must size the reusable
+    /// audio/packet buffers from `buffer_size * channels`, store both buffer
+    /// pointers, and register the `has_data` `Int32Array` view used by the send
+    /// loop's `Atomics.waitAsync`. Run on a *local* `WorkerState` so it can't
+    /// perturb the thread-local `WORKER_STATE` other tests share.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn configure_sizes_buffers_and_stores_pointers() {
+        let ring = RingBuffer::new();
+        let mut regulator = Regulator::new();
+        let ring_ptr = &ring as *const RingBuffer as usize;
+        let reg_ptr = &mut regulator as *mut Regulator as usize;
+
+        let buffer_size: usize = 64;
+        let channels: u8 = 2;
+        let samples_per_packet = buffer_size * channels as usize;
+
+        let mut state = WorkerState::new();
+        state.configure(ring_ptr, reg_ptr, buffer_size, channels);
+
+        assert_eq!(state.ring_buffer_ptr as usize, ring_ptr, "ring buffer pointer must be stored");
+        assert_eq!(state.regulator_ptr as usize, reg_ptr, "regulator pointer must be stored");
+        assert_eq!(state.buffer_size, buffer_size);
+        assert_eq!(state.channels, channels);
+        assert_eq!(
+            state.audio_buffer.borrow().len(),
+            samples_per_packet,
+            "audio buffer must be sized buffer_size * channels"
+        );
+        assert_eq!(
+            state.packet_buffer.borrow().len(),
+            HEADER_SIZE + samples_per_packet * 2,
+            "packet buffer must be sized to header + 16-bit payload"
+        );
+        assert!(
+            state.has_data_int32_array.borrow().is_some(),
+            "non-null ring buffer must register the has_data Int32Array view"
+        );
+
+        // Keep the backing buffers alive until after configure has read them.
+        drop(ring);
+        drop(regulator);
+    }
+
+    /// `worker_disconnect()` with no live connection must flip the running flag
+    /// off and fire the `Atomics.notify` wake-up without panicking, and be
+    /// idempotent on a second call. Configured with a real ring buffer so the
+    /// `has_data` array is `Some` and the notify branch (skipped by the
+    /// null-buffer T20 disconnect test) actually runs.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn worker_disconnect_stops_and_notifies_idempotently() {
+        let ring = RingBuffer::new();
+        let mut regulator = Regulator::new();
+        let ring_ptr = &ring as *const RingBuffer as usize;
+        let reg_ptr = &mut regulator as *mut Regulator as usize;
+
+        WORKER_STATE.with(|state| {
+            state.borrow_mut().configure(ring_ptr, reg_ptr, 128, 2);
+            state.borrow().start();
+        });
+        assert!(
+            WORKER_STATE.with(|s| s.borrow().is_running()),
+            "state should be running after start()"
+        );
+
+        worker_disconnect();
+        assert!(
+            !WORKER_STATE.with(|s| s.borrow().is_running()),
+            "disconnect must clear the running flag"
+        );
+
+        // Idempotent: a second disconnect is a harmless no-op.
+        worker_disconnect();
+        assert!(!WORKER_STATE.with(|s| s.borrow().is_running()));
+
+        // Reset the shared state's pointers back to null before the backing
+        // buffers drop, so no later test can observe dangling pointers.
+        WORKER_STATE.with(|state| state.borrow_mut().configure(0, 0, 128, 2));
+        drop(ring);
+        drop(regulator);
+    }
+
+    /// `post_error_to_main()` builds the `{type:"error", error}` object and
+    /// posts it via `post_message_to_main()`. In the test's window context the
+    /// `DedicatedWorkerGlobalScope` post is a swallowed no-op, but calling it
+    /// still exercises the error-object construction + post path that otherwise
+    /// only runs inside the live send/receive loops (which need a server).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn post_error_to_main_builds_and_posts_without_panic() {
+        post_error_to_main("synthetic test error");
+    }
 }
