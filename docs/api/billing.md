@@ -43,19 +43,19 @@ Get the billing portal URL for managing subscriptions via Stripe.
 | `userId` | `string` | User ID |
 
 ```javascript
-const { url } = await client.billing().getPortal('user123');
-window.location.href = url; // Redirect to Stripe portal
+const { redirect } = await client.billing().getPortal('user123');
+window.location.href = redirect; // Redirect to Stripe portal
 ```
 
 ```rust
 let response = client.billing().get_portal("user123").await?;
 ```
 
-**Returns:** `BillingPortalResponse`
+**Returns:** `Redirect`
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `url` | `string?` | Stripe billing portal URL |
+| `redirect` | `string?` | Stripe billing portal URL |
 
 ---
 

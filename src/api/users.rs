@@ -465,7 +465,7 @@ mod tests {
             "GET",
             "/users/u1/channels-paginated",
             200,
-            r#"{"_meta":{"total":1,"pages":1,"current":2,"count":1,"limit":10},"results":[{"id":"c1"}]}"#,
+            r#"{"_meta":{"total":11,"pages":2,"current":2,"count":1,"limit":10},"results":[{"id":"c1"}]}"#,
         )
         .await;
 

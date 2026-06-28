@@ -27,8 +27,11 @@ impl StreamsApi {
         self.client.get("/streams").await
     }
 
-    /// Search for broadcasts by keyword
-    pub async fn search_streams(&self, query: Option<&str>) -> Result<Vec<models::StreamInfo>, ApiError> {
+    /// Search for broadcasts by keyword.
+    ///
+    /// Returns the paginated `{ _meta, results }` envelope whose items carry
+    /// search-specific fields ([`models::StreamInfoSearchResult`]).
+    pub async fn search_streams(&self, query: Option<&str>) -> Result<models::PaginatedStreamSearchResults, ApiError> {
         #[derive(Serialize)]
         struct Query<'a> {
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -357,22 +360,31 @@ mod tests {
             "GET",
             "/streams/search",
             200,
-            r#"[{"id":"s9","name":"jazz"}]"#,
+            r#"{"_meta":{"total":1,"pages":1,"current":1,"count":1,"limit":10},"results":[{"id":"s9","name":"jazz","serverId":"studio-9","lookingFor":2}]}"#,
         )
         .await;
 
         let result = api(&client).search_streams(Some("jazz")).await.unwrap();
-        assert_eq!(result[0].name, Some("jazz".to_string()));
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].base.name, Some("jazz".to_string()));
+        assert_eq!(result.results[0].server_id, Some("studio-9".to_string()));
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_search_streams_without_query() {
         let (mut server, client) = mock_api().await;
-        let mock = mock_json(&mut server, "GET", "/streams/search", 200, "[]").await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/streams/search",
+            200,
+            r#"{"_meta":{"total":0,"pages":0,"current":1,"count":0,"limit":10},"results":[]}"#,
+        )
+        .await;
 
         let result = api(&client).search_streams(None).await.unwrap();
-        assert!(result.is_empty());
+        assert!(result.results.is_empty());
         mock.assert_async().await;
     }
 
@@ -440,7 +452,7 @@ mod tests {
             "GET",
             "/channels-paginated",
             200,
-            r#"{"_meta":{"total":1,"pages":1,"current":2,"count":1,"limit":10},"results":[{"id":"c1"}]}"#,
+            r#"{"_meta":{"total":11,"pages":2,"current":2,"count":1,"limit":10},"results":[{"id":"c1"}]}"#,
         )
         .await;
 

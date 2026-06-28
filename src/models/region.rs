@@ -35,9 +35,17 @@ pub struct Region {
     #[serde(default, rename = "armImageId", skip_serializing_if = "Option::is_none")]
     pub arm_image_id: Option<String>,
 
+    /// VM image ID for remote-root instances
+    #[serde(default, rename = "remoteRootImageId", skip_serializing_if = "Option::is_none")]
+    pub remote_root_image_id: Option<String>,
+
     /// Subnet identifier
     #[serde(default, rename = "subnetId", skip_serializing_if = "Option::is_none")]
     pub subnet_id: Option<String>,
+
+    /// Provider security-group identifiers applied to studio VMs
+    #[serde(default, rename = "securityGroupIds", skip_serializing_if = "Option::is_none")]
+    pub security_group_ids: Option<Vec<String>>,
 
     /// Available instance types for this region
     #[serde(default, rename = "instanceTypes", skip_serializing_if = "Option::is_none")]
@@ -58,6 +66,22 @@ pub struct Region {
     /// Cloud host URL for this region
     #[serde(default, rename = "cloudHost", skip_serializing_if = "Option::is_none")]
     pub cloud_host: Option<String>,
+
+    /// Availability zone within the region where studios are provisioned
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+
+    /// Name of the provider-managed volume attached to studios in this region
+    #[serde(default, rename = "volumeName", skip_serializing_if = "Option::is_none")]
+    pub volume_name: Option<String>,
+
+    /// Type of the provider-managed volume attached to studios in this region
+    #[serde(default, rename = "volumeType", skip_serializing_if = "Option::is_none")]
+    pub volume_type: Option<String>,
+
+    /// Server-side autoscaling parameters (only populated on single-region responses)
+    #[serde(default, rename = "scaleParams", skip_serializing_if = "Option::is_none")]
+    pub scale_params: Option<serde_json::Value>,
 }
 
 /// Instance type available in a region

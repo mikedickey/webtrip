@@ -17,24 +17,28 @@ api_module_struct!(StudiosApi);
 // =============================================================================
 
 impl StudiosApi {
-    /// List all studios for the authenticated user
-    pub async fn list_studios(&self) -> Result<Vec<models::Server>, ApiError> {
+    /// List all studios for the authenticated user.
+    ///
+    /// Responses carry the caller's relationship to each studio (`admin`,
+    /// `owner`, `subStatus`), so they deserialize into [`models::ServerWithSubscription`].
+    pub async fn list_studios(&self) -> Result<Vec<models::ServerWithSubscription>, ApiError> {
         self.client.get("/studios").await
     }
 
-    /// Create a new studio
-    pub async fn create_studio(&self, studio: &models::Server) -> Result<models::Server, ApiError> {
+    /// Create a new studio. The request payload is a [`models::Server`]; the
+    /// response includes the caller's relationship fields.
+    pub async fn create_studio(&self, studio: &models::Server) -> Result<models::ServerWithSubscription, ApiError> {
         self.client.post("/studios", studio).await
     }
 
     /// Get a studio by ID
-    pub async fn get_studio(&self, studio_id: &str) -> Result<models::Server, ApiError> {
+    pub async fn get_studio(&self, studio_id: &str) -> Result<models::ServerWithSubscription, ApiError> {
         let path = format!("/studios/{}", urlencode(studio_id));
         self.client.get(&path).await
     }
 
     /// Update a studio's configuration
-    pub async fn update_studio(&self, studio_id: &str, studio: &models::Server) -> Result<models::Server, ApiError> {
+    pub async fn update_studio(&self, studio_id: &str, studio: &models::Server) -> Result<models::ServerWithSubscription, ApiError> {
         let path = format!("/studios/{}", urlencode(studio_id));
         self.client.put(&path, studio).await
     }
@@ -45,26 +49,19 @@ impl StudiosApi {
         self.client.delete(&path).await
     }
 
-    /// Extend a studio's expiration time
-    pub async fn extend_studio(&self, studio_id: &str) -> Result<models::Server, ApiError> {
+    /// Extend a studio's expiration time.
+    ///
+    /// The endpoint responds with `202 Accepted` (extended) or `204 No Content`
+    /// (no extension needed) and never returns a body.
+    pub async fn extend_studio(&self, studio_id: &str) -> Result<(), ApiError> {
         let path = format!("/studios/{}/extend", urlencode(studio_id));
-        self.client.post_empty(&path).await
+        self.client.post_empty_no_response(&path).await
     }
 
-    /// Get access settings for a studio
+    /// Get the authenticated user's access rights for a studio
     pub async fn get_access_settings(&self, studio_id: &str) -> Result<models::ServerAccess, ApiError> {
         let path = format!("/studios/{}/access", urlencode(studio_id));
         self.client.get(&path).await
-    }
-
-    /// Update access settings for a studio
-    pub async fn update_access_settings(
-        &self,
-        studio_id: &str,
-        settings: &models::ServerAccess,
-    ) -> Result<models::ServerAccess, ApiError> {
-        let path = format!("/studios/{}/access", urlencode(studio_id));
-        self.client.put(&path, settings).await
     }
 
     /// Get the mixer configuration for a studio
@@ -134,17 +131,17 @@ impl StudiosApi {
     }
 
     #[wasm_bindgen(js_name = createStudio)]
-    pub async fn create_studio_js(&self, studio: models::Server) -> Result<models::Server, ApiError> {
+    pub async fn create_studio_js(&self, studio: models::Server) -> Result<models::ServerWithSubscription, ApiError> {
         self.create_studio(&studio).await
     }
 
     #[wasm_bindgen(js_name = getStudio)]
-    pub async fn get_studio_js(&self, studio_id: String) -> Result<models::Server, ApiError> {
+    pub async fn get_studio_js(&self, studio_id: String) -> Result<models::ServerWithSubscription, ApiError> {
         self.get_studio(&studio_id).await
     }
 
     #[wasm_bindgen(js_name = updateStudio)]
-    pub async fn update_studio_js(&self, studio_id: String, studio: models::Server) -> Result<models::Server, ApiError> {
+    pub async fn update_studio_js(&self, studio_id: String, studio: models::Server) -> Result<models::ServerWithSubscription, ApiError> {
         self.update_studio(&studio_id, &studio).await
     }
 
@@ -154,22 +151,13 @@ impl StudiosApi {
     }
 
     #[wasm_bindgen(js_name = extendStudio)]
-    pub async fn extend_studio_js(&self, studio_id: String) -> Result<models::Server, ApiError> {
+    pub async fn extend_studio_js(&self, studio_id: String) -> Result<(), ApiError> {
         self.extend_studio(&studio_id).await
     }
 
     #[wasm_bindgen(js_name = getAccessSettings)]
     pub async fn get_access_settings_js(&self, studio_id: String) -> Result<models::ServerAccess, ApiError> {
         self.get_access_settings(&studio_id).await
-    }
-
-    #[wasm_bindgen(js_name = updateAccessSettings)]
-    pub async fn update_access_settings_js(
-        &self,
-        studio_id: String,
-        settings: models::ServerAccess,
-    ) -> Result<models::ServerAccess, ApiError> {
-        self.update_access_settings(&studio_id, &settings).await
     }
 
     #[wasm_bindgen(js_name = getMixer)]
@@ -243,7 +231,7 @@ mod tests {
 
         let result = api(&client).list_studios().await.unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].id, Some("studio1".to_string()));
+        assert_eq!(result[0].server.id, Some("studio1".to_string()));
         mock.assert_async().await;
     }
 
@@ -271,7 +259,7 @@ mod tests {
 
         let body = models::Server::default();
         let studio = api(&client).create_studio(&body).await.unwrap();
-        assert_eq!(studio.id, Some("new1".to_string()));
+        assert_eq!(studio.server.id, Some("new1".to_string()));
         mock.assert_async().await;
     }
 
@@ -288,7 +276,7 @@ mod tests {
         .await;
 
         let studio = api(&client).get_studio("studio123").await.unwrap();
-        assert_eq!(studio.id, Some("studio123".to_string()));
+        assert_eq!(studio.server.id, Some("studio123".to_string()));
         mock.assert_async().await;
     }
 
@@ -316,7 +304,7 @@ mod tests {
 
         let body = models::Server::default();
         let studio = api(&client).update_studio("st1", &body).await.unwrap();
-        assert_eq!(studio.id, Some("st1".to_string()));
+        assert_eq!(studio.server.id, Some("st1".to_string()));
         mock.assert_async().await;
     }
 
@@ -341,18 +329,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_extend_studio_success() {
+        // Spec: 202 (extended) or 204 (no extension needed), no JSON body.
         let (mut server, client) = mock_api().await;
-        let mock = mock_json(
-            &mut server,
-            "POST",
-            "/studios/st1/extend",
-            200,
-            r#"{"id":"st1","expiresAt":"2030-01-01T00:00:00Z"}"#,
-        )
-        .await;
+        let mock = mock_empty(&mut server, "POST", "/studios/st1/extend", 202).await;
 
-        let studio = api(&client).extend_studio("st1").await.unwrap();
-        assert_eq!(studio.config.expires_at, Some("2030-01-01T00:00:00Z".to_string()));
+        api(&client).extend_studio("st1").await.unwrap();
         mock.assert_async().await;
     }
 
@@ -372,24 +353,6 @@ mod tests {
         assert_eq!(settings.server_id, Some("st1".to_string()));
         assert_eq!(settings.admin, Some(true));
         assert_eq!(settings.owner, Some(false));
-        mock.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn test_update_access_settings_success() {
-        let (mut server, client) = mock_api().await;
-        let mock = mock_json(
-            &mut server,
-            "PUT",
-            "/studios/st1/access",
-            200,
-            r#"{"serverId":"st1","admin":false}"#,
-        )
-        .await;
-
-        let body = models::ServerAccess::default();
-        let settings = api(&client).update_access_settings("st1", &body).await.unwrap();
-        assert_eq!(settings.admin, Some(false));
         mock.assert_async().await;
     }
 

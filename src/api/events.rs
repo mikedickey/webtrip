@@ -212,7 +212,7 @@ mod tests {
             "GET",
             "/events-paginated",
             200,
-            r#"{"_meta":{"total":1,"pages":1,"current":2,"count":1,"limit":10},"results":[{"id":"e1"}]}"#,
+            r#"{"_meta":{"total":11,"pages":2,"current":2,"count":1,"limit":10},"results":[{"id":"e1"}]}"#,
         )
         .await;
 
