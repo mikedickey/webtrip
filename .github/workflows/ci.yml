@@ -138,6 +138,20 @@ jobs:
           printf '%s\n' "$MIKED_TLS_KEY"  > certs/star.miked.io.key
           chmod 600 certs/star.miked.io.key
 
+      # The server's TLS is what WebRTC (wss) and WebTransport (QUIC) validate,
+      # so a malformed or leaf-only (no intermediates) cert makes both fail in
+      # the browser with opaque errors. Verify the PEM up front.
+      - name: Validate TLS material
+        run: |
+          echo "cert bytes: $(wc -c < certs/star.miked.io.chained.crt), key bytes: $(wc -c < certs/star.miked.io.key)"
+          n=$(grep -c 'BEGIN CERTIFICATE' certs/star.miked.io.chained.crt || true)
+          echo "certificates in chain: $n"
+          openssl x509 -in certs/star.miked.io.chained.crt -noout -subject -issuer -dates \
+            || { echo "::error::MIKED_TLS_CERT is not valid PEM"; exit 1; }
+          if [ "$n" -lt 2 ]; then
+            echo "::warning::cert chain has $n certificate(s); a leaf-only cert (no intermediates) will fail browser TLS validation for wss/WebTransport"
+          fi
+
       # Reuse the same service definition local devs use, so the JackTrip server
       # contract lives in one place (the compose file).
       - name: Start JackTrip server
@@ -145,17 +159,26 @@ jobs:
           JACKTRIP_CERT_DIR: ${{ github.workspace }}/certs
         run: docker compose -f tests/integration/docker-compose.integration.yml up -d
 
-      - name: Wait for server (TCP 4464)
+      # Probe the actual TLS endpoint, not just a raw TCP connect: JackTrip keeps
+      # the plain control port on 4464 up even when its TLS (wss/WebTransport)
+      # layer failed to start, so a bare TCP check would pass spuriously and the
+      # failure would only surface deep in the browser.
+      - name: Wait for server (TLS on 4464)
         run: |
           for i in $(seq 1 60); do
-            if (echo > /dev/tcp/localhost.miked.io/4464) 2>/dev/null; then
-              echo "JackTrip server is accepting connections on 4464"
+            code=$(curl -ksS -o /dev/null -w '%{http_code}' "https://localhost.miked.io:4464/ping" || echo 000)
+            if [ "$code" != "000" ]; then
+              echo "JackTrip TLS endpoint responding on 4464 (HTTP $code)"
+              # Validating fetch (system CAs): if this fails but the -k probe
+              # above succeeded, the served chain is untrusted/incomplete.
+              curl -fsS -o /dev/null "https://localhost.miked.io:4464/ping" \
+                || echo "::warning::server TLS is up but the cert is not browser-trusted (likely missing intermediates) — wss/WebTransport will fail"
               exit 0
             fi
             sleep 2
           done
-          echo "::error::JackTrip server did not become reachable on localhost.miked.io:4464"
-          docker logs jacktrip || true
+          echo "::error::JackTrip TLS endpoint never came up on localhost.miked.io:4464 — check the cert/key the server loaded"
+          docker logs jacktrip 2>&1 | tail -50 || true
           exit 1
 
       # Run inside the prebuilt build image (nightly toolchain + chromium) on the
@@ -172,7 +195,9 @@ jobs:
 
       - name: JackTrip server logs
         if: always()
-        run: docker compose -f tests/integration/docker-compose.integration.yml logs || true
+        run: |
+          docker ps -a --filter name=jacktrip || true
+          docker logs jacktrip 2>&1 || true
 
       - name: Stop JackTrip server
         if: always()
