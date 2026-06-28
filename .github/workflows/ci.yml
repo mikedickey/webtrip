@@ -159,26 +159,25 @@ jobs:
           JACKTRIP_CERT_DIR: ${{ github.workspace }}/certs
         run: docker compose -f tests/integration/docker-compose.integration.yml up -d
 
-      # Probe the actual TLS endpoint, not just a raw TCP connect: JackTrip keeps
-      # the plain control port on 4464 up even when its TLS (wss/WebTransport)
-      # layer failed to start, so a bare TCP check would pass spuriously and the
-      # failure would only surface deep in the browser.
+      # Probe the actual TLS endpoint (curl -k returns the HTTP status once TLS is
+      # up; "000" means it couldn't even connect). The container's PID 1 is
+      # systemd, so the jacktrip unit may take a while to come up — or fail to.
       - name: Wait for server (TLS on 4464)
         run: |
           for i in $(seq 1 60); do
-            code=$(curl -ksS -o /dev/null -w '%{http_code}' "https://localhost.miked.io:4464/ping" || echo 000)
+            code=$(curl -ksS -o /dev/null -w '%{http_code}' "https://localhost.miked.io:4464/ping" || true)
+            code=${code:-000}
             if [ "$code" != "000" ]; then
               echo "JackTrip TLS endpoint responding on 4464 (HTTP $code)"
-              # Validating fetch (system CAs): if this fails but the -k probe
-              # above succeeded, the served chain is untrusted/incomplete.
-              curl -fsS -o /dev/null "https://localhost.miked.io:4464/ping" \
-                || echo "::warning::server TLS is up but the cert is not browser-trusted (likely missing intermediates) — wss/WebTransport will fail"
               exit 0
             fi
             sleep 2
           done
-          echo "::error::JackTrip TLS endpoint never came up on localhost.miked.io:4464 — check the cert/key the server loaded"
-          docker logs jacktrip 2>&1 | tail -50 || true
+          echo "::error::JackTrip TLS endpoint never came up on localhost.miked.io:4464"
+          echo "--- listeners in container ---"
+          docker exec jacktrip sh -c 'command -v ss >/dev/null && ss -ltnup || netstat -ltnup' 2>&1 || true
+          echo "--- jacktrip service / journal ---"
+          docker exec jacktrip sh -c 'systemctl --no-pager --failed 2>&1 | head -40; systemctl --no-pager status "*jacktrip*" 2>&1 | head -60; journalctl --no-pager -n 150 2>&1 | tail -150' || true
           exit 1
 
       # Run inside the prebuilt build image (nightly toolchain + chromium) on the
@@ -197,7 +196,12 @@ jobs:
         if: always()
         run: |
           docker ps -a --filter name=jacktrip || true
-          docker logs jacktrip 2>&1 || true
+          echo "--- docker logs (stdout/stderr of PID 1) ---"
+          docker logs jacktrip 2>&1 | tail -80 || true
+          echo "--- listeners in container ---"
+          docker exec jacktrip sh -c 'command -v ss >/dev/null && ss -ltnup || netstat -ltnup' 2>&1 || true
+          echo "--- jacktrip service / journal ---"
+          docker exec jacktrip sh -c 'systemctl --no-pager --failed 2>&1 | head -40; systemctl --no-pager status "*jacktrip*" 2>&1 | head -60; journalctl --no-pager -n 150 2>&1 | tail -150' || true
 
       - name: Stop JackTrip server
         if: always()
