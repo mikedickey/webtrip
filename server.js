@@ -12,7 +12,7 @@ for (let i = 0; i < args.length; i++) {
 }
 
 const useTLS = !!(keyFile && certFile);
-const PORT = useTLS ? 8443 : 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : (useTLS ? 8443 : 3000);
 
 const MIME_TYPES = {
   '.html': 'text/html',
