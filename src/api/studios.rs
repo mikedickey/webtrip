@@ -260,6 +260,7 @@ mod tests {
         let body = models::Server::default();
         let studio = api(&client).create_studio(&body).await.unwrap();
         assert_eq!(studio.server.id, Some("new1".to_string()));
+        assert_eq!(studio.server.config.name, Some("Created".to_string()));
         mock.assert_async().await;
     }
 
@@ -277,6 +278,8 @@ mod tests {
 
         let studio = api(&client).get_studio("studio123").await.unwrap();
         assert_eq!(studio.server.id, Some("studio123".to_string()));
+        assert_eq!(studio.server.config.name, Some("My Studio".to_string()));
+        assert_eq!(studio.server.config.enabled, Some(true));
         mock.assert_async().await;
     }
 

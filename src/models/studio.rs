@@ -1,6 +1,6 @@
 //! Studio (server) models
 
-use super::{BroadcastVisibility, BufferStrategy, Period, QueueBuffer, ResourceStatus};
+use super::{BroadcastVisibility, BufferStrategy, Period, QueueBuffer, ResourceStatus, ServerConfig};
 use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 use wasm_bindgen::prelude::*;
@@ -69,14 +69,21 @@ pub struct ServerAgentConfig {
 /// A JackTrip Virtual Studio instance (spec name: `Server`).
 ///
 /// Composed from [`ServerAgentConfig`] plus studio-level identifiers and
-/// metadata.
+/// metadata. The studio configuration properties (`type`, `name`, `serverHost`,
+/// `serverPort`, `sampleRate`, `public`, `stereo`, `loopback`, `enabled`) are
+/// flattened in from [`ServerConfig`] so create/update payloads and `/studios`
+/// responses preserve studio metadata.
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
 pub struct Server {
+    /// Studio configuration (type, name, host/port, sample rate, visibility flags)
+    #[serde(flatten)]
+    pub config: ServerConfig,
+
     /// Agent configuration (audio properties, mix, broadcast, expiry, capacity)
     #[serde(flatten)]
-    pub config: ServerAgentConfig,
+    pub agent: ServerAgentConfig,
 
     /// Studio ID
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -297,6 +304,12 @@ mod tests {
           "skillLevels": ["beginner", "intermediate"],
           "instruments": ["guitar"],
           "genres": ["rock"],
+          "type": "JackTrip+Jamulus",
+          "name": "My Studio",
+          "serverHost": "1.2.3.4",
+          "serverPort": 4464,
+          "sampleRate": 48000,
+          "public": true,
           "period": 128,
           "queueBuffer": 4,
           "bufferStrategy": 1,
@@ -312,22 +325,32 @@ mod tests {
         assert_eq!(s.status, Some(ResourceStatus::Ready));
         assert_eq!(s.managed, Some(1));
         assert_eq!(s.looking_for, Some(2));
-        assert_eq!(s.config.audio.period, Some(Period::P128));
-        assert_eq!(s.config.audio.queue_buffer, Some(QueueBuffer::Q4));
-        assert_eq!(s.config.audio.buffer_strategy, Some(BufferStrategy::Standard));
-        assert_eq!(s.config.broadcast, Some(BroadcastVisibility::Public));
-        assert_eq!(s.config.max_musicians, Some(5));
-        assert_eq!(s.config.mix.mix_branch.as_deref(), Some("main"));
-        assert_eq!(s.config.expires_at.as_deref(), Some("2026-06-14T00:00:00Z"));
+        // ServerConfig fields (flattened).
+        assert_eq!(s.config.name.as_deref(), Some("My Studio"));
+        assert_eq!(s.config.studio_type, Some(super::super::StudioType::JackTripJamulus));
+        assert_eq!(s.config.server_port, Some(4464));
+        assert_eq!(s.config.public, Some(true));
+        // ServerAgentConfig fields (flattened).
+        assert_eq!(s.agent.audio.period, Some(Period::P128));
+        assert_eq!(s.agent.audio.queue_buffer, Some(QueueBuffer::Q4));
+        assert_eq!(s.agent.audio.buffer_strategy, Some(BufferStrategy::Standard));
+        assert_eq!(s.agent.broadcast, Some(BroadcastVisibility::Public));
+        assert_eq!(s.agent.max_musicians, Some(5));
+        assert_eq!(s.agent.mix.mix_branch.as_deref(), Some("main"));
+        assert_eq!(s.agent.expires_at.as_deref(), Some("2026-06-14T00:00:00Z"));
 
         // Wire-format check: flattened fields are at the top level.
         let out = serde_json::to_string(&s).unwrap();
         assert!(out.contains("\"bannerURL\":"));
         assert!(out.contains("\"ownerId\":"));
+        assert!(out.contains("\"type\":\"JackTrip+Jamulus\""));
+        assert!(out.contains("\"name\":\"My Studio\""));
+        assert!(out.contains("\"serverPort\":4464"));
         assert!(out.contains("\"queueBuffer\":4"));
         assert!(out.contains("\"mixBranch\":\"main\""));
         assert!(out.contains("\"maxMusicians\":5"));
         assert!(!out.contains("\"config\":"));
+        assert!(!out.contains("\"agent\":"));
         assert!(!out.contains("\"audio\":"));
     }
 

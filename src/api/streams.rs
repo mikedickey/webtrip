@@ -4,7 +4,6 @@
 
 use super::{to_js_value, PaginationQuery, ApiClient, ApiError, urlencode};
 use crate::models;
-use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
 // =============================================================================
@@ -27,29 +26,17 @@ impl StreamsApi {
         self.client.get("/streams").await
     }
 
-    /// Search for broadcasts by keyword.
+    /// Search for broadcasts.
     ///
-    /// Returns the paginated `{ _meta, results }` envelope whose items carry
-    /// search-specific fields ([`models::StreamInfoSearchResult`]). `page` and
-    /// `limit` select the page of results.
+    /// Accepts the full [`models::StreamSearchQuery`] contract (`q`, `lookingFor`,
+    /// `skillLevel`, `instrument`, `genre`, `region`, `page`, `limit`) and returns
+    /// the paginated `{ _meta, results }` envelope whose items carry
+    /// search-specific fields ([`models::StreamInfoSearchResult`]).
     pub async fn search_streams(
         &self,
-        query: Option<&str>,
-        page: Option<i32>,
-        limit: Option<i32>,
+        query: &models::StreamSearchQuery,
     ) -> Result<models::PaginatedStreamSearchResults, ApiError> {
-        #[derive(Serialize)]
-        struct Query<'a> {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            q: Option<&'a str>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            page: Option<i32>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            limit: Option<i32>,
-        }
-        self.client
-            .get_with_query("/streams/search", &Query { q: query, page, limit })
-            .await
+        self.client.get_with_query("/streams/search", query).await
     }
 
     /// Get a broadcast by ID
@@ -202,13 +189,8 @@ impl StreamsApi {
     }
 
     #[wasm_bindgen(js_name = searchStreams)]
-    pub async fn search_streams_js(
-        &self,
-        query: Option<String>,
-        page: Option<i32>,
-        limit: Option<i32>,
-    ) -> Result<JsValue, ApiError> {
-        let streams = self.search_streams(query.as_deref(), page, limit).await?;
+    pub async fn search_streams_js(&self, query: models::StreamSearchQuery) -> Result<JsValue, ApiError> {
+        let streams = self.search_streams(&query).await?;
         to_js_value(&streams)
     }
 
@@ -370,12 +352,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_search_streams_with_query_and_pagination() {
+    async fn test_search_streams_with_filters_and_pagination() {
         let (mut server, client) = mock_api().await;
+        // Assert every supported filter is serialized with the spec's query-key
+        // casing (e.g. `lookingFor`, `skillLevel`).
         let mock = server
             .mock("GET", "/streams/search")
             .match_query(mockito::Matcher::AllOf(vec![
                 mockito::Matcher::UrlEncoded("q".into(), "jazz".into()),
+                mockito::Matcher::UrlEncoded("lookingFor".into(), "2".into()),
+                mockito::Matcher::UrlEncoded("skillLevel".into(), "intermediate".into()),
+                mockito::Matcher::UrlEncoded("instrument".into(), "sax".into()),
+                mockito::Matcher::UrlEncoded("genre".into(), "jazz".into()),
+                mockito::Matcher::UrlEncoded("region".into(), "ec2-us-north-ca".into()),
                 mockito::Matcher::UrlEncoded("page".into(), "2".into()),
                 mockito::Matcher::UrlEncoded("limit".into(), "5".into()),
             ]))
@@ -385,7 +374,17 @@ mod tests {
             .create_async()
             .await;
 
-        let result = api(&client).search_streams(Some("jazz"), Some(2), Some(5)).await.unwrap();
+        let query = models::StreamSearchQuery {
+            q: Some("jazz".to_string()),
+            looking_for: Some(2),
+            skill_level: Some("intermediate".to_string()),
+            instrument: Some("sax".to_string()),
+            genre: Some("jazz".to_string()),
+            region: Some("ec2-us-north-ca".to_string()),
+            page: Some(2),
+            limit: Some(5),
+        };
+        let result = api(&client).search_streams(&query).await.unwrap();
         assert_eq!(result.results.len(), 1);
         assert_eq!(result.meta.current, 2);
         assert_eq!(result.results[0].base.name, Some("jazz".to_string()));
@@ -394,7 +393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_search_streams_without_query() {
+    async fn test_search_streams_empty_query() {
         let (mut server, client) = mock_api().await;
         let mock = mock_json(
             &mut server,
@@ -405,7 +404,7 @@ mod tests {
         )
         .await;
 
-        let result = api(&client).search_streams(None, None, None).await.unwrap();
+        let result = api(&client).search_streams(&models::StreamSearchQuery::default()).await.unwrap();
         assert!(result.results.is_empty());
         mock.assert_async().await;
     }

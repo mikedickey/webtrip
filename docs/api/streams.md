@@ -34,23 +34,25 @@ let streams = client.streams().list_streams().await?;
 
 ### searchStreams / search_streams
 
-Search for broadcasts by keyword.
+Search for broadcasts.
 
 **Authentication:** None required
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `query` | `string?` | Search query |
+| `query` | `StreamSearchQuery` | Search filters (`q`, `lookingFor`, `skillLevel`, `instrument`, `genre`, `region`, `page`, `limit`) |
 
 ```javascript
-const streams = await client.streams().searchStreams('jazz');
+const results = await client.streams().searchStreams({ q: 'jazz', genre: 'jazz', page: 1, limit: 20 });
+results.results.forEach(s => console.log(s.name));
 ```
 
 ```rust
-let streams = client.streams().search_streams(Some("jazz")).await?;
+let query = StreamSearchQuery { q: Some("jazz".into()), ..Default::default() };
+let results = client.streams().search_streams(&query).await?;
 ```
 
-**Returns:** `StreamInfo[]`
+**Returns:** `PaginatedStreamSearchResults` (`{ _meta, results: StreamInfoSearchResult[] }`)
 
 ---
 

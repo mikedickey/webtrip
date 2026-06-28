@@ -126,6 +126,47 @@ pub struct StreamInfoWithEngagement {
     pub following: Option<bool>,
 }
 
+/// Query options for `GET /streams/search`.
+///
+/// Mirrors the spec's query parameters; all fields are optional and omitted from
+/// the request when `None`.
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamSearchQuery {
+    /// Free-text search term
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
+
+    /// Studio looking-for status filter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub looking_for: Option<i32>,
+
+    /// Skill level filter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_level: Option<String>,
+
+    /// Instrument filter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instrument: Option<String>,
+
+    /// Genre filter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genre: Option<String>,
+
+    /// Cloud region filter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+
+    /// Page number (1-indexed)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<i32>,
+
+    /// Maximum number of items per page
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i32>,
+}
+
 /// Live stream configuration
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
