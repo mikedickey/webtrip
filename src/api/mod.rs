@@ -372,6 +372,25 @@ impl ApiClient {
         self.handle_response(response).await
     }
 
+    /// Execute a PUT request with a raw binary body (e.g. an image upload),
+    /// returning nothing. Used by endpoints like `PUT /studios/{id}/banner`
+    /// whose payload is image bytes rather than JSON.
+    pub(crate) async fn put_bytes(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        content_type: &str,
+    ) -> ApiResult<()> {
+        let response = self
+            .build_request(reqwest::Method::PUT, path)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(body)
+            .send()
+            .await?;
+
+        self.handle_empty_response(response).await
+    }
+
     /// Execute a DELETE request
     pub(crate) async fn delete(&self, path: &str) -> ApiResult<()> {
         let response = self

@@ -28,7 +28,7 @@ const studios = await client.studios().listStudios();
 let studios = client.studios().list_studios().await?;
 ```
 
-**Returns:** `Studio[]`
+**Returns:** `ServerWithSubscription[]`
 
 ---
 
@@ -40,7 +40,7 @@ Create a new studio.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `studio` | `Studio` | Studio configuration |
+| `studio` | `Server` | Studio configuration |
 
 ```javascript
 const studio = await client.studios().createStudio({
@@ -53,7 +53,7 @@ const studio = await client.studios().createStudio({
 let studio = client.studios().create_studio(&new_studio).await?;
 ```
 
-**Returns:** `Studio`
+**Returns:** `ServerWithSubscription`
 
 ---
 
@@ -75,7 +75,7 @@ const studio = await client.studios().getStudio('studio123');
 let studio = client.studios().get_studio("studio123").await?;
 ```
 
-**Returns:** `Studio`
+**Returns:** `ServerWithSubscription`
 
 ---
 
@@ -88,7 +88,7 @@ Update a studio's configuration.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `studioId` | `string` | Studio ID |
-| `studio` | `Studio` | Updated configuration |
+| `studio` | `Server` | Updated configuration |
 
 ```javascript
 const updated = await client.studios().updateStudio('studio123', {
@@ -100,7 +100,7 @@ const updated = await client.studios().updateStudio('studio123', {
 let updated = client.studios().update_studio("studio123", &studio).await?;
 ```
 
-**Returns:** `Studio`
+**Returns:** `ServerWithSubscription`
 
 ---
 
@@ -137,14 +137,14 @@ Extend a studio's expiration time.
 | `studioId` | `string` | Studio ID |
 
 ```javascript
-const studio = await client.studios().extendStudio('studio123');
+await client.studios().extendStudio('studio123');
 ```
 
 ```rust
-let studio = client.studios().extend_studio("studio123").await?;
+client.studios().extend_studio("studio123").await?;
 ```
 
-**Returns:** `Studio`
+**Returns:** `void` / `()`
 
 ---
 
@@ -166,86 +166,40 @@ const settings = await client.studios().getAccessSettings('studio123');
 let settings = client.studios().get_access_settings("studio123").await?;
 ```
 
-**Returns:** `AccessSettings`
+**Returns:** `ServerAccess`
 
 ---
 
-### updateAccessSettings / update_access_settings
+### updateBanner / update_banner
 
-Update access settings for a studio.
+Update a studio's banner image (also used for its JackTrip Radio broadcast
+banner). The payload is the raw image bytes; the endpoint responds with no body.
 
 **Authentication:** Required
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `studioId` | `string` | Studio ID |
-| `settings` | `AccessSettings` | New settings |
+| `image` | `Uint8Array` / `Vec<u8>` | Raw image bytes |
+| `contentType` | `string` | MIME type of the image (e.g. `image/png`) |
 
 ```javascript
-const updated = await client.studios().updateAccessSettings('studio123', {
-  isPublic: true,
-  requireApproval: false
-});
+await client.studios().updateBanner('studio123', pngBytes, 'image/png');
 ```
 
 ```rust
-let updated = client.studios().update_access_settings("studio123", &settings).await?;
+client.studios().update_banner("studio123", png_bytes, "image/png").await?;
 ```
 
-**Returns:** `AccessSettings`
-
----
-
-### getMixer / get_mixer
-
-Get the mixer configuration for a studio.
-
-**Authentication:** Required
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `studioId` | `string` | Studio ID |
-
-```javascript
-const mixer = await client.studios().getMixer('studio123');
-```
-
-```rust
-let mixer = client.studios().get_mixer("studio123").await?;
-```
-
-**Returns:** `Mixer`
-
----
-
-### updateMixer / update_mixer
-
-Update the mixer configuration for a studio.
-
-**Authentication:** Required
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `studioId` | `string` | Studio ID |
-| `mixer` | `Mixer` | New mixer configuration |
-
-```javascript
-const updated = await client.studios().updateMixer('studio123', mixer);
-```
-
-```rust
-let updated = client.studios().update_mixer("studio123", &mixer).await?;
-```
-
-**Returns:** `Mixer`
+**Returns:** `void` / `()`
 
 ---
 
 ### listMixers / list_mixers
 
-Get all mixers.
+Get all mixers, keyed by mixer name (`GET /mixers` returns a map).
 
-**Authentication:** Required
+**Authentication:** Not required
 
 ```javascript
 const mixers = await client.studios().listMixers();
@@ -255,7 +209,7 @@ const mixers = await client.studios().listMixers();
 let mixers = client.studios().list_mixers().await?;
 ```
 
-**Returns:** `Mixer[]`
+**Returns:** `Record<string, Mixer>` / `HashMap<String, Mixer>`
 
 ---
 
@@ -383,6 +337,31 @@ let participants = client.studios().get_participants("studio123").await?;
 
 ---
 
+### getParticipant / get_participant
+
+Get a single participant's full user metadata by user ID. Unlike
+`getParticipants` (which returns lightweight session-scoped `Participant`
+objects), this returns the complete `User` record.
+
+**Authentication:** Required
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `studioId` | `string` | Studio ID |
+| `userId` | `string` | Participant's user ID |
+
+```javascript
+const user = await client.studios().getParticipant('studio123', 'user456');
+```
+
+```rust
+let user = client.studios().get_participant("studio123", "user456").await?;
+```
+
+**Returns:** `User`
+
+---
+
 ### getSession / get_session
 
 Get the current session for a studio.
@@ -407,9 +386,9 @@ let session = client.studios().get_session("studio123").await?;
 
 ## Types
 
-### Studio
+### Server
 
-A JackTrip Virtual Studio instance.
+A JackTrip Virtual Studio instance (spec name: `Server`).
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -443,34 +422,58 @@ A JackTrip Virtual Studio instance.
 | `stereo` | `boolean?` | Whether stereo audio is enabled |
 | `loopback` | `boolean?` | Whether loopback audio is enabled |
 | `enabled` | `boolean?` | Whether the studio is currently active/enabled |
-| `admin` | `boolean?` | Whether the current user is an admin of this studio |
-| `owner` | `boolean?` | Whether the current user is the owner of this studio |
-| `subStatus` | `string?` | Subscription status (Active, Deleted) |
 
-### AccessSettings
+### ServerWithSubscription
 
-Studio access control settings.
+A `Server` plus the authenticated caller's relationship to it. Returned by
+`listStudios`, `createStudio`, `getStudio`, and `updateStudio`. Includes all
+`Server` fields above plus:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `passwordProtected` | `boolean?` | Whether the studio requires a password |
-| `password` | `string?` | Studio access password (write-only) |
-| `allowGuests` | `boolean?` | Whether to allow anonymous/guest access |
-| `maxGuests` | `number?` | Maximum number of guests allowed |
-| `allowedUsers` | `string[]?` | Allowed user IDs (if restricted) |
+| `admin` | `boolean?` | Whether the current user is an admin of this studio |
+| `owner` | `boolean?` | Whether the current user is the owner of this studio |
+| `subStatus` | `string?` | Studio subscription status (Active, Deleted) |
+
+### ServerAccess
+
+Access rights of the authenticated user for a studio (spec name: `ServerAccess`),
+returned by `getAccessSettings`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `serverId` | `string?` | Studio ID |
+| `userId` | `string?` | Authenticated user ID |
+| `admin` | `boolean?` | Whether the user is a studio admin |
+| `owner` | `boolean?` | Whether the user is the studio owner |
+| `permissions` | `ServerAccessPermission[]?` | Named permissions with current values |
+
+#### ServerAccessPermission
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `string?` | Permission name |
+| `value` | `boolean?` | Whether the permission is granted |
+| `explanation` | `string?` | Human-readable explanation |
 
 ### Mixer
 
-Studio mixer configuration.
+Mixer definition (returned in the `listMixers` map).
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | `string?` | Mixer ID |
-| `name` | `string?` | Mixer name |
-| `description` | `string?` | Mixer description |
-| `branch` | `string?` | SuperCollider code branch |
-| `code` | `string?` | Custom SuperCollider code |
-| `preset` | `boolean?` | Whether this is a system preset |
+| `type` | `string?` | Mixer type |
+| `url` | `string?` | Mixer source URL |
+| `configs` | `MixerConfig[]?` | Mixer configurations |
+| `links` | `MixerConfig[]?` | Link configurations |
+| `presets` | `MixerConfig[]?` | Preset configurations |
+
+#### MixerConfig
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `content` | `string?` | Encoded mixer configuration content |
+| `encoding` | `string?` | Configuration encoding format (e.g. `base64`) |
 
 ### Participant
 
