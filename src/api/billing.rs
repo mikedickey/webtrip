@@ -4,7 +4,7 @@
 //! happen via the Stripe-hosted billing portal, so this module only exposes the
 //! plan-pricing lookup plus the portal/checkout redirect surfaces.
 
-use super::{to_js_value, ApiClient, ApiError, urlencode};
+use super::{ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -21,10 +21,13 @@ api_module_struct!(BillingApi);
 
 impl BillingApi {
     /// Resolve the Stripe price for a plan / pricing mode (`GET /users/{userId}/plans`).
+    ///
+    /// `plan` is required by the spec; `pricing_mode` and `force_stripe_test_mode`
+    /// are optional.
     pub async fn get_plans(
         &self,
         user_id: &str,
-        plan: Option<&str>,
+        plan: &str,
         pricing_mode: Option<&str>,
         force_stripe_test_mode: Option<&str>,
     ) -> Result<models::PlanPrice, ApiError> {
@@ -33,8 +36,7 @@ impl BillingApi {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Query<'a> {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            plan: Option<&'a str>,
+            plan: &'a str,
             #[serde(skip_serializing_if = "Option::is_none")]
             pricing_mode: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -79,11 +81,11 @@ impl BillingApi {
     pub async fn get_plans_js(
         &self,
         user_id: String,
-        plan: Option<String>,
+        plan: String,
         pricing_mode: Option<String>,
         force_stripe_test_mode: Option<String>,
     ) -> Result<models::PlanPrice, ApiError> {
-        self.get_plans(&user_id, plan.as_deref(), pricing_mode.as_deref(), force_stripe_test_mode.as_deref())
+        self.get_plans(&user_id, &plan, pricing_mode.as_deref(), force_stripe_test_mode.as_deref())
             .await
     }
 
@@ -130,7 +132,7 @@ mod tests {
             .create_async()
             .await;
 
-        let resolved = api(&client).get_plans("u1", Some("pro"), Some("yearly"), None).await.unwrap();
+        let resolved = api(&client).get_plans("u1", "pro", Some("yearly"), None).await.unwrap();
         assert_eq!(resolved.plan, Some("pro".to_string()));
         assert_eq!(resolved.price_id, Some("price_abc".to_string()));
         mock.assert_async().await;
@@ -141,7 +143,7 @@ mod tests {
         let (mut server, client) = mock_api().await;
         let mock = mock_json(&mut server, "GET", "/users/u1/plans", 500, "boom").await;
 
-        let err = api(&client).get_plans("u1", None, None, None).await.unwrap_err();
+        let err = api(&client).get_plans("u1", "pro", None, None).await.unwrap_err();
         assert_http_status(err, 500);
         mock.assert_async().await;
     }
@@ -179,8 +181,8 @@ mod tests {
         .await;
 
         let req = models::CheckoutRequest {
-            plan: Some("pro".to_string()),
-            callback_url: Some("https://app/done".to_string()),
+            plan: "pro".to_string(),
+            callback_url: "https://app/done".to_string(),
             ..Default::default()
         };
         let resp = api(&client).create_checkout("u1", &req).await.unwrap();

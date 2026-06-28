@@ -133,17 +133,16 @@ pub struct AnalyticsEvent {
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckoutRequest {
-    /// Subscription plan name to check out
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub plan: Option<String>,
+    /// Subscription plan name to check out (required)
+    pub plan: String,
+
+    /// URL to redirect to after checkout completes (required)
+    #[serde(rename = "callbackURL")]
+    pub callback_url: String,
 
     /// Pricing mode (e.g. "yearly")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing_mode: Option<String>,
-
-    /// URL to redirect to after checkout completes
-    #[serde(rename = "callbackURL", skip_serializing_if = "Option::is_none")]
-    pub callback_url: Option<String>,
 
     /// Force Stripe test mode regardless of environment
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,9 +206,9 @@ mod tests {
     #[test]
     fn checkout_request_wire_format() {
         let r = CheckoutRequest {
-            plan: Some("pro".into()),
+            plan: "pro".into(),
             pricing_mode: Some("yearly".into()),
-            callback_url: Some("https://app/done".into()),
+            callback_url: "https://app/done".into(),
             force_stripe_test_mode: Some(true),
         };
         let s = roundtrip(&r);

@@ -208,7 +208,8 @@
                 updateAuth();
                 showLoading('Fetching regions...');
                 const data = await window.apiClient.system().listRegions();
-                showOutput(`✅ Found ${data.length} region(s)`, data);
+                // listRegions returns a map of regionId -> Region, not an array.
+                showOutput(`✅ Found ${Object.keys(data).length} region(s)`, data);
             } catch (error) {
                 showOutput('❌ Failed to fetch regions', { error: error.toString() }, true);
             }

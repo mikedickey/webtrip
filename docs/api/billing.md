@@ -27,7 +27,7 @@ Resolve the Stripe price for a plan / pricing mode (`GET /users/{userId}/plans`)
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `userId` | `string` | User ID |
-| `plan` | `string?` | Plan name to resolve |
+| `plan` | `string` | Plan name to resolve (required) |
 | `pricingMode` | `string?` | Pricing mode (e.g. `yearly`) |
 | `forceStripeTestMode` | `string?` | Force Stripe test mode |
 
@@ -36,7 +36,7 @@ const { plan, priceID } = await client.billing().getPlans('user123', 'pro', 'yea
 ```
 
 ```rust
-let resolved = client.billing().get_plans("user123", Some("pro"), Some("yearly"), None).await?;
+let resolved = client.billing().get_plans("user123", "pro", Some("yearly"), None).await?;
 ```
 
 **Returns:** `PlanPrice`
@@ -103,8 +103,8 @@ window.location.href = redirect; // Redirect to Stripe checkout
 
 ```rust
 let request = CheckoutRequest {
-    plan: Some("pro".into()),
-    callback_url: Some("https://app.example.com/done".into()),
+    plan: "pro".into(),
+    callback_url: "https://app.example.com/done".into(),
     ..Default::default()
 };
 let response = client.billing().create_checkout("user123", &request).await?;
@@ -120,8 +120,8 @@ let response = client.billing().create_checkout("user123", &request).await?;
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `plan` | `string?` | Subscription plan name to check out |
+| `plan` | `string` | Subscription plan name to check out (required) |
+| `callbackURL` | `string` | URL to redirect to after checkout completes (required) |
 | `pricingMode` | `string?` | Pricing mode (e.g. `yearly`) |
-| `callbackURL` | `string?` | URL to redirect to after checkout completes |
 | `forceStripeTestMode` | `boolean?` | Force Stripe test mode regardless of environment |
 
