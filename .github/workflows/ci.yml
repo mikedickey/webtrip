@@ -95,3 +95,84 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info,lcov.wasm.info
           fail_ci_if_error: true
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Integration tests against a REAL JackTrip server.
+  #
+  # Boots `jacktrip/jacktrip:edge` (host networking, TLS via the *.miked.io
+  # wildcard cert) and drives the WASM client against it from headless Chrome in
+  # the prebuilt build image (also on host networking so it reaches
+  # localhost.miked.io:4464). Requires the MIKED_TLS_* secrets, which GitHub does
+  # not expose to fork PRs — so the job skips on forks.
+  # ──────────────────────────────────────────────────────────────────────────
+  integration:
+    name: Integration (live JackTrip server)
+    needs: container
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Materialize the wildcard TLS cert/key from secrets. localhost.miked.io
+      # resolves to 127.0.0.1 publicly, so the loopback server can present a cert
+      # the browser trusts.
+      - name: Write TLS cert/key
+        env:
+          MIKED_TLS_CERT: ${{ secrets.MIKED_TLS_CERT }}
+          MIKED_TLS_KEY: ${{ secrets.MIKED_TLS_KEY }}
+        run: |
+          mkdir -p certs
+          printf '%s\n' "$MIKED_TLS_CERT" > certs/star.miked.io.chained.crt
+          printf '%s\n' "$MIKED_TLS_KEY"  > certs/star.miked.io.key
+          chmod 600 certs/star.miked.io.key
+
+      - name: Start JackTrip server
+        run: |
+          docker run -d --name jacktrip --network host --privileged --shm-size=512M \
+            -e BUFFER_SIZE=128 \
+            -e JACKTRIP_OPTS="-S -D -I 1 -p 4 --bufstrategy 3 -q auto --udprt --certfile /certs/star.miked.io.chained.crt --keyfile /certs/star.miked.io.key" \
+            -v "$PWD/certs:/certs:ro" \
+            jacktrip/jacktrip:edge
+
+      - name: Wait for server (TCP 4464)
+        run: |
+          for i in $(seq 1 60); do
+            if (echo > /dev/tcp/localhost.miked.io/4464) 2>/dev/null; then
+              echo "JackTrip server is accepting connections on 4464"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::JackTrip server did not become reachable on localhost.miked.io:4464"
+          docker logs jacktrip || true
+          exit 1
+
+      # Run inside the prebuilt build image (nightly toolchain + chromium) on the
+      # same host network so the browser reaches the JackTrip server. Build the
+      # app first (the served-app harness needs pkg/ + dist/), then serve it over
+      # TLS and drive both transports through a headless browser.
+      - name: Run integration tests
+        run: |
+          docker run --rm --network host -v "$PWD:/work" -w /work --user root \
+            -e JACKTRIP_TEST_HOST=localhost.miked.io \
+            -e PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
+            ${{ needs.container.outputs.image }} \
+            bash -lc "npm ci && npm run build && npm run test:integration"
+
+      - name: JackTrip server logs
+        if: always()
+        run: docker logs jacktrip || true
+
+      - name: Stop JackTrip server
+        if: always()
+        run: docker rm -f jacktrip || true

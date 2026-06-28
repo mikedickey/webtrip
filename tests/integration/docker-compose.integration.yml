@@ -1,0 +1,32 @@
+# Local JackTrip hub server for the integration tests (`npm run test:integration`).
+#
+# Brings up a real `jacktrip/jacktrip:edge` hub on the host network so the
+# browser test can connect to it over TLS at a hostname the `*.miked.io`
+# wildcard cert is valid for. `localhost.miked.io` resolves to 127.0.0.1 via
+# public DNS, so the loopback server presents a cert the browser trusts.
+#
+# The cert/key are NOT committed. Point `JACKTRIP_CERT_DIR` at a directory
+# containing `star.miked.io.chained.crt` and `star.miked.io.key`:
+#
+#   JACKTRIP_CERT_DIR=/path/to/certs docker compose -f tests/integration/docker-compose.integration.yml up -d
+#   npm run test:integration
+#   docker compose -f tests/integration/docker-compose.integration.yml down
+#
+# In CI the cert/key are written from the MIKED_TLS_CERT / MIKED_TLS_KEY secrets
+# (see .github/workflows/ci.yml).
+services:
+  jacktrip:
+    image: jacktrip/jacktrip:edge
+    container_name: jacktrip
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    shm_size: "512M"
+    volumes:
+      # Relative paths resolve against this file's directory, so the default
+      # points back to the repo-root `certs/` (matching tests/integration/run.mjs
+      # and .gitignore). Override with an absolute JACKTRIP_CERT_DIR.
+      - "${JACKTRIP_CERT_DIR:-../../certs}:/certs:ro"
+    environment:
+      BUFFER_SIZE: 128
+      JACKTRIP_OPTS: "-S -D -I 1 -p 4 --bufstrategy 3 -q auto --udprt --certfile /certs/star.miked.io.chained.crt --keyfile /certs/star.miked.io.key"

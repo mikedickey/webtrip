@@ -162,6 +162,84 @@ the toolchain container (`containers/build/Containerfile`). The browser setup
 (`chromium` + `chromium-driver`, `CHROMEDRIVER`, and the root-level
 `webdriver.json` flags) is documented at those sources.
 
+## Integration tests (real JackTrip server)
+
+The unit tests above stop at the transport boundary (`MockTransport` or pure
+logic). The **integration tests** drive the real WASM client against an actual
+`jacktrip/jacktrip:edge` hub server in Docker, for **both** the WebRTC and
+WebTransport transports — the live surface unit tests can't reach (WebRTC's
+WebSocket signaling + SDP/ICE + data-channel open; WebTransport's QUIC worker
+loops).
+
+```bash
+npm run build            # produces pkg/ and dist/
+npm run test:integration # tests/integration/run.mjs
+```
+
+### How it works (served-app + browser driver)
+
+Unlike the unit tests, these do **not** use `wasm-bindgen-test`. The WebTransport
+worker loads the wasm module from `{origin}/pkg/webtrip.js`
+(`src/audio/webtransport.rs::wasm_module_url`), which only resolves when the page
+is served at the site root with `pkg/` present — something the
+`wasm-bindgen-test` harness origin does not do. So `tests/integration/run.mjs`:
+
+1. serves the real app via `server.js` over plain HTTP on `localhost` (a secure
+   context, so its COOP/COEP headers still yield `crossOriginIsolated` +
+   WebTransport — no cert needed for the page),
+2. drives it with a headless browser (`puppeteer-core`), and
+3. for each transport, runs the actual exported session API
+   (`createAudioParams` → `WebTripSession` → `setTransportType` →
+   `connectToStudio`), then asserts the transport reports **connected** and that
+   captured (fake-device) audio reaches the **send** ring buffer
+   (`ring_buffer_samples_written > 0`). The receive/loopback counters are logged
+   but not asserted (a lone hub client may get no echo).
+
+The browser uses fake-media-device + `--autoplay-policy=no-user-gesture-required`
+flags so capture/playback run headless without a real mic or user gesture.
+
+### Why the `*.miked.io` cert + `localhost.miked.io`
+
+The cert is needed by the **JackTrip server**, not the test script. WebRTC
+`wss://` and WebTransport HTTP/3 require a browser-trusted TLS cert valid for the
+connection hostname — a bare `127.0.0.1` can't provide one, and WebTransport's
+cert check can't be bypassed. `localhost.miked.io` resolves to `127.0.0.1` via
+public DNS, so a loopback JackTrip server can present the repo's CA-trusted
+`*.miked.io` wildcard cert, which the browser accepts. Hosts/ports are
+overridable via `JACKTRIP_TEST_HOST` / `JACKTRIP_TEST_PORT` (and `APP_HOST` /
+`APP_PORT` for the page server); see the env knobs at the top of
+`tests/integration/run.mjs`.
+
+### Running locally
+
+`npm run test:integration` does **not** need a cert — it serves the app over
+plain HTTP on `localhost`. Only the JackTrip server needs the (uncommitted)
+`*.miked.io` cert/key. If you already have a JackTrip server running with a
+trusted cert, just point the test at it; otherwise start one via the bundled
+compose file (pass `JACKTRIP_CERT_DIR` to *that*). Set
+`PUPPETEER_EXECUTABLE_PATH` if your Chrome/Chromium isn't auto-detected.
+
+```bash
+# Option A: server already running in another terminal on localhost.miked.io:4464
+npm run build
+npm run test:integration
+
+# Option B: start the server via the bundled compose file (needs the cert)
+JACKTRIP_CERT_DIR=/path/to/certs docker compose -f tests/integration/docker-compose.integration.yml up -d
+npm run build
+npm run test:integration
+docker compose -f tests/integration/docker-compose.integration.yml down
+```
+
+### CI
+
+The `integration` job in `.github/workflows/ci.yml` runs on every push and on
+PRs from branches in this repo. It writes the cert/key from the `MIKED_TLS_CERT`
+/ `MIKED_TLS_KEY` secrets, starts the JackTrip server with host networking, then
+builds the app and runs the harness inside the build image (chromium at
+`/usr/bin/chromium`) on the same network. **Fork PRs are skipped** — GitHub does
+not expose secrets to them.
+
 ## Code Coverage
 
 Coverage spans the **whole** Rust surface by combining two runs:

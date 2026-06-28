@@ -7,3 +7,5 @@ pkg/
 wasm-pack.log
 lcov.info
 lcov.wasm.info
+# Local TLS cert/key for the integration server (never commit secrets)
+/certs/
