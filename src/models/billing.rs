@@ -55,6 +55,20 @@ pub struct Plan {
     pub studio_minutes: Option<f64>,
 }
 
+/// Resolved plan pricing (`GET /users/{userId}/plans`).
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanPrice {
+    /// Resolved plan name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+
+    /// Stripe price ID for the requested plan and pricing mode
+    #[serde(rename = "priceID", skip_serializing_if = "Option::is_none")]
+    pub price_id: Option<String>,
+}
+
 /// Coupon redemption record
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
@@ -154,6 +168,19 @@ mod tests {
         let out = roundtrip(&p);
         assert!(out.contains("\"maxMusicians\":"));
         assert!(out.contains("\"studioMinutes\":"));
+    }
+
+    #[test]
+    fn plan_price_renames_price_id() {
+        let json = r#"{"plan":"pro","priceID":"price_abc"}"#;
+        let p: PlanPrice = serde_json::from_str(json).unwrap();
+        assert_eq!(p.plan.as_deref(), Some("pro"));
+        assert_eq!(p.price_id.as_deref(), Some("price_abc"));
+
+        let out = roundtrip(&p);
+        // priceID keeps its uppercase casing on the wire.
+        assert!(out.contains("\"priceID\":"));
+        assert!(!out.contains("\"priceId\":"));
     }
 
     #[test]

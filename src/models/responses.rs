@@ -58,20 +58,6 @@ pub struct LiveKitTokenResponse {
     pub url: Option<String>,
 }
 
-/// Checkout session response
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct CheckoutResponse {
-    /// Stripe checkout session URL
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-
-    /// Stripe session ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-}
-
 /// Unread messages count response
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
