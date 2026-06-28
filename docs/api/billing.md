@@ -13,10 +13,40 @@ let billing_api = client.billing();
 ```
 
 Plan changes (upgrade/downgrade/cancel/reactivate) are handled through the
-Stripe-hosted billing portal, so this client only exposes plan-price lookup plus
-the portal/checkout redirect surfaces.
+Stripe-hosted billing portal, so this client exposes billing-info lookup,
+plan-price lookup, the portal/checkout redirect surfaces, coupon redemption, and
+studio usage.
 
 ## Methods
+
+### getBilling / get_billing
+
+Get a user's Stripe billing information (`GET /users/{userId}/billing`).
+
+**Authentication:** Required
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `userId` | `string` | User ID |
+
+```javascript
+const info = await client.billing().getBilling('user123');
+```
+
+```rust
+let info = client.billing().get_billing("user123").await?;
+```
+
+**Returns:** `BillingInfo`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `customerId` | `string?` | Stripe customer ID |
+| `plan` | `string?` | Current subscription plan |
+| `status` | `string?` | Subscription status |
+| `periodEnd` | `string?` | Current billing period end date |
+
+---
 
 ### getPlans / get_plans
 
@@ -124,4 +154,71 @@ let response = client.billing().create_checkout("user123", &request).await?;
 | `callbackURL` | `string` | URL to redirect to after checkout completes (required) |
 | `pricingMode` | `string?` | Pricing mode (e.g. `yearly`) |
 | `forceStripeTestMode` | `boolean?` | Force Stripe test mode regardless of environment |
+
+---
+
+### redeem
+
+Redeem a coupon code for the authenticated user (`PUT /redemptions`).
+
+**Authentication:** Required
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `request` | `CodeRequest` | `{ code }` |
+
+```javascript
+const redemption = await client.billing().redeem({ code: 'FREEMONTH' });
+```
+
+```rust
+let redemption = client.billing().redeem(&CodeRequest { code: "FREEMONTH".into() }).await?;
+```
+
+**Returns:** `Redemption`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `code` | `string?` | Coupon code |
+| `ownerID` | `string?` | User ID of the redeemer |
+| `monthlyMinutes` | `number?` | Monthly minutes granted |
+| `expiresAt` | `string?` | Timestamp when the redemption expires (RFC3339) |
+| `redeemedAt` | `string?` | Timestamp when the coupon was redeemed (RFC3339) |
+
+---
+
+### getUsage / get_usage
+
+Get studio usage in musician minutes over a time range (`GET /usage`). Both
+timestamps are RFC3339 and required.
+
+**Authentication:** Required
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `earliest` | `string` | Earliest RFC3339 timestamp (required) |
+| `latest` | `string` | Latest RFC3339 timestamp (required) |
+
+```javascript
+const usage = await client.billing().getUsage('2026-06-01T00:00:00Z', '2026-06-30T00:00:00Z');
+```
+
+```rust
+let usage = client.billing().get_usage("2026-06-01T00:00:00Z", "2026-06-30T00:00:00Z").await?;
+```
+
+**Returns:** `UsageResponse`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `summary` | `Usage?` | Aggregated usage summary |
+| `details` | `Usage[]?` | List of usage data points per day |
+
+**Usage Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `earliest` | `string?` | Earliest RFC3339 timestamp of results |
+| `latest` | `string?` | Latest RFC3339 timestamp of results |
+| `total` | `number?` | Aggregated result within the time span |
 
