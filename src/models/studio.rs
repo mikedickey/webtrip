@@ -1,15 +1,90 @@
-//! Studio (virtual server) models
+//! Studio (server) models
 
 use super::{BroadcastVisibility, BufferStrategy, Period, QueueBuffer, ResourceStatus, ServerConfig};
 use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 use wasm_bindgen::prelude::*;
 
-/// A JackTrip Virtual Studio instance
+/// Shared audio network properties used by devices and studios.
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
-pub struct Studio {
+pub struct AudioProperties {
+    /// Audio frame period
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period: Option<Period>,
+
+    /// Jitter buffer size
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_buffer: Option<QueueBuffer>,
+
+    /// Buffer strategy
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_strategy: Option<BufferStrategy>,
+}
+
+/// SuperCollider mix configuration.
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerMix {
+    /// SuperCollider mixer branch (from jacktrip-sc)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mix_branch: Option<String>,
+
+    /// SuperCollider mixer raw code
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mix_code: Option<String>,
+}
+
+/// Studio configuration state when connected to by devices.
+///
+/// Spec composes this as `AudioProperties` + `ServerMix` + a few studio-level
+/// fields; we flatten the shared structs.
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerAgentConfig {
+    /// Shared audio network properties
+    #[serde(flatten)]
+    pub audio: AudioProperties,
+
+    /// SuperCollider mix configuration
+    #[serde(flatten)]
+    pub mix: ServerMix,
+
+    /// Broadcast visibility setting
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broadcast: Option<BroadcastVisibility>,
+
+    /// Expiration timestamp (RFC3339)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+
+    /// Maximum number of musicians allowed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_musicians: Option<i32>,
+}
+
+/// A JackTrip Virtual Studio instance (spec name: `Server`).
+///
+/// Composed from [`ServerAgentConfig`] plus studio-level identifiers and
+/// metadata. The studio configuration properties (`type`, `name`, `serverHost`,
+/// `serverPort`, `sampleRate`, `public`, `stereo`, `loopback`, `enabled`) are
+/// flattened in from [`ServerConfig`] so create/update payloads and `/studios`
+/// responses preserve studio metadata.
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct Server {
+    /// Studio configuration (type, name, host/port, sample rate, visibility flags)
+    #[serde(flatten)]
+    pub config: ServerConfig,
+
+    /// Agent configuration (audio properties, mix, broadcast, expiry, capacity)
+    #[serde(flatten)]
+    pub agent: ServerAgentConfig,
+
     /// Studio ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -21,6 +96,10 @@ pub struct Studio {
     /// Cloud instance identifier
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cloud_id: Option<String>,
+
+    /// Cloud identifier recorded when the studio was first provisioned
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_cloud_id: Option<String>,
 
     /// Active session identifier
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -38,6 +117,10 @@ pub struct Studio {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_id: Option<String>,
 
+    /// Invite key used to generate shareable join links
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_key: Option<String>,
+
     /// Cloud region identifier
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
@@ -54,37 +137,26 @@ pub struct Studio {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ResourceStatus>,
 
-    /// Audio frame period
+    /// Non-zero if this studio is provisioned and managed by JackTrip
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub period: Option<Period>,
+    pub managed: Option<i32>,
 
-    /// Jitter buffer size
+    /// Collaboration intent advertised by the studio owner
+    /// (0 = unset, 1 = not looking, 2 = looking for band members, 3 = looking for students)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub queue_buffer: Option<QueueBuffer>,
+    pub looking_for: Option<i32>,
 
-    /// Buffer strategy
+    /// Skill levels the studio is targeted at
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub buffer_strategy: Option<BufferStrategy>,
+    pub skill_levels: Option<Vec<String>>,
 
-    /// SuperCollider mixer branch name
+    /// Instruments associated with the studio
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mix_branch: Option<String>,
+    pub instruments: Option<Vec<String>>,
 
-    /// Custom SuperCollider mixer code
+    /// Musical genres associated with the studio
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mix_code: Option<String>,
-
-    /// Broadcast visibility setting
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub broadcast: Option<BroadcastVisibility>,
-
-    /// Maximum number of musicians allowed
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_musicians: Option<i32>,
-
-    /// Expiration timestamp (RFC3339)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<String>,
+    pub genres: Option<Vec<String>>,
 
     /// Creation timestamp (RFC3339)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,108 +165,91 @@ pub struct Studio {
     /// Last update timestamp (RFC3339)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
-
-    // =========================================================================
-    // ServerConfig fields
-    // =========================================================================
-
-    /// Configuration properties (type, name, serverHost, serverPort, sampleRate, public, stereo, loopback, enabled)
-    #[serde(flatten)]
-    pub config: ServerConfig,
-
-    // =========================================================================
-    // ServerWithSubscription fields (returned when listing studios)
-    // =========================================================================
-
-    /// Whether the current user is an admin of this studio
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub admin: Option<bool>,
-
-    /// Whether the current user is the owner of this studio
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub owner: Option<bool>,
-
-    /// Subscription status (Active, Deleted)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sub_status: Option<String>,
 }
 
-/// Studio access control settings
+/// Access rights of the authenticated user for a studio (spec name: `ServerAccess`),
+/// returned by `GET /studios/{studioId}/access`.
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
-pub struct AccessSettings {
-    /// Whether the studio requires a password
+pub struct ServerAccess {
+    /// Studio ID
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub password_protected: Option<bool>,
+    pub server_id: Option<String>,
 
-    /// Studio access password (write-only, not returned in responses)
+    /// Authenticated user ID
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub password: Option<String>,
+    pub user_id: Option<String>,
 
-    /// Whether to allow anonymous/guest access
+    /// Whether the user is a studio admin
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub allow_guests: Option<bool>,
+    pub admin: Option<bool>,
 
-    /// Maximum number of guests allowed
+    /// Whether the user is the studio owner
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_guests: Option<i32>,
+    pub owner: Option<bool>,
 
-    /// Allowed user IDs (if restricted)
+    /// List of named permissions with current values
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub allowed_users: Option<Vec<String>>,
+    pub permissions: Option<Vec<ServerAccessPermission>>,
 }
 
-/// Studio mixer configuration
+/// A single named permission entry within [`ServerAccess`].
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerAccessPermission {
+    /// Permission name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// Whether permission is granted
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<bool>,
+
+    /// Human-readable explanation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+}
+
+/// Mixer definition (returned in the `GET /mixers` map).
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
 pub struct Mixer {
-    /// Mixer ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    /// Mixer type
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub mixer_type: Option<String>,
 
-    /// Mixer name
+    /// Mixer source URL
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub url: Option<String>,
 
-    /// Mixer description
+    /// List of mixer configurations
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub configs: Option<Vec<MixerConfig>>,
 
-    /// SuperCollider code branch
+    /// List of link configurations
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
+    pub links: Option<Vec<MixerConfig>>,
 
-    /// Custom SuperCollider code
+    /// List of preset configurations
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
-
-    /// Whether this is a system preset
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub preset: Option<bool>,
+    pub presets: Option<Vec<MixerConfig>>,
 }
 
-/// Mixer configuration settings
+/// A single encoded mixer configuration entry.
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
 pub struct MixerConfig {
-    /// Master volume (0-100)
+    /// Encoded mixer configuration content
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub master_volume: Option<u32>,
+    pub content: Option<String>,
 
-    /// Reverb level (0-100)
+    /// Configuration encoding format (e.g. "base64")
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reverb: Option<u32>,
-
-    /// Whether limiter is enabled
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limiter: Option<bool>,
-
-    /// Whether compressor is enabled
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compressor: Option<bool>,
+    pub encoding: Option<String>,
 }
 
 /// A participant in a studio session
@@ -227,77 +282,128 @@ pub struct Participant {
     pub joined_at: Option<String>,
 }
 
-/// Server mix track information
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct ServerMix {
-    /// Track ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-
-    /// Track name
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-
-    /// Volume level (0-100)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub volume: Option<u32>,
-
-    /// Pan position (-100 to 100)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pan: Option<i32>,
-
-    /// Whether the track is muted
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mute: Option<bool>,
-
-    /// Whether the track is soloed
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub solo: Option<bool>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::test_utils::roundtrip;
 
     #[test]
-    fn studio_fixture_known_good() {
-        // Fixture modeled after docs/api/studios.md — a typical studio create response.
-        // Note the `bannerURL` (preserved casing) and `type` rename.
+    fn server_fixture_known_good() {
+        // Fixture modeled after the spec `Server` schema. Note the `bannerURL`
+        // (preserved casing) and the flattened agent-config fields.
         let json = r#"{
           "id": "studio123",
           "ownerId": "user-1",
-          "region": "us-west-2",
-          "type": "JackTrip+Jamulus",
-          "name": "My Studio",
+          "initialCloudId": "i-0123",
+          "region": "ec2-us-north-ca",
+          "size": "c5.large",
           "bannerURL": "https://cdn.example.com/banner.png",
           "status": "Ready",
+          "managed": 1,
+          "lookingFor": 2,
+          "skillLevels": ["beginner", "intermediate"],
+          "instruments": ["guitar"],
+          "genres": ["rock"],
+          "type": "JackTrip+Jamulus",
+          "name": "My Studio",
+          "serverHost": "1.2.3.4",
+          "serverPort": 4464,
+          "sampleRate": 48000,
+          "public": true,
           "period": 128,
           "queueBuffer": 4,
           "bufferStrategy": 1,
-          "sampleRate": 48000,
           "broadcast": 2,
-          "stereo": true,
-          "public": false,
+          "maxMusicians": 5,
+          "mixBranch": "main",
+          "expiresAt": "2026-06-14T00:00:00Z",
           "createdAt": "2026-06-14T00:00:00Z"
         }"#;
-        let s: Studio = serde_json::from_str(json).unwrap();
+        let s: Server = serde_json::from_str(json).unwrap();
         assert_eq!(s.id.as_deref(), Some("studio123"));
-        assert_eq!(s.config.studio_type, Some(super::super::StudioType::JackTripJamulus));
+        assert_eq!(s.initial_cloud_id.as_deref(), Some("i-0123"));
         assert_eq!(s.status, Some(ResourceStatus::Ready));
-        assert_eq!(s.period, Some(Period::P128));
-        assert_eq!(s.queue_buffer, Some(QueueBuffer::Q4));
-        assert_eq!(s.buffer_strategy, Some(BufferStrategy::Standard));
-        assert_eq!(s.config.sample_rate, Some(super::super::SampleRate::Rate48000));
-        assert_eq!(s.broadcast, Some(BroadcastVisibility::Public));
-        assert_eq!(s.banner_url.as_deref(), Some("https://cdn.example.com/banner.png"));
+        assert_eq!(s.managed, Some(1));
+        assert_eq!(s.looking_for, Some(2));
+        // ServerConfig fields (flattened).
+        assert_eq!(s.config.name.as_deref(), Some("My Studio"));
+        assert_eq!(s.config.studio_type, Some(super::super::StudioType::JackTripJamulus));
+        assert_eq!(s.config.server_port, Some(4464));
+        assert_eq!(s.config.public, Some(true));
+        // ServerAgentConfig fields (flattened).
+        assert_eq!(s.agent.audio.period, Some(Period::P128));
+        assert_eq!(s.agent.audio.queue_buffer, Some(QueueBuffer::Q4));
+        assert_eq!(s.agent.audio.buffer_strategy, Some(BufferStrategy::Standard));
+        assert_eq!(s.agent.broadcast, Some(BroadcastVisibility::Public));
+        assert_eq!(s.agent.max_musicians, Some(5));
+        assert_eq!(s.agent.mix.mix_branch.as_deref(), Some("main"));
+        assert_eq!(s.agent.expires_at.as_deref(), Some("2026-06-14T00:00:00Z"));
 
-        // Wire-format check: `type` and `bannerURL` are preserved verbatim.
+        // Wire-format check: flattened fields are at the top level.
         let out = serde_json::to_string(&s).unwrap();
-        assert!(out.contains("\"type\":\"JackTrip+Jamulus\""));
         assert!(out.contains("\"bannerURL\":"));
         assert!(out.contains("\"ownerId\":"));
+        assert!(out.contains("\"type\":\"JackTrip+Jamulus\""));
+        assert!(out.contains("\"name\":\"My Studio\""));
+        assert!(out.contains("\"serverPort\":4464"));
         assert!(out.contains("\"queueBuffer\":4"));
+        assert!(out.contains("\"mixBranch\":\"main\""));
+        assert!(out.contains("\"maxMusicians\":5"));
+        assert!(!out.contains("\"config\":"));
+        assert!(!out.contains("\"agent\":"));
+        assert!(!out.contains("\"audio\":"));
+    }
+
+    #[test]
+    fn server_status_removed_variant_roundtrips() {
+        let s: Server = serde_json::from_str(r#"{"status":"Removed"}"#).unwrap();
+        assert_eq!(s.status, Some(ResourceStatus::Removed));
+    }
+
+    #[test]
+    fn server_access_fixture_known_good() {
+        let json = r#"{
+          "serverId": "studio-1",
+          "userId": "user-1",
+          "admin": true,
+          "owner": false,
+          "permissions": [
+            {"name": "edit", "value": true, "explanation": "Can edit studio"}
+          ]
+        }"#;
+        let a: ServerAccess = serde_json::from_str(json).unwrap();
+        assert_eq!(a.server_id.as_deref(), Some("studio-1"));
+        assert_eq!(a.user_id.as_deref(), Some("user-1"));
+        assert_eq!(a.admin, Some(true));
+        assert_eq!(a.owner, Some(false));
+        assert_eq!(a.permissions.as_ref().map(|p| p.len()), Some(1));
+
+        let out = roundtrip(&a);
+        assert!(out.contains("\"serverId\":"));
+        assert!(out.contains("\"userId\":"));
+    }
+
+    #[test]
+    fn mixer_fixture_known_good() {
+        let json = r#"{
+          "type": "sclang",
+          "url": "https://api.github.com/repos/jacktrip/jacktrip-sc/commits/abc",
+          "configs": [{"content": "Zm9v", "encoding": "base64"}],
+          "links": [],
+          "presets": [{"content": "YmFy", "encoding": "base64"}]
+        }"#;
+        let m: Mixer = serde_json::from_str(json).unwrap();
+        assert_eq!(m.mixer_type.as_deref(), Some("sclang"));
+        assert_eq!(m.configs.as_ref().map(|c| c.len()), Some(1));
+        assert_eq!(
+            m.configs.as_ref().and_then(|c| c.first()).and_then(|c| c.encoding.as_deref()),
+            Some("base64")
+        );
+
+        let out = roundtrip(&m);
+        assert!(out.contains("\"type\":\"sclang\""));
+        assert!(out.contains("\"configs\":"));
+        assert!(out.contains("\"presets\":"));
+        assert!(!out.contains("mixerType"));
     }
 }

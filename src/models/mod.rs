@@ -29,6 +29,9 @@ pub use event::*;
 mod billing;
 pub use billing::*;
 
+mod subscription;
+pub use subscription::*;
+
 mod chat;
 pub use chat::*;
 

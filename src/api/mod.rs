@@ -383,6 +383,8 @@ impl ApiClient {
     }
 
     /// Execute a DELETE request and return the response body
+    // Retained as a shared helper for downstream endpoint work (e.g. WEB-35).
+    #[allow(dead_code)]
     pub(crate) async fn delete_with_response<T: for<'de> Deserialize<'de>>(&self, path: &str) -> ApiResult<T> {
         let response = self
             .build_request(reqwest::Method::DELETE, path)
@@ -507,16 +509,6 @@ pub(crate) struct PaginationQuery {
     pub page: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<i32>,
-}
-
-/// Convert a HashMap of regions to a Vec, injecting IDs from keys
-pub(crate) fn regions_from_map(map: HashMap<String, models::Region>) -> Vec<models::Region> {
-    map.into_iter()
-        .map(|(id, mut region)| {
-            region.id = Some(id);
-            region
-        })
-        .collect()
 }
 
 /// Convert a value to JsValue using serde_wasm_bindgen

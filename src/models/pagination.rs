@@ -1,108 +1,110 @@
 //! Pagination models
+//!
+//! The API wraps every paginated list in a `{ _meta, results }` envelope, where
+//! `_meta` carries [`PaginationMeta`] and `results` is a typed array.
 
 use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 use wasm_bindgen::prelude::*;
 
-use super::{PublicUpcomingEvent, RecordingMetadata, StreamInfo};
+use super::{BackingTrack, PublicUpcomingEvent, RecordingMetadata, StreamInfo, StreamInfoSearchResult};
 
-/// Generic paginated response
+/// Pagination metadata returned in the `_meta` field of every paginated response.
+///
+/// All fields are required per the spec.
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
-pub struct PaginatedResponse<T> {
-    /// Items in this page
-    pub items: Vec<T>,
-
-    /// Current page number (1-indexed)
-    pub page: i32,
-
-    /// Items per page
-    pub limit: i32,
-
-    /// Total number of items
+pub struct PaginationMeta {
+    /// Total number of items that match the query criteria
     pub total: i32,
 
     /// Total number of pages
-    pub total_pages: i32,
+    pub pages: i32,
 
-    /// Whether there is a next page
-    pub has_next: bool,
+    /// Current page number (1-indexed)
+    pub current: i32,
 
-    /// Whether there is a previous page
-    pub has_prev: bool,
+    /// Number of items returned on this page
+    pub count: i32,
+
+    /// Maximum number of items per page
+    pub limit: i32,
 }
 
-/// Pagination metadata shared across paginated response types.
+/// Generic paginated response envelope: `{ _meta, results }`.
+///
+/// Concrete paginated types (e.g. [`PaginatedChannels`]) mirror this shape with
+/// a typed `results` array.
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct PageMeta {
-    /// Current page number
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub page: Option<i32>,
+pub struct PaginatedResponse<T> {
+    /// Pagination metadata
+    #[serde(rename = "_meta")]
+    pub meta: PaginationMeta,
 
-    /// Items per page
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<i32>,
-
-    /// Total number of items
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total: Option<i32>,
-
-    /// Total number of pages
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_pages: Option<i32>,
-
-    /// Whether there is a next page
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub has_next: Option<bool>,
-
-    /// Whether there is a previous page
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub has_prev: Option<bool>,
+    /// Items on the current page
+    pub results: Vec<T>,
 }
 
 /// Paginated channels/streams response
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
 pub struct PaginatedChannels {
-    /// Channels in this page
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub items: Option<Vec<StreamInfo>>,
-
     /// Pagination metadata
-    #[serde(flatten)]
-    pub meta: PageMeta,
+    #[serde(rename = "_meta")]
+    pub meta: PaginationMeta,
+
+    /// Channels on the current page
+    pub results: Vec<StreamInfo>,
 }
 
 /// Paginated events response
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
 pub struct PaginatedEvents {
-    /// Events in this page
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub items: Option<Vec<PublicUpcomingEvent>>,
-
     /// Pagination metadata
-    #[serde(flatten)]
-    pub meta: PageMeta,
+    #[serde(rename = "_meta")]
+    pub meta: PaginationMeta,
+
+    /// Events on the current page
+    pub results: Vec<PublicUpcomingEvent>,
 }
 
 /// Paginated recordings response
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
 pub struct PaginatedRecordings {
-    /// Recordings in this page
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub items: Option<Vec<RecordingMetadata>>,
-
     /// Pagination metadata
-    #[serde(flatten)]
-    pub meta: PageMeta,
+    #[serde(rename = "_meta")]
+    pub meta: PaginationMeta,
+
+    /// Recordings on the current page
+    pub results: Vec<RecordingMetadata>,
+}
+
+/// Paginated stream search results response
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+pub struct PaginatedStreamSearchResults {
+    /// Pagination metadata
+    #[serde(rename = "_meta")]
+    pub meta: PaginationMeta,
+
+    /// Search results on the current page
+    pub results: Vec<StreamInfoSearchResult>,
+}
+
+/// Paginated backing tracks response
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+pub struct PaginatedBackingTracks {
+    /// Pagination metadata
+    #[serde(rename = "_meta")]
+    pub meta: PaginationMeta,
+
+    /// Backing tracks on the current page
+    pub results: Vec<BackingTrack>,
 }
 
 #[cfg(test)]
@@ -110,133 +112,75 @@ mod tests {
     use super::*;
     use super::super::test_utils::roundtrip;
 
+    fn meta_fixture() -> PaginationMeta {
+        PaginationMeta { total: 9, pages: 3, current: 2, count: 3, limit: 3 }
+    }
+
+    // ---- PaginationMeta ----
+
+    #[test]
+    fn pagination_meta_fixture_known_good() {
+        let json = r#"{
+          "total": 42,
+          "pages": 5,
+          "current": 2,
+          "count": 10,
+          "limit": 10
+        }"#;
+        let m: PaginationMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(m.total, 42);
+        assert_eq!(m.pages, 5);
+        assert_eq!(m.current, 2);
+        assert_eq!(m.count, 10);
+        assert_eq!(m.limit, 10);
+
+        let s = roundtrip(&m);
+        assert!(s.contains("\"total\":42"));
+        assert!(s.contains("\"pages\":5"));
+        assert!(s.contains("\"current\":2"));
+        assert!(s.contains("\"count\":10"));
+        assert!(s.contains("\"limit\":10"));
+    }
+
     // ---- PaginatedResponse<T> ----
 
     #[test]
     fn paginated_response_fixture_known_good() {
-        // Realistic fixture for the generic type using strings as the item type.
         let json = r#"{
-          "items": ["alpha", "beta", "gamma"],
-          "page": 2,
-          "limit": 3,
-          "total": 9,
-          "totalPages": 3,
-          "hasNext": true,
-          "hasPrev": true
+          "_meta": {"total": 9, "pages": 3, "current": 2, "count": 3, "limit": 3},
+          "results": ["alpha", "beta", "gamma"]
         }"#;
         let r: PaginatedResponse<String> = serde_json::from_str(json).unwrap();
-        assert_eq!(r.items.len(), 3);
-        assert_eq!(r.items[0], "alpha");
-        assert_eq!(r.page, 2);
-        assert_eq!(r.total_pages, 3);
-        assert_eq!(r.has_next, true);
-        assert_eq!(r.has_prev, true);
+        assert_eq!(r.results.len(), 3);
+        assert_eq!(r.results[0], "alpha");
+        assert_eq!(r.meta.current, 2);
+        assert_eq!(r.meta.pages, 3);
 
         let s = serde_json::to_string(&r).unwrap();
-        // camelCase wire keys must be present
-        assert!(s.contains("\"totalPages\":"));
-        assert!(s.contains("\"hasNext\":"));
-        assert!(s.contains("\"hasPrev\":"));
-        // snake_case must NOT appear on the wire
-        assert!(!s.contains("\"total_pages\":"));
-        assert!(!s.contains("\"has_next\":"));
-        assert!(!s.contains("\"has_prev\":"));
+        // Envelope keys must be present verbatim.
+        assert!(s.contains("\"_meta\":"));
+        assert!(s.contains("\"results\":"));
     }
 
     #[test]
-    fn paginated_response_empty_items() {
-        // Edge case: empty page (total=0).
+    fn paginated_response_empty_results() {
         let r: PaginatedResponse<String> = PaginatedResponse {
-            items: vec![],
-            page: 1,
-            limit: 10,
-            total: 0,
-            total_pages: 0,
-            has_next: false,
-            has_prev: false,
+            meta: PaginationMeta { total: 0, pages: 0, current: 1, count: 0, limit: 10 },
+            results: vec![],
         };
         let s = roundtrip(&r);
-        assert!(s.contains("\"items\":[]"));
+        assert!(s.contains("\"results\":[]"));
         assert!(s.contains("\"total\":0"));
-        assert!(s.contains("\"hasNext\":false"));
-        assert!(s.contains("\"hasPrev\":false"));
-    }
-
-    #[test]
-    fn paginated_response_single_page() {
-        // Single page: first and only page — no next, no prev.
-        let r: PaginatedResponse<i32> = PaginatedResponse {
-            items: vec![1, 2, 3],
-            page: 1,
-            limit: 10,
-            total: 3,
-            total_pages: 1,
-            has_next: false,
-            has_prev: false,
-        };
-        let s = roundtrip(&r);
-        assert!(s.contains("\"page\":1"));
-        assert!(s.contains("\"totalPages\":1"));
-        assert!(s.contains("\"hasNext\":false"));
-        assert!(s.contains("\"hasPrev\":false"));
-    }
-
-    #[test]
-    fn paginated_response_last_page() {
-        // Last page of a multi-page result: hasPrev=true, hasNext=false.
-        let r: PaginatedResponse<String> = PaginatedResponse {
-            items: vec!["x".into()],
-            page: 3,
-            limit: 10,
-            total: 21,
-            total_pages: 3,
-            has_next: false,
-            has_prev: true,
-        };
-        let s = roundtrip(&r);
-        assert!(s.contains("\"page\":3"));
-        assert!(s.contains("\"totalPages\":3"));
-        assert!(s.contains("\"hasNext\":false"));
-        assert!(s.contains("\"hasPrev\":true"));
-    }
-
-    // ---- PageMeta ----
-
-    #[test]
-    fn page_meta_skips_none_fields() {
-        // All fields None → serializes to an empty object.
-        let m = PageMeta::default();
-        let s = roundtrip(&m);
-        assert_eq!(s, "{}");
-    }
-
-    #[test]
-    fn page_meta_partial_fields_camelcase() {
-        // Only some fields populated; None fields must be absent from the wire.
-        let m = PageMeta {
-            page: Some(2),
-            limit: Some(20),
-            total: None,
-            total_pages: Some(5),
-            has_next: Some(true),
-            has_prev: Some(true),
-        };
-        let s = roundtrip(&m);
-        assert!(s.contains("\"totalPages\":5"));
-        assert!(s.contains("\"hasNext\":true"));
-        assert!(s.contains("\"hasPrev\":true"));
-        // total was None → must be absent
-        assert!(!s.contains("\"total\":"));
     }
 
     // ---- PaginatedChannels ----
 
     #[test]
     fn paginated_channels_fixture_known_good() {
-        // Realistic fixture mirroring a paginated streams/channels response.
         // bannerURL preserves its uppercase casing (see StreamInfo).
         let json = r#"{
-          "items": [
+          "_meta": {"total": 1, "pages": 1, "current": 1, "count": 1, "limit": 10},
+          "results": [
             {
               "id": "stream-1",
               "name": "Live Jam",
@@ -246,57 +190,27 @@ mod tests {
               "chatId": "chat-1",
               "bannerURL": "https://cdn.example.com/banner.png"
             }
-          ],
-          "page": 1,
-          "limit": 10,
-          "total": 1,
-          "totalPages": 1,
-          "hasNext": false,
-          "hasPrev": false
+          ]
         }"#;
         let p: PaginatedChannels = serde_json::from_str(json).unwrap();
-        let items = p.items.as_ref().expect("items should be Some");
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].id.as_deref(), Some("stream-1"));
-        assert_eq!(items[0].server_name.as_deref(), Some("Studio A"));
-        assert_eq!(p.meta.page, Some(1));
-        assert_eq!(p.meta.has_next, Some(false));
-        assert_eq!(p.meta.has_prev, Some(false));
+        assert_eq!(p.results.len(), 1);
+        assert_eq!(p.results[0].id.as_deref(), Some("stream-1"));
+        assert_eq!(p.results[0].server_name.as_deref(), Some("Studio A"));
+        assert_eq!(p.meta.current, 1);
 
         let s = roundtrip(&p);
-        assert!(s.contains("\"hasNext\":"));
-        assert!(s.contains("\"hasPrev\":"));
-        assert!(s.contains("\"totalPages\":"));
+        assert!(s.contains("\"_meta\":"));
+        assert!(s.contains("\"results\":"));
         assert!(s.contains("\"bannerURL\":"));
-    }
-
-    #[test]
-    fn paginated_channels_none_items() {
-        // items absent from the server response → None, and must be omitted on re-serialization.
-        let p = PaginatedChannels {
-            items: None,
-            meta: PageMeta {
-                page: Some(1),
-                limit: Some(10),
-                total: Some(0),
-                total_pages: Some(0),
-                has_next: Some(false),
-                has_prev: Some(false),
-            },
-        };
-        let s = roundtrip(&p);
-        assert!(!s.contains("\"items\":"));
-        assert!(s.contains("\"hasNext\":false"));
-        assert!(s.contains("\"hasPrev\":false"));
     }
 
     // ---- PaginatedEvents ----
 
     #[test]
     fn paginated_events_fixture_known_good() {
-        // Realistic fixture mirroring a paginated upcoming events response.
         let json = r#"{
-          "items": [
+          "_meta": {"total": 1, "pages": 1, "current": 1, "count": 1, "limit": 20},
+          "results": [
             {
               "id": "evt-1",
               "title": "Friday Night Jam",
@@ -307,55 +221,26 @@ mod tests {
               "timezone": "America/New_York",
               "recurring": false
             }
-          ],
-          "page": 1,
-          "limit": 20,
-          "total": 1,
-          "totalPages": 1,
-          "hasNext": false,
-          "hasPrev": false
+          ]
         }"#;
         let p: PaginatedEvents = serde_json::from_str(json).unwrap();
-        let items = p.items.as_ref().expect("items should be Some");
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].core.id.as_deref(), Some("evt-1"));
-        assert_eq!(items[0].stream_name.as_deref(), Some("Studio Live"));
-        assert_eq!(p.meta.total, Some(1));
-        assert_eq!(p.meta.has_next, Some(false));
+        assert_eq!(p.results.len(), 1);
+        assert_eq!(p.results[0].core.id.as_deref(), Some("evt-1"));
+        assert_eq!(p.results[0].stream_name.as_deref(), Some("Studio Live"));
+        assert_eq!(p.meta.total, 1);
 
         let s = roundtrip(&p);
-        assert!(s.contains("\"hasNext\":"));
-        assert!(s.contains("\"totalPages\":"));
+        assert!(s.contains("\"_meta\":"));
         assert!(s.contains("\"streamId\":"));
-    }
-
-    #[test]
-    fn paginated_events_empty_items() {
-        // Edge case: Some(vec![]) — list present but no events on this page.
-        let p = PaginatedEvents {
-            items: Some(vec![]),
-            meta: PageMeta {
-                page: Some(1),
-                limit: Some(20),
-                total: Some(0),
-                total_pages: Some(0),
-                has_next: Some(false),
-                has_prev: Some(false),
-            },
-        };
-        let s = roundtrip(&p);
-        assert!(s.contains("\"items\":[]"));
-        assert!(s.contains("\"hasNext\":false"));
-        assert!(s.contains("\"hasPrev\":false"));
     }
 
     // ---- PaginatedRecordings ----
 
     #[test]
     fn paginated_recordings_fixture_known_good() {
-        // Realistic fixture mirroring a paginated recordings response.
         let json = r#"{
-          "items": [
+          "_meta": {"total": 5, "pages": 1, "current": 1, "count": 1, "limit": 10},
+          "results": [
             {
               "id": "rec-1",
               "name": "Last Night's Show",
@@ -366,51 +251,89 @@ mod tests {
               "visibility": 1,
               "createdAt": "2026-06-14T01:00:00Z"
             }
-          ],
-          "page": 1,
-          "limit": 10,
-          "total": 5,
-          "totalPages": 1,
-          "hasNext": false,
-          "hasPrev": false
+          ]
         }"#;
         let p: PaginatedRecordings = serde_json::from_str(json).unwrap();
-        let items = p.items.as_ref().expect("items should be Some");
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].id.as_deref(), Some("rec-1"));
-        assert_eq!(items[0].views, Some(10));
-        assert_eq!(p.meta.total, Some(5));
-        assert_eq!(p.meta.total_pages, Some(1));
+        assert_eq!(p.results.len(), 1);
+        assert_eq!(p.results[0].id.as_deref(), Some("rec-1"));
+        assert_eq!(p.results[0].views, Some(10));
+        assert_eq!(p.meta.total, 5);
 
         let s = roundtrip(&p);
-        assert!(s.contains("\"hasNext\":"));
-        assert!(s.contains("\"hasPrev\":"));
-        assert!(s.contains("\"totalPages\":"));
+        assert!(s.contains("\"_meta\":"));
         assert!(s.contains("\"streamId\":"));
     }
 
     #[test]
     fn paginated_recordings_last_page() {
-        // Multi-page response on the last page: hasPrev=true, hasNext=false.
         let p = PaginatedRecordings {
-            items: Some(vec![RecordingMetadata {
+            meta: meta_fixture(),
+            results: vec![RecordingMetadata {
                 id: Some("rec-42".into()),
                 name: Some("Final Recording".into()),
                 ..Default::default()
-            }]),
-            meta: PageMeta {
-                page: Some(5),
-                limit: Some(10),
-                total: Some(42),
-                total_pages: Some(5),
-                has_next: Some(false),
-                has_prev: Some(true),
-            },
+            }],
         };
         let s = roundtrip(&p);
-        assert!(s.contains("\"hasNext\":false"));
-        assert!(s.contains("\"hasPrev\":true"));
-        assert!(s.contains("\"page\":5"));
-        assert!(s.contains("\"totalPages\":5"));
+        assert!(s.contains("\"current\":2"));
+        assert!(s.contains("\"pages\":3"));
+    }
+
+    // ---- PaginatedStreamSearchResults ----
+
+    #[test]
+    fn paginated_stream_search_results_fixture_known_good() {
+        let json = r#"{
+          "_meta": {"total": 1, "pages": 1, "current": 1, "count": 1, "limit": 10},
+          "results": [
+            {
+              "id": "stream-1",
+              "name": "Jazz Quartet",
+              "bannerURL": "https://cdn.example.com/banner.png",
+              "serverId": "studio-1",
+              "region": "ec2-us-north-ca",
+              "lookingFor": 2,
+              "skillLevels": ["intermediate"],
+              "instruments": ["sax"],
+              "genres": ["jazz"]
+            }
+          ]
+        }"#;
+        let p: PaginatedStreamSearchResults = serde_json::from_str(json).unwrap();
+        assert_eq!(p.results.len(), 1);
+        assert_eq!(p.results[0].base.id.as_deref(), Some("stream-1"));
+        assert_eq!(p.results[0].server_id.as_deref(), Some("studio-1"));
+        assert_eq!(p.results[0].looking_for, Some(2));
+
+        let s = roundtrip(&p);
+        assert!(s.contains("\"serverId\":"));
+        assert!(s.contains("\"lookingFor\":"));
+        assert!(s.contains("\"bannerURL\":"));
+    }
+
+    // ---- PaginatedBackingTracks ----
+
+    #[test]
+    fn paginated_backing_tracks_fixture_known_good() {
+        let json = r#"{
+          "_meta": {"total": 1, "pages": 1, "current": 1, "count": 1, "limit": 10},
+          "results": [
+            {
+              "id": "trk-1",
+              "serverId": "studio-1",
+              "name": "Drum Loop",
+              "duration": 120,
+              "status": 0
+            }
+          ]
+        }"#;
+        let p: PaginatedBackingTracks = serde_json::from_str(json).unwrap();
+        assert_eq!(p.results.len(), 1);
+        assert_eq!(p.results[0].id.as_deref(), Some("trk-1"));
+        assert_eq!(p.results[0].server_id.as_deref(), Some("studio-1"));
+
+        let s = roundtrip(&p);
+        assert!(s.contains("\"_meta\":"));
+        assert!(s.contains("\"serverId\":"));
     }
 }

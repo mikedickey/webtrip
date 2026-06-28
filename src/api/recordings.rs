@@ -128,12 +128,12 @@ impl RecordingsApi {
         self.client.delete(&path).await
     }
 
-    /// Get stem information for a recording
+    /// Get the stem summary for a recording
     pub async fn get_recording_stems(
         &self,
         studio_id: &str,
         recording_id: &str,
-    ) -> Result<Vec<models::StemInfo>, ApiError> {
+    ) -> Result<models::StemSummary, ApiError> {
         let path = format!("/studios/{}/recordings/{}/stems", urlencode(studio_id), urlencode(recording_id));
         self.client.get(&path).await
     }
@@ -257,9 +257,8 @@ impl RecordingsApi {
     }
 
     #[wasm_bindgen(js_name = getRecordingStems)]
-    pub async fn get_recording_stems_js(&self, studio_id: String, recording_id: String) -> Result<JsValue, ApiError> {
-        let stems = self.get_recording_stems(&studio_id, &recording_id).await?;
-        to_js_value(&stems)
+    pub async fn get_recording_stems_js(&self, studio_id: String, recording_id: String) -> Result<models::StemSummary, ApiError> {
+        self.get_recording_stems(&studio_id, &recording_id).await
     }
 
     #[wasm_bindgen(js_name = getUserRecordings)]
@@ -329,7 +328,7 @@ mod tests {
             "GET",
             "/recordings-paginated",
             200,
-            r#"{"items":[{"id":"rec1"}],"page":2}"#,
+            r#"{"_meta":{"total":1,"pages":1,"current":2,"count":1,"limit":10},"results":[{"id":"rec1"}]}"#,
         )
         .await;
 
@@ -337,8 +336,8 @@ mod tests {
             .list_recordings_paginated(Some(2), Some(10), Some(true))
             .await
             .unwrap();
-        assert_eq!(result.items.unwrap().len(), 1);
-        assert_eq!(result.meta.page, Some(2));
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.meta.current, 2);
         mock.assert_async().await;
     }
 
@@ -350,7 +349,7 @@ mod tests {
             "GET",
             "/recordings-paginated",
             200,
-            r#"{"items":[]}"#,
+            r#"{"_meta":{"total":0,"pages":0,"current":1,"count":0,"limit":10},"results":[]}"#,
         )
         .await;
 
@@ -358,7 +357,7 @@ mod tests {
             .list_recordings_paginated(None, None, None)
             .await
             .unwrap();
-        assert!(result.items.unwrap().is_empty());
+        assert!(result.results.is_empty());
         mock.assert_async().await;
     }
 
@@ -468,7 +467,7 @@ mod tests {
             "GET",
             "/studios/st1/recordings-paginated",
             200,
-            r#"{"items":[{"id":"rec1"}],"page":3}"#,
+            r#"{"_meta":{"total":1,"pages":1,"current":3,"count":1,"limit":5},"results":[{"id":"rec1"}]}"#,
         )
         .await;
 
@@ -476,7 +475,7 @@ mod tests {
             .get_studio_recordings_paginated("st1", Some(3), Some(5))
             .await
             .unwrap();
-        assert_eq!(result.meta.page, Some(3));
+        assert_eq!(result.meta.current, 3);
         mock.assert_async().await;
     }
 
@@ -488,7 +487,7 @@ mod tests {
             "GET",
             "/studios/st1/recordings-paginated",
             200,
-            r#"{"items":[]}"#,
+            r#"{"_meta":{"total":0,"pages":0,"current":1,"count":0,"limit":10},"results":[]}"#,
         )
         .await;
 
@@ -496,7 +495,7 @@ mod tests {
             .get_studio_recordings_paginated("st1", None, None)
             .await
             .unwrap();
-        assert!(result.items.unwrap().is_empty());
+        assert!(result.results.is_empty());
         mock.assert_async().await;
     }
 
@@ -556,12 +555,13 @@ mod tests {
             "GET",
             "/studios/st1/recordings/rec1/stems",
             200,
-            r#"[{"id":"stem1","name":"vocals"}]"#,
+            r#"{"clients":[{"id":1,"name":"vocals","filename":"stem-1.wav"}]}"#,
         )
         .await;
 
         let result = api(&client).get_recording_stems("st1", "rec1").await.unwrap();
-        assert_eq!(result[0].name, Some("vocals".to_string()));
+        let clients = result.clients.expect("clients present");
+        assert_eq!(clients[0].name, Some("vocals".to_string()));
         mock.assert_async().await;
     }
 
@@ -600,7 +600,7 @@ mod tests {
             "GET",
             "/users/u1/recordings-paginated",
             200,
-            r#"{"items":[{"id":"rec1"}],"page":1}"#,
+            r#"{"_meta":{"total":1,"pages":1,"current":1,"count":1,"limit":20},"results":[{"id":"rec1"}]}"#,
         )
         .await;
 
@@ -608,7 +608,7 @@ mod tests {
             .get_user_recordings_paginated("u1", Some(1), Some(20))
             .await
             .unwrap();
-        assert_eq!(result.items.unwrap().len(), 1);
+        assert_eq!(result.results.len(), 1);
         mock.assert_async().await;
     }
 
@@ -620,7 +620,7 @@ mod tests {
             "GET",
             "/users/u1/recordings-paginated",
             200,
-            r#"{"items":[]}"#,
+            r#"{"_meta":{"total":0,"pages":0,"current":1,"count":0,"limit":10},"results":[]}"#,
         )
         .await;
 
@@ -628,7 +628,7 @@ mod tests {
             .get_user_recordings_paginated("u1", None, None)
             .await
             .unwrap();
-        assert!(result.items.unwrap().is_empty());
+        assert!(result.results.is_empty());
         mock.assert_async().await;
     }
 

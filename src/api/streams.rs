@@ -4,7 +4,6 @@
 
 use super::{to_js_value, PaginationQuery, ApiClient, ApiError, urlencode};
 use crate::models;
-use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
 // =============================================================================
@@ -27,14 +26,17 @@ impl StreamsApi {
         self.client.get("/streams").await
     }
 
-    /// Search for broadcasts by keyword
-    pub async fn search_streams(&self, query: Option<&str>) -> Result<Vec<models::StreamInfo>, ApiError> {
-        #[derive(Serialize)]
-        struct Query<'a> {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            q: Option<&'a str>,
-        }
-        self.client.get_with_query("/streams/search", &Query { q: query }).await
+    /// Search for broadcasts.
+    ///
+    /// Accepts the full [`models::StreamSearchQuery`] contract (`q`, `lookingFor`,
+    /// `skillLevel`, `instrument`, `genre`, `region`, `page`, `limit`) and returns
+    /// the paginated `{ _meta, results }` envelope whose items carry
+    /// search-specific fields ([`models::StreamInfoSearchResult`]).
+    pub async fn search_streams(
+        &self,
+        query: &models::StreamSearchQuery,
+    ) -> Result<models::PaginatedStreamSearchResults, ApiError> {
+        self.client.get_with_query("/streams/search", query).await
     }
 
     /// Get a broadcast by ID
@@ -187,8 +189,8 @@ impl StreamsApi {
     }
 
     #[wasm_bindgen(js_name = searchStreams)]
-    pub async fn search_streams_js(&self, query: Option<String>) -> Result<JsValue, ApiError> {
-        let streams = self.search_streams(query.as_deref()).await?;
+    pub async fn search_streams_js(&self, query: models::StreamSearchQuery) -> Result<JsValue, ApiError> {
+        let streams = self.search_streams(&query).await?;
         to_js_value(&streams)
     }
 
@@ -350,29 +352,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_search_streams_with_query() {
+    async fn test_search_streams_with_filters_and_pagination() {
+        let (mut server, client) = mock_api().await;
+        // Assert every supported filter is serialized with the spec's query-key
+        // casing (e.g. `lookingFor`, `skillLevel`).
+        let mock = server
+            .mock("GET", "/streams/search")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("q".into(), "jazz".into()),
+                mockito::Matcher::UrlEncoded("lookingFor".into(), "2".into()),
+                mockito::Matcher::UrlEncoded("skillLevel".into(), "intermediate".into()),
+                mockito::Matcher::UrlEncoded("instrument".into(), "sax".into()),
+                mockito::Matcher::UrlEncoded("genre".into(), "jazz".into()),
+                mockito::Matcher::UrlEncoded("region".into(), "ec2-us-north-ca".into()),
+                mockito::Matcher::UrlEncoded("page".into(), "2".into()),
+                mockito::Matcher::UrlEncoded("limit".into(), "5".into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"_meta":{"total":6,"pages":2,"current":2,"count":1,"limit":5},"results":[{"id":"s9","name":"jazz","serverId":"studio-9","lookingFor":2}]}"#)
+            .create_async()
+            .await;
+
+        let query = models::StreamSearchQuery {
+            q: Some("jazz".to_string()),
+            looking_for: Some(2),
+            skill_level: Some("intermediate".to_string()),
+            instrument: Some("sax".to_string()),
+            genre: Some("jazz".to_string()),
+            region: Some("ec2-us-north-ca".to_string()),
+            page: Some(2),
+            limit: Some(5),
+        };
+        let result = api(&client).search_streams(&query).await.unwrap();
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.meta.current, 2);
+        assert_eq!(result.results[0].base.name, Some("jazz".to_string()));
+        assert_eq!(result.results[0].server_id, Some("studio-9".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_search_streams_empty_query() {
         let (mut server, client) = mock_api().await;
         let mock = mock_json(
             &mut server,
             "GET",
             "/streams/search",
             200,
-            r#"[{"id":"s9","name":"jazz"}]"#,
+            r#"{"_meta":{"total":0,"pages":0,"current":1,"count":0,"limit":10},"results":[]}"#,
         )
         .await;
 
-        let result = api(&client).search_streams(Some("jazz")).await.unwrap();
-        assert_eq!(result[0].name, Some("jazz".to_string()));
-        mock.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn test_search_streams_without_query() {
-        let (mut server, client) = mock_api().await;
-        let mock = mock_json(&mut server, "GET", "/streams/search", 200, "[]").await;
-
-        let result = api(&client).search_streams(None).await.unwrap();
-        assert!(result.is_empty());
+        let result = api(&client).search_streams(&models::StreamSearchQuery::default()).await.unwrap();
+        assert!(result.results.is_empty());
         mock.assert_async().await;
     }
 
@@ -440,7 +473,7 @@ mod tests {
             "GET",
             "/channels-paginated",
             200,
-            r#"{"items":[{"id":"c1"}],"page":2}"#,
+            r#"{"_meta":{"total":11,"pages":2,"current":2,"count":1,"limit":10},"results":[{"id":"c1"}]}"#,
         )
         .await;
 
@@ -448,7 +481,8 @@ mod tests {
             .list_channels_paginated(Some(2), Some(10))
             .await
             .unwrap();
-        assert_eq!(result.items.unwrap().len(), 1);
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.meta.current, 2);
         mock.assert_async().await;
     }
 
@@ -460,12 +494,12 @@ mod tests {
             "GET",
             "/channels-paginated",
             200,
-            r#"{"items":[]}"#,
+            r#"{"_meta":{"total":0,"pages":0,"current":1,"count":0,"limit":10},"results":[]}"#,
         )
         .await;
 
         let result = api(&client).list_channels_paginated(None, None).await.unwrap();
-        assert_eq!(result.items.unwrap().len(), 0);
+        assert_eq!(result.results.len(), 0);
         mock.assert_async().await;
     }
 

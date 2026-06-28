@@ -2,7 +2,7 @@
 //!
 //! User profile management, preferences, and related operations.
 
-use super::{to_js_value, regions_from_map, PaginationQuery, ApiClient, ApiError, urlencode};
+use super::{to_js_value, PaginationQuery, ApiClient, ApiError, urlencode};
 use crate::models;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -55,11 +55,10 @@ impl UsersApi {
         self.client.delete(&path).await
     }
 
-    /// Get all regions available to a user
-    pub async fn get_user_regions(&self, user_id: &str) -> Result<Vec<models::Region>, ApiError> {
+    /// Get all regions available to a user, keyed by region identifier.
+    pub async fn get_user_regions(&self, user_id: &str) -> Result<HashMap<String, models::Region>, ApiError> {
         let path = format!("/users/{}/regions", urlencode(user_id));
-        let map: HashMap<String, models::Region> = self.client.get(&path).await?;
-        Ok(regions_from_map(map))
+        self.client.get(&path).await
     }
 
     /// Get a user's notifications
@@ -364,8 +363,8 @@ mod tests {
 
         let regions = api(&client).get_user_regions("u1").await.unwrap();
         assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0].id, Some("gcloud-us-ut-slc".to_string()));
-        assert_eq!(regions[0].label, Some("USA - Salt Lake City, UT".to_string()));
+        let region = regions.get("gcloud-us-ut-slc").expect("region present");
+        assert_eq!(region.label, Some("USA - Salt Lake City, UT".to_string()));
         mock.assert_async().await;
     }
 
@@ -466,7 +465,7 @@ mod tests {
             "GET",
             "/users/u1/channels-paginated",
             200,
-            r#"{"items":[{"id":"c1"}],"page":2}"#,
+            r#"{"_meta":{"total":11,"pages":2,"current":2,"count":1,"limit":10},"results":[{"id":"c1"}]}"#,
         )
         .await;
 
@@ -474,7 +473,8 @@ mod tests {
             .get_user_channels("u1", Some(2), Some(10))
             .await
             .unwrap();
-        assert_eq!(result.items.unwrap().len(), 1);
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.meta.current, 2);
         mock.assert_async().await;
     }
 
@@ -486,12 +486,12 @@ mod tests {
             "GET",
             "/users/u1/channels-paginated",
             200,
-            r#"{"items":[]}"#,
+            r#"{"_meta":{"total":0,"pages":0,"current":1,"count":0,"limit":10},"results":[]}"#,
         )
         .await;
 
         let result = api(&client).get_user_channels("u1", None, None).await.unwrap();
-        assert_eq!(result.items.unwrap().len(), 0);
+        assert_eq!(result.results.len(), 0);
         mock.assert_async().await;
     }
 
@@ -503,7 +503,7 @@ mod tests {
             "GET",
             "/users/u1/follows-paginated",
             200,
-            r#"{"items":[{"id":"c1"}],"page":1}"#,
+            r#"{"_meta":{"total":1,"pages":1,"current":1,"count":1,"limit":10},"results":[{"id":"c1"}]}"#,
         )
         .await;
 
@@ -511,7 +511,7 @@ mod tests {
             .get_user_follows("u1", Some(1), None)
             .await
             .unwrap();
-        assert_eq!(result.items.unwrap().len(), 1);
+        assert_eq!(result.results.len(), 1);
         mock.assert_async().await;
     }
 
@@ -523,12 +523,12 @@ mod tests {
             "GET",
             "/users/u1/follows-paginated",
             200,
-            r#"{"items":[]}"#,
+            r#"{"_meta":{"total":0,"pages":0,"current":1,"count":0,"limit":10},"results":[]}"#,
         )
         .await;
 
         let result = api(&client).get_user_follows("u1", None, None).await.unwrap();
-        assert_eq!(result.items.unwrap().len(), 0);
+        assert_eq!(result.results.len(), 0);
         mock.assert_async().await;
     }
 }

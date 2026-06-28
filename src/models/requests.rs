@@ -128,53 +128,36 @@ pub struct AnalyticsEvent {
     pub timestamp: Option<String>,
 }
 
-/// Checkout session request
+/// Checkout session request (`POST /users/{userId}/checkout`).
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckoutRequest {
-    /// Price ID from the plan
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub price_id: Option<String>,
+    /// Subscription plan name to check out (required)
+    pub plan: String,
 
-    /// Success redirect URL
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub success_url: Option<String>,
+    /// URL to redirect to after checkout completes (required)
+    #[serde(rename = "callbackURL")]
+    pub callback_url: String,
 
-    /// Cancel redirect URL
+    /// Pricing mode (e.g. "yearly")
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cancel_url: Option<String>,
+    pub pricing_mode: Option<String>,
 
-    /// Coupon code to apply
+    /// Force Stripe test mode regardless of environment
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub coupon: Option<String>,
+    pub force_stripe_test_mode: Option<bool>,
 }
 
-/// Modify subscription request
+/// Billing portal session request (`POST /users/{userId}/billing`).
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
-pub struct ModifySubscriptionRequest {
-    /// New price ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub price_id: Option<String>,
-
-    /// Whether to prorate the change
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prorate: Option<bool>,
+pub struct BillingPortalRequest {
+    /// URL to redirect to after the billing portal session ends
+    #[serde(rename = "callbackURL", skip_serializing_if = "Option::is_none")]
+    pub callback_url: Option<String>,
 }
-
-/// Generic code request (used for coupon and promo code redemption)
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct CodeRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
-}
-
-pub type CouponRequest = CodeRequest;
-pub type PromoRequest = CodeRequest;
 
 #[cfg(test)]
 mod tests {
@@ -218,6 +201,31 @@ mod tests {
         let s = roundtrip(&m);
         assert!(s.contains("\"type\":\"text\""));
         assert!(!s.contains("messageType"));
+    }
+
+    #[test]
+    fn checkout_request_wire_format() {
+        let r = CheckoutRequest {
+            plan: "pro".into(),
+            pricing_mode: Some("yearly".into()),
+            callback_url: "https://app/done".into(),
+            force_stripe_test_mode: Some(true),
+        };
+        let s = roundtrip(&r);
+        assert!(s.contains("\"plan\":\"pro\""));
+        assert!(s.contains("\"pricingMode\":\"yearly\""));
+        // callbackURL keeps its uppercase casing on the wire.
+        assert!(s.contains("\"callbackURL\":"));
+        assert!(s.contains("\"forceStripeTestMode\":true"));
+        assert!(!s.contains("\"callbackUrl\":"));
+    }
+
+    #[test]
+    fn billing_portal_request_renames_callback_url() {
+        let r = BillingPortalRequest { callback_url: Some("https://app/done".into()) };
+        let s = roundtrip(&r);
+        assert!(s.contains("\"callbackURL\":"));
+        assert!(!s.contains("\"callbackUrl\":"));
     }
 
     #[test]

@@ -11,11 +11,6 @@ use wasm_bindgen::prelude::*;
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 pub struct Region {
-    /// Region identifier (e.g., "azure-ae-dubai", "gcloud-us-ut-slc")
-    /// This is the key from the API response map, added during conversion.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-
     /// Geographic group (e.g., "Americas", "Europe", "Asia", "Oceania", "Africa")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
@@ -40,9 +35,17 @@ pub struct Region {
     #[serde(default, rename = "armImageId", skip_serializing_if = "Option::is_none")]
     pub arm_image_id: Option<String>,
 
+    /// VM image ID for remote-root instances
+    #[serde(default, rename = "remoteRootImageId", skip_serializing_if = "Option::is_none")]
+    pub remote_root_image_id: Option<String>,
+
     /// Subnet identifier
     #[serde(default, rename = "subnetId", skip_serializing_if = "Option::is_none")]
     pub subnet_id: Option<String>,
+
+    /// Provider security-group identifiers applied to studio VMs
+    #[serde(default, rename = "securityGroupIds", skip_serializing_if = "Option::is_none")]
+    pub security_group_ids: Option<Vec<String>>,
 
     /// Available instance types for this region
     #[serde(default, rename = "instanceTypes", skip_serializing_if = "Option::is_none")]
@@ -63,6 +66,22 @@ pub struct Region {
     /// Cloud host URL for this region
     #[serde(default, rename = "cloudHost", skip_serializing_if = "Option::is_none")]
     pub cloud_host: Option<String>,
+
+    /// Availability zone within the region where studios are provisioned
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+
+    /// Name of the provider-managed volume attached to studios in this region
+    #[serde(default, rename = "volumeName", skip_serializing_if = "Option::is_none")]
+    pub volume_name: Option<String>,
+
+    /// Type of the provider-managed volume attached to studios in this region
+    #[serde(default, rename = "volumeType", skip_serializing_if = "Option::is_none")]
+    pub volume_type: Option<String>,
+
+    /// Server-side autoscaling parameters (only populated on single-region responses)
+    #[serde(default, rename = "scaleParams", skip_serializing_if = "Option::is_none")]
+    pub scale_params: Option<serde_json::Value>,
 }
 
 /// Instance type available in a region
@@ -96,7 +115,6 @@ mod tests {
         // docs/api/system.md. Region uses explicit per-field renames rather
         // than rename_all; verify those are honoured on the wire.
         let json = r#"{
-          "id": "gcloud-us-ut-slc",
           "group": "Americas",
           "provider": "gcloud",
           "region": "us-west3",
@@ -113,7 +131,7 @@ mod tests {
           "cloudHost": "https://gcloud.example.com"
         }"#;
         let r: Region = serde_json::from_str(json).unwrap();
-        assert_eq!(r.id.as_deref(), Some("gcloud-us-ut-slc"));
+        assert_eq!(r.region.as_deref(), Some("us-west3"));
         assert_eq!(r.instance_types.as_ref().map(|v| v.len()), Some(1));
         assert_eq!(
             r.instance_types.as_ref().and_then(|v| v.first()).map(|i| i.id.as_str()),

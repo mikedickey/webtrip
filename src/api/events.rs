@@ -212,7 +212,7 @@ mod tests {
             "GET",
             "/events-paginated",
             200,
-            r#"{"items":[{"id":"e1"}],"page":2}"#,
+            r#"{"_meta":{"total":11,"pages":2,"current":2,"count":1,"limit":10},"results":[{"id":"e1"}]}"#,
         )
         .await;
 
@@ -220,7 +220,8 @@ mod tests {
             .list_events_paginated(Some(2), Some(10))
             .await
             .unwrap();
-        assert_eq!(result.items.unwrap().len(), 1);
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.meta.current, 2);
         mock.assert_async().await;
     }
 
@@ -232,12 +233,12 @@ mod tests {
             "GET",
             "/events-paginated",
             200,
-            r#"{"items":[]}"#,
+            r#"{"_meta":{"total":0,"pages":0,"current":1,"count":0,"limit":10},"results":[]}"#,
         )
         .await;
 
         let result = api(&client).list_events_paginated(None, None).await.unwrap();
-        assert_eq!(result.items.unwrap().len(), 0);
+        assert_eq!(result.results.len(), 0);
         mock.assert_async().await;
     }
 

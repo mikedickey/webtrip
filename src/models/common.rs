@@ -159,6 +159,7 @@ pub enum ResourceStatus {
     Ready,
     Disabled,
     Deleting,
+    Removed,
 }
 
 impl Default for ResourceStatus {
