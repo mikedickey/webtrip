@@ -131,18 +131,19 @@ jobs:
           MIKED_TLS_CERT: ${{ secrets.MIKED_TLS_CERT }}
           MIKED_TLS_KEY: ${{ secrets.MIKED_TLS_KEY }}
         run: |
+          : "${MIKED_TLS_CERT:?MIKED_TLS_CERT secret is not set}"
+          : "${MIKED_TLS_KEY:?MIKED_TLS_KEY secret is not set}"
           mkdir -p certs
           printf '%s\n' "$MIKED_TLS_CERT" > certs/star.miked.io.chained.crt
           printf '%s\n' "$MIKED_TLS_KEY"  > certs/star.miked.io.key
           chmod 600 certs/star.miked.io.key
 
+      # Reuse the same service definition local devs use, so the JackTrip server
+      # contract lives in one place (the compose file).
       - name: Start JackTrip server
-        run: |
-          docker run -d --name jacktrip --network host --privileged --shm-size=512M \
-            -e BUFFER_SIZE=128 \
-            -e JACKTRIP_OPTS="-S -D -I 1 -p 4 --bufstrategy 3 -q auto --udprt --certfile /certs/star.miked.io.chained.crt --keyfile /certs/star.miked.io.key" \
-            -v "$PWD/certs:/certs:ro" \
-            jacktrip/jacktrip:edge
+        env:
+          JACKTRIP_CERT_DIR: ${{ github.workspace }}/certs
+        run: docker compose -f tests/integration/docker-compose.integration.yml up -d
 
       - name: Wait for server (TCP 4464)
         run: |
@@ -158,21 +159,23 @@ jobs:
           exit 1
 
       # Run inside the prebuilt build image (nightly toolchain + chromium) on the
-      # same host network so the browser reaches the JackTrip server. Build the
-      # app first (the served-app harness needs pkg/ + dist/), then serve it over
-      # TLS and drive both transports through a headless browser.
+      # same host network so the browser reaches the JackTrip server.
+      # `npm run test:integration` builds the app (pkg/ + dist/) before serving it
+      # and driving both transports through a headless browser.
       - name: Run integration tests
         run: |
           docker run --rm --network host -v "$PWD:/work" -w /work --user root \
             -e JACKTRIP_TEST_HOST=localhost.miked.io \
             -e PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
             ${{ needs.container.outputs.image }} \
-            bash -lc "npm ci && npm run build && npm run test:integration"
+            bash -lc "npm ci && npm run test:integration"
 
       - name: JackTrip server logs
         if: always()
-        run: docker logs jacktrip || true
+        run: docker compose -f tests/integration/docker-compose.integration.yml logs || true
 
       - name: Stop JackTrip server
         if: always()
-        run: docker rm -f jacktrip || true
+        env:
+          JACKTRIP_CERT_DIR: ${{ github.workspace }}/certs
+        run: docker compose -f tests/integration/docker-compose.integration.yml down || true

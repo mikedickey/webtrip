@@ -54,11 +54,16 @@ const TRANSPORTS = (process.env.INTEGRATION_TRANSPORTS || "webrtc,webtransport")
 const CONNECT_TIMEOUT_MS = 30_000;
 const SEND_POLL_MS = 10_000;
 
+/** Print an error and mark the process as failed (without exiting immediately). */
 function fail(msg) {
   console.error(`\n❌ ${msg}`);
   process.exitCode = 1;
 }
 
+/**
+ * Resolve a Chrome/Chromium executable: an explicit env path first, then common
+ * binaries on PATH, then the default macOS location. Throws if none are found.
+ */
 function resolveChrome() {
   const explicit = process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROME_BIN;
   if (explicit) return explicit;
@@ -79,6 +84,7 @@ function resolveChrome() {
   );
 }
 
+/** Resolve once `host:port` accepts a TCP connection, or reject after `timeoutMs`. */
 function waitForPort(host, port, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolve, reject) => {
@@ -97,8 +103,11 @@ function waitForPort(host, port, timeoutMs) {
   });
 }
 
-// Runs inside the page. Drives one transport end-to-end through the exported
-// session API and returns plain JSON for the Node side to assert on.
+/**
+ * Runs inside the page. Drives one transport end-to-end through the exported
+ * session API (init → connect → resume → poll send path → disconnect) and
+ * returns plain JSON for the Node side to assert on.
+ */
 async function inPageDrive({ transportName, host, port, connectTimeoutMs, sendPollMs }) {
   const m = await import("/pkg/webtrip.js");
 
@@ -133,10 +142,24 @@ async function inPageDrive({ transportName, host, port, connectTimeoutMs, sendPo
   const session = new m.WebTripSession(ptr);
   session.setTransportType(tt);
 
-  await Promise.race([
-    session.connectToStudio(host, port, undefined, false, false, false, `webtrip-it-${transportName}`),
-    new Promise((_, rej) => setTimeout(() => rej(new Error("connect timeout")), connectTimeoutMs)),
-  ]);
+  // Race the connect against a timeout, clearing the timer on settle so the
+  // loser never fires a late (unhandled) rejection into the page.
+  const connectPromise = session.connectToStudio(
+    host, port, undefined, false, false, false, `webtrip-it-${transportName}`,
+  );
+  // If the timeout wins, connectPromise may still settle later; swallow it.
+  connectPromise.catch(() => {});
+  let timer;
+  try {
+    await Promise.race([
+      connectPromise,
+      new Promise((_, rej) => {
+        timer = setTimeout(() => rej(new Error("connect timeout")), connectTimeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 
   // Resume the AudioContext so the worklet actually runs and feeds the send ring
   // buffer headless (paired with --autoplay-policy=no-user-gesture-required).
@@ -168,7 +191,15 @@ async function inPageDrive({ transportName, host, port, connectTimeoutMs, sendPo
   return result;
 }
 
+/**
+ * Serve the app, drive each requested transport against the live JackTrip
+ * server in a headless browser, and assert connect + send-path. Sets a non-zero
+ * exit code (via `fail`/throw) on any failure.
+ */
 async function main() {
+  if (TRANSPORTS.length === 0) {
+    throw new Error("INTEGRATION_TRANSPORTS is empty — nothing to test");
+  }
   if (!fs.existsSync(path.join(REPO_ROOT, "pkg", "webtrip.js"))) {
     throw new Error("pkg/webtrip.js missing — run `npm run build` first.");
   }
@@ -176,10 +207,12 @@ async function main() {
   // Serve the real app over plain HTTP on localhost (a secure context, so
   // server.js's COOP/COEP still yield crossOriginIsolated + WebTransport). No
   // cert needed here — only the JackTrip server needs a browser-trusted cert.
+  // server.js reads PORT, so APP_PORT is honored.
   console.log(`▶ starting app server on http://${APP_HOST}:${APP_PORT}`);
   const server = spawn("node", ["server.js"], {
     cwd: REPO_ROOT,
     stdio: "inherit",
+    env: { ...process.env, PORT: String(APP_PORT) },
   });
   let browser;
   try {

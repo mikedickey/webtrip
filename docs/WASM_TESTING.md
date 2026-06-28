@@ -172,8 +172,8 @@ WebSocket signaling + SDP/ICE + data-channel open; WebTransport's QUIC worker
 loops).
 
 ```bash
-npm run build            # produces pkg/ and dist/
-npm run test:integration # tests/integration/run.mjs
+npm run test:integration       # builds the app, then drives tests/integration/run.mjs
+npm run test:integration:run   # inner-loop: skip the build, reuse existing pkg/ + dist/
 ```
 
 ### How it works (served-app + browser driver)
@@ -221,12 +221,10 @@ compose file (pass `JACKTRIP_CERT_DIR` to *that*). Set
 
 ```bash
 # Option A: server already running in another terminal on localhost.miked.io:4464
-npm run build
 npm run test:integration
 
 # Option B: start the server via the bundled compose file (needs the cert)
 JACKTRIP_CERT_DIR=/path/to/certs docker compose -f tests/integration/docker-compose.integration.yml up -d
-npm run build
 npm run test:integration
 docker compose -f tests/integration/docker-compose.integration.yml down
 ```
