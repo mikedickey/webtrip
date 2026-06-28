@@ -136,7 +136,11 @@ jobs:
           mkdir -p certs
           printf '%s\n' "$MIKED_TLS_CERT" > certs/star.miked.io.chained.crt
           printf '%s\n' "$MIKED_TLS_KEY"  > certs/star.miked.io.key
-          chmod 600 certs/star.miked.io.key
+          # World-readable: the jacktrip process in the container may run as a
+          # non-root user, and a 600 key owned by the runner UID would be
+          # unreadable to it (cert load then silently fails). Fine on an
+          # ephemeral, isolated CI runner.
+          chmod 644 certs/star.miked.io.chained.crt certs/star.miked.io.key
 
       # The server's TLS is what WebRTC (wss) and WebTransport (QUIC) validate,
       # so a malformed or leaf-only (no intermediates) cert makes both fail in
@@ -174,6 +178,8 @@ jobs:
             sleep 2
           done
           echo "::error::JackTrip TLS endpoint never came up on localhost.miked.io:4464"
+          echo "--- cert visibility inside container (process user must be able to read these) ---"
+          docker exec jacktrip sh -c 'id; ls -la /certs 2>&1; for f in /certs/star.miked.io.chained.crt /certs/star.miked.io.key; do { head -c1 "$f" >/dev/null 2>&1 && echo "READABLE $f"; } || echo "UNREADABLE/MISSING $f"; done' 2>&1 || true
           echo "--- listeners in container ---"
           docker exec jacktrip sh -c 'command -v ss >/dev/null && ss -ltnup || netstat -ltnup' 2>&1 || true
           echo "--- jacktrip service / journal ---"
