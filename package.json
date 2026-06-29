@@ -7,6 +7,7 @@
   },
   "scripts": {
     "build:wasm": "wasm-pack build --target web . -Zbuild-std=std,panic_abort --config \"target.wasm32-unknown-unknown.rustflags='$npm_package_config_web_sys_cfg $npm_package_config_wasm_rustflags'\"",
+    "build:wasm:coverage": "CFLAGS_wasm32_unknown_unknown=\"$npm_package_config_wasm_coverage_cflags\" wasm-pack build --target web --dev . --features coverage -Zbuild-std=std,panic_abort --config \"target.wasm32-unknown-unknown.rustflags='$npm_package_config_web_sys_cfg $npm_package_config_wasm_rustflags $npm_package_config_wasm_coverage_rustflags'\"",
     "build:app": "tsc",
     "build": "npm run build:wasm && npm run build:app",
     "build:container": "docker build -t webtrip/webtrip-builder -f containers/build/Containerfile .",
@@ -16,6 +17,7 @@
     "test:wasm": "RUSTFLAGS=\"$npm_package_config_web_sys_cfg $npm_package_config_wasm_rustflags\" scripts/wasm-browser-env.sh test wasm-pack test --headless --chrome -- -Zbuild-std=std,panic_abort",
     "test:integration": "npm run build && npm run test:integration:run",
     "test:integration:run": "node tests/integration/run.mjs",
+    "coverage:integration": "npm run build:wasm:coverage && npm run build:app && INTEGRATION_COVERAGE=1 npm run test:integration:run && scripts/integration-coverage-report.sh",
     "coverage:wasm": "CFLAGS_wasm32_unknown_unknown=\"$npm_package_config_wasm_coverage_cflags\" CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS=\"$npm_package_config_web_sys_cfg $npm_package_config_wasm_rustflags $npm_package_config_wasm_coverage_rustflags\" scripts/wasm-browser-env.sh coverage cargo llvm-cov test --target wasm32-unknown-unknown -Zbuild-std=std,panic_abort --lcov --output-path lcov.wasm.info",
     "clean": "rm -rf dist pkg target",
     "serve": "node server.js"

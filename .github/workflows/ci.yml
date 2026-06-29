@@ -94,6 +94,7 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info,lcov.wasm.info
+          flags: unit
           fail_ci_if_error: true
 
   # ──────────────────────────────────────────────────────────────────────────
@@ -188,15 +189,30 @@ jobs:
 
       # Run inside the prebuilt build image (nightly toolchain + chromium) on the
       # same host network so the browser reaches the JackTrip server.
-      # `npm run test:integration` builds the app (pkg/ + dist/) before serving it
-      # and driving both transports through a headless browser.
-      - name: Run integration tests
+      # `npm run coverage:integration` builds an instrumented app (pkg/ + dist/),
+      # serves it, drives both transports through a headless browser, then dumps
+      # the live WASM coverage and exports lcov.integration.info. The dump covers
+      # the WebTransport worker too: it shares the module's linear memory (where
+      # the LLVM counters live), so a single main-thread capture sees both.
+      - name: Run integration tests (+ coverage)
         run: |
           docker run --rm --network host -v "$PWD:/work" -w /work --user root \
             -e JACKTRIP_TEST_HOST=localhost.miked.io \
             -e PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
             ${{ needs.container.outputs.image }} \
-            bash -lc "npm ci && npm run test:integration"
+            bash -lc "npm ci && npm run coverage:integration"
+
+      # Union this report with the unit/wasm reports (uploaded by the build job).
+      # Flagged `integration` + carryforward (see codecov.yml) so fork PRs — which
+      # skip this whole job for lack of the MIKED_TLS_* secrets — reuse the last
+      # known integration coverage instead of reading these lines as a drop.
+      - name: Upload integration coverage
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.integration.info
+          flags: integration
+          fail_ci_if_error: true
 
       - name: JackTrip server logs
         if: always()
