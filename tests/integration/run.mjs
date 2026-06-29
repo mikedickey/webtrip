@@ -29,6 +29,8 @@
 //   JACKTRIP_TEST_HOST      JackTrip host (default localhost.miked.io)
 //   JACKTRIP_TEST_PORT      JackTrip port (default 4464)
 //   INTEGRATION_TRANSPORTS  comma list (default "webrtc,webtransport")
+//   INTEGRATION_COVERAGE    if set, dump LLVM coverage to coverage/integration.profraw
+//                           (requires a `build:wasm:coverage` build)
 //   PUPPETEER_EXECUTABLE_PATH  Chrome/Chromium binary (auto-detected otherwise)
 //
 // Failure-case mode (opt-in, kept OFF by default so it can't flake the
@@ -202,6 +204,20 @@ async function inPageDrive({ transportName, host, port, connectTimeoutMs, sendPo
     await new Promise((r) => setTimeout(r, 200));
   }
 
+  // Receive-path counters are reported for visibility but NOT asserted here.
+  // This harness drives a SINGLE client against the hub (`-p 4`, see
+  // docker-compose.integration.yml), so with no second participant the hub mixes
+  // nothing back: `recvPlayed` stays 0 and `recvInitialized` stays false. Rather
+  // than depend on a second live client (flaky, and the hub patch mode does not
+  // reliably loop a lone/echo client back to itself), the inbound audio path —
+  // the WebTransport worker's datagram read loop (`parse_read_result` →
+  // `handle_datagram` → `Regulator::push`, plus the deserialize-error / high-
+  // error-rate / connection-lost branches) and the WebRTC data-channel receive
+  // body (`enqueue_channel_message`, both channel-creation directions, incl. the
+  // non-ArrayBuffer rejection) — is covered by targeted browser unit tests
+  // (`#[wasm_bindgen_test]` in src/audio/webtransport_worker.rs and
+  // src/audio/webrtc.rs; see WEB-45). Those feed synthetic inbound data straight
+  // into the receive handlers and assert on Regulator state + the stats counters.
   const s = session.get_stats();
   const result = {
     connected,
@@ -255,6 +271,24 @@ async function runFailureCase(page) {
     );
   }
   throw new Error("failure-case did not reject as expected");
+}
+
+/**
+ * Runs inside the page. Serializes the WASM module's accumulated LLVM coverage
+ * counters as `.profraw` bytes, base64-encoded for a JSON-safe transfer back to
+ * Node. The counters live in shared linear memory, so this single main-thread
+ * call also captures the WebTransport worker's execution. Requires a build with
+ * the `coverage` feature (see `build:wasm:coverage`).
+ */
+async function inPageDumpCoverage() {
+  const m = await import("/pkg/webtrip.js");
+  if (typeof m.__coverageDump !== "function") {
+    return { error: "module was not built with the `coverage` feature" };
+  }
+  const bytes = m.__coverageDump();
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return { base64: btoa(bin), length: bytes.length };
 }
 
 /**
@@ -357,6 +391,22 @@ async function main() {
             `(${result.ringWrites} writes); recv played=${result.recvPlayed} ` +
             `initialized=${result.recvInitialized}`,
         );
+      }
+    }
+
+    // Pull coverage out of the live module before tearing the page down. Done
+    // regardless of pass/fail so a partial run still yields the lines it hit.
+    if (process.env.INTEGRATION_COVERAGE) {
+      console.log("\n▶ dumping WASM coverage");
+      const cov = await page.evaluate(inPageDumpCoverage);
+      if (cov.error) {
+        anyFailed = true;
+        fail(`coverage dump: ${cov.error}`);
+      } else {
+        const outFile = path.join(REPO_ROOT, "coverage", "integration.profraw");
+        fs.mkdirSync(path.dirname(outFile), { recursive: true });
+        fs.writeFileSync(outFile, Buffer.from(cov.base64, "base64"));
+        console.log(`   wrote ${cov.length} bytes → ${outFile}`);
       }
     }
 

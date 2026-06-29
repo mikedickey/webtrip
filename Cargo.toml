@@ -9,8 +9,18 @@ version = "0.1.0"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# Enables the `__coverage_dump` export used by the integration harness to pull
+# LLVM profile data out of the live (browser) WASM build. Pair with the
+# instrument-coverage rustflags (see `build:wasm:coverage` in package.json);
+# never enable for a shipped build.
+coverage = ["dep:minicov"]
+
 [dependencies]
 console_error_panic_hook = "0.1.7"
+# Supplies the LLVM profiler runtime (we build with `-Zno-profiler-runtime`) and
+# a `capture_coverage` sink. Only compiled under the `coverage` feature.
+minicov = { version = "0.3.8", optional = true }
 js-sys = "0.3.83"
 wasm-bindgen = "0.2.106"
 wasm-bindgen-futures = "0.4.56"

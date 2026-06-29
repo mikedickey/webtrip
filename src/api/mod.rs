@@ -44,6 +44,7 @@ pub mod recordings;
 pub mod streams;
 pub mod studios;
 pub mod system;
+pub mod tracks;
 pub mod users;
 
 // Re-export models from the existing models module
@@ -226,6 +227,12 @@ impl ApiClient {
     pub fn recordings(&self) -> recordings::RecordingsApi {
         recordings::RecordingsApi::from_client(self)
     }
+
+    /// Get the Backing Tracks API
+    #[wasm_bindgen]
+    pub fn tracks(&self) -> tracks::TracksApi {
+        tracks::TracksApi::from_client(self)
+    }
 }
 
 impl Default for ApiClient {
@@ -326,6 +333,21 @@ impl ApiClient {
         self.handle_response(response).await
     }
 
+    /// Execute a POST request with a `multipart/form-data` body (e.g. file uploads)
+    pub(crate) async fn post_multipart<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        form: reqwest::multipart::Form,
+    ) -> ApiResult<T> {
+        let response = self
+            .build_request(reqwest::Method::POST, path)
+            .multipart(form)
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
     /// Execute a POST request with a JSON body, returning nothing
     pub(crate) async fn post_no_response<B: Serialize>(&self, path: &str, body: &B) -> ApiResult<()> {
         let response = self
@@ -370,6 +392,25 @@ impl ApiClient {
             .await?;
 
         self.handle_response(response).await
+    }
+
+    /// Execute a PUT request with a raw binary body (e.g. an image upload),
+    /// returning nothing. Used by endpoints like `PUT /studios/{id}/banner`
+    /// whose payload is image bytes rather than JSON.
+    pub(crate) async fn put_bytes(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        content_type: &str,
+    ) -> ApiResult<()> {
+        let response = self
+            .build_request(reqwest::Method::PUT, path)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(body)
+            .send()
+            .await?;
+
+        self.handle_empty_response(response).await
     }
 
     /// Execute a DELETE request

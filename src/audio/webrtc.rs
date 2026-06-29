@@ -144,6 +144,33 @@ pub(crate) fn signaling_close_error_message(server: &str, port: u16, state: &str
 /// Data channel label for audio data
 const AUDIO_CHANNEL_LABEL: &str = "jacktrip-audio";
 
+/// Handle one inbound data-channel `MessageEvent`: if it carries binary data
+/// (`ArrayBuffer`), copy the bytes onto the receive `queue` and return `true`;
+/// otherwise log and drop it, returning `false`.
+///
+/// This is the single source of truth for the data-channel receive body, shared
+/// by both the client-created channel (`create_data_channel`) and the
+/// server-created channel (`create_peer_connection`'s `ondatachannel`) so the
+/// copy-into-queue / non-`ArrayBuffer`-rejection logic isn't duplicated.
+fn enqueue_channel_message(
+    msg_event: &MessageEvent,
+    queue: &Rc<RefCell<VecDeque<Vec<u8>>>>,
+) -> bool {
+    match msg_event.data().dyn_into::<ArrayBuffer>() {
+        Ok(buffer) => {
+            let array = Uint8Array::new(&buffer);
+            let mut data = vec![0u8; array.length() as usize];
+            array.copy_to(&mut data);
+            queue.borrow_mut().push_back(data);
+            true
+        }
+        Err(_) => {
+            web_sys::console::error_1(&"❌ Received non-ArrayBuffer message".into());
+            false
+        }
+    }
+}
+
 /// Warm up TLS for HTTPS/WSS on the signaling origin before opening WebSocket.
 ///
 /// Some Chrome versions can fail an initial `wss://` handshake unless an `https://`
@@ -976,18 +1003,10 @@ impl WebRtcTransport {
             web_sys::console::debug_1(&format!("📥 Server created data channel: {}", channel.label()).into());
             channel.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
 
-            // Set up message handler for incoming channel
+            // Set up message handler for incoming channel (shared receive body)
             let queue = receive_queue.clone();
             let on_message = Closure::wrap(Box::new(move |msg_event: MessageEvent| {
-                if let Ok(buffer) = msg_event.data().dyn_into::<ArrayBuffer>() {
-                    let array = Uint8Array::new(&buffer);
-                    let mut data = vec![0u8; array.length() as usize];
-                    array.copy_to(&mut data);
-                    web_sys::console::debug_1(&format!("📨 Received {} bytes on server-created channel", data.len()).into());
-                    queue.borrow_mut().push_back(data);
-                } else {
-                    web_sys::console::error_1(&"❌ Received non-ArrayBuffer message".into());
-                }
+                enqueue_channel_message(&msg_event, &queue);
             }) as Box<dyn FnMut(_)>);
 
             channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
@@ -1023,17 +1042,10 @@ impl WebRtcTransport {
         let channel = pc.create_data_channel_with_data_channel_dict(AUDIO_CHANNEL_LABEL, &dc_init);
         channel.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
 
-        // Set up message handler
+        // Set up message handler (shared receive body)
         let receive_queue = self.receive_queue.clone();
         let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
-            if let Ok(buffer) = event.data().dyn_into::<ArrayBuffer>() {
-                let array = Uint8Array::new(&buffer);
-                let mut data = vec![0u8; array.length() as usize];
-                array.copy_to(&mut data);
-                receive_queue.borrow_mut().push_back(data);
-            } else {
-                web_sys::console::error_1(&"❌ Received non-ArrayBuffer message on client channel".into());
-            }
+            enqueue_channel_message(&event, &receive_queue);
         }) as Box<dyn FnMut(_)>);
         channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
         self.on_message_closure = Some(on_message);
@@ -1817,5 +1829,118 @@ mod tests {
             log.borrow()
         );
         drop(cb);
+    }
+
+    // ── Data-channel receive body (enqueue_channel_message) ──────────────────
+    //
+    // The shared receive body that both the client-created channel
+    // (`create_data_channel`) and the server-created channel
+    // (`create_peer_connection`'s `ondatachannel`) install as their
+    // `onmessage` handler. Synthetic `MessageEvent`s drive it directly: a live
+    // data channel only fires `onmessage` after a full DTLS/SCTP handshake with
+    // a remote peer (out of scope here), but the body that runs when it does is
+    // exactly this helper.
+
+    /// Build a `MessageEvent` whose `data` is an `ArrayBuffer` holding `bytes`,
+    /// mirroring a binary data-channel frame.
+    #[cfg(target_arch = "wasm32")]
+    fn binary_message_event(bytes: &[u8]) -> MessageEvent {
+        let buffer = ArrayBuffer::new(bytes.len() as u32);
+        Uint8Array::new(&buffer).copy_from(bytes);
+        let init = web_sys::MessageEventInit::new();
+        init.set_data(&buffer);
+        MessageEvent::new_with_event_init_dict("message", &init)
+            .expect("MessageEvent construction should succeed")
+    }
+
+    /// A binary (`ArrayBuffer`) message is copied onto the receive queue and is
+    /// retrievable in order with its exact bytes.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn enqueue_channel_message_binary_lands_on_queue() {
+        let queue: Rc<RefCell<VecDeque<Vec<u8>>>> = Rc::new(RefCell::new(VecDeque::new()));
+
+        let first: Vec<u8> = vec![1, 2, 3, 4, 250, 0, 128];
+        let second: Vec<u8> = (0u8..=63).collect();
+
+        assert!(enqueue_channel_message(&binary_message_event(&first), &queue));
+        assert!(enqueue_channel_message(&binary_message_event(&second), &queue));
+
+        assert_eq!(queue.borrow().len(), 2);
+        // FIFO order and exact byte content round-trip through the queue.
+        assert_eq!(queue.borrow_mut().pop_front(), Some(first));
+        assert_eq!(queue.borrow_mut().pop_front(), Some(second));
+    }
+
+    /// A non-`ArrayBuffer` message hits the rejection branch: it returns `false`
+    /// and leaves the queue untouched (no garbage enqueued).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn enqueue_channel_message_non_arraybuffer_is_rejected() {
+        let queue: Rc<RefCell<VecDeque<Vec<u8>>>> = Rc::new(RefCell::new(VecDeque::new()));
+
+        let init = web_sys::MessageEventInit::new();
+        init.set_data(&JsValue::from_str("not binary"));
+        let event = MessageEvent::new_with_event_init_dict("message", &init)
+            .expect("MessageEvent construction should succeed");
+
+        assert!(
+            !enqueue_channel_message(&event, &queue),
+            "a non-ArrayBuffer message must be rejected"
+        );
+        assert!(queue.borrow().is_empty(), "rejected messages must not enqueue");
+    }
+
+    /// An enqueued binary message is observable through the transport's public
+    /// receive accessors — i.e. the queue the data-channel handlers feed is the
+    /// same one `receive_bytes`/`has_pending_data` drain. This is what a live
+    /// `onmessage` ultimately accomplishes, exercised without a peer.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn enqueue_channel_message_visible_via_transport_accessors() {
+        let transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+
+        let payload: Vec<u8> = vec![9, 8, 7, 6, 5];
+        assert!(enqueue_channel_message(
+            &binary_message_event(&payload),
+            &transport.receive_queue,
+        ));
+
+        assert!(transport.has_pending_data());
+        assert_eq!(transport.pending_count(), 1);
+        assert_eq!(transport.receive_bytes(), Some(payload));
+        assert!(!transport.has_pending_data());
+    }
+
+    /// Both channel-creation directions register an `onmessage` handler (the
+    /// shared `enqueue_channel_message` body): the client path
+    /// (`create_data_channel`) stores `on_message_closure`, and the
+    /// peer-connection path (`create_peer_connection`) stores the
+    /// `ondatachannel` handler that wires the server-created channel's
+    /// `onmessage`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn both_channel_directions_register_receive_handlers() {
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+
+        transport
+            .create_peer_connection()
+            .expect("peer connection creation should succeed");
+        // create_peer_connection wires the server-created-channel handler.
+        assert!(
+            transport.on_data_channel_closure.is_some(),
+            "ondatachannel handler (server-created channel) must be registered"
+        );
+
+        transport
+            .create_data_channel()
+            .expect("data channel creation should succeed");
+        // create_data_channel wires the client-created-channel onmessage handler.
+        assert!(
+            transport.on_message_closure.is_some(),
+            "client-created channel onmessage handler must be registered"
+        );
     }
 }

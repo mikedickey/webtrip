@@ -1,0 +1,30 @@
+# Codecov configuration.
+#
+# Coverage arrives from two CI sources, each tagged with a flag so Codecov keeps
+# them straight:
+#   - `unit`        — native + wasm-bindgen-test reports (build job), every push/PR.
+#   - `integration` — live-JackTrip-server browser run (integration job). This job
+#                     needs the MIKED_TLS_* secrets, which GitHub withholds from
+#                     fork PRs, so it does NOT run on forks.
+#
+# Codecov unions all flags by file:line, so a line covered by either source counts.
+# `carryforward: true` on `integration` means a commit that doesn't re-run the
+# integration job (fork PRs) inherits the previous integration coverage instead of
+# treating those lines as newly uncovered.
+flag_management:
+  default_rules:
+    carryforward: false
+  individual_flags:
+    - name: integration
+      carryforward: true
+
+coverage:
+  status:
+    project:
+      default:
+        # Don't fail the whole project status on the fork-PR gap, where the
+        # integration flag is carried forward rather than freshly measured.
+        informational: true
+    patch:
+      default:
+        informational: true

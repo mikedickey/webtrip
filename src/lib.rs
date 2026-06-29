@@ -48,10 +48,29 @@ pub fn init() {
 }
 
 /// Get the WASM memory for use with Atomics.waitAsync
-/// 
+///
 /// This is needed by the event-driven network loop to access
 /// the ring buffer flag via SharedArrayBuffer.
 #[wasm_bindgen(js_name = getWasmMemory)]
 pub fn get_wasm_memory() -> JsValue {
     wasm_bindgen::memory().into()
+}
+
+/// Serialize this module's accumulated LLVM coverage counters as `.profraw`
+/// bytes, for the integration harness to write to disk and feed to
+/// `llvm-profdata`/`llvm-cov`.
+///
+/// The counters live in the module's linear memory, which every thread shares
+/// (the WebTransport worker is handed `wasm_bindgen::memory()` at init), so a
+/// single call from the main thread captures the worker's execution too.
+///
+/// Only compiled under the `coverage` feature, which pulls in `minicov` to
+/// supply the profiler runtime (`-Zno-profiler-runtime` omits LLVM's own).
+#[cfg(feature = "coverage")]
+#[wasm_bindgen(js_name = __coverageDump)]
+pub fn coverage_dump() -> Vec<u8> {
+    let mut data = Vec::new();
+    // SAFETY: called once, from the main thread, after driving has quiesced.
+    unsafe { minicov::capture_coverage(&mut data).expect("capture coverage") };
+    data
 }
