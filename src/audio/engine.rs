@@ -465,11 +465,18 @@ mod tests {
     /// coverage-instrumented build, the accumulation exhausts the renderer
     /// mid-suite (the driver gets SIGKILLed). Each test that builds an engine
     /// hands it here when done so the context is torn down promptly.
+    ///
+    /// Both a synchronous `close()` failure and a rejected close promise are
+    /// surfaced as hard test failures so a teardown leak can't pass unnoticed.
     #[cfg(target_arch = "wasm32")]
     async fn close_engine(engine: AudioEngine) {
-        if let Ok(promise) = engine.ctx.close() {
-            let _ = JsFuture::from(promise).await;
-        }
+        let promise = engine
+            .ctx
+            .close()
+            .expect("AudioContext.close() should be issuable");
+        JsFuture::from(promise)
+            .await
+            .expect("AudioContext should close without error");
     }
 
     /// Assert a freshly read JS object carries the three processing toggles
@@ -678,11 +685,22 @@ mod tests {
     /// `set_local_to_network_buffer` / `set_network_to_local_buffer` install
     /// real buffers after the fact, so `start_capture` takes the
     /// `AudioProcessor::with_network` branch and hands the worklet the ring
-    /// buffer's has-data flag. We assert capture still comes up (worklet port
-    /// present), proving the setters fed live pointers into the capture path.
+    /// buffer's has-data flag.
+    ///
+    /// To prove the networked branch was actually taken (and not just that
+    /// capture came up — `is_capturing` / `get_worklet_port` are identical on
+    /// both branches), we assert a **network-only side effect**: with streaming
+    /// enabled, the running worklet's networked send path writes the captured
+    /// fake-device tone into the very ring buffer wired via the setter, so
+    /// `samples_written` climbs above zero. The non-network processor
+    /// (`AudioProcessor::new`) holds no ring buffer and could never produce this
+    /// write, so a non-zero count is unique to the networked path fed by the
+    /// setters.
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn buffer_setters_feed_capture_path() {
+        use crate::test_support::wait_until;
+
         // All three backing allocations must outlive the engine, which holds raw
         // pointers into them — declare them before the engine so they drop last.
         let params = AudioParams::default();
@@ -692,6 +710,10 @@ mod tests {
 
         engine.set_local_to_network_buffer(&mut ring as *mut RingBuffer);
         engine.set_network_to_local_buffer(&mut regulator as *mut Regulator);
+
+        // The networked send path is a no-op unless the ring buffer is
+        // streaming, so enable it before the worklet starts producing.
+        ring.set_streaming(true);
 
         engine
             .start_capture(None, false, false, false)
@@ -705,6 +727,26 @@ mod tests {
         assert!(
             engine.get_worklet_port().is_some(),
             "networked capture must still expose a worklet message port"
+        );
+
+        // Resume the graph so the worklet actually runs process() callbacks
+        // (start_capture only fires resume in the background). The fake input
+        // device emits a synthetic tone the networked processor then forwards.
+        engine
+            .resume_ctx()
+            .await
+            .expect("resuming the AudioContext should succeed");
+
+        let wrote_to_ring = wait_until(
+            || ring.samples_written() > 0,
+            /* timeout_ms */ 3000,
+            /* interval_ms */ 10,
+        )
+        .await;
+        assert!(
+            wrote_to_ring,
+            "the networked worklet must write captured audio into the ring buffer \
+             wired via set_local_to_network_buffer (samples_written stayed 0)"
         );
 
         engine.stop_capture();
