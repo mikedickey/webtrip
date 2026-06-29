@@ -64,16 +64,17 @@ impl StudiosApi {
         self.client.get(&path).await
     }
 
-    /// Get the mixer configuration for a studio
-    pub async fn get_mixer(&self, studio_id: &str) -> Result<models::Mixer, ApiError> {
-        let path = format!("/studios/{}/mixer", urlencode(studio_id));
-        self.client.get(&path).await
-    }
-
-    /// Update the mixer configuration for a studio
-    pub async fn update_mixer(&self, studio_id: &str, mixer: &models::Mixer) -> Result<models::Mixer, ApiError> {
-        let path = format!("/studios/{}/mixer", urlencode(studio_id));
-        self.client.put(&path, mixer).await
+    /// Update a studio's banner image (also used for its JackTrip Radio
+    /// broadcast banner). The payload is the raw image bytes; the endpoint
+    /// responds `200` with no body.
+    pub async fn update_banner(
+        &self,
+        studio_id: &str,
+        image: Vec<u8>,
+        content_type: &str,
+    ) -> Result<(), ApiError> {
+        let path = format!("/studios/{}/banner", urlencode(studio_id));
+        self.client.put_bytes(&path, image, content_type).await
     }
 
     /// Get all mixers, keyed by mixer name (`GET /mixers` returns a map)
@@ -108,6 +109,19 @@ impl StudiosApi {
     /// Get participants in a studio
     pub async fn get_participants(&self, studio_id: &str) -> Result<Vec<models::Participant>, ApiError> {
         let path = format!("/studios/{}/participants", urlencode(studio_id));
+        self.client.get(&path).await
+    }
+
+    /// Get a single studio participant's full user metadata by user ID.
+    ///
+    /// The spec returns a complete [`models::User`] (not the lighter
+    /// session-scoped `Participant` from [`Self::get_participants`]).
+    pub async fn get_participant(&self, studio_id: &str, user_id: &str) -> Result<models::User, ApiError> {
+        let path = format!(
+            "/studios/{}/participants/{}",
+            urlencode(studio_id),
+            urlencode(user_id)
+        );
         self.client.get(&path).await
     }
 
@@ -160,14 +174,14 @@ impl StudiosApi {
         self.get_access_settings(&studio_id).await
     }
 
-    #[wasm_bindgen(js_name = getMixer)]
-    pub async fn get_mixer_js(&self, studio_id: String) -> Result<models::Mixer, ApiError> {
-        self.get_mixer(&studio_id).await
-    }
-
-    #[wasm_bindgen(js_name = updateMixer)]
-    pub async fn update_mixer_js(&self, studio_id: String, mixer: models::Mixer) -> Result<models::Mixer, ApiError> {
-        self.update_mixer(&studio_id, &mixer).await
+    #[wasm_bindgen(js_name = updateBanner)]
+    pub async fn update_banner_js(
+        &self,
+        studio_id: String,
+        image: Vec<u8>,
+        content_type: String,
+    ) -> Result<(), ApiError> {
+        self.update_banner(&studio_id, image, &content_type).await
     }
 
     #[wasm_bindgen(js_name = listMixers)]
@@ -200,6 +214,11 @@ impl StudiosApi {
     pub async fn get_participants_js(&self, studio_id: String) -> Result<JsValue, ApiError> {
         let participants = self.get_participants(&studio_id).await?;
         to_js_value(&participants)
+    }
+
+    #[wasm_bindgen(js_name = getParticipant)]
+    pub async fn get_participant_js(&self, studio_id: String, user_id: String) -> Result<models::User, ApiError> {
+        self.get_participant(&studio_id, &user_id).await
     }
 
     #[wasm_bindgen(js_name = getSession)]
@@ -360,37 +379,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_mixer_success() {
+    async fn test_update_banner_success() {
+        // Spec: PUT /studios/{id}/banner uploads raw image bytes, 200 no body.
         let (mut server, client) = mock_api().await;
-        let mock = mock_json(
-            &mut server,
-            "GET",
-            "/studios/st1/mixer",
-            200,
-            r#"{"type":"sclang","url":"https://example.com/mix"}"#,
-        )
-        .await;
+        let mock = mock_empty(&mut server, "PUT", "/studios/st1/banner", 200).await;
 
-        let mixer = api(&client).get_mixer("st1").await.unwrap();
-        assert_eq!(mixer.mixer_type, Some("sclang".to_string()));
+        api(&client)
+            .update_banner("st1", b"\x89PNG\r\n".to_vec(), "image/png")
+            .await
+            .unwrap();
         mock.assert_async().await;
     }
 
     #[tokio::test]
-    async fn test_update_mixer_success() {
+    async fn test_update_banner_error() {
         let (mut server, client) = mock_api().await;
-        let mock = mock_json(
-            &mut server,
-            "PUT",
-            "/studios/st1/mixer",
-            200,
-            r#"{"type":"sclang","url":"https://example.com/tweaked"}"#,
-        )
-        .await;
+        let mock = mock_empty(&mut server, "PUT", "/studios/st1/banner", 403).await;
 
-        let body = models::Mixer::default();
-        let mixer = api(&client).update_mixer("st1", &body).await.unwrap();
-        assert_eq!(mixer.url, Some("https://example.com/tweaked".to_string()));
+        let err = api(&client)
+            .update_banner("st1", b"img".to_vec(), "image/png")
+            .await
+            .unwrap_err();
+        assert_http_status(err, 403);
         mock.assert_async().await;
     }
 
@@ -473,6 +483,36 @@ mod tests {
 
         let result = api(&client).get_participants("st1").await.unwrap();
         assert_eq!(result[0].user_id, Some("u1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_participant_success() {
+        // Spec: GET /studios/{id}/participants/{userId} returns a full User.
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/st1/participants/u1",
+            200,
+            r#"{"user_id":"u1","name":"Alice","nickname":"al"}"#,
+        )
+        .await;
+
+        let user = api(&client).get_participant("st1", "u1").await.unwrap();
+        assert_eq!(user.user_id, Some("u1".to_string()));
+        assert_eq!(user.name, Some("Alice".to_string()));
+        assert_eq!(user.nickname, Some("al".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_participant_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/studios/st1/participants/u9", 404, "Not Found").await;
+
+        let err = api(&client).get_participant("st1", "u9").await.unwrap_err();
+        assert_http_status(err, 404);
         mock.assert_async().await;
     }
 
