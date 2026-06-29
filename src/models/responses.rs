@@ -114,6 +114,16 @@ pub struct Redirect {
     pub redirect: Option<String>,
 }
 
+/// HubSpot visitor token response (`GET /users/{userId}/hubspot-token`)
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct HubSpotToken {
+    /// HubSpot visitor identification token
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
 /// Server configuration (returned with studios)
 ///
 /// Configuration properties for JackTrip Virtual Studios including
@@ -225,6 +235,22 @@ mod tests {
         let s = roundtrip(&e);
         assert!(s.contains("\"code\":\"not_found\""));
         assert!(s.contains("\"status\":404"));
+    }
+
+    #[test]
+    fn hubspot_token_roundtrips() {
+        let t = HubSpotToken {
+            token: Some("hs-visitor-123".into()),
+        };
+        let s = roundtrip(&t);
+        assert!(s.contains("\"token\":\"hs-visitor-123\""));
+
+        let parsed: HubSpotToken = serde_json::from_str(r#"{"token":"abc"}"#).unwrap();
+        assert_eq!(parsed.token.as_deref(), Some("abc"));
+
+        // Empty body deserializes to a token-less response.
+        let empty: HubSpotToken = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.token, None);
     }
 
     #[test]

@@ -4,7 +4,6 @@
 
 use super::{to_js_value, PaginationQuery, ApiClient, ApiError, urlencode};
 use crate::models;
-use serde::Serialize;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
@@ -22,15 +21,6 @@ impl UsersApi {
     /// Get the currently authenticated user
     pub async fn get_current_user(&self) -> Result<models::User, ApiError> {
         self.client.get("/users/me").await
-    }
-
-    /// Search for users
-    pub async fn search_users(&self, query: &str) -> Result<Vec<models::User>, ApiError> {
-        #[derive(Serialize)]
-        struct Query<'a> {
-            q: &'a str,
-        }
-        self.client.get_with_query("/users", &Query { q: query }).await
     }
 
     /// Get a user by ID
@@ -70,6 +60,22 @@ impl UsersApi {
     /// Get a user's conversations
     pub async fn get_conversations(&self, user_id: &str) -> Result<Vec<models::Conversation>, ApiError> {
         let path = format!("/users/{}/conversations", urlencode(user_id));
+        self.client.get(&path).await
+    }
+
+    /// Get a specific conversation between the user and a studio, identified by stream ID
+    pub async fn get_conversation(
+        &self,
+        user_id: &str,
+        stream_id: &str,
+    ) -> Result<models::Conversation, ApiError> {
+        let path = format!("/users/{}/conversations/{}", urlencode(user_id), urlencode(stream_id));
+        self.client.get(&path).await
+    }
+
+    /// Get a HubSpot visitor identification token for the user
+    pub async fn get_hubspot_token(&self, user_id: &str) -> Result<models::HubSpotToken, ApiError> {
+        let path = format!("/users/{}/hubspot-token", urlencode(user_id));
         self.client.get(&path).await
     }
 
@@ -135,12 +141,6 @@ impl UsersApi {
         self.get_current_user().await
     }
 
-    #[wasm_bindgen(js_name = searchUsers)]
-    pub async fn search_users_js(&self, query: String) -> Result<JsValue, ApiError> {
-        let users = self.search_users(&query).await?;
-        to_js_value(&users)
-    }
-
     #[wasm_bindgen(js_name = getUser)]
     pub async fn get_user_js(&self, user_id: String) -> Result<models::User, ApiError> {
         self.get_user(&user_id).await
@@ -176,6 +176,20 @@ impl UsersApi {
     pub async fn get_conversations_js(&self, user_id: String) -> Result<JsValue, ApiError> {
         let conversations = self.get_conversations(&user_id).await?;
         to_js_value(&conversations)
+    }
+
+    #[wasm_bindgen(js_name = getConversation)]
+    pub async fn get_conversation_js(
+        &self,
+        user_id: String,
+        stream_id: String,
+    ) -> Result<models::Conversation, ApiError> {
+        self.get_conversation(&user_id, &stream_id).await
+    }
+
+    #[wasm_bindgen(js_name = getHubspotToken)]
+    pub async fn get_hubspot_token_js(&self, user_id: String) -> Result<models::HubSpotToken, ApiError> {
+        self.get_hubspot_token(&user_id).await
     }
 
     #[wasm_bindgen(js_name = getUnreadMessagesCount)]
@@ -249,34 +263,6 @@ mod tests {
 
         let err = api(&client).get_current_user().await.unwrap_err();
         assert_http_status(err, 401);
-        mock.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn test_search_users_success() {
-        let (mut server, client) = mock_api().await;
-        let mock = mock_json(
-            &mut server,
-            "GET",
-            "/users",
-            200,
-            r#"[{"user_id":"user1","name":"John Doe"}]"#,
-        )
-        .await;
-
-        let users = api(&client).search_users("john").await.unwrap();
-        assert_eq!(users.len(), 1);
-        assert_eq!(users[0].user_id, Some("user1".to_string()));
-        mock.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn test_search_users_error() {
-        let (mut server, client) = mock_api().await;
-        let mock = mock_json(&mut server, "GET", "/users", 400, "Bad Request").await;
-
-        let err = api(&client).search_users("test").await.unwrap_err();
-        assert_http_status(err, 400);
         mock.assert_async().await;
     }
 
@@ -401,6 +387,61 @@ mod tests {
         let result = api(&client).get_conversations("u1").await.unwrap();
         assert_eq!(result[0].id, Some("conv1".to_string()));
         assert_eq!(result[0].user_id, Some("u2".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_conversation_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/conversations/s1",
+            200,
+            r#"{"id":"conv1","userId":"u2"}"#,
+        )
+        .await;
+
+        let conv = api(&client).get_conversation("u1", "s1").await.unwrap();
+        assert_eq!(conv.id, Some("conv1".to_string()));
+        assert_eq!(conv.user_id, Some("u2".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_conversation_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/users/u1/conversations/s1", 404, "nope").await;
+
+        let err = api(&client).get_conversation("u1", "s1").await.unwrap_err();
+        assert_http_status(err, 404);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_hubspot_token_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/users/u1/hubspot-token",
+            200,
+            r#"{"token":"hs-visitor-abc"}"#,
+        )
+        .await;
+
+        let result = api(&client).get_hubspot_token("u1").await.unwrap();
+        assert_eq!(result.token, Some("hs-visitor-abc".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_hubspot_token_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/users/u1/hubspot-token", 403, "Forbidden").await;
+
+        let err = api(&client).get_hubspot_token("u1").await.unwrap_err();
+        assert_http_status(err, 403);
         mock.assert_async().await;
     }
 

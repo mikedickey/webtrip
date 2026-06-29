@@ -32,28 +32,6 @@ let user = client.users().get_current_user().await?;
 
 ---
 
-### searchUsers / search_users
-
-Search for users by name or email.
-
-**Authentication:** Required
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `query` | `string` | Search query |
-
-```javascript
-const users = await client.users().searchUsers('john');
-```
-
-```rust
-let users = client.users().search_users("john").await?;
-```
-
-**Returns:** `User[]`
-
----
-
 ### getUser / get_user
 
 Get a user by ID.
@@ -187,6 +165,57 @@ let conversations = client.users().get_conversations("user123").await?;
 ```
 
 **Returns:** `Conversation[]`
+
+---
+
+### getConversation / get_conversation
+
+Get a specific conversation between the user and a studio, identified by the stream ID.
+
+**Authentication:** Required
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `userId` | `string` | User ID |
+| `streamId` | `string` | Stream/channel ID identifying the conversation |
+
+```javascript
+const conversation = await client.users().getConversation('user123', 'stream456');
+```
+
+```rust
+let conversation = client.users().get_conversation("user123", "stream456").await?;
+```
+
+**Returns:** `Conversation`
+
+---
+
+### getHubspotToken / get_hubspot_token
+
+Get a HubSpot visitor identification token for the user. Used to authenticate with the
+HubSpot Conversations API on the frontend. Users may only fetch their own token.
+
+**Authentication:** Required
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `userId` | `string` | User ID |
+
+```javascript
+const result = await client.users().getHubspotToken('user123');
+// { token: "hs-visitor-..." }
+```
+
+```rust
+let result = client.users().get_hubspot_token("user123").await?;
+```
+
+**Returns:** `HubSpotToken`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `token` | `string?` | HubSpot visitor identification token |
 
 ---
 

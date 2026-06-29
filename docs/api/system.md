@@ -40,9 +40,9 @@ let result = client.system().ping().await?;
 
 ---
 
-### getRedirectUrl / get_redirect_url
+### getRedirect / get_redirect
 
-Get redirect URL for a destination identifier.
+Resolve a URL-shortened redirect for a destination identifier.
 
 **Authentication:** None required
 
@@ -51,15 +51,43 @@ Get redirect URL for a destination identifier.
 | `destination` | `string` | Destination identifier (e.g., "openapi") |
 
 ```javascript
-const url = await client.system().getRedirectUrl('openapi');
-// "https://test.jacktrip.com/api/redirect/openapi"
+const result = await client.system().getRedirect('openapi');
+// { redirect: "https://test.jacktrip.com/api/openapi.json" }
 ```
 
 ```rust
-let url = client.system().get_redirect_url("openapi").await?;
+let result = client.system().get_redirect("openapi").await?;
 ```
 
-**Returns:** `string` - The redirect URL or final destination after following redirects
+**Returns:** `Redirect`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `redirect` | `string?` | The resolved redirect URL |
+
+---
+
+### getRedirectExt / get_redirect_ext
+
+Resolve a URL-shortened redirect with a file extension appended to the resolved URL.
+
+**Authentication:** None required
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `destination` | `string` | Destination identifier |
+| `ext` | `string` | File extension to append (e.g., "jpg") |
+
+```javascript
+const result = await client.system().getRedirectExt('avatar', 'jpg');
+// { redirect: "https://cdn.example.com/avatar.jpg" }
+```
+
+```rust
+let result = client.system().get_redirect_ext("avatar", "jpg").await?;
+```
+
+**Returns:** `Redirect`
 
 ---
 
