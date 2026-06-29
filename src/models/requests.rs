@@ -159,6 +159,15 @@ pub struct BillingPortalRequest {
     pub callback_url: Option<String>,
 }
 
+/// Coupon code request (`PUT /redemptions`).
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeRequest {
+    /// Coupon code to redeem
+    pub code: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +235,13 @@ mod tests {
         let s = roundtrip(&r);
         assert!(s.contains("\"callbackURL\":"));
         assert!(!s.contains("\"callbackUrl\":"));
+    }
+
+    #[test]
+    fn code_request_wire_format() {
+        let r = CodeRequest { code: "FREEMONTH".into() };
+        let s = roundtrip(&r);
+        assert!(s.contains("\"code\":\"FREEMONTH\""));
     }
 
     #[test]
