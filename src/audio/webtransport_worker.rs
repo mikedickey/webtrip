@@ -117,9 +117,15 @@ fn classify_receive_error(receive_errors: u64, packets_received: u64) -> Receive
     ReceiveErrorLevel::Isolated
 }
 
-/// Process one received datagram: account for it in `stats`, then deserialize
-/// and either push the decoded samples into `regulator` (the network → jitter
-/// buffer feed that triggers PLC) or record the deserialize error.
+/// Process one received datagram: account for it in `stats`, then (when a
+/// `regulator` is present) deserialize and either push the decoded samples into
+/// it (the network → jitter buffer feed that triggers PLC) or record the
+/// deserialize error.
+///
+/// The packet/byte counters are bumped unconditionally so worker stats stay
+/// accurate even during an init/teardown race where the regulator pointer is
+/// not yet wired (`regulator == None`); there is simply nowhere to deliver the
+/// audio in that window, so deserialization is skipped.
 ///
 /// This is the per-datagram body of [`receive_loop`], lifted out so the
 /// realtime-correctness logic (deserialize → `Regulator::push`, error
@@ -128,12 +134,16 @@ fn classify_receive_error(receive_errors: u64, packets_received: u64) -> Receive
 /// stays at the [`receive_loop`] call site; here it is an ordinary `&mut`.
 fn handle_datagram(
     data: &[u8],
-    regulator: &mut Regulator,
+    regulator: Option<&mut Regulator>,
     samples: &mut Vec<f32>,
     stats: &mut WebTransportWorkerStats,
 ) {
     stats.packets_received += 1;
     stats.bytes_received += data.len() as u64;
+
+    let Some(regulator) = regulator else {
+        return;
+    };
 
     match deserialize_datagram(data, samples) {
         Ok(sequence_number) => {
@@ -673,18 +683,22 @@ async fn receive_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(
                     DatagramRead::Bytes(data) => data,
                 };
 
-                // Deserialize and push to regulator. The raw-pointer deref of
-                // the regulator stays here; the per-datagram logic lives in the
-                // testable `handle_datagram` helper.
+                // Account for and deserialize/push the datagram. The raw-pointer
+                // deref of the regulator stays here; the per-datagram logic
+                // (counting, deserialize → push, error accounting) lives in the
+                // testable `handle_datagram` helper. A null regulator pointer
+                // (init/teardown race) still counts the datagram but skips the
+                // push.
                 WORKER_STATE.with(|state| {
                     let state = state.borrow();
 
-                    if state.regulator_ptr.is_null() {
-                        return;
-                    }
-
-                    // Safety: pointer is valid and Regulator uses atomics
-                    let regulator = unsafe { &mut *state.regulator_ptr };
+                    // Safety: pointer is valid for the session lifetime and the
+                    // Regulator uses atomics for cross-thread access.
+                    let regulator = if state.regulator_ptr.is_null() {
+                        None
+                    } else {
+                        Some(unsafe { &mut *state.regulator_ptr })
+                    };
                     let mut samples = state.samples_buffer.borrow_mut();
                     STATS.with(|stats| {
                         handle_datagram(&data, regulator, &mut samples, &mut stats.borrow_mut());
@@ -971,7 +985,7 @@ mod tests {
         let audio: Vec<f32> = (0..128).map(|i| (i as f32) / 128.0).collect();
         let datagram = AudioPacket::mono(5, 0, audio).serialize().unwrap();
 
-        handle_datagram(&datagram, &mut regulator, &mut samples, &mut stats);
+        handle_datagram(&datagram, Some(&mut regulator), &mut samples, &mut stats);
 
         // The decoded packet reached the regulator (initialized + seq recorded).
         assert!(
@@ -993,7 +1007,7 @@ mod tests {
 
         // Too short to contain even the 16-byte header → deserialize fails.
         let garbage = [0u8; 4];
-        handle_datagram(&garbage, &mut regulator, &mut samples, &mut stats);
+        handle_datagram(&garbage, Some(&mut regulator), &mut samples, &mut stats);
 
         assert!(
             !regulator.is_initialized(),
@@ -1014,7 +1028,7 @@ mod tests {
 
         let garbage = [0u8; 4];
         for _ in 0..20 {
-            handle_datagram(&garbage, &mut regulator, &mut samples, &mut stats);
+            handle_datagram(&garbage, Some(&mut regulator), &mut samples, &mut stats);
         }
 
         assert_eq!(stats.packets_received, 20);
@@ -1024,6 +1038,27 @@ mod tests {
         assert_eq!(
             classify_receive_error(stats.receive_errors, stats.packets_received),
             ReceiveErrorLevel::HighRate
+        );
+    }
+
+    #[test]
+    fn handle_datagram_without_regulator_still_counts() {
+        // During an init/teardown race the regulator pointer can be null. The
+        // datagram must still be counted for stats visibility, but with nowhere
+        // to deliver audio there is no deserialize attempt (so no receive_error
+        // either, even for a malformed datagram) — matching the original
+        // pre-refactor behavior.
+        let mut samples = Vec::new();
+        let mut stats = WebTransportWorkerStats::default();
+
+        let garbage = [0u8; 4];
+        handle_datagram(&garbage, None, &mut samples, &mut stats);
+
+        assert_eq!(stats.packets_received, 1, "the packet is still counted");
+        assert_eq!(stats.bytes_received, garbage.len() as u64);
+        assert_eq!(
+            stats.receive_errors, 0,
+            "no regulator means no deserialize attempt, so no error is recorded"
         );
     }
 
