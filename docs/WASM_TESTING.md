@@ -249,7 +249,10 @@ Coverage spans the **whole** Rust surface by combining three runs:
 | `npm run coverage:integration` | `wasm32-unknown-unknown` | `lcov.integration.info` | the *live* transport surface (WebRTC signaling/SDP/ICE/data-channel, WebTransport QUIC worker, protocol wire) the unit suites can't reach |
 
 CI runs all three and uploads all three files; Codecov unions them by
-`file:line`, so a line covered by *any* run counts as covered. This is why the native-only
+`file:line`, so a line covered by *any* run counts as covered. (The
+`coverage:integration` pass needs the secret-gated live server, so it is skipped
+on fork PRs and its coverage is carried forward instead — see
+[Integration coverage](#integration-coverage-coverageintegration) below.) This is why the native-only
 report previously hid the browser/transport surface: `#[cfg(target_arch =
 "wasm32")]` code is compiled *out* of the native build, so it never appeared in
 `lcov.info` at all (not even as 0%) — it was excluded from the denominator.

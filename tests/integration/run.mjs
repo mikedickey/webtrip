@@ -308,6 +308,7 @@ async function main() {
       console.log("\n▶ dumping WASM coverage");
       const cov = await page.evaluate(inPageDumpCoverage);
       if (cov.error) {
+        anyFailed = true;
         fail(`coverage dump: ${cov.error}`);
       } else {
         const outFile = path.join(REPO_ROOT, "coverage", "integration.profraw");

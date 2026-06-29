@@ -14,7 +14,7 @@ WASM=pkg/webtrip_bg.wasm
 OUT=lcov.integration.info
 
 [ -f "$PROFRAW" ] || { echo "error: $PROFRAW missing — run the harness with INTEGRATION_COVERAGE set" >&2; exit 1; }
-[ -f "$WASM" ]    || { echo "error: $WASM missing — run `npm run build:wasm:coverage` first" >&2; exit 1; }
+[ -f "$WASM" ]    || { echo "error: $WASM missing — run 'npm run build:wasm:coverage' first" >&2; exit 1; }
 
 # Resolve llvm-profdata/llvm-cov: prefer the rustup llvm-tools-preview binaries
 # (present in the CI build container), fall back to whatever is on PATH (e.g.
