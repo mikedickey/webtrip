@@ -2,6 +2,12 @@
 //!
 //! Upload, list, and manage backing track audio files stored for a studio
 //! (`/studios/{studioId}/tracks*`).
+//!
+//! The `GET /studios/{studioId}/tracks/{trackId}/download` route is intentionally
+//! omitted: per the OpenAPI spec it is authenticated with VS-agent
+//! `APIPrefix`/`APISecret` credentials rather than the user JWT this client
+//! carries, making it a VS-agent endpoint that falls outside this client-facing
+//! module's scope.
 
 use super::{ApiClient, ApiError, PaginationQuery, urlencode};
 use crate::models;
@@ -73,16 +79,6 @@ impl TracksApi {
     pub async fn delete_track(&self, studio_id: &str, track_id: &str) -> Result<(), ApiError> {
         self.client.delete(&track_path(studio_id, track_id)).await
     }
-
-    /// Get a signed download URL for a backing track's audio file
-    pub async fn get_track_download_url(
-        &self,
-        studio_id: &str,
-        track_id: &str,
-    ) -> Result<models::DownloadUrl, ApiError> {
-        let path = format!("{}/download", track_path(studio_id, track_id));
-        self.client.get(&path).await
-    }
 }
 
 // =============================================================================
@@ -129,15 +125,6 @@ impl TracksApi {
     #[wasm_bindgen(js_name = deleteTrack)]
     pub async fn delete_track_js(&self, studio_id: String, track_id: String) -> Result<(), ApiError> {
         self.delete_track(&studio_id, &track_id).await
-    }
-
-    #[wasm_bindgen(js_name = getTrackDownloadUrl)]
-    pub async fn get_track_download_url_js(
-        &self,
-        studio_id: String,
-        track_id: String,
-    ) -> Result<models::DownloadUrl, ApiError> {
-        self.get_track_download_url(&studio_id, &track_id).await
     }
 }
 
@@ -305,36 +292,6 @@ mod tests {
         let mock = mock_empty(&mut server, "DELETE", "/studios/st1/tracks/trk1", 404).await;
 
         let err = api(&client).delete_track("st1", "trk1").await.unwrap_err();
-        assert_http_status(err, 404);
-        mock.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn test_get_track_download_url_success() {
-        let (mut server, client) = mock_api().await;
-        let mock = mock_json(
-            &mut server,
-            "GET",
-            "/studios/st1/tracks/trk1/download",
-            200,
-            r#"{"url":"https://storage.googleapis.com/bucket/trk1.wav?signature=abc"}"#,
-        )
-        .await;
-
-        let result = api(&client).get_track_download_url("st1", "trk1").await.unwrap();
-        assert_eq!(
-            result.url.as_deref(),
-            Some("https://storage.googleapis.com/bucket/trk1.wav?signature=abc")
-        );
-        mock.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn test_get_track_download_url_error() {
-        let (mut server, client) = mock_api().await;
-        let mock = mock_json(&mut server, "GET", "/studios/st1/tracks/trk1/download", 404, "Not Found").await;
-
-        let err = api(&client).get_track_download_url("st1", "trk1").await.unwrap_err();
         assert_http_status(err, 404);
         mock.assert_async().await;
     }

@@ -114,16 +114,6 @@ pub struct Redirect {
     pub redirect: Option<String>,
 }
 
-/// Signed download URL response (e.g. `GET /studios/{studioId}/tracks/{trackId}/download`).
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct DownloadUrl {
-    /// Signed URL to download the file
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-}
-
 /// Server configuration (returned with studios)
 ///
 /// Configuration properties for JackTrip Virtual Studios including
@@ -235,23 +225,6 @@ mod tests {
         let s = roundtrip(&e);
         assert!(s.contains("\"code\":\"not_found\""));
         assert!(s.contains("\"status\":404"));
-    }
-
-    #[test]
-    fn download_url_roundtrip() {
-        let json = r#"{"url":"https://storage.googleapis.com/bucket/trk-1.wav?signature=abc"}"#;
-        let d: DownloadUrl = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            d.url.as_deref(),
-            Some("https://storage.googleapis.com/bucket/trk-1.wav?signature=abc")
-        );
-
-        let out = roundtrip(&d);
-        assert!(out.contains("\"url\":"));
-
-        // Empty payload omits the optional field entirely.
-        let empty = roundtrip(&DownloadUrl::default());
-        assert_eq!(empty, "{}");
     }
 
     #[test]
