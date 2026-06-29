@@ -45,6 +45,7 @@ pub mod streams;
 pub mod studios;
 pub mod subscriptions;
 pub mod system;
+pub mod tracks;
 pub mod users;
 
 // Re-export models from the existing models module
@@ -233,6 +234,12 @@ impl ApiClient {
     pub fn subscriptions(&self) -> subscriptions::SubscriptionsApi {
         subscriptions::SubscriptionsApi::from_client(self)
     }
+
+    /// Get the Backing Tracks API
+    #[wasm_bindgen]
+    pub fn tracks(&self) -> tracks::TracksApi {
+        tracks::TracksApi::from_client(self)
+    }
 }
 
 impl Default for ApiClient {
@@ -327,6 +334,21 @@ impl ApiClient {
         let response = self
             .build_request(reqwest::Method::POST, path)
             .json(body)
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    /// Execute a POST request with a `multipart/form-data` body (e.g. file uploads)
+    pub(crate) async fn post_multipart<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        form: reqwest::multipart::Form,
+    ) -> ApiResult<T> {
+        let response = self
+            .build_request(reqwest::Method::POST, path)
+            .multipart(form)
             .send()
             .await?;
 
