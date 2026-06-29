@@ -1071,5 +1071,283 @@ mod tests {
             assert_eq!(PacketHeader::decode_outgoing_channels(n, 2), n);
         }
     }
+
+    // ----- Malformed-header rejection branches (PacketHeader::deserialize) -----
+    //
+    // These tests build a *valid* header with the protocol's own serialize
+    // helper, then mutate a single field to the value under test. This reuses
+    // the real wire layout instead of hand-rolling byte buffers (per AGENTS.md).
+
+    /// Serialize a `PacketHeader` into a fresh 16-byte buffer using the real
+    /// protocol helper. `serialize()` performs no validation, so this is the
+    /// canonical way to construct both valid and deliberately-invalid headers.
+    fn header_bytes(header: &PacketHeader) -> Vec<u8> {
+        let mut buffer = vec![0u8; HEADER_SIZE];
+        header.serialize(&mut buffer).unwrap();
+        buffer
+    }
+
+    /// A baseline header whose every field is valid: mono, 48 kHz, 128-sample
+    /// buffer, 16-bit. Tests mutate one field at a time off of this.
+    fn valid_header() -> PacketHeader {
+        PacketHeader::new(7, 12345)
+    }
+
+    #[test]
+    fn test_deserialize_rejects_buffer_too_small() {
+        // Any buffer shorter than the 16-byte header is rejected outright.
+        for len in [0usize, 1, 8, 15] {
+            let buffer = vec![0u8; len];
+            assert_eq!(
+                PacketHeader::deserialize(&buffer).unwrap_err(),
+                ProtocolError::BufferTooSmall,
+                "len={len} should be too small"
+            );
+        }
+
+        // Exactly 16 bytes (a full, valid header) is accepted.
+        let buffer = header_bytes(&valid_header());
+        assert!(PacketHeader::deserialize(&buffer).is_ok());
+    }
+
+    #[test]
+    fn test_deserialize_incoming_channel_count_boundaries() {
+        // 0 channels is invalid (zero audio channels makes no sense).
+        let mut header = valid_header();
+        header.num_incoming_channels = 0;
+        // Keep outgoing explicit & valid so the incoming check is what fires.
+        header.num_outgoing_channels = 1;
+        assert_eq!(
+            PacketHeader::deserialize(&header_bytes(&header)).unwrap_err(),
+            ProtocolError::InvalidChannelCount,
+            "0 incoming channels must be rejected"
+        );
+
+        // 1..=8 channels are the valid range.
+        for ch in 1u8..=8 {
+            let mut header = valid_header();
+            header.num_incoming_channels = ch;
+            header.num_outgoing_channels = ch; // symmetric -> encodes to 0
+            let decoded = PacketHeader::deserialize(&header_bytes(&header))
+                .unwrap_or_else(|e| panic!("{ch} incoming channels should be valid: {e:?}"));
+            assert_eq!(decoded.num_incoming_channels, ch);
+        }
+
+        // 9 channels (one past the max) is invalid.
+        let mut header = valid_header();
+        header.num_incoming_channels = 9;
+        header.num_outgoing_channels = 1;
+        assert_eq!(
+            PacketHeader::deserialize(&header_bytes(&header)).unwrap_err(),
+            ProtocolError::InvalidChannelCount,
+            "9 incoming channels must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_outgoing_channel_count_boundaries() {
+        // Decoded outgoing channels are validated separately from incoming.
+        // Use an explicit (asymmetric) encoding so the wire byte equals the
+        // outgoing count directly. Incoming stays valid (2) throughout.
+
+        // Decoded outgoing == 8 is the highest valid value.
+        let mut header = valid_header();
+        header.num_incoming_channels = 2;
+        header.num_outgoing_channels = 8;
+        let decoded = PacketHeader::deserialize(&header_bytes(&header))
+            .expect("8 outgoing channels should be valid");
+        assert_eq!(decoded.num_outgoing_channels, 8);
+
+        // Decoded outgoing == 9 is one past the max and must be rejected.
+        let mut header = valid_header();
+        header.num_incoming_channels = 2;
+        header.num_outgoing_channels = 9;
+        assert_eq!(
+            PacketHeader::deserialize(&header_bytes(&header)).unwrap_err(),
+            ProtocolError::InvalidChannelCount,
+            "9 outgoing channels must be rejected"
+        );
+
+        // A large explicit outgoing count (still < 255, so not the receive-only
+        // sentinel) is likewise rejected.
+        let mut header = valid_header();
+        header.num_incoming_channels = 2;
+        header.num_outgoing_channels = 200;
+        assert_eq!(
+            PacketHeader::deserialize(&header_bytes(&header)).unwrap_err(),
+            ProtocolError::InvalidChannelCount,
+            "200 outgoing channels must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_bit_depth_boundaries() {
+        // Only 8, 16, 24, 32 are accepted.
+        for depth in [8u8, 16, 24, 32] {
+            let mut header = valid_header();
+            header.bit_depth = depth;
+            let decoded = PacketHeader::deserialize(&header_bytes(&header))
+                .unwrap_or_else(|e| panic!("bit depth {depth} should be valid: {e:?}"));
+            assert_eq!(decoded.bit_depth, depth);
+        }
+
+        // Everything else is InvalidBitDepth, including values adjacent to the
+        // valid set (7, 33) and 0.
+        for depth in [0u8, 7, 9, 12, 33, 64, 255] {
+            let mut header = valid_header();
+            header.bit_depth = depth;
+            assert_eq!(
+                PacketHeader::deserialize(&header_bytes(&header)).unwrap_err(),
+                ProtocolError::InvalidBitDepth,
+                "bit depth {depth} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deserialize_buffer_size_boundaries() {
+        // buffer_size 0 is invalid (empty packet).
+        let mut header = valid_header();
+        header.buffer_size = 0;
+        assert_eq!(
+            PacketHeader::deserialize(&header_bytes(&header)).unwrap_err(),
+            ProtocolError::InvalidBufferSize,
+            "buffer_size 0 must be rejected"
+        );
+
+        // 1 and 4096 are the inclusive valid bounds.
+        for size in [1u16, 4096] {
+            let mut header = valid_header();
+            header.buffer_size = size;
+            let decoded = PacketHeader::deserialize(&header_bytes(&header))
+                .unwrap_or_else(|e| panic!("buffer_size {size} should be valid: {e:?}"));
+            assert_eq!(decoded.buffer_size, size);
+        }
+
+        // 4097 (one past the max) is invalid.
+        let mut header = valid_header();
+        header.buffer_size = 4097;
+        assert_eq!(
+            PacketHeader::deserialize(&header_bytes(&header)).unwrap_err(),
+            ProtocolError::InvalidBufferSize,
+            "buffer_size 4097 must be rejected"
+        );
+    }
+
+    // ----- AudioPacket::deserialize_into payload guards & bit-depth arms -----
+
+    #[test]
+    fn test_deserialize_into_rejects_truncated_audio() {
+        // A header that is itself valid but whose declared payload is larger
+        // than the bytes actually present must be rejected as BufferTooSmall.
+        // Mono / 128 samples / 16-bit => 256 bytes of audio expected.
+        let buffer = header_bytes(&valid_header());
+        let mut samples = Vec::new();
+        // PacketHeader has no PartialEq, so assert on the error value directly.
+        assert_eq!(
+            AudioPacket::deserialize_into(&buffer, &mut samples).unwrap_err(),
+            ProtocolError::BufferTooSmall,
+            "header-only buffer with non-empty declared payload must be rejected"
+        );
+
+        // One byte short of the full payload is still rejected.
+        let full = AudioPacket::mono(0, 0, vec![0.25f32; 128]).serialize().unwrap();
+        let truncated = &full[..full.len() - 1];
+        assert_eq!(
+            AudioPacket::deserialize_into(truncated, &mut samples).unwrap_err(),
+            ProtocolError::BufferTooSmall,
+            "payload one byte short must be rejected"
+        );
+
+        // The exact-length buffer succeeds (boundary on the valid side).
+        assert!(AudioPacket::deserialize_into(&full, &mut samples).is_ok());
+    }
+
+    /// Build an `AudioPacket` with the given channel count and bit depth, filled
+    /// with deterministic samples spanning negative and positive values.
+    fn make_packet(channels: u8, bit_depth: u8, buf_size: u16) -> AudioPacket {
+        let n = buf_size as usize * channels as usize;
+        let samples: Vec<f32> = (0..n)
+            .map(|i| (i as f32 / n as f32) - 0.5) // range [-0.5, 0.5)
+            .collect();
+        let mut header = if channels == 1 {
+            PacketHeader::new(0, 0)
+        } else {
+            PacketHeader::stereo(0, 0)
+        };
+        header.buffer_size = buf_size;
+        header.bit_depth = bit_depth;
+        AudioPacket::new(header, samples)
+    }
+
+    #[test]
+    fn test_deserialize_into_all_bit_depths_roundtrip() {
+        // Exercises the 8/16/24/32-bit decode arms of deserialize_into for both
+        // mono and stereo (planar) wire layouts.
+        for bit_depth in [8u8, 16, 24, 32] {
+            // 8-bit has only ~1/128 resolution; the rest are far finer.
+            let tol = if bit_depth == 8 { 1e-2 } else { 1e-4 };
+            for channels in [1u8, 2] {
+                let packet = make_packet(channels, bit_depth, 16);
+                let serialized = packet.serialize().unwrap();
+                let decoded = AudioPacket::deserialize(&serialized).unwrap();
+
+                assert_eq!(
+                    decoded.samples.len(),
+                    packet.samples.len(),
+                    "sample count, depth={bit_depth} channels={channels}"
+                );
+                for (i, (a, b)) in packet.samples.iter().zip(decoded.samples.iter()).enumerate() {
+                    assert!(
+                        (a - b).abs() < tol,
+                        "depth={bit_depth} channels={channels} sample {i}: {a} vs {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    // ----- ProtocolError Display & AudioFormat constructors -----
+
+    #[test]
+    fn test_protocol_error_display() {
+        // Every variant must render a distinct, non-empty human-readable string.
+        let variants = [
+            ProtocolError::BufferTooSmall,
+            ProtocolError::InvalidChannelCount,
+            ProtocolError::InvalidBitDepth,
+            ProtocolError::InvalidBufferSize,
+            ProtocolError::InvalidPacket,
+            ProtocolError::SequenceGap,
+        ];
+        let mut seen = Vec::new();
+        for v in variants {
+            let s = v.to_string();
+            assert!(!s.is_empty(), "{v:?} should render a message");
+            assert!(!seen.contains(&s), "{v:?} message must be unique");
+            seen.push(s);
+        }
+    }
+
+    #[test]
+    fn test_audio_format_constructor_and_default() {
+        // The wasm_bindgen constructor and the Default impl both delegate to
+        // mono(); confirm they produce the documented mono configuration.
+        let via_new = AudioFormat::new();
+        let via_default = AudioFormat::default();
+        let mono = AudioFormat::mono();
+
+        for fmt in [via_new, via_default] {
+            assert_eq!(fmt.sample_rate, mono.sample_rate);
+            assert_eq!(fmt.channels, mono.channels);
+            assert_eq!(fmt.buffer_size, mono.buffer_size);
+            assert_eq!(fmt.bit_depth, mono.bit_depth);
+        }
+
+        assert_eq!(via_new.sample_rate, DEFAULT_SAMPLE_RATE);
+        assert_eq!(via_new.channels, 1);
+        assert_eq!(via_new.buffer_size, DEFAULT_BUFFER_SIZE);
+        assert_eq!(via_new.bit_depth, DEFAULT_BIT_DEPTH);
+    }
 }
 
