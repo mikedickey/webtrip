@@ -178,6 +178,20 @@ async function inPageDrive({ transportName, host, port, connectTimeoutMs, sendPo
     await new Promise((r) => setTimeout(r, 200));
   }
 
+  // Receive-path counters are reported for visibility but NOT asserted here.
+  // This harness drives a SINGLE client against the hub (`-p 4`, see
+  // docker-compose.integration.yml), so with no second participant the hub mixes
+  // nothing back: `recvPlayed` stays 0 and `recvInitialized` stays false. Rather
+  // than depend on a second live client (flaky, and the hub patch mode does not
+  // reliably loop a lone/echo client back to itself), the inbound audio path —
+  // the WebTransport worker's datagram read loop (`parse_read_result` →
+  // `handle_datagram` → `Regulator::push`, plus the deserialize-error / high-
+  // error-rate / connection-lost branches) and the WebRTC data-channel receive
+  // body (`enqueue_channel_message`, both channel-creation directions, incl. the
+  // non-ArrayBuffer rejection) — is covered by targeted browser unit tests
+  // (`#[wasm_bindgen_test]` in src/audio/webtransport_worker.rs and
+  // src/audio/webrtc.rs; see WEB-45). Those feed synthetic inbound data straight
+  // into the receive handlers and assert on Regulator state + the stats counters.
   const s = session.get_stats();
   const result = {
     connected,
