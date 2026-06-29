@@ -168,6 +168,27 @@ pub struct CodeRequest {
     pub code: String,
 }
 
+/// Create studio subscription request (`POST /studios/{studioId}/subscriptions`).
+///
+/// All fields are optional in the spec; `inviteKey` is only required for
+/// private studios.
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSubscriptionRequest {
+    /// Studio ID to subscribe to
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
+
+    /// User ID of the subscriber
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+
+    /// Optional invite key for private studios
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_key: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +263,25 @@ mod tests {
         let r = CodeRequest { code: "FREEMONTH".into() };
         let s = roundtrip(&r);
         assert!(s.contains("\"code\":\"FREEMONTH\""));
+    }
+
+    #[test]
+    fn create_subscription_request_wire_format() {
+        let r = CreateSubscriptionRequest {
+            server_id: Some("studio-1".into()),
+            user_id: Some("auth0|abc".into()),
+            invite_key: Some("secret".into()),
+        };
+        let s = roundtrip(&r);
+        assert!(s.contains("\"serverId\":\"studio-1\""));
+        assert!(s.contains("\"userId\":\"auth0|abc\""));
+        assert!(s.contains("\"inviteKey\":\"secret\""));
+    }
+
+    #[test]
+    fn create_subscription_request_omits_none_fields() {
+        let r = CreateSubscriptionRequest::default();
+        assert_eq!(roundtrip(&r), "{}");
     }
 
     #[test]
