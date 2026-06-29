@@ -29,6 +29,8 @@
 //   JACKTRIP_TEST_HOST      JackTrip host (default localhost.miked.io)
 //   JACKTRIP_TEST_PORT      JackTrip port (default 4464)
 //   INTEGRATION_TRANSPORTS  comma list (default "webrtc,webtransport")
+//   INTEGRATION_COVERAGE    if set, dump LLVM coverage to coverage/integration.profraw
+//                           (requires a `build:wasm:coverage` build)
 //   PUPPETEER_EXECUTABLE_PATH  Chrome/Chromium binary (auto-detected otherwise)
 
 import net from "node:net";
@@ -192,6 +194,24 @@ async function inPageDrive({ transportName, host, port, connectTimeoutMs, sendPo
 }
 
 /**
+ * Runs inside the page. Serializes the WASM module's accumulated LLVM coverage
+ * counters as `.profraw` bytes, base64-encoded for a JSON-safe transfer back to
+ * Node. The counters live in shared linear memory, so this single main-thread
+ * call also captures the WebTransport worker's execution. Requires a build with
+ * the `coverage` feature (see `build:wasm:coverage`).
+ */
+async function inPageDumpCoverage() {
+  const m = await import("/pkg/webtrip.js");
+  if (typeof m.__coverageDump !== "function") {
+    return { error: "module was not built with the `coverage` feature" };
+  }
+  const bytes = m.__coverageDump();
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return { base64: btoa(bin), length: bytes.length };
+}
+
+/**
  * Serve the app, drive each requested transport against the live JackTrip
  * server in a headless browser, and assert connect + send-path. Sets a non-zero
  * exit code (via `fail`/throw) on any failure.
@@ -279,6 +299,22 @@ async function main() {
             `(${result.ringWrites} writes); recv played=${result.recvPlayed} ` +
             `initialized=${result.recvInitialized}`,
         );
+      }
+    }
+
+    // Pull coverage out of the live module before tearing the page down. Done
+    // regardless of pass/fail so a partial run still yields the lines it hit.
+    if (process.env.INTEGRATION_COVERAGE) {
+      console.log("\n▶ dumping WASM coverage");
+      const cov = await page.evaluate(inPageDumpCoverage);
+      if (cov.error) {
+        anyFailed = true;
+        fail(`coverage dump: ${cov.error}`);
+      } else {
+        const outFile = path.join(REPO_ROOT, "coverage", "integration.profraw");
+        fs.mkdirSync(path.dirname(outFile), { recursive: true });
+        fs.writeFileSync(outFile, Buffer.from(cov.base64, "base64"));
+        console.log(`   wrote ${cov.length} bytes → ${outFile}`);
       }
     }
 

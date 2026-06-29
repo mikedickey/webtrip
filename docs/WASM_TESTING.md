@@ -240,15 +240,19 @@ not expose secrets to them.
 
 ## Code Coverage
 
-Coverage spans the **whole** Rust surface by combining two runs:
+Coverage spans the **whole** Rust surface by combining three runs:
 
 | Command | Target | Output | Covers |
 |---------|--------|--------|--------|
 | `npm run coverage` | native host | `lcov.info` | `#[test]` logic + `#[cfg(not(target_arch = "wasm32"))]` paths |
 | `npm run coverage:wasm` | `wasm32-unknown-unknown` | `lcov.wasm.info` | `#[wasm_bindgen_test]` + `#[cfg(target_arch = "wasm32")]` paths |
+| `npm run coverage:integration` | `wasm32-unknown-unknown` | `lcov.integration.info` | the *live* transport surface (WebRTC signaling/SDP/ICE/data-channel, WebTransport QUIC worker, protocol wire) the unit suites can't reach |
 
-CI runs both and uploads both files; Codecov unions them by `file:line`, so a
-line covered by *either* run counts as covered. This is why the native-only
+CI runs all three and uploads all three files; Codecov unions them by
+`file:line`, so a line covered by *any* run counts as covered. (The
+`coverage:integration` pass needs the secret-gated live server, so it is skipped
+on fork PRs and its coverage is carried forward instead — see
+[Integration coverage](#integration-coverage-coverageintegration) below.) This is why the native-only
 report previously hid the browser/transport surface: `#[cfg(target_arch =
 "wasm32")]` code is compiled *out* of the native build, so it never appeared in
 `lcov.info` at all (not even as 0%) — it was excluded from the denominator.
@@ -292,6 +296,38 @@ not a different, unthreaded build. `coverage:wasm` drives the run with
 Requirements (all satisfied by the toolchain container): Rust ≥ 1.87,
 `wasm-bindgen-test` ≥ 0.3.57, `llvm-tools-preview`, and a `cargo-llvm-cov` that
 drives the wasm32 target.
+
+### Integration coverage (`coverage:integration`)
+
+`coverage:wasm` covers what `#[wasm_bindgen_test]` exercises, but the live
+transport surface — WebRTC SDP/ICE/data-channel negotiation, the WebTransport
+QUIC **worker**, and the protocol wire path — only runs when the real client
+talks to a real JackTrip server. `coverage:integration` captures *that* run:
+
+1. **`build:wasm:coverage`** builds the actual app (`wasm-pack build --target
+   web`) with the same instrument-coverage flags as `coverage:wasm` layered on,
+   plus `--features coverage`. `--dev` keeps `wasm-opt` off so the
+   `__llvm_covmap`/`__llvm_covfun` sections survive. The `coverage` feature pulls
+   in `minicov` and enables a `__coverageDump` export (`src/lib.rs`).
+2. The harness (`tests/integration/run.mjs`, with `INTEGRATION_COVERAGE` set)
+   drives both transports against the live server, then calls `__coverageDump`
+   and writes `coverage/integration.profraw`.
+3. **`scripts/integration-coverage-report.sh`** runs `llvm-profdata` +
+   `llvm-cov export` against `pkg/webtrip_bg.wasm`, filtering out std/build-std
+   and registry sources, to produce `lcov.integration.info`.
+
+**The WebTransport worker is covered by the same single dump.** Its counters
+live in the module's linear memory, and the worker is handed
+`wasm_bindgen::memory()` at init (it shares that memory for the SPSC ring
+buffers), so one `__coverageDump` call from the main thread captures the worker
+thread's execution too — no per-thread profile merge needed.
+
+This run needs a live JackTrip server, so the CI `integration` job (which has
+the `*.miked.io` cert) owns it, uploading under the **`integration` Codecov flag
+with `carryforward: true`** (see `codecov.yml`). Fork PRs skip the job for lack
+of the `MIKED_TLS_*` secrets, so they inherit the last integration coverage
+rather than reading those lines as a regression. Locally it needs `clang` and
+the LLVM tools on `PATH` (`brew install llvm`); see [Local setup](#local-setup-macos).
 
 ## Local setup (macOS)
 
