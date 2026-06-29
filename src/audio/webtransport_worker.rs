@@ -102,6 +102,13 @@ enum ReceiveErrorLevel {
     HighRate,
 }
 
+/// In the high-error-rate regime, emit at most one warning per this many
+/// deserialize errors so a degraded link can't flood the console from the
+/// realtime receive loop. Only the browser build logs, so the constant is
+/// wasm-only (it would be dead code in the native test build otherwise).
+#[cfg(target_arch = "wasm32")]
+const HIGH_RATE_WARN_INTERVAL: u64 = 50;
+
 /// Classify a deserialize error against the cumulative receive counters.
 ///
 /// Returns [`ReceiveErrorLevel::HighRate`] once more than 10 errors have
@@ -153,16 +160,22 @@ fn handle_datagram(
             stats.receive_errors += 1;
 
             // Log but continue — single corrupted packets are expected under
-            // real network conditions; a sustained high rate gets a louder,
-            // throttled warning. The console logging is browser-only.
+            // real network conditions. A sustained high rate gets a louder
+            // warning, but only once per `HIGH_RATE_WARN_INTERVAL` errors:
+            // otherwise a degraded link would have the realtime receive loop
+            // spam `console.warn` on every bad datagram. The console logging is
+            // browser-only.
             #[cfg(target_arch = "wasm32")]
             match classify_receive_error(stats.receive_errors, stats.packets_received) {
                 ReceiveErrorLevel::HighRate => {
-                    let error_rate = stats.receive_errors as f64 / stats.packets_received as f64;
-                    web_sys::console::warn_1(&format!(
-                        "[WebTransport Worker] ⚠️ High error rate ({:.1}%), deserialization error: {:?}",
-                        error_rate * 100.0, _e
-                    ).into());
+                    if stats.receive_errors % HIGH_RATE_WARN_INTERVAL == 0 {
+                        let error_rate =
+                            stats.receive_errors as f64 / stats.packets_received as f64;
+                        web_sys::console::warn_1(&format!(
+                            "[WebTransport Worker] ⚠️ High error rate ({:.1}%), deserialization error: {:?}",
+                            error_rate * 100.0, _e
+                        ).into());
+                    }
                 }
                 ReceiveErrorLevel::Isolated => {
                     web_sys::console::warn_1(&format!(
