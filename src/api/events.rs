@@ -53,6 +53,15 @@ impl EventsApi {
         self.client.get(&path).await
     }
 
+    /// Get the live stream URL for an active event.
+    ///
+    /// Returns the active broadcast URL (`{ "redirect": "..." }`). The server
+    /// returns 400 when the event is not currently active.
+    pub async fn get_event_live(&self, event_id: &str) -> Result<models::Redirect, ApiError> {
+        let path = format!("/events/{}/live", urlencode(event_id));
+        self.client.get(&path).await
+    }
+
     /// List events for a studio
     pub async fn list_studio_events(&self, studio_id: &str) -> Result<Vec<models::UpcomingEvent>, ApiError> {
         let path = format!("/studios/{}/events", urlencode(studio_id));
@@ -129,6 +138,11 @@ impl EventsApi {
     pub async fn get_similar_events_js(&self, event_id: String) -> Result<JsValue, ApiError> {
         let events = self.get_similar_events(&event_id).await?;
         to_js_value(&events)
+    }
+
+    #[wasm_bindgen(js_name = getEventLive)]
+    pub async fn get_event_live_js(&self, event_id: String) -> Result<models::Redirect, ApiError> {
+        self.get_event_live(&event_id).await
     }
 
     #[wasm_bindgen(js_name = listStudioEvents)]
@@ -302,6 +316,34 @@ mod tests {
 
         let result = api(&client).get_similar_events("evt1").await.unwrap();
         assert_eq!(result[0].core.id, Some("evt2".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_event_live_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/events/evt1/live",
+            200,
+            r#"{"redirect":"https://live.example.com/stream"}"#,
+        )
+        .await;
+
+        let live = api(&client).get_event_live("evt1").await.unwrap();
+        assert_eq!(live.redirect, Some("https://live.example.com/stream".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_event_live_inactive() {
+        let (mut server, client) = mock_api().await;
+        // The API returns 400 when the event is not currently active.
+        let mock = mock_json(&mut server, "GET", "/events/evt1/live", 400, "not active").await;
+
+        let err = api(&client).get_event_live("evt1").await.unwrap_err();
+        assert_http_status(err, 400);
         mock.assert_async().await;
     }
 

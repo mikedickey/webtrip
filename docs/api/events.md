@@ -121,6 +121,34 @@ let similar = client.events().get_similar_events("event123").await?;
 
 ---
 
+### getEventLive / get_event_live
+
+Get the live stream URL for an active event. The server returns a `400` error when the
+event is not currently active (before its start time or after its end time).
+
+**Authentication:** None required
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `eventId` | `string` | Event ID |
+
+```javascript
+const live = await client.events().getEventLive('event123');
+// { redirect: "https://live.example.com/stream" }
+```
+
+```rust
+let live = client.events().get_event_live("event123").await?;
+```
+
+**Returns:** `Redirect`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `redirect` | `string?` | URL of the active live stream |
+
+---
+
 ### listStudioEvents / list_studio_events
 
 List events for a specific studio.

@@ -23,14 +23,21 @@ impl SystemApi {
         self.client.get("/ping").await
     }
 
-    /// Get redirect URL for a destination
-    /// 
-    /// Note: This endpoint returns a 307 redirect. This method will follow
-    /// the redirect and return the final URL as a string.
-    pub async fn get_redirect_url(&self, destination: &str) -> Result<String, ApiError> {
+    /// Resolve a URL-shortened redirect for a destination identifier
+    /// (`GET /redirect/{destination}`).
+    pub async fn get_redirect(&self, destination: &str) -> Result<models::Redirect, ApiError> {
         let path = format!("/redirect/{}", urlencode(destination));
-        // For redirects, we might want to just return the redirect URL
-        // The actual implementation depends on how you want to handle 307 redirects
+        self.client.get(&path).await
+    }
+
+    /// Resolve a URL-shortened redirect with a file extension appended to the
+    /// resolved URL (`GET /redirect/{destination}/{ext}`).
+    pub async fn get_redirect_ext(
+        &self,
+        destination: &str,
+        ext: &str,
+    ) -> Result<models::Redirect, ApiError> {
+        let path = format!("/redirect/{}/{}", urlencode(destination), urlencode(ext));
         self.client.get(&path).await
     }
 
@@ -70,10 +77,20 @@ impl SystemApi {
         self.ping().await
     }
 
-    /// Get redirect URL for a destination
-    #[wasm_bindgen(js_name = getRedirectUrl)]
-    pub async fn get_redirect_url_js(&self, destination: String) -> Result<String, ApiError> {
-        self.get_redirect_url(&destination).await
+    /// Resolve a URL-shortened redirect for a destination identifier
+    #[wasm_bindgen(js_name = getRedirect)]
+    pub async fn get_redirect_js(&self, destination: String) -> Result<models::Redirect, ApiError> {
+        self.get_redirect(&destination).await
+    }
+
+    /// Resolve a URL-shortened redirect with a file extension appended
+    #[wasm_bindgen(js_name = getRedirectExt)]
+    pub async fn get_redirect_ext_js(
+        &self,
+        destination: String,
+        ext: String,
+    ) -> Result<models::Redirect, ApiError> {
+        self.get_redirect_ext(&destination, &ext).await
     }
 
     /// Get the client's public IP address
@@ -140,28 +157,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_redirect_url_success() {
+    async fn test_get_redirect_success() {
         let (mut server, client) = mock_api().await;
         let mock = mock_json(
             &mut server,
             "GET",
             "/redirect/openapi",
             200,
-            r#""https://example.com/openapi.json""#,
+            r#"{"redirect":"https://example.com/openapi.json"}"#,
         )
         .await;
 
-        let url = api(&client).get_redirect_url("openapi").await.unwrap();
-        assert_eq!(url, "https://example.com/openapi.json");
+        let result = api(&client).get_redirect("openapi").await.unwrap();
+        assert_eq!(result.redirect, Some("https://example.com/openapi.json".to_string()));
         mock.assert_async().await;
     }
 
     #[tokio::test]
-    async fn test_get_redirect_url_error() {
+    async fn test_get_redirect_error() {
         let (mut server, client) = mock_api().await;
         let mock = mock_json(&mut server, "GET", "/redirect/missing", 404, "nope").await;
 
-        let err = api(&client).get_redirect_url("missing").await.unwrap_err();
+        let err = api(&client).get_redirect("missing").await.unwrap_err();
+        assert_http_status(err, 404);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_redirect_ext_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/redirect/avatar/jpg",
+            200,
+            r#"{"redirect":"https://cdn.example.com/avatar.jpg"}"#,
+        )
+        .await;
+
+        let result = api(&client).get_redirect_ext("avatar", "jpg").await.unwrap();
+        assert_eq!(result.redirect, Some("https://cdn.example.com/avatar.jpg".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_redirect_ext_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "GET", "/redirect/avatar/jpg", 404, "nope").await;
+
+        let err = api(&client).get_redirect_ext("avatar", "jpg").await.unwrap_err();
         assert_http_status(err, 404);
         mock.assert_async().await;
     }
