@@ -303,26 +303,39 @@ impl AudioEngine {
     /// * `device_id` - The device ID from the output device selector, or empty string for default
     #[wasm_bindgen(js_name = setOutputDevice)]
     pub async fn set_output_device(&self, device_id: Option<String>) -> Result<(), JsValue> {
-        let ctx_obj: &JsValue = self.ctx.as_ref();
-        
-        // Check if setSinkId is available
-        let has_set_sink_id = js_sys::Reflect::has(ctx_obj, &JsValue::from_str("setSinkId"))?;
-        
-        if !has_set_sink_id {
-            web_sys::console::warn_1(&"setSinkId not supported in this browser, using default output device".into());
-            return Ok(());
-        }
-
-        // Call setSinkId with the device ID or empty string for default
-        let sink_id = device_id.unwrap_or_default();
-        let set_sink_id_fn = js_sys::Reflect::get(ctx_obj, &JsValue::from_str("setSinkId"))?
-            .dyn_into::<js_sys::Function>()?;
-        
-        let promise = set_sink_id_fn.call1(ctx_obj, &JsValue::from_str(&sink_id))?;
-        JsFuture::from(js_sys::Promise::from(promise)).await?;
-        
-        Ok(())
+        route_output_sink(self.ctx.as_ref(), device_id).await
     }
+}
+
+/// Route playback to the requested output sink on `ctx_obj` via `setSinkId`.
+///
+/// Split out of [`AudioEngine::set_output_device`] so the two branches can be
+/// exercised against a synthetic context regardless of whether the *real*
+/// `AudioContext` of the running browser happens to expose `setSinkId` (modern
+/// Chrome does; older browsers do not):
+///
+/// - When `setSinkId` is absent it is a graceful no-op — warn and return
+///   `Ok(())` rather than erroring (the app falls back to the default sink).
+/// - Otherwise it calls `setSinkId(device_id | "")`, where an absent/empty id
+///   selects the default device, and awaits the returned promise.
+async fn route_output_sink(ctx_obj: &JsValue, device_id: Option<String>) -> Result<(), JsValue> {
+    // Check if setSinkId is available
+    let has_set_sink_id = js_sys::Reflect::has(ctx_obj, &JsValue::from_str("setSinkId"))?;
+
+    if !has_set_sink_id {
+        web_sys::console::warn_1(&"setSinkId not supported in this browser, using default output device".into());
+        return Ok(());
+    }
+
+    // Call setSinkId with the device ID or empty string for default
+    let sink_id = device_id.unwrap_or_default();
+    let set_sink_id_fn = js_sys::Reflect::get(ctx_obj, &JsValue::from_str("setSinkId"))?
+        .dyn_into::<js_sys::Function>()?;
+
+    let promise = set_sink_id_fn.call1(ctx_obj, &JsValue::from_str(&sink_id))?;
+    JsFuture::from(js_sys::Promise::from(promise)).await?;
+
+    Ok(())
 }
 
 // ==============================================================================
@@ -430,6 +443,56 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;
 
+    /// Build an `AudioEngine` in the browser harness.
+    ///
+    /// `create` (no network) leaves both buffer pointers null and registers the
+    /// worklet module against a fresh `AudioContext`. Shared so every engine
+    /// browser test bootstraps the same way instead of re-rolling the
+    /// `AudioEngine::create(...).await.expect(...)` dance.
+    #[cfg(target_arch = "wasm32")]
+    async fn create_engine(params: &AudioParams) -> AudioEngine {
+        AudioEngine::create(params as *const AudioParams)
+            .await
+            .expect("AudioEngine::create should succeed in the browser")
+    }
+
+    /// Close an engine's `AudioContext`, releasing its native audio resources.
+    ///
+    /// All engine browser tests share a single Chrome page, so an unclosed
+    /// `AudioContext` (especially one with a live worklet / capture stream)
+    /// leaks real audio-thread resources for the rest of the suite. That is
+    /// tolerable for the plain `test:wasm` run but, under the much heavier
+    /// coverage-instrumented build, the accumulation exhausts the renderer
+    /// mid-suite (the driver gets SIGKILLed). Each test that builds an engine
+    /// hands it here when done so the context is torn down promptly.
+    #[cfg(target_arch = "wasm32")]
+    async fn close_engine(engine: AudioEngine) {
+        if let Ok(promise) = engine.ctx.close() {
+            let _ = JsFuture::from(promise).await;
+        }
+    }
+
+    /// Assert a freshly read JS object carries the three processing toggles
+    /// verbatim as booleans. Shared between the device-present / device-absent
+    /// `to_js` tests so the toggle-field reads aren't duplicated.
+    #[cfg(target_arch = "wasm32")]
+    fn assert_toggle_fields(js: &JsValue, agc: bool, ec: bool, ns: bool) {
+        for (field, expected) in [
+            ("autoGainControl", agc),
+            ("echoCancellation", ec),
+            ("noiseSuppression", ns),
+        ] {
+            let value = js_sys::Reflect::get(js, &field.into())
+                .unwrap_or_else(|_| panic!("constraints object must expose {field}"))
+                .as_bool();
+            assert_eq!(
+                value,
+                Some(expected),
+                "{field} must be carried through as {expected}, got {value:?}"
+            );
+        }
+    }
+
     /// `AudioEngine::create` must build a real `AudioContext` that reports a
     /// plausible, positive sample rate — the bootstrap on the critical path of
     /// every session. `create` also registers the worklet module, so this
@@ -441,9 +504,7 @@ mod tests {
         // dereferences it, so a stack `AudioParams` kept alive for the duration
         // of the test is sufficient.
         let params = AudioParams::default();
-        let engine = AudioEngine::create(&params as *const AudioParams)
-            .await
-            .expect("AudioEngine::create should succeed in the browser");
+        let engine = create_engine(&params).await;
 
         let sample_rate = engine.get_sample_rate();
         assert!(
@@ -456,5 +517,243 @@ mod tests {
             (8_000.0..=768_000.0).contains(&sample_rate),
             "sample rate {sample_rate} is outside any plausible audio range"
         );
+
+        close_engine(engine).await;
+    }
+
+    /// End-to-end: `set_output_device` must resolve `Ok` for the default-sink
+    /// request against a real `AudioContext`.
+    ///
+    /// `None` and an empty string both normalize to the default device (sink id
+    /// `""`). Depending on the browser the real context either lacks `setSinkId`
+    /// (graceful warn + `Ok(())`) or exposes it (resolves via `setSinkId("")`);
+    /// either way the entry point must not throw. Both branches are pinned down
+    /// deterministically — independent of this browser's capabilities — by the
+    /// `route_output_sink_*` tests below.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn set_output_device_default_resolves_ok() {
+        let params = AudioParams::default();
+        let engine = create_engine(&params).await;
+
+        engine
+            .set_output_device(None)
+            .await
+            .expect("set_output_device(None) must resolve Ok (graceful no-op or setSinkId default)");
+        engine
+            .set_output_device(Some(String::new()))
+            .await
+            .expect("set_output_device(\"\") must resolve Ok for the default sink");
+
+        close_engine(engine).await;
+    }
+
+    /// Graceful no-op branch: when the context object has no `setSinkId`,
+    /// `route_output_sink` must warn and return `Ok(())` without throwing —
+    /// the requested device id is simply ignored (default sink is kept). Driven
+    /// against a plain object so the absent-`setSinkId` path is reached even on
+    /// browsers (like current Chrome) whose real `AudioContext` does expose it.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn route_output_sink_absent_setsinkid_is_graceful_noop() {
+        let ctx_like: JsValue = js_sys::Object::new().into();
+        assert!(
+            !js_sys::Reflect::has(&ctx_like, &"setSinkId".into()).unwrap(),
+            "a plain object must not expose setSinkId (precondition for the no-op branch)"
+        );
+
+        route_output_sink(&ctx_like, Some("ignored-device".to_string()))
+            .await
+            .expect("a context without setSinkId must yield a graceful Ok no-op");
+    }
+
+    /// Call path: when the context object exposes `setSinkId`,
+    /// `route_output_sink` must invoke it with the device id, and with `""`
+    /// when no device is requested (the default-sink case). A stub records the
+    /// argument it was called with so we can assert the mapping. Driven against
+    /// a synthetic object so this branch is covered regardless of whether the
+    /// real `AudioContext` happens to implement `setSinkId`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn route_output_sink_calls_setsinkid_with_resolved_id() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use wasm_bindgen::closure::Closure;
+
+        let recorded: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let recorded_cb = recorded.clone();
+        // The stub mirrors `AudioContext.setSinkId`: it records its single string
+        // argument and resolves, so the awaited promise completes `Ok`.
+        let stub = Closure::wrap(Box::new(move |id: JsValue| -> js_sys::Promise {
+            *recorded_cb.borrow_mut() = id.as_string();
+            js_sys::Promise::resolve(&JsValue::UNDEFINED)
+        }) as Box<dyn FnMut(JsValue) -> js_sys::Promise>);
+
+        let ctx_like = js_sys::Object::new();
+        js_sys::Reflect::set(&ctx_like, &"setSinkId".into(), stub.as_ref().unchecked_ref())
+            .expect("attaching the setSinkId stub should succeed");
+        let ctx_like: JsValue = ctx_like.into();
+
+        route_output_sink(&ctx_like, Some("speaker-3".to_string()))
+            .await
+            .expect("setSinkId stub should resolve Ok");
+        assert_eq!(
+            recorded.borrow().as_deref(),
+            Some("speaker-3"),
+            "a specific device id must be forwarded verbatim to setSinkId"
+        );
+
+        route_output_sink(&ctx_like, None)
+            .await
+            .expect("default-sink request should resolve Ok");
+        assert_eq!(
+            recorded.borrow().as_deref(),
+            Some(""),
+            "an absent device id must select the default sink via setSinkId(\"\")"
+        );
+
+        drop(stub);
+    }
+
+    /// `get_worklet_port` / `is_capturing` must track the worklet node's
+    /// presence across the capture lifecycle.
+    ///
+    /// Before capture there is no worklet node: `is_capturing()` is `false` and
+    /// `get_worklet_port()` is `None`. After `start_capture` (over the no-network
+    /// `create` path — both buffer pointers null, so the processor takes its
+    /// non-networked branch and the worklet gets no ring-buffer flag) a worklet
+    /// node exists, so `is_capturing()` flips to `true` and `get_worklet_port()`
+    /// returns `Some(MessagePort)`. `stop_capture` must tear that back down to
+    /// the absent state. Capture works headless thanks to the fake-device flags
+    /// in `webdriver.json`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn worklet_port_tracks_capture_lifecycle() {
+        // `start_capture` dereferences the params pointer, so `params` must
+        // outlive the engine — declare it first so it drops last.
+        let params = AudioParams::default();
+        let mut engine = create_engine(&params).await;
+
+        assert!(
+            !engine.is_capturing(),
+            "a fresh engine must not report capturing"
+        );
+        assert!(
+            engine.get_worklet_port().is_none(),
+            "get_worklet_port must be None before capture starts"
+        );
+
+        engine
+            .start_capture(None, false, false, false)
+            .await
+            .expect("start_capture should resolve with the fake-device flags");
+
+        assert!(
+            engine.is_capturing(),
+            "is_capturing must report true once a worklet node exists"
+        );
+        assert!(
+            engine.get_worklet_port().is_some(),
+            "get_worklet_port must return Some(MessagePort) while capturing"
+        );
+
+        engine.stop_capture();
+
+        assert!(
+            !engine.is_capturing(),
+            "is_capturing must report false after stop_capture"
+        );
+        assert!(
+            engine.get_worklet_port().is_none(),
+            "get_worklet_port must be None after stop_capture"
+        );
+
+        close_engine(engine).await;
+    }
+
+    /// Wiring buffer pointers via the setters must route a later `start_capture`
+    /// through the *networked* processor branch.
+    ///
+    /// An engine built with `create` starts with null buffer pointers;
+    /// `set_local_to_network_buffer` / `set_network_to_local_buffer` install
+    /// real buffers after the fact, so `start_capture` takes the
+    /// `AudioProcessor::with_network` branch and hands the worklet the ring
+    /// buffer's has-data flag. We assert capture still comes up (worklet port
+    /// present), proving the setters fed live pointers into the capture path.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn buffer_setters_feed_capture_path() {
+        // All three backing allocations must outlive the engine, which holds raw
+        // pointers into them — declare them before the engine so they drop last.
+        let params = AudioParams::default();
+        let mut ring = RingBuffer::new();
+        let mut regulator = Regulator::new();
+        let mut engine = create_engine(&params).await;
+
+        engine.set_local_to_network_buffer(&mut ring as *mut RingBuffer);
+        engine.set_network_to_local_buffer(&mut regulator as *mut Regulator);
+
+        engine
+            .start_capture(None, false, false, false)
+            .await
+            .expect("start_capture over the networked branch should resolve");
+
+        assert!(
+            engine.is_capturing(),
+            "capture must come up after wiring buffers via the setters"
+        );
+        assert!(
+            engine.get_worklet_port().is_some(),
+            "networked capture must still expose a worklet message port"
+        );
+
+        engine.stop_capture();
+        close_engine(engine).await;
+    }
+
+    /// `AudioConstraints::to_js` must emit an `exact` device-id constraint when a
+    /// specific device is requested, alongside the three processing toggles.
+    ///
+    /// This is the optional-config branch of the constraints builder (the
+    /// natively-tested `resolve` only produces the plain struct); the JS-object
+    /// conversion is browser glue, so the device-id path is exercised here.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn to_js_emits_exact_device_id() {
+        let js = AudioConstraints::resolve(Some("mic-7".to_string()), true, false, true)
+            .to_js()
+            .expect("to_js must build the getUserMedia constraints object");
+
+        let device_id = js_sys::Reflect::get(&js, &"deviceId".into())
+            .expect("constraints must expose a deviceId field for a specific device");
+        let exact = js_sys::Reflect::get(&device_id, &"exact".into())
+            .expect("deviceId must carry an exact constraint")
+            .as_string();
+        assert_eq!(
+            exact.as_deref(),
+            Some("mic-7"),
+            "deviceId.exact must equal the requested device id"
+        );
+
+        assert_toggle_fields(&js, true, false, true);
+    }
+
+    /// `AudioConstraints::to_js` must omit the device-id constraint entirely when
+    /// no device is requested (the default-device path), while still carrying the
+    /// processing toggles — the complementary branch to `to_js_emits_exact_device_id`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn to_js_omits_device_id_for_default() {
+        let js = AudioConstraints::resolve(None, false, true, false)
+            .to_js()
+            .expect("to_js must build the getUserMedia constraints object");
+
+        assert!(
+            !js_sys::Reflect::has(&js, &"deviceId".into())
+                .expect("Reflect::has must succeed on the constraints object"),
+            "the default-device path must not set a deviceId constraint"
+        );
+
+        assert_toggle_fields(&js, false, true, false);
     }
 }
