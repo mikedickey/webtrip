@@ -20,6 +20,26 @@ fn stream_follow_path(stream_id: &str) -> String {
     format!("/streams/{}/follow", urlencode(stream_id))
 }
 
+fn conversation_path(stream_id: &str, user_id: &str) -> String {
+    format!(
+        "/streams/{}/conversations/{}",
+        urlencode(stream_id),
+        urlencode(user_id)
+    )
+}
+
+fn conversation_messages_path(stream_id: &str, user_id: &str) -> String {
+    format!("{}/messages", conversation_path(stream_id, user_id))
+}
+
+fn conversation_message_path(stream_id: &str, user_id: &str, message_id: &str) -> String {
+    format!(
+        "{}/{}",
+        conversation_messages_path(stream_id, user_id),
+        urlencode(message_id)
+    )
+}
+
 impl StreamsApi {
     /// List all public, active broadcasts
     pub async fn list_streams(&self) -> Result<Vec<models::StreamInfo>, ApiError> {
@@ -91,8 +111,20 @@ impl StreamsApi {
         stream_id: &str,
         user_id: &str,
     ) -> Result<models::Conversation, ApiError> {
-        let path = format!("/streams/{}/conversations/{}", urlencode(stream_id), urlencode(user_id));
-        self.client.get(&path).await
+        self.client.get(&conversation_path(stream_id, user_id)).await
+    }
+
+    /// Mark messages as read in a conversation.
+    ///
+    /// Updates the last-read message position for the authenticated user.
+    pub async fn mark_conversation_read(
+        &self,
+        stream_id: &str,
+        user_id: &str,
+        req: &models::MarkReadRequest,
+    ) -> Result<(), ApiError> {
+        let path = format!("{}/last", conversation_path(stream_id, user_id));
+        self.client.post_no_response(&path, req).await
     }
 
     /// Get messages in a conversation
@@ -101,8 +133,7 @@ impl StreamsApi {
         stream_id: &str,
         user_id: &str,
     ) -> Result<Vec<models::Message>, ApiError> {
-        let path = format!("/streams/{}/conversations/{}/messages", urlencode(stream_id), urlencode(user_id));
-        self.client.get(&path).await
+        self.client.get(&conversation_messages_path(stream_id, user_id)).await
     }
 
     /// Send a message in a conversation
@@ -112,8 +143,34 @@ impl StreamsApi {
         user_id: &str,
         message: &models::SendMessageRequest,
     ) -> Result<models::Message, ApiError> {
-        let path = format!("/streams/{}/conversations/{}/messages", urlencode(stream_id), urlencode(user_id));
-        self.client.post(&path, message).await
+        self.client.post(&conversation_messages_path(stream_id, user_id), message).await
+    }
+
+    /// Get a specific message in a conversation
+    pub async fn get_conversation_message(
+        &self,
+        stream_id: &str,
+        user_id: &str,
+        message_id: &str,
+    ) -> Result<models::Message, ApiError> {
+        self.client
+            .get(&conversation_message_path(stream_id, user_id, message_id))
+            .await
+    }
+
+    /// Update an existing message in a conversation.
+    ///
+    /// Only the message status may be changed; the text is immutable.
+    pub async fn update_conversation_message(
+        &self,
+        stream_id: &str,
+        user_id: &str,
+        message_id: &str,
+        req: &models::UpdateMessageRequest,
+    ) -> Result<models::Message, ApiError> {
+        self.client
+            .put(&conversation_message_path(stream_id, user_id, message_id), req)
+            .await
     }
 
     /// Get the stream for a studio
@@ -244,6 +301,16 @@ impl StreamsApi {
         self.get_stream_conversation(&stream_id, &user_id).await
     }
 
+    #[wasm_bindgen(js_name = markConversationRead)]
+    pub async fn mark_conversation_read_js(
+        &self,
+        stream_id: String,
+        user_id: String,
+        req: models::MarkReadRequest,
+    ) -> Result<(), ApiError> {
+        self.mark_conversation_read(&stream_id, &user_id, &req).await
+    }
+
     #[wasm_bindgen(js_name = getConversationMessages)]
     pub async fn get_conversation_messages_js(&self, stream_id: String, user_id: String) -> Result<JsValue, ApiError> {
         let messages = self.get_conversation_messages(&stream_id, &user_id).await?;
@@ -258,6 +325,27 @@ impl StreamsApi {
         message: models::SendMessageRequest,
     ) -> Result<models::Message, ApiError> {
         self.send_message(&stream_id, &user_id, &message).await
+    }
+
+    #[wasm_bindgen(js_name = getConversationMessage)]
+    pub async fn get_conversation_message_js(
+        &self,
+        stream_id: String,
+        user_id: String,
+        message_id: String,
+    ) -> Result<models::Message, ApiError> {
+        self.get_conversation_message(&stream_id, &user_id, &message_id).await
+    }
+
+    #[wasm_bindgen(js_name = updateConversationMessage)]
+    pub async fn update_conversation_message_js(
+        &self,
+        stream_id: String,
+        user_id: String,
+        message_id: String,
+        req: models::UpdateMessageRequest,
+    ) -> Result<models::Message, ApiError> {
+        self.update_conversation_message(&stream_id, &user_id, &message_id, &req).await
     }
 
     #[wasm_bindgen(js_name = getStudioStream)]
@@ -589,6 +677,77 @@ mod tests {
         };
         let msg = api(&client).send_message("s1", "u1", &req).await.unwrap();
         assert_eq!(msg.id, Some("m2".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_mark_conversation_read() {
+        let (mut server, client) = mock_api().await;
+        // Assert the last-read payload serializes `message_id` as `messageId`.
+        let mock = server
+            .mock("POST", "/streams/s1/conversations/u1/last")
+            .match_body(mockito::Matcher::Json(serde_json::json!({"messageId": "m1"})))
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let req = models::MarkReadRequest {
+            message_id: Some("m1".to_string()),
+        };
+        api(&client).mark_conversation_read("s1", "u1", &req).await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_mark_conversation_read_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "POST", "/streams/s1/conversations/u1/last", 403).await;
+
+        let err = api(&client)
+            .mark_conversation_read("s1", "u1", &models::MarkReadRequest::default())
+            .await
+            .unwrap_err();
+        assert_http_status(err, 403);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_conversation_message() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/streams/s1/conversations/u1/messages/m1",
+            200,
+            r#"{"id":"m1","content":"hi"}"#,
+        )
+        .await;
+
+        let msg = api(&client).get_conversation_message("s1", "u1", "m1").await.unwrap();
+        assert_eq!(msg.id, Some("m1".to_string()));
+        assert_eq!(msg.content, Some("hi".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_conversation_message() {
+        let (mut server, client) = mock_api().await;
+        // Assert the update payload serializes `status` and the decoded result.
+        let mock = server
+            .mock("PUT", "/streams/s1/conversations/u1/messages/m1")
+            .match_body(mockito::Matcher::Json(serde_json::json!({"status": 1})))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"m1","content":"hi"}"#)
+            .create_async()
+            .await;
+
+        let req = models::UpdateMessageRequest { status: Some(1) };
+        let msg = api(&client)
+            .update_conversation_message("s1", "u1", "m1", &req)
+            .await
+            .unwrap();
+        assert_eq!(msg.id, Some("m1".to_string()));
         mock.assert_async().await;
     }
 

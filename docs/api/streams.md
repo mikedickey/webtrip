@@ -231,6 +231,31 @@ let conversation = client.streams().get_stream_conversation("stream123", "user45
 
 ---
 
+### markConversationRead / mark_conversation_read
+
+Mark messages as read in a conversation (updates the last-read message position for the authenticated user).
+
+**Authentication:** Required
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `streamId` | `string` | Stream ID |
+| `userId` | `string` | User ID |
+| `req` | `MarkReadRequest` | Last-read message position (`messageId`) |
+
+```javascript
+await client.streams().markConversationRead('stream123', 'user456', { messageId: 'msg789' });
+```
+
+```rust
+let req = MarkReadRequest { message_id: Some("msg789".into()) };
+client.streams().mark_conversation_read("stream123", "user456", &req).await?;
+```
+
+**Returns:** `void` / `()`
+
+---
+
 ### getConversationMessages / get_conversation_messages
 
 Get messages in a conversation.
@@ -275,6 +300,56 @@ const message = await client.streams().sendMessage('stream123', 'user456', {
 
 ```rust
 let message = client.streams().send_message("stream123", "user456", &msg).await?;
+```
+
+**Returns:** `Message`
+
+---
+
+### getConversationMessage / get_conversation_message
+
+Get a specific message in a conversation.
+
+**Authentication:** Required
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `streamId` | `string` | Stream ID |
+| `userId` | `string` | User ID |
+| `messageId` | `string` | Message ID |
+
+```javascript
+const message = await client.streams().getConversationMessage('stream123', 'user456', 'msg789');
+```
+
+```rust
+let message = client.streams().get_conversation_message("stream123", "user456", "msg789").await?;
+```
+
+**Returns:** `Message`
+
+---
+
+### updateConversationMessage / update_conversation_message
+
+Update an existing message in a conversation. Only the message `status` may be changed; the text is immutable.
+
+**Authentication:** Required
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `streamId` | `string` | Stream ID |
+| `userId` | `string` | User ID |
+| `messageId` | `string` | Message ID |
+| `req` | `UpdateMessageRequest` | Fields to update (`status`) |
+
+```javascript
+const message = await client.streams().updateConversationMessage('stream123', 'user456', 'msg789', { status: 1 });
+```
+
+```rust
+let req = UpdateMessageRequest { status: Some(1) };
+let message = client.streams().update_conversation_message("stream123", "user456", "msg789", &req).await?;
 ```
 
 **Returns:** `Message`

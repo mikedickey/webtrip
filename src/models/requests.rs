@@ -28,6 +28,28 @@ pub struct SendMessageRequest {
     pub message_type: Option<String>,
 }
 
+/// Mark-messages-read request (`POST /streams/{streamId}/conversations/{userId}/last`).
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkReadRequest {
+    /// ID of the last message read by the user
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+}
+
+/// Update-message request (`PUT /streams/{streamId}/conversations/{userId}/messages/{messageId}`).
+///
+/// Only `status` may be changed; message text is immutable after creation.
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateMessageRequest {
+    /// Message status (0=normal, 1=deleted)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<i32>,
+}
+
 /// Studio session feedback request
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
@@ -210,6 +232,23 @@ mod tests {
         let s = roundtrip(&m);
         assert!(s.contains("\"type\":\"text\""));
         assert!(!s.contains("messageType"));
+    }
+
+    #[test]
+    fn mark_read_request_wire_format() {
+        let r = MarkReadRequest {
+            message_id: Some("m1".into()),
+        };
+        let s = roundtrip(&r);
+        assert!(s.contains("\"messageId\":\"m1\""));
+        assert!(!s.contains("message_id"));
+    }
+
+    #[test]
+    fn update_message_request_wire_format() {
+        let r = UpdateMessageRequest { status: Some(1) };
+        let s = roundtrip(&r);
+        assert!(s.contains("\"status\":1"));
     }
 
     #[test]
