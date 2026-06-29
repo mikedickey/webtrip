@@ -67,7 +67,9 @@ web-sys = { version = "0.3.83", features = [
   "CloseEvent",
   "CloseEventInit",
   "Event",
+  "EventTarget",
   "ErrorEvent",
+  "ErrorEventInit",
   
   # WebRTC for JackTrip protocol
   "RtcConfiguration",
