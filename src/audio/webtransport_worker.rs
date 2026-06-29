@@ -85,6 +85,86 @@ fn deserialize_datagram(data: &[u8], samples: &mut Vec<f32>) -> Result<u16, Prot
     Ok(header.sequence_number)
 }
 
+/// How a deserialize error should be surfaced, based on the running error
+/// accounting.
+///
+/// Single corrupted datagrams are expected under real network conditions, so
+/// they are logged individually ([`ReceiveErrorLevel::Isolated`]). A sustained
+/// high failure rate is a sign the connection may be degraded and warrants a
+/// throttled, louder warning ([`ReceiveErrorLevel::HighRate`]). Extracted as a
+/// pure function (mirroring [`send_decision`]) so the threshold is the single
+/// source of truth and testable natively without a browser or transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiveErrorLevel {
+    /// An isolated deserialize failure — log once, keep going.
+    Isolated,
+    /// Errors dominate the received packets (>10 errors and >50% rate).
+    HighRate,
+}
+
+/// Classify a deserialize error against the cumulative receive counters.
+///
+/// Returns [`ReceiveErrorLevel::HighRate`] once more than 10 errors have
+/// occurred *and* they account for more than half of all received packets;
+/// otherwise [`ReceiveErrorLevel::Isolated`].
+fn classify_receive_error(receive_errors: u64, packets_received: u64) -> ReceiveErrorLevel {
+    if receive_errors > 10 && packets_received > 0 {
+        let error_rate = receive_errors as f64 / packets_received as f64;
+        if error_rate > 0.5 {
+            return ReceiveErrorLevel::HighRate;
+        }
+    }
+    ReceiveErrorLevel::Isolated
+}
+
+/// Process one received datagram: account for it in `stats`, then deserialize
+/// and either push the decoded samples into `regulator` (the network → jitter
+/// buffer feed that triggers PLC) or record the deserialize error.
+///
+/// This is the per-datagram body of [`receive_loop`], lifted out so the
+/// realtime-correctness logic (deserialize → `Regulator::push`, error
+/// accounting, high-error-rate classification) is unit-testable without a live
+/// WebTransport connection. The `unsafe` raw-pointer deref of the regulator
+/// stays at the [`receive_loop`] call site; here it is an ordinary `&mut`.
+fn handle_datagram(
+    data: &[u8],
+    regulator: &mut Regulator,
+    samples: &mut Vec<f32>,
+    stats: &mut WebTransportWorkerStats,
+) {
+    stats.packets_received += 1;
+    stats.bytes_received += data.len() as u64;
+
+    match deserialize_datagram(data, samples) {
+        Ok(sequence_number) => {
+            regulator.push(sequence_number, samples);
+        }
+        Err(_e) => {
+            stats.receive_errors += 1;
+
+            // Log but continue — single corrupted packets are expected under
+            // real network conditions; a sustained high rate gets a louder,
+            // throttled warning. The console logging is browser-only.
+            #[cfg(target_arch = "wasm32")]
+            match classify_receive_error(stats.receive_errors, stats.packets_received) {
+                ReceiveErrorLevel::HighRate => {
+                    let error_rate = stats.receive_errors as f64 / stats.packets_received as f64;
+                    web_sys::console::warn_1(&format!(
+                        "[WebTransport Worker] ⚠️ High error rate ({:.1}%), deserialization error: {:?}",
+                        error_rate * 100.0, _e
+                    ).into());
+                }
+                ReceiveErrorLevel::Isolated => {
+                    web_sys::console::warn_1(&format!(
+                        "[WebTransport Worker] ⚠️ Deserialize error: {:?}",
+                        _e
+                    ).into());
+                }
+            }
+        }
+    }
+}
+
 /// Post a message to the main thread from the worker
 fn post_message_to_main(msg: &JsValue) {
     // Get the global worker scope
@@ -97,6 +177,16 @@ fn post_error_to_main(msg: &str) {
     let _ = Reflect::set(&obj, &"type".into(), &"error".into());
     let _ = Reflect::set(&obj, &"error".into(), &msg.into());
     post_message_to_main(&obj.into());
+}
+
+/// Stop the worker and notify the main thread that the connection was lost.
+///
+/// Shared by the send and receive loops' connection-error branches so the
+/// "flip `running` off + post a `Connection lost` error to main" teardown lives
+/// in one place rather than being duplicated per loop.
+fn signal_connection_lost() {
+    WORKER_STATE.with(|state| state.borrow().stop());
+    post_error_to_main("Connection lost");
 }
 
 /// Worker state shared between message handler and transport loops
@@ -427,15 +517,11 @@ async fn send_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(), 
                             "[WebTransport Worker] ❌ Connection lost in send loop: {:?}",
                             e
                         ).into());
-                        
-                        // Stop the worker
-                        WORKER_STATE.with(|state| {
-                            state.borrow().stop();
-                        });
-                        
-                        // Notify main thread
-                        post_error_to_main("Connection lost");
-                        
+
+                        // Stop the worker and notify the main thread (shared
+                        // with the receive loop's error branch).
+                        signal_connection_lost();
+
                         break;
                     }
                     
@@ -515,6 +601,47 @@ async fn send_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(), 
     Ok(())
 }
 
+/// Outcome of reading one item from the datagram
+/// `ReadableStreamDefaultReader`.
+#[derive(Debug)]
+enum DatagramRead {
+    /// The stream signalled `done` — the receive loop should stop.
+    Done,
+    /// A datagram's bytes, ready to hand to [`handle_datagram`].
+    Bytes(Vec<u8>),
+}
+
+/// Parse the `{ done, value }` object yielded by `reader.read()` into a
+/// [`DatagramRead`].
+///
+/// - `done == true` → [`DatagramRead::Done`] (stream closed).
+/// - a `Uint8Array` value → [`DatagramRead::Bytes`] copied out of the view.
+/// - any other value → the typed `"Expected Uint8Array"` error, so the receive
+///   loop surfaces it the same way it would a malformed stream item.
+///
+/// Lifted out of [`receive_loop`] so the done / value / non-`Uint8Array`
+/// branches are addressable from a browser unit test.
+fn parse_read_result(result: &JsValue) -> Result<DatagramRead, JsValue> {
+    let done = Reflect::get(result, &"done".into())
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if done {
+        return Ok(DatagramRead::Done);
+    }
+
+    let value = Reflect::get(result, &"value".into())?;
+    let array = value.dyn_into::<Uint8Array>().map_err(|e| {
+        web_sys::console::error_1(&format!("[WebTransport Worker] ❌ Expected Uint8Array, got: {:?}", e).into());
+        JsValue::from_str("Expected Uint8Array")
+    })?;
+
+    let data_len = array.length() as usize;
+    let mut data = vec![0u8; data_len];
+    array.copy_to(&mut data);
+    Ok(DatagramRead::Bytes(data))
+}
+
 /// Receive loop: receives QUIC datagrams, writes to Regulator
 /// 
 /// This loop runs continuously while connected, receiving audio packets as
@@ -539,77 +666,29 @@ async fn receive_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(
         
         match read_result {
             Ok(result) => {
-                // Check if stream is done
-                let done = Reflect::get(&result, &"done".into())
-                    .ok()
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                
-                if done {
-                    break;
-                }
+                // Parse the {done, value} item: stop on `done`, surface a typed
+                // error on a non-Uint8Array value, otherwise get the bytes.
+                let data = match parse_read_result(&result)? {
+                    DatagramRead::Done => break,
+                    DatagramRead::Bytes(data) => data,
+                };
 
-                // Get the value (Uint8Array)
-                let value = Reflect::get(&result, &"value".into())?;
-                let array = value.dyn_into::<Uint8Array>()
-                    .map_err(|e| {
-                        web_sys::console::error_1(&format!("[WebTransport Worker] ❌ Expected Uint8Array, got: {:?}", e).into());
-                        JsValue::from_str("Expected Uint8Array")
-                    })?;
-                
-                let data_len = array.length() as usize;
-
-                STATS.with(|stats| {
-                    let mut s = stats.borrow_mut();
-                    s.packets_received += 1;
-                    s.bytes_received += data_len as u64;
-                });
-
-                // Convert Uint8Array to Vec<u8>
-                let mut data = vec![0u8; data_len];
-                array.copy_to(&mut data);
-
-                // Deserialize and push to regulator
+                // Deserialize and push to regulator. The raw-pointer deref of
+                // the regulator stays here; the per-datagram logic lives in the
+                // testable `handle_datagram` helper.
                 WORKER_STATE.with(|state| {
                     let state = state.borrow();
-                    
+
                     if state.regulator_ptr.is_null() {
                         return;
                     }
 
                     // Safety: pointer is valid and Regulator uses atomics
                     let regulator = unsafe { &mut *state.regulator_ptr };
-
-                    // Deserialize packet
                     let mut samples = state.samples_buffer.borrow_mut();
-                    match deserialize_datagram(&data, &mut samples) {
-                        Ok(sequence_number) => {
-                            regulator.push(sequence_number, &samples);                            
-                        }
-                        Err(e) => {
-                            STATS.with(|stats| {
-                                let mut s = stats.borrow_mut();
-                                s.receive_errors += 1;
-                                
-                                // If we're getting too many errors in a row, the connection may be dead
-                                // Log but continue - single corrupted packets are expected in network conditions
-                                if s.receive_errors > 10 && s.packets_received > 0 {
-                                    let error_rate = s.receive_errors as f64 / s.packets_received as f64;
-                                    if error_rate > 0.5 {
-                                        web_sys::console::warn_1(&format!(
-                                            "[WebTransport Worker] ⚠️ High error rate ({:.1}%), deserialization error: {:?}",
-                                            error_rate * 100.0, e
-                                        ).into());
-                                    }
-                                } else {
-                                    web_sys::console::warn_1(&format!(
-                                        "[WebTransport Worker] ⚠️ Deserialize error: {:?}",
-                                        e
-                                    ).into());
-                                }
-                            });
-                        }
-                    }
+                    STATS.with(|stats| {
+                        handle_datagram(&data, regulator, &mut samples, &mut stats.borrow_mut());
+                    });
                 });
             }
             Err(e) => {
@@ -627,15 +706,11 @@ async fn receive_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(
                 STATS.with(|stats| {
                     stats.borrow_mut().receive_errors += 1;
                 });
-                
-                // Stop the worker
-                WORKER_STATE.with(|state| {
-                    state.borrow().stop();
-                });
-                
-                // Notify main thread
-                post_error_to_main("Connection lost");
-                
+
+                // Stop the worker and notify the main thread of the lost
+                // connection (shared with the send loop's error branch).
+                signal_connection_lost();
+
                 // For connection errors, break the loop
                 break;
             }
@@ -853,6 +928,103 @@ mod tests {
         state.start();
         state.start();
         assert!(state.is_running());
+    }
+
+    // --- classify_receive_error (deserialize-error rate threshold) ------------
+
+    #[test]
+    fn classify_receive_error_isolated_below_threshold() {
+        // Fewer than the 10-error floor is always isolated, regardless of rate.
+        assert_eq!(classify_receive_error(0, 0), ReceiveErrorLevel::Isolated);
+        assert_eq!(classify_receive_error(1, 1), ReceiveErrorLevel::Isolated);
+        assert_eq!(classify_receive_error(10, 10), ReceiveErrorLevel::Isolated);
+        // >10 errors but with packets_received == 0 must not divide by zero.
+        assert_eq!(classify_receive_error(11, 0), ReceiveErrorLevel::Isolated);
+    }
+
+    #[test]
+    fn classify_receive_error_high_rate_above_both_thresholds() {
+        // >10 errors AND >50% error rate trips the high-rate warning.
+        assert_eq!(classify_receive_error(11, 20), ReceiveErrorLevel::HighRate);
+        assert_eq!(classify_receive_error(100, 100), ReceiveErrorLevel::HighRate);
+    }
+
+    #[test]
+    fn classify_receive_error_high_count_but_low_rate_is_isolated() {
+        // Many errors but a healthy majority of good packets (≤50% rate) stays
+        // isolated — exactly 50% is not "high".
+        assert_eq!(classify_receive_error(50, 100), ReceiveErrorLevel::Isolated);
+        assert_eq!(classify_receive_error(11, 1000), ReceiveErrorLevel::Isolated);
+    }
+
+    // --- handle_datagram (deserialize -> Regulator::push + error accounting) --
+
+    #[test]
+    fn handle_datagram_valid_pushes_to_regulator_and_counts() {
+        let mut regulator = Regulator::new();
+        let mut samples = Vec::new();
+        let mut stats = WebTransportWorkerStats::default();
+        assert!(!regulator.is_initialized());
+
+        // Build a valid datagram with the shared serializer (no wire-format
+        // duplication) and feed it through the per-datagram body.
+        let audio: Vec<f32> = (0..128).map(|i| (i as f32) / 128.0).collect();
+        let datagram = AudioPacket::mono(5, 0, audio).serialize().unwrap();
+
+        handle_datagram(&datagram, &mut regulator, &mut samples, &mut stats);
+
+        // The decoded packet reached the regulator (initialized + seq recorded).
+        assert!(
+            regulator.is_initialized(),
+            "a valid datagram must be pushed into the regulator"
+        );
+        assert_eq!(regulator.stats().last_seq_received, 5);
+        // Stats account for the received packet, no errors.
+        assert_eq!(stats.packets_received, 1);
+        assert_eq!(stats.bytes_received, datagram.len() as u64);
+        assert_eq!(stats.receive_errors, 0);
+    }
+
+    #[test]
+    fn handle_datagram_corrupt_counts_error_and_skips_push() {
+        let mut regulator = Regulator::new();
+        let mut samples = Vec::new();
+        let mut stats = WebTransportWorkerStats::default();
+
+        // Too short to contain even the 16-byte header → deserialize fails.
+        let garbage = [0u8; 4];
+        handle_datagram(&garbage, &mut regulator, &mut samples, &mut stats);
+
+        assert!(
+            !regulator.is_initialized(),
+            "a corrupt datagram must not be pushed into the regulator"
+        );
+        assert_eq!(stats.packets_received, 1, "the packet is still counted");
+        assert_eq!(stats.bytes_received, garbage.len() as u64);
+        assert_eq!(stats.receive_errors, 1, "the deserialize error is recorded");
+    }
+
+    #[test]
+    fn handle_datagram_continues_through_high_error_rate() {
+        // A burst of corrupt datagrams must keep counting (the loop "continues")
+        // and cross the high-error-rate threshold without panicking.
+        let mut regulator = Regulator::new();
+        let mut samples = Vec::new();
+        let mut stats = WebTransportWorkerStats::default();
+
+        let garbage = [0u8; 4];
+        for _ in 0..20 {
+            handle_datagram(&garbage, &mut regulator, &mut samples, &mut stats);
+        }
+
+        assert_eq!(stats.packets_received, 20);
+        assert_eq!(stats.receive_errors, 20);
+        assert!(!regulator.is_initialized());
+        // Past the >10 errors / >50% rate threshold.
+        assert_eq!(
+            classify_receive_error(stats.receive_errors, stats.packets_received),
+            ReceiveErrorLevel::HighRate
+        );
     }
 
     // ── Browser tests (worker-side #[wasm_bindgen] entry points) ──────────────
@@ -1096,5 +1268,91 @@ mod tests {
     #[wasm_bindgen_test]
     fn post_error_to_main_builds_and_posts_without_panic() {
         post_error_to_main("synthetic test error");
+    }
+
+    // ── Browser tests (receive-loop datagram read parsing + teardown) ─────────
+    //
+    // `parse_read_result` and `signal_connection_lost` are the parts of
+    // `receive_loop` that don't need a live HTTP/3 server: the `{done, value}`
+    // item parsing (including the non-`Uint8Array` typed-error branch) and the
+    // connection-lost teardown. They use `web_sys`/`js_sys` types, so they run
+    // in headless Chrome. The end-to-end deserialize → `Regulator::push` body
+    // (`handle_datagram`) is covered natively above.
+
+    /// `parse_read_result` maps a `{ done: true }` stream item to
+    /// `DatagramRead::Done` so the receive loop stops.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn parse_read_result_done_stops_loop() {
+        let result = worker_message(&[("done", JsValue::from_bool(true))]);
+        match parse_read_result(&result).expect("done item must parse") {
+            DatagramRead::Done => {}
+            DatagramRead::Bytes(_) => panic!("a done item must map to DatagramRead::Done"),
+        }
+    }
+
+    /// A `{ done: false, value: Uint8Array }` item yields the datagram bytes,
+    /// copied out of the view in order.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn parse_read_result_uint8array_yields_bytes() {
+        let bytes: Vec<u8> = vec![1, 2, 3, 4, 250, 0, 128];
+        let view = Uint8Array::from(&bytes[..]);
+        let result = worker_message(&[
+            ("done", JsValue::from_bool(false)),
+            ("value", view.into()),
+        ]);
+
+        match parse_read_result(&result).expect("a Uint8Array value must parse") {
+            DatagramRead::Bytes(data) => assert_eq!(data, bytes),
+            DatagramRead::Done => panic!("a value item must map to DatagramRead::Bytes"),
+        }
+    }
+
+    /// A non-`Uint8Array` `value` is rejected with the typed
+    /// `"Expected Uint8Array"` error (the branch that guards the receive loop
+    /// against malformed stream items).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn parse_read_result_non_uint8array_value_is_typed_error() {
+        let result = worker_message(&[
+            ("done", JsValue::from_bool(false)),
+            ("value", JsValue::from_str("not an array")),
+        ]);
+
+        let err = parse_read_result(&result).expect_err("a non-Uint8Array value must error");
+        assert_eq!(err.as_string().as_deref(), Some("Expected Uint8Array"));
+    }
+
+    /// `signal_connection_lost()` flips the running flag off (so both transport
+    /// loops break) and posts the error to main without panicking. Driven with
+    /// a real ring buffer/regulator so the shared `WORKER_STATE` is realistic;
+    /// reset back to null pointers afterward so no later test sees a dangling
+    /// pointer.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn signal_connection_lost_stops_worker() {
+        let ring = RingBuffer::new();
+        let mut regulator = Regulator::new();
+        let ring_ptr = &ring as *const RingBuffer as usize;
+        let reg_ptr = &mut regulator as *mut Regulator as usize;
+
+        WORKER_STATE.with(|state| {
+            state.borrow_mut().configure(ring_ptr, reg_ptr, 128, 2);
+            state.borrow().start();
+        });
+        assert!(WORKER_STATE.with(|s| s.borrow().is_running()));
+
+        signal_connection_lost();
+
+        assert!(
+            !WORKER_STATE.with(|s| s.borrow().is_running()),
+            "a lost connection must stop the worker so both loops break"
+        );
+
+        // Restore null pointers before the backing buffers drop.
+        WORKER_STATE.with(|state| state.borrow_mut().configure(0, 0, 128, 2));
+        drop(ring);
+        drop(regulator);
     }
 }
