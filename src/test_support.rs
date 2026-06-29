@@ -15,9 +15,29 @@
 //! Standalone integration test files under `tests/*.rs` are separate binaries
 //! and therefore each need their own `wasm_bindgen_test_configure!` call.
 
+use wasm_bindgen::JsValue;
 use wasm_bindgen_test::wasm_bindgen_test_configure;
 
 wasm_bindgen_test_configure!(run_in_browser);
+
+/// Construct a synthetic `MessageEvent` carrying `data` and dispatch it to
+/// `target`, which invokes the target's registered `onmessage` handler
+/// synchronously.
+///
+/// Shared by the WebSocket signaling tests (`HubSignaling`) and the
+/// WebTransport main-thread worker-message tests so the message-event
+/// construction/dispatch isn't re-implemented per module (per AGENTS.md). Pass
+/// a `EventTarget` reference (e.g. `ws.as_ref()` / `worker.as_ref()`); `data`
+/// may be any `JsValue` (a string or a plain object).
+pub(crate) fn dispatch_message_event(target: &web_sys::EventTarget, data: &JsValue) {
+    let init = web_sys::MessageEventInit::new();
+    init.set_data(data);
+    let event = web_sys::MessageEvent::new_with_event_init_dict("message", &init)
+        .expect("MessageEvent construction should succeed");
+    target
+        .dispatch_event(&event)
+        .expect("dispatching the message event should succeed");
+}
 
 /// Yield for roughly `ms` milliseconds inside a browser test.
 ///
