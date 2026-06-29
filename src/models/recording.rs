@@ -34,6 +34,10 @@ pub struct RecordingMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_name: Option<String>,
 
+    /// Studio banner image URL of the studio that produced the recording
+    #[serde(rename = "serverBannerURL", skip_serializing_if = "Option::is_none")]
+    pub server_banner_url: Option<String>,
+
     /// Thumbnail image URL
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -85,7 +89,9 @@ pub struct PersonalizedRecording {
     pub following: Option<bool>,
 }
 
-/// Server-side recording with additional fields
+/// Server-side recording with additional studio/session identifiers.
+///
+/// Spec composes this as `RecordingMetadata` + `{serverId, sessionId, ownerId}`.
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
@@ -94,21 +100,28 @@ pub struct ServerRecording {
     #[serde(flatten)]
     pub metadata: RecordingMetadata,
 
-    /// Studio ID
+    /// Studio identifier
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub studio_id: Option<String>,
+    pub server_id: Option<String>,
 
-    /// Duration in seconds
+    /// Session identifier
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration: Option<f64>,
+    pub session_id: Option<String>,
 
-    /// File size in bytes
+    /// Studio owner user identifier
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub file_size: Option<i64>,
+    pub owner_id: Option<String>,
+}
 
-    /// Whether stems are available
+/// Signed download URL returned by
+/// `GET /studios/{studioId}/recordings/{recordingId}/download`.
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingDownload {
+    /// Signed GCS URL to download the recording file
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub has_stems: Option<bool>,
+    pub url: Option<String>,
 }
 
 /// Stem track summary returned by
@@ -140,22 +153,28 @@ pub struct StemClient {
     pub filename: Option<String>,
 }
 
-/// User recordings storage quota
+/// User recordings quota, returned by `GET /users/{userId}/recordings/quota`.
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordingsQuota {
-    /// Total storage used in bytes
+    /// Private recording quota usage
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub used: Option<i64>,
+    pub private_recordings: Option<PrivateRecordingsQuota>,
+}
 
-    /// Total storage limit in bytes
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<i64>,
-
-    /// Number of recordings
+/// Private recording counts within a [`RecordingsQuota`].
+#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct PrivateRecordingsQuota {
+    /// Current number of private recordings
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<i32>,
+
+    /// Maximum allowed private recordings
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i32>,
 }
 
 #[cfg(test)]
@@ -173,6 +192,7 @@ mod tests {
           "location": "https://s3.example.com/rec-1.mp4",
           "streamId": "stream-1",
           "serverName": "My Studio",
+          "serverBannerURL": "https://cdn.example.com/banner.png",
           "image": "https://cdn.example.com/thumb.png",
           "views": 42,
           "likes": 7,
@@ -187,11 +207,15 @@ mod tests {
         assert_eq!(r.visibility, Some(Visibility::Public));
         assert_eq!(r.views, Some(42));
 
+        assert_eq!(r.server_banner_url.as_deref(), Some("https://cdn.example.com/banner.png"));
+
         let out = serde_json::to_string(&r).unwrap();
         assert!(out.contains("\"streamId\":"));
         assert!(out.contains("\"startOffset\":"));
         assert!(out.contains("\"status\":2"));
         assert!(out.contains("\"visibility\":1"));
+        // serverBannerURL uses the spec's exact (non-camelCase) casing.
+        assert!(out.contains("\"serverBannerURL\":"));
     }
 
     #[test]
@@ -220,16 +244,39 @@ mod tests {
     fn server_recording_flattens_metadata() {
         let r = ServerRecording {
             metadata: RecordingMetadata { id: Some("r1".into()), ..Default::default() },
-            studio_id: Some("s1".into()),
-            duration: Some(360.5),
-            file_size: Some(1_234_567_890),
-            has_stems: Some(true),
+            server_id: Some("s1".into()),
+            session_id: Some("sess1".into()),
+            owner_id: Some("u1".into()),
         };
         let s = roundtrip(&r);
-        assert!(s.contains("\"studioId\":\"s1\""));
-        assert!(s.contains("\"hasStems\":true"));
-        assert!(s.contains("\"fileSize\":1234567890"));
+        // Flatten means metadata fields are at top level, not nested under "metadata".
+        assert!(s.contains("\"id\":\"r1\""));
+        assert!(s.contains("\"serverId\":\"s1\""));
+        assert!(s.contains("\"sessionId\":\"sess1\""));
+        assert!(s.contains("\"ownerId\":\"u1\""));
         assert!(!s.contains("\"metadata\":"));
+    }
+
+    #[test]
+    fn recording_download_roundtrip() {
+        let json = r#"{"url":"https://storage.example.com/signed?token=abc"}"#;
+        let d: RecordingDownload = serde_json::from_str(json).unwrap();
+        assert_eq!(d.url.as_deref(), Some("https://storage.example.com/signed?token=abc"));
+        let out = roundtrip(&d);
+        assert!(out.contains("\"url\":\"https://storage.example.com/signed?token=abc\""));
+    }
+
+    #[test]
+    fn recordings_quota_nests_private_recordings() {
+        let json = r#"{"privateRecordings":{"count":3,"limit":10}}"#;
+        let q: RecordingsQuota = serde_json::from_str(json).unwrap();
+        let private = q.private_recordings.as_ref().expect("privateRecordings present");
+        assert_eq!(private.count, Some(3));
+        assert_eq!(private.limit, Some(10));
+        let out = roundtrip(&q);
+        assert!(out.contains("\"privateRecordings\":"));
+        assert!(out.contains("\"count\":3"));
+        assert!(out.contains("\"limit\":10"));
     }
 
     #[test]

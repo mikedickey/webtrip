@@ -285,6 +285,56 @@ client.recordings().delete_studio_recording("studio123", "rec456").await?;
 
 ---
 
+### downloadRecording / download_recording
+
+Get a signed download URL for a studio recording. The URL can be used to
+download the recording as a FLAC or ZIP file. Responds `202` while the
+recording is still transcoding and `400` if it is in progress or deleted.
+
+**Authentication:** Required
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `studioId` | `string` | Studio ID |
+| `recordingId` | `string` | Recording ID |
+
+```javascript
+const { url } = await client.recordings().downloadRecording('studio123', 'rec456');
+```
+
+```rust
+let download = client.recordings().download_recording("studio123", "rec456").await?;
+```
+
+**Returns:** `RecordingDownload`
+
+---
+
+### updateRecordingBanner / update_recording_banner
+
+Update a recording's banner image. The payload is the raw image bytes.
+
+**Authentication:** Required
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `studioId` | `string` | Studio ID |
+| `recordingId` | `string` | Recording ID |
+| `image` | `Uint8Array` / `Vec<u8>` | Raw image bytes |
+| `contentType` | `string` | Image MIME type (e.g. `image/png`) |
+
+```javascript
+await client.recordings().updateRecordingBanner('studio123', 'rec456', bytes, 'image/png');
+```
+
+```rust
+client.recordings().update_recording_banner("studio123", "rec456", bytes, "image/png").await?;
+```
+
+**Returns:** `void` / `()`
+
+---
+
 ### getRecordingStems / get_recording_stems
 
 Get stem information for a recording (individual audio tracks).
@@ -304,7 +354,7 @@ const stems = await client.recordings().getRecordingStems('studio123', 'rec456')
 let stems = client.recordings().get_recording_stems("studio123", "rec456").await?;
 ```
 
-**Returns:** `StemInfo[]`
+**Returns:** `StemSummary`
 
 ---
 

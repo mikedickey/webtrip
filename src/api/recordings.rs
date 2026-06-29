@@ -21,6 +21,18 @@ fn recording_like_path(recording_id: &str) -> String {
     format!("/recordings/{}/likes", urlencode(recording_id))
 }
 
+fn studio_recordings_path(studio_id: &str) -> String {
+    format!("/studios/{}/recordings", urlencode(studio_id))
+}
+
+fn studio_recording_path(studio_id: &str, recording_id: &str) -> String {
+    format!(
+        "/studios/{}/recordings/{}",
+        urlencode(studio_id),
+        urlencode(recording_id)
+    )
+}
+
 impl RecordingsApi {
     /// List all public recordings
     pub async fn list_recordings(&self) -> Result<Vec<models::RecordingMetadata>, ApiError> {
@@ -81,8 +93,7 @@ impl RecordingsApi {
 
     /// Get all recordings for a studio
     pub async fn get_studio_recordings(&self, studio_id: &str) -> Result<Vec<models::ServerRecording>, ApiError> {
-        let path = format!("/studios/{}/recordings", urlencode(studio_id));
-        self.client.get(&path).await
+        self.client.get(&studio_recordings_path(studio_id)).await
     }
 
     /// Get paginated recordings for a studio
@@ -92,7 +103,7 @@ impl RecordingsApi {
         page: Option<i32>,
         limit: Option<i32>,
     ) -> Result<models::PaginatedRecordings, ApiError> {
-        let path = format!("/studios/{}/recordings-paginated", urlencode(studio_id));
+        let path = format!("{}-paginated", studio_recordings_path(studio_id));
 
         if page.is_some() || limit.is_some() {
             self.client.get_with_query(&path, &PaginationQuery { page, limit }).await
@@ -107,8 +118,7 @@ impl RecordingsApi {
         studio_id: &str,
         recording_id: &str,
     ) -> Result<models::ServerRecording, ApiError> {
-        let path = format!("/studios/{}/recordings/{}", urlencode(studio_id), urlencode(recording_id));
-        self.client.get(&path).await
+        self.client.get(&studio_recording_path(studio_id, recording_id)).await
     }
 
     /// Update a recording for a studio
@@ -118,14 +128,39 @@ impl RecordingsApi {
         recording_id: &str,
         metadata: &models::RecordingMetadata,
     ) -> Result<models::ServerRecording, ApiError> {
-        let path = format!("/studios/{}/recordings/{}", urlencode(studio_id), urlencode(recording_id));
-        self.client.put(&path, metadata).await
+        self.client.put(&studio_recording_path(studio_id, recording_id), metadata).await
     }
 
     /// Delete a recording for a studio
     pub async fn delete_studio_recording(&self, studio_id: &str, recording_id: &str) -> Result<(), ApiError> {
-        let path = format!("/studios/{}/recordings/{}", urlencode(studio_id), urlencode(recording_id));
-        self.client.delete(&path).await
+        self.client.delete(&studio_recording_path(studio_id, recording_id)).await
+    }
+
+    /// Get a signed download URL for a studio recording.
+    ///
+    /// The returned URL can be used to download the recording as a FLAC or ZIP
+    /// file. The endpoint responds `202` while the recording is still being
+    /// transcoded and `400` if it is in progress or has been deleted.
+    pub async fn download_recording(
+        &self,
+        studio_id: &str,
+        recording_id: &str,
+    ) -> Result<models::RecordingDownload, ApiError> {
+        let path = format!("{}/download", studio_recording_path(studio_id, recording_id));
+        self.client.get(&path).await
+    }
+
+    /// Update a recording's banner image. The payload is the raw image bytes;
+    /// the endpoint responds `200` with no body.
+    pub async fn update_recording_banner(
+        &self,
+        studio_id: &str,
+        recording_id: &str,
+        image: Vec<u8>,
+        content_type: &str,
+    ) -> Result<(), ApiError> {
+        let path = format!("{}/banner", studio_recording_path(studio_id, recording_id));
+        self.client.put_bytes(&path, image, content_type).await
     }
 
     /// Get the stem summary for a recording
@@ -134,7 +169,7 @@ impl RecordingsApi {
         studio_id: &str,
         recording_id: &str,
     ) -> Result<models::StemSummary, ApiError> {
-        let path = format!("/studios/{}/recordings/{}/stems", urlencode(studio_id), urlencode(recording_id));
+        let path = format!("{}/stems", studio_recording_path(studio_id, recording_id));
         self.client.get(&path).await
     }
 
@@ -254,6 +289,26 @@ impl RecordingsApi {
     #[wasm_bindgen(js_name = deleteStudioRecording)]
     pub async fn delete_studio_recording_js(&self, studio_id: String, recording_id: String) -> Result<(), ApiError> {
         self.delete_studio_recording(&studio_id, &recording_id).await
+    }
+
+    #[wasm_bindgen(js_name = downloadRecording)]
+    pub async fn download_recording_js(
+        &self,
+        studio_id: String,
+        recording_id: String,
+    ) -> Result<models::RecordingDownload, ApiError> {
+        self.download_recording(&studio_id, &recording_id).await
+    }
+
+    #[wasm_bindgen(js_name = updateRecordingBanner)]
+    pub async fn update_recording_banner_js(
+        &self,
+        studio_id: String,
+        recording_id: String,
+        image: Vec<u8>,
+        content_type: String,
+    ) -> Result<(), ApiError> {
+        self.update_recording_banner(&studio_id, &recording_id, image, &content_type).await
     }
 
     #[wasm_bindgen(js_name = getRecordingStems)]
@@ -450,12 +505,12 @@ mod tests {
             "GET",
             "/studios/st1/recordings",
             200,
-            r#"[{"id":"rec1","studioId":"st1"}]"#,
+            r#"[{"id":"rec1","serverId":"st1"}]"#,
         )
         .await;
 
         let result = api(&client).get_studio_recordings("st1").await.unwrap();
-        assert_eq!(result[0].studio_id, Some("st1".to_string()));
+        assert_eq!(result[0].server_id, Some("st1".to_string()));
         mock.assert_async().await;
     }
 
@@ -507,13 +562,15 @@ mod tests {
             "GET",
             "/studios/st1/recordings/rec1",
             200,
-            r#"{"id":"rec1","hasStems":true}"#,
+            r#"{"id":"rec1","serverId":"st1","sessionId":"sess1","ownerId":"u1"}"#,
         )
         .await;
 
         let rec = api(&client).get_studio_recording("st1", "rec1").await.unwrap();
         assert_eq!(rec.metadata.id, Some("rec1".to_string()));
-        assert_eq!(rec.has_stems, Some(true));
+        assert_eq!(rec.server_id, Some("st1".to_string()));
+        assert_eq!(rec.session_id, Some("sess1".to_string()));
+        assert_eq!(rec.owner_id, Some("u1".to_string()));
         mock.assert_async().await;
     }
 
@@ -544,6 +601,70 @@ mod tests {
         let mock = mock_empty(&mut server, "DELETE", "/studios/st1/recordings/rec1", 204).await;
 
         api(&client).delete_studio_recording("st1", "rec1").await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_download_recording_success() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/st1/recordings/rec1/download",
+            200,
+            r#"{"url":"https://storage.example.com/rec1.flac?token=abc"}"#,
+        )
+        .await;
+
+        let result = api(&client).download_recording("st1", "rec1").await.unwrap();
+        assert_eq!(
+            result.url,
+            Some("https://storage.example.com/rec1.flac?token=abc".to_string())
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_download_recording_error() {
+        let (mut server, client) = mock_api().await;
+        // Spec: 400 when the recording is in progress or has been deleted.
+        let mock = mock_json(
+            &mut server,
+            "GET",
+            "/studios/st1/recordings/rec1/download",
+            400,
+            "in progress",
+        )
+        .await;
+
+        let err = api(&client).download_recording("st1", "rec1").await.unwrap_err();
+        assert_http_status(err, 400);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_recording_banner_success() {
+        // Spec: PUT .../banner uploads raw image bytes, 200 no body.
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "PUT", "/studios/st1/recordings/rec1/banner", 200).await;
+
+        api(&client)
+            .update_recording_banner("st1", "rec1", b"\x89PNG\r\n".to_vec(), "image/png")
+            .await
+            .unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_recording_banner_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "PUT", "/studios/st1/recordings/rec1/banner", 403).await;
+
+        let err = api(&client)
+            .update_recording_banner("st1", "rec1", b"img".to_vec(), "image/png")
+            .await
+            .unwrap_err();
+        assert_http_status(err, 403);
         mock.assert_async().await;
     }
 
@@ -640,13 +761,14 @@ mod tests {
             "GET",
             "/users/u1/recordings/quota",
             200,
-            r#"{"used":1000,"limit":5000,"count":3}"#,
+            r#"{"privateRecordings":{"count":3,"limit":10}}"#,
         )
         .await;
 
         let quota = api(&client).get_recordings_quota("u1").await.unwrap();
-        assert_eq!(quota.used, Some(1000));
-        assert_eq!(quota.count, Some(3));
+        let private = quota.private_recordings.expect("privateRecordings present");
+        assert_eq!(private.count, Some(3));
+        assert_eq!(private.limit, Some(10));
         mock.assert_async().await;
     }
 }
