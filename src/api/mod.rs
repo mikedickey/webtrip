@@ -43,6 +43,7 @@ pub mod events;
 pub mod recordings;
 pub mod streams;
 pub mod studios;
+pub mod subscriptions;
 pub mod system;
 pub mod tracks;
 pub mod users;
@@ -226,6 +227,12 @@ impl ApiClient {
     #[wasm_bindgen]
     pub fn recordings(&self) -> recordings::RecordingsApi {
         recordings::RecordingsApi::from_client(self)
+    }
+
+    /// Get the Subscriptions (studio memberships) API
+    #[wasm_bindgen]
+    pub fn subscriptions(&self) -> subscriptions::SubscriptionsApi {
+        subscriptions::SubscriptionsApi::from_client(self)
     }
 
     /// Get the Backing Tracks API
