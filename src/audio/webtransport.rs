@@ -123,6 +123,54 @@ fn wasm_module_url(origin: &str, pathname: &str) -> String {
     format!("{}{}pkg/webtrip.js", origin, base_path)
 }
 
+/// Assemble a human-readable error string from a worker `ErrorEvent`.
+///
+/// `ErrorEvent` properties may be undefined, null, empty, or (for a synthetic
+/// event) the wrong type, so each of `filename`/`lineno`/`message` is read
+/// defensively via `Reflect` and only appended when present and meaningful. The
+/// base prefix is always included, so the result is never empty. Extracted from
+/// the worker `onerror` handler so this defensive parsing is the single source
+/// of truth and can be unit-tested with synthetic events (including ones with
+/// missing/undefined fields) without constructing a real `ErrorEvent` or worker.
+fn assemble_error_event_message(event: &JsValue) -> String {
+    let mut msg_parts = vec!["[WebTransport] Worker error".to_string()];
+
+    // filename (may be undefined/null/empty)
+    if let Ok(filename_val) = Reflect::get(event, &"filename".into()) {
+        if !filename_val.is_undefined() && !filename_val.is_null() {
+            if let Some(filename) = filename_val.as_string() {
+                if !filename.is_empty() {
+                    msg_parts.push(format!("at {}", filename));
+                }
+            }
+        }
+    }
+
+    // line number (may be undefined/null or non-positive)
+    if let Ok(lineno_val) = Reflect::get(event, &"lineno".into()) {
+        if !lineno_val.is_undefined() && !lineno_val.is_null() {
+            if let Some(lineno) = lineno_val.as_f64() {
+                if lineno > 0.0 {
+                    msg_parts.push(format!("line {}", lineno as u32));
+                }
+            }
+        }
+    }
+
+    // message (may be undefined/null/empty)
+    if let Ok(message_val) = Reflect::get(event, &"message".into()) {
+        if !message_val.is_undefined() && !message_val.is_null() {
+            if let Some(message) = message_val.as_string() {
+                if !message.is_empty() {
+                    msg_parts.push(format!("- {}", message));
+                }
+            }
+        }
+    }
+
+    msg_parts.join(" ")
+}
+
 /// Build the plain-JSON `init` message sent to the worker from the audio buffer
 /// configuration.
 ///
@@ -339,49 +387,16 @@ impl WebTransportImpl {
         let onerror_connection_reject = self.connection_promise_reject.clone();
         let on_error = Closure::wrap(Box::new(move |event: web_sys::ErrorEvent| {
             web_sys::console::error_1(&"[WebTransport] Worker error event triggered".into());
-            
+
             // Log the full error object for debugging
             web_sys::console::error_1(&event);
-            
-            // Build error message safely - ErrorEvent properties may be undefined
-            let mut msg_parts = vec!["[WebTransport] Worker error".to_string()];
-            
-            // Try to get filename (may be undefined)
-            if let Ok(filename_val) = js_sys::Reflect::get(&event, &"filename".into()) {
-                if !filename_val.is_undefined() && !filename_val.is_null() {
-                    if let Some(filename) = filename_val.as_string() {
-                        if !filename.is_empty() {
-                            msg_parts.push(format!("at {}", filename));
-                        }
-                    }
-                }
-            }
-            
-            // Try to get line number
-            if let Ok(lineno_val) = js_sys::Reflect::get(&event, &"lineno".into()) {
-                if !lineno_val.is_undefined() && !lineno_val.is_null() {
-                    if let Some(lineno) = lineno_val.as_f64() {
-                        if lineno > 0.0 {
-                            msg_parts.push(format!("line {}", lineno as u32));
-                        }
-                    }
-                }
-            }
-            
-            // Try to get message
-            if let Ok(message_val) = js_sys::Reflect::get(&event, &"message".into()) {
-                if !message_val.is_undefined() && !message_val.is_null() {
-                    if let Some(message) = message_val.as_string() {
-                        if !message.is_empty() {
-                            msg_parts.push(format!("- {}", message));
-                        }
-                    }
-                }
-            }
-            
-            let msg = msg_parts.join(" ");
+
+            // Build the error message defensively (any ErrorEvent field may be
+            // undefined). Shared with the unit tests so the parsing isn't
+            // duplicated.
+            let msg = assemble_error_event_message(event.as_ref());
             web_sys::console::error_1(&msg.clone().into());
-            
+
             if let Some(ref callback) = state_change_cb2 {
                 let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("failed"));
             }
@@ -710,6 +725,8 @@ mod tests {
 
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;
+    #[cfg(target_arch = "wasm32")]
+    use crate::test_support::{dispatch_message_event, recording_state_callback};
 
     /// Chrome (the headless test browser, v97+) exposes the `WebTransport`
     /// global, so detection must report availability — the inverse of the
@@ -923,6 +940,196 @@ mod tests {
             transport.worker.borrow().is_none(),
             "the fallback timer must terminate and clear the worker"
         );
+    }
+
+    // ── Connection-failure & graceful-teardown (main-thread handlers) ────────
+    //
+    // These cover the worker→main message/error handling the happy-path tests
+    // can't reach: the `{type:"error"}` onmessage branch, the `onerror`
+    // `ErrorEvent` handler, and the `"disconnected"` teardown branch. The
+    // handlers capture clones of the struct's shared promise-resolver / state
+    // callback `Rc`s at `create_worker()` time, so each test sets the state
+    // callback first, creates the worker, stashes synthetic pending promise
+    // resolvers, then drives the handler with a synthetic event. The worker
+    // itself never connects (no HTTP/3 server is needed) and is torn down
+    // before awaiting so the harness's async module-load failure can't fire a
+    // late callback into the (already detached) handlers.
+
+    /// Build a synthetic `{type:"error", error}` worker message payload.
+    #[cfg(target_arch = "wasm32")]
+    fn error_message_data(error: &str) -> JsValue {
+        let obj = Object::new();
+        Reflect::set(&obj, &"type".into(), &"error".into()).unwrap();
+        Reflect::set(&obj, &"error".into(), &JsValue::from_str(error)).unwrap();
+        obj.into()
+    }
+
+    /// A worker `{type:"error"}` message must reject BOTH still-pending startup
+    /// promises (the `worker_ready` gate and the `connection` promise) and fire
+    /// the state callback with `"failed"`, so a caller awaiting either promise
+    /// never hangs.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn worker_error_message_rejects_pending_promises_and_fails() {
+        let mut transport = WebTransportImpl::new().expect("construction in browser");
+
+        let (log, cb) = recording_state_callback();
+        transport.set_on_state_change(cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+
+        transport.create_worker().expect("create_worker should build the worker");
+
+        // Stash pending startup promises exactly as `connect_to_server` would.
+        let (ready_promise, _ready_resolve, ready_reject) = crate::audio::make_promise();
+        *transport.worker_ready_reject.borrow_mut() = Some(ready_reject);
+        let (conn_promise, _conn_resolve, conn_reject) = crate::audio::make_promise();
+        *transport.connection_promise_reject.borrow_mut() = Some(conn_reject);
+
+        // Deliver the synthetic worker error to the real (registered) handler.
+        let worker = transport.worker.borrow().clone().expect("worker present");
+        dispatch_message_event(worker.as_ref(), &error_message_data("boom"));
+
+        // Detach + terminate BEFORE awaiting so the harness's async module-load
+        // failure can't fire a second "failed" into the state callback.
+        teardown_worker(&transport);
+
+        let ready_err = JsFuture::from(ready_promise)
+            .await
+            .expect_err("worker_ready promise must reject");
+        assert_eq!(ready_err.as_string().as_deref(), Some("boom"));
+
+        let conn_err = JsFuture::from(conn_promise)
+            .await
+            .expect_err("connection promise must reject");
+        assert_eq!(conn_err.as_string().as_deref(), Some("boom"));
+
+        assert_eq!(
+            log.borrow().as_slice(),
+            ["failed"],
+            "a worker error must emit exactly one \"failed\" state change"
+        );
+        drop(cb);
+    }
+
+    /// A worker `ErrorEvent` must reject the pending startup promises and emit
+    /// `"failed"`, with the rejection message assembled from the event's
+    /// `message` field.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn worker_error_event_rejects_pending_promises_and_fails() {
+        let mut transport = WebTransportImpl::new().expect("construction in browser");
+
+        let (log, cb) = recording_state_callback();
+        transport.set_on_state_change(cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+
+        transport.create_worker().expect("create_worker should build the worker");
+
+        let (ready_promise, _ready_resolve, ready_reject) = crate::audio::make_promise();
+        *transport.worker_ready_reject.borrow_mut() = Some(ready_reject);
+        let (conn_promise, _conn_resolve, conn_reject) = crate::audio::make_promise();
+        *transport.connection_promise_reject.borrow_mut() = Some(conn_reject);
+
+        // Fire a real ErrorEvent carrying a message at the registered onerror.
+        let init = web_sys::ErrorEventInit::new();
+        init.set_message("kaboom");
+        let event = web_sys::ErrorEvent::new_with_event_init_dict("error", &init)
+            .expect("ErrorEvent construction should succeed");
+        let worker = transport.worker.borrow().clone().expect("worker present");
+        worker
+            .dispatch_event(&event)
+            .expect("dispatching the error event should succeed");
+
+        teardown_worker(&transport);
+
+        let ready_err = JsFuture::from(ready_promise)
+            .await
+            .expect_err("worker_ready promise must reject on ErrorEvent");
+        assert!(
+            ready_err.as_string().unwrap_or_default().contains("kaboom"),
+            "rejection should carry the assembled error message, got: {ready_err:?}"
+        );
+        let conn_err = JsFuture::from(conn_promise)
+            .await
+            .expect_err("connection promise must reject on ErrorEvent");
+        assert!(conn_err.as_string().unwrap_or_default().contains("kaboom"));
+
+        assert_eq!(log.borrow().as_slice(), ["failed"]);
+        drop(cb);
+    }
+
+    /// `assemble_error_event_message` must read `filename`/`lineno`/`message`
+    /// defensively: all three present and valid produce the full string.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn assemble_error_event_message_with_all_fields() {
+        let obj = Object::new();
+        Reflect::set(&obj, &"filename".into(), &"worker.js".into()).unwrap();
+        Reflect::set(&obj, &"lineno".into(), &JsValue::from_f64(42.0)).unwrap();
+        Reflect::set(&obj, &"message".into(), &"boom".into()).unwrap();
+
+        let msg = assemble_error_event_message(obj.as_ref());
+        assert_eq!(msg, "[WebTransport] Worker error at worker.js line 42 - boom");
+    }
+
+    /// `assemble_error_event_message` must NOT panic when fields are entirely
+    /// absent (undefined) — it falls back to just the base prefix. This is the
+    /// real-world defensive case the worker `onerror` guards against.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn assemble_error_event_message_tolerates_missing_fields() {
+        // An empty object: every field read returns `undefined`.
+        let empty = Object::new();
+        assert_eq!(
+            assemble_error_event_message(empty.as_ref()),
+            "[WebTransport] Worker error"
+        );
+
+        // Mixed: a valid message but a zero line number and an empty filename,
+        // both of which must be skipped (only meaningful parts are appended).
+        let obj = Object::new();
+        Reflect::set(&obj, &"filename".into(), &"".into()).unwrap();
+        Reflect::set(&obj, &"lineno".into(), &JsValue::from_f64(0.0)).unwrap();
+        Reflect::set(&obj, &"message".into(), &"only message".into()).unwrap();
+        assert_eq!(
+            assemble_error_event_message(obj.as_ref()),
+            "[WebTransport] Worker error - only message"
+        );
+    }
+
+    /// The graceful `"disconnected"` worker message must terminate the worker
+    /// (clearing the slot), resolve the pending `close()` promise, and emit a
+    /// `"disconnected"` (NOT `"failed"`) state change.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn disconnected_message_terminates_worker_and_resolves_close() {
+        let mut transport = WebTransportImpl::new().expect("construction in browser");
+
+        let (log, cb) = recording_state_callback();
+        transport.set_on_state_change(cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+
+        transport.create_worker().expect("create_worker should build the worker");
+
+        // Stash a pending close() resolver as Transport::close would.
+        let (close_promise, close_resolve, _close_reject) = crate::audio::make_promise();
+        *transport.close_promise_resolve.borrow_mut() = Some(close_resolve);
+
+        let worker = transport.worker.borrow().clone().expect("worker present");
+        dispatch_message_event(worker.as_ref(), &JsValue::from_str("disconnected"));
+
+        // The handler resolves the close promise; awaiting must complete.
+        JsFuture::from(close_promise)
+            .await
+            .expect("close promise must resolve on \"disconnected\"");
+
+        assert!(
+            transport.worker.borrow().is_none(),
+            "the \"disconnected\" branch must terminate and clear the worker"
+        );
+        assert_eq!(
+            log.borrow().as_slice(),
+            ["disconnected"],
+            "graceful teardown must emit \"disconnected\", never \"failed\""
+        );
+        drop(cb);
     }
 
     // --- encode_uri_component ---

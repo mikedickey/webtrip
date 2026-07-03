@@ -107,6 +107,41 @@ pub(crate) fn tick_decision(
     }
 }
 
+/// Whether a `HubSignaling` state string represents a closed/error condition.
+///
+/// `HubSignaling` reports closure as `"closed"` / `"closed:<code>"` (see
+/// `signaling.rs::set_state`/`onclose`), a failed connection as `"failed"`
+/// (`HubConnectionState::Failed`), and transport errors as `"error"`.
+/// Extracted from the `connect_to_hub` signaling callback so the
+/// connection-failure decision is the single source of truth and testable
+/// without a live WebSocket.
+pub(crate) fn signaling_state_is_closed(state: &str) -> bool {
+    state.starts_with("closed") || state == "failed" || state == "error"
+}
+
+/// Build the actionable connect-failure message for a closed signaling state.
+///
+/// Parses the optional close code from a `"closed:<code>"` state string and
+/// includes it when present (notably code 1006 ≈ TLS cert not trusted), so the
+/// caller surfaces *why* the WebSocket dropped before the SDP answer arrived.
+/// Extracted from the `connect_to_hub` signaling callback so the message wording
+/// /code-parsing is testable natively.
+pub(crate) fn signaling_close_error_message(server: &str, port: u16, state: &str) -> String {
+    let close_code: u16 = state
+        .strip_prefix("closed:")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    if close_code > 0 {
+        format!(
+            "Could not connect to {}:{} (WebSocket closed with code {}).",
+            server, port, close_code
+        )
+    } else {
+        format!("Could not connect to {}:{}.", server, port)
+    }
+}
+
 /// Data channel label for audio data
 const AUDIO_CHANNEL_LABEL: &str = "jacktrip-audio";
 
@@ -481,42 +516,33 @@ impl WebRtcTransport {
         // so we can give specific error messages — notably for code 1006 (TLS cert not trusted).
         let server_for_err = server.to_string();
         let port_for_err = port;
-        if let Some(ref callback) = self.on_state_change {
-            let callback_clone = callback.clone();
-            let reject_for_close = reject_rc.clone();
-            let signaling_state_cb = Closure::wrap(Box::new(move |state: String| {
-                let is_closed = state.starts_with("closed") || state == "error";
-                if is_closed {
-                    if let Some(reject_fn) = reject_for_close.borrow_mut().take() {
-                        // Promise still pending — WebSocket closed before connection established.
-                        // Build an actionable error message based on the close code.
-                        let close_code: u16 = state
-                            .strip_prefix("closed:")
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(0);
-
-                        let err_msg = if close_code > 0 {
-                            format!(
-                                "Could not connect to {}:{} (WebSocket closed with code {}).",
-                                server_for_err, port_for_err, close_code
-                            )
-                        } else {
-                            format!(
-                                "Could not connect to {}:{}.",
-                                server_for_err, port_for_err
-                            )
-                        };
-                        let _ = reject_fn.call1(&JsValue::NULL, &JsValue::from_str(&err_msg));
-                    } else {
-                        // Promise already resolved — connection was established and is now closing.
-                        let _ = callback_clone.call1(&JsValue::NULL, &JsValue::from_str("disconnected"));
-                    }
+        // Always install the signaling-close handler so a WebSocket that closes
+        // BEFORE the SDP answer arrives rejects the connection promise. Otherwise
+        // connect_to_hub() would await the promise forever whenever no state-change
+        // observer is registered. Only the post-connection "disconnected" notification
+        // depends on on_state_change.
+        let reject_for_close = reject_rc.clone();
+        let state_callback_for_close = self.on_state_change.clone();
+        let signaling_state_cb = Closure::wrap(Box::new(move |state: String| {
+            if signaling_state_is_closed(&state) {
+                if let Some(reject_fn) = reject_for_close.borrow_mut().take() {
+                    // Promise still pending — WebSocket closed before connection
+                    // established. Surface an actionable, code-aware error.
+                    let err_msg = signaling_close_error_message(
+                        &server_for_err,
+                        port_for_err,
+                        &state,
+                    );
+                    let _ = reject_fn.call1(&JsValue::NULL, &JsValue::from_str(&err_msg));
+                } else if let Some(ref callback) = state_callback_for_close {
+                    // Promise already resolved — connection was established and is now closing.
+                    let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("disconnected"));
                 }
-            }) as Box<dyn FnMut(String)>);
-            
-            signaling.set_on_state_change(signaling_state_cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
-            signaling_state_cb.forget(); // Keep callback alive
-        }
+            }
+        }) as Box<dyn FnMut(String)>);
+
+        signaling.set_on_state_change(signaling_state_cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        signaling_state_cb.forget(); // Keep callback alive
         
         self.signaling = Some(signaling);
 
@@ -1384,6 +1410,60 @@ mod tests {
         );
     }
 
+    // ── Signaling-close connect-failure decision (pure) ──────────────────────
+    //
+    // The `connect_to_hub` signaling callback's "did the WebSocket drop before
+    // the answer arrived, and what should we tell the user" decision, extracted
+    // so it is testable without a live WebSocket.
+
+    #[test]
+    fn signaling_state_is_closed_recognizes_closed_and_error() {
+        assert!(signaling_state_is_closed("closed"));
+        assert!(signaling_state_is_closed("closed:1006"));
+        assert!(signaling_state_is_closed("closed:1000"));
+        // "failed" is HubConnectionState::Failed's string form (signaling.rs
+        // set_state) — a terminal pre-answer state connect_to_hub must not wait on.
+        assert!(signaling_state_is_closed("failed"));
+        assert!(signaling_state_is_closed("error"));
+    }
+
+    #[test]
+    fn signaling_state_is_closed_ignores_live_states() {
+        for live in ["connecting", "handshaking", "negotiating", "connected", "disconnected"] {
+            assert!(
+                !signaling_state_is_closed(live),
+                "{live} must not be treated as a closed/error state"
+            );
+        }
+    }
+
+    #[test]
+    fn signaling_close_error_message_includes_close_code() {
+        // A "closed:1006" state (TLS cert not trusted, typically) carries the
+        // numeric code through into the actionable message.
+        assert_eq!(
+            signaling_close_error_message("hub.example.com", 4464, "closed:1006"),
+            "Could not connect to hub.example.com:4464 (WebSocket closed with code 1006).",
+        );
+    }
+
+    #[test]
+    fn signaling_close_error_message_omits_missing_or_zero_code() {
+        // No code (bare "closed" / "error") falls back to the code-less wording.
+        let expected = "Could not connect to hub.example.com:4464.";
+        assert_eq!(signaling_close_error_message("hub.example.com", 4464, "closed"), expected);
+        assert_eq!(signaling_close_error_message("hub.example.com", 4464, "error"), expected);
+        // A malformed/zero code is treated as "no usable code".
+        assert_eq!(
+            signaling_close_error_message("hub.example.com", 4464, "closed:notacode"),
+            expected,
+        );
+        assert_eq!(
+            signaling_close_error_message("hub.example.com", 4464, "closed:0"),
+            expected,
+        );
+    }
+
     // ── Browser tests (web_sys / WebRTC) ─────────────────────────────────────
     //
     // These exercise the real WebRTC glue against `web_sys` types and run in
@@ -1815,5 +1895,59 @@ mod tests {
             transport.on_message_closure.is_some(),
             "client-created channel onmessage handler must be registered"
         );
+    }
+
+    // ── Connect-failure paths (web_sys, no live hub) ─────────────────────────
+    //
+    // These reach the genuinely browser-only failure surface the native
+    // decision tests above can't: the `preflight_signaling_tls` best-effort
+    // probe and the `connect_to_hub` signaling-failure branch (WebSocket can't
+    // open → close → reject the pending connection promise). Both point at an
+    // unreachable loopback endpoint so they need no live JackTrip hub and settle
+    // quickly (connection refused), exercising the error paths that, when
+    // broken, would hang the UI instead of surfacing an error.
+
+    /// `preflight_signaling_tls` is best-effort and must never fail the connect
+    /// flow: awaiting it against an unreachable host simply completes (the fetch
+    /// rejection is swallowed and logged), proving the warn/Err branch is safe.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn preflight_signaling_tls_completes_against_unreachable_host() {
+        preflight_signaling_tls("127.0.0.1", 1).await;
+    }
+
+    /// Driving the real `connect_to_hub` at an unreachable signaling endpoint
+    /// exercises the connect-failure branch end-to-end: the SDP offer + data
+    /// channel are built locally, the TLS pre-flight fails quietly, then the
+    /// `wss://` WebSocket cannot open and closes — the signaling callback
+    /// rejects the still-pending connection promise so `connect_to_hub` returns
+    /// `Err` (rather than hanging). The state callback must never report
+    /// `"connected"`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn webrtc_connect_to_hub_rejects_against_unreachable_signaling() {
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+
+        // The signaling close→reject wiring only arms when a state callback is set.
+        let (log, cb) = recording_state_callback();
+        Transport::set_on_state_change(
+            &mut transport,
+            cb.as_ref().unchecked_ref::<js_sys::Function>().clone(),
+        );
+
+        let result = transport
+            .connect_to_hub("127.0.0.1", 1, "webtrip-fail-test")
+            .await;
+        assert!(
+            result.is_err(),
+            "connect_to_hub must reject when signaling cannot open"
+        );
+        assert!(
+            !log.borrow().iter().any(|s| s == "connected"),
+            "a failed connect must never report \"connected\", got: {:?}",
+            log.borrow()
+        );
+        drop(cb);
     }
 }
