@@ -32,6 +32,14 @@
 //   INTEGRATION_COVERAGE    if set, dump LLVM coverage to coverage/integration.profraw
 //                           (requires a `build:wasm:coverage` build)
 //   PUPPETEER_EXECUTABLE_PATH  Chrome/Chromium binary (auto-detected otherwise)
+//
+// Failure-case mode (opt-in, kept OFF by default so it can't flake the
+// happy-path assertion run — see the T30 guardrail):
+//   INTEGRATION_FAILURE_CASE=1   run ONLY the connect-failure check (and skip
+//                                the happy path; no live JackTrip server needed)
+//   FAILURE_TRANSPORT            transport to drive in failure mode (default webrtc)
+//   FAILURE_HOST / FAILURE_PORT  the unreachable/garbage endpoint
+//                                (default 127.0.0.1 : 1)
 
 import net from "node:net";
 import fs from "node:fs";
@@ -55,6 +63,22 @@ const TRANSPORTS = (process.env.INTEGRATION_TRANSPORTS || "webrtc,webtransport")
 // Per-transport budgets (ms).
 const CONNECT_TIMEOUT_MS = 30_000;
 const SEND_POLL_MS = 10_000;
+
+// Opt-in connect-failure mode (see the env-knobs header). Gated so the primary
+// run is unaffected: when set, we run ONLY the failure check.
+const FAILURE_CASE = ["1", "true", "yes"].includes(
+  (process.env.INTEGRATION_FAILURE_CASE || "").toLowerCase(),
+);
+const FAILURE_TRANSPORT = process.env.FAILURE_TRANSPORT || "webrtc";
+const FAILURE_HOST = process.env.FAILURE_HOST || "127.0.0.1";
+// A normal, almost-certainly-closed high port: connection is refused fast (and,
+// unlike Chrome's "unsafe" low ports e.g. 1, the wss:// attempt actually runs
+// and closes with code 1006, so the connect rejects promptly rather than only
+// via the outer timeout).
+const FAILURE_PORT = parseInt(process.env.FAILURE_PORT || "48462", 10);
+// The unreachable endpoint refuses fast; cap the wait well under the happy-path
+// budget so a hung connect surfaces as a failure rather than stalling the job.
+const FAILURE_CONNECT_TIMEOUT_MS = 20_000;
 
 /** Print an error and mark the process as failed (without exiting immediately). */
 function fail(msg) {
@@ -159,6 +183,11 @@ async function inPageDrive({ transportName, host, port, connectTimeoutMs, sendPo
         timer = setTimeout(() => rej(new Error("connect timeout")), connectTimeoutMs);
       }),
     ]);
+  } catch (err) {
+    // Tag failures that come from the connect phase so the failure-case check
+    // can tell an expected connect rejection apart from an unrelated setup/init
+    // error (transport lookup, WASM init, etc.), which must NOT pass as success.
+    throw new Error(`connect-failed: ${(err && err.message) || err}`);
   } finally {
     clearTimeout(timer);
   }
@@ -226,6 +255,56 @@ async function inPageDumpCoverage() {
 }
 
 /**
+ * Connect-failure check (opt-in). Drives one transport at an unreachable/garbage
+ * endpoint via the same `inPageDrive` and asserts the connect REJECTS within the
+ * timeout (so the UI surfaces an error instead of hanging). Reuses the served
+ * page; needs no live JackTrip server. Sets a non-zero exit code on a wrong
+ * outcome (connect unexpectedly resolved / reported connected).
+ */
+async function runFailureCase(page) {
+  console.log(
+    `\n── failure-case (${FAILURE_TRANSPORT} → ${FAILURE_HOST}:${FAILURE_PORT}) ─────`,
+  );
+  let result;
+  try {
+    result = await page.evaluate(inPageDrive, {
+      transportName: FAILURE_TRANSPORT,
+      host: FAILURE_HOST,
+      port: FAILURE_PORT,
+      connectTimeoutMs: FAILURE_CONNECT_TIMEOUT_MS,
+      sendPollMs: 0,
+    });
+  } catch (err) {
+    // Only a failure from the connect phase counts as the expected outcome.
+    // Unrelated setup/page errors (transport lookup, WASM init, a synchronous
+    // throw from connectToStudio) must NOT be swallowed as success — surface
+    // them so a broken harness/build can't masquerade as a passing failure case.
+    const msg = (err && err.message) || String(err);
+    if (msg.includes("connect-failed:")) {
+      console.log(`✅ failure-case: connect rejected as expected: ${msg}`);
+      return;
+    }
+    fail(`failure-case: unexpected error before the connect attempt: ${msg}`);
+    throw err;
+  }
+
+  if (result && result.skipped) {
+    fail(`failure-case: ${FAILURE_TRANSPORT} could not run (${result.reason})`);
+  } else if (result && result.connected) {
+    fail(
+      `failure-case: expected connect to ${FAILURE_HOST}:${FAILURE_PORT} to fail, ` +
+        `but the transport reported connected`,
+    );
+  } else {
+    fail(
+      `failure-case: expected connect to ${FAILURE_HOST}:${FAILURE_PORT} to reject, ` +
+        `but it resolved without connecting: ${JSON.stringify(result)}`,
+    );
+  }
+  throw new Error("failure-case did not reject as expected");
+}
+
+/**
  * Serve the app, drive each requested transport against the live JackTrip
  * server in a headless browser, and assert connect + send-path. Sets a non-zero
  * exit code (via `fail`/throw) on any failure.
@@ -252,8 +331,12 @@ async function main() {
   try {
     await waitForPort("127.0.0.1", APP_PORT, 15_000);
 
-    console.log(`▶ verifying JackTrip server at ${JT_HOST}:${JT_PORT}`);
-    await waitForPort(JT_HOST, JT_PORT, 30_000);
+    // The failure-case run points at an unreachable endpoint on purpose, so it
+    // must NOT wait for a live JackTrip server (there may be none).
+    if (!FAILURE_CASE) {
+      console.log(`▶ verifying JackTrip server at ${JT_HOST}:${JT_PORT}`);
+      await waitForPort(JT_HOST, JT_PORT, 30_000);
+    }
 
     browser = await puppeteer.launch({
       executablePath: resolveChrome(),
@@ -274,6 +357,14 @@ async function main() {
     const appUrl = `http://${APP_HOST}:${APP_PORT}/`;
     console.log(`▶ loading ${appUrl}`);
     await page.goto(appUrl, { waitUntil: "load", timeout: 30_000 });
+
+    // Opt-in: run ONLY the connect-failure check, then stop (kept separate from
+    // the happy-path assertions so it can't destabilize them).
+    if (FAILURE_CASE) {
+      await runFailureCase(page);
+      console.log("\n✅ failure-case passed");
+      return;
+    }
 
     let anyFailed = false;
     for (const transportName of TRANSPORTS) {

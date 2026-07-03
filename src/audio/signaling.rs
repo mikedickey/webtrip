@@ -896,15 +896,12 @@ mod tests {
     }
 
     /// Construct a synthetic text `MessageEvent` and dispatch it to the socket,
-    /// which invokes the registered `onmessage` handler synchronously.
+    /// which invokes the registered `onmessage` handler synchronously. Thin
+    /// wrapper over the shared [`crate::test_support::dispatch_message_event`]
+    /// so the event construction isn't duplicated.
     #[cfg(target_arch = "wasm32")]
     fn dispatch_text_message(ws: &WebSocket, data: &str) {
-        let init = web_sys::MessageEventInit::new();
-        init.set_data(&JsValue::from_str(data));
-        let event = web_sys::MessageEvent::new_with_event_init_dict("message", &init)
-            .expect("MessageEvent construction should succeed");
-        ws.dispatch_event(&event)
-            .expect("dispatching the message event should succeed");
+        crate::test_support::dispatch_message_event(ws.as_ref(), &JsValue::from_str(data));
     }
 
     /// `new()` with a non-ASCII client name must percent-encode the name via the
