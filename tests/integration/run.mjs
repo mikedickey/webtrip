@@ -5,12 +5,12 @@
 // WebTransport worker loads the wasm module from `{origin}/pkg/webtrip.js`
 // (see `src/audio/webtransport.rs::wasm_module_url`), which only resolves when
 // the page is served at the site root with `pkg/` present. So we serve the real
-// app via `server.js`, point a headless browser at it, and run each transport
+// app via `website/server.js`, point a headless browser at it, and run each transport
 // through the actual exported session API
 // (`createAudioParams` → `WebTripSession` → `connectToStudio`).
 //
 // The page is served over plain HTTP on `localhost` — a "secure context" in
-// Chrome — so with the COOP/COEP headers `server.js` already sets we still get
+// Chrome — so with the COOP/COEP headers `website/server.js` already sets we still get
 // `crossOriginIsolated` (SharedArrayBuffer) and WebTransport. No cert is needed
 // for the page server. The only thing that needs the trusted `*.miked.io` cert
 // is the JackTrip server itself: the browser validates it on the
@@ -137,9 +137,10 @@ function waitForPort(host, port, timeoutMs) {
 async function inPageDrive({ transportName, host, port, connectTimeoutMs, sendPollMs }) {
   const m = await import("/pkg/webtrip.js");
 
-  // The served app (dist/app.js) normally initializes the wasm module. If it
-  // hasn't (e.g. dist not built), initialize it here. Probe before init to avoid
-  // a redundant second instantiation.
+  // The demo page (the SPA's /demo route) normally initializes the wasm
+  // module. If it hasn't (e.g. mic permission denied before device setup),
+  // initialize it here. Probe before init to avoid a redundant second
+  // instantiation.
   let ready = false;
   try {
     m.createAudioParams();
@@ -316,13 +317,19 @@ async function main() {
   if (!fs.existsSync(path.join(REPO_ROOT, "pkg", "webtrip.js"))) {
     throw new Error("pkg/webtrip.js missing — run `npm run build` first.");
   }
+  // The SPA build must exist: without it the demo route 404s, and the 404
+  // response carries no COOP/COEP headers, so the page never becomes
+  // crossOriginIsolated.
+  if (!fs.existsSync(path.join(REPO_ROOT, "website", "dist", "index.html"))) {
+    throw new Error("website/dist missing — run `npm run build:site` first.");
+  }
 
   // Serve the real app over plain HTTP on localhost (a secure context, so
-  // server.js's COOP/COEP still yield crossOriginIsolated + WebTransport). No
+  // website/server.js's COOP/COEP still yield crossOriginIsolated + WebTransport). No
   // cert needed here — only the JackTrip server needs a browser-trusted cert.
   // server.js reads PORT, so APP_PORT is honored.
   console.log(`▶ starting app server on http://${APP_HOST}:${APP_PORT}`);
-  const server = spawn("node", ["server.js"], {
+  const server = spawn("node", ["website/server.js"], {
     cwd: REPO_ROOT,
     stdio: "inherit",
     env: { ...process.env, PORT: String(APP_PORT) },
@@ -354,7 +361,7 @@ async function main() {
     page.on("console", (msg) => console.log(`  [page:${msg.type()}] ${msg.text()}`));
     page.on("pageerror", (err) => console.log(`  [page:error] ${err.message}`));
 
-    const appUrl = `http://${APP_HOST}:${APP_PORT}/`;
+    const appUrl = `http://${APP_HOST}:${APP_PORT}/demo`;
     console.log(`▶ loading ${appUrl}`);
     await page.goto(appUrl, { waitUntil: "load", timeout: 30_000 });
 

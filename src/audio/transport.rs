@@ -201,7 +201,8 @@ mod tests {
 
     #[test]
     fn transport_type_id_covers_all_variants() {
-        // Pins a cross-language contract: src/app.ts hardcodes these id strings.
+        // Pins a cross-language contract: the demo UI
+        // (website/src/pages/demo/Demo.tsx) hardcodes these id strings.
         assert_eq!(TransportType::WebRTC.id(), "webrtc");
         assert_eq!(TransportType::WebTransport.id(), "webtransport");
     }

@@ -26,7 +26,7 @@ WebTrip uses a multi-threaded architecture with WebAssembly for high-performance
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                     Main Thread (TypeScript)                     │
-│                          src/app.ts                              │
+│                   website/src (React demo UI)                    │
 │                                                                   │
 │  • UI rendering and interaction                                  │
 │  • Device selection and configuration                            │
@@ -81,7 +81,7 @@ WebTrip uses a multi-threaded architecture with WebAssembly for high-performance
 
 ### Component Summary
 
-- **Frontend Layer** (`src/app.ts`): TypeScript UI that manages user interactions, device selection, and WebRTC signaling
+- **Frontend Layer** (`website/src/pages/demo/`): React demo UI that manages user interactions, device selection, and WebRTC signaling
 - **Session Layer** (`src/session.rs`): Orchestrates network and audio, owns shared buffers, bridges WebRTC and AudioWorklet
 - **Audio Engine** (`src/audio/engine.rs`): Manages Web Audio API, creates AudioContext and worklet nodes
 - **Audio Processor** (`src/audio/processor.rs`): Real-time DSP processing in dedicated audio thread

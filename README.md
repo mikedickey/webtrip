@@ -25,7 +25,7 @@ Install dependencies:
 npm install
 ```
 
-Build both WASM and TypeScript:
+Build both the WASM module and the website:
 ```bash
 npm run build
 ```
@@ -33,7 +33,7 @@ npm run build
 Or build separately:
 ```bash
 npm run build:wasm  # Build Rust to WASM
-npm run build:app   # Compile TypeScript UI example
+npm run build:site  # Install website deps and build the React SPA
 ```
 
 ## Running
@@ -43,9 +43,19 @@ Start a local web server:
 npm run serve
 ```
 
-Then point your browser at http://localhost:3000/
+Then point your browser at http://localhost:3000/demo for the demo app.
 
-**Note**: The application requires microphone permissions. You'll be prompted to allow microphone access when the page loads.
+**Note**: The demo requires microphone permissions. You'll be prompted to allow microphone access when the page loads.
+
+## Website
+
+The [webtrip.dev](https://webtrip.dev) website lives in [website/](website/): a React SPA
+(Vite) with the demo embedded at `/demo` and a docs page at `/docs`. The demo loads the
+wasm-pack output at runtime from `/pkg/`, which `website/server.js` serves from the repo
+root alongside the built site.
+
+For website development with hot reload, run `npm run dev` inside `website/`
+(the demo also works there once the repo-root `npm run build:wasm` has produced `pkg/`).
 
 ## Browser Compatibility
 

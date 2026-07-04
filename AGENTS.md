@@ -16,11 +16,11 @@ This applies equally to test helpers, serialization utilities, fixture builders,
 
 **Always use npm scripts for building, never call wasm-pack directly** — the WASM build requires specific flags for threading support (atomics, shared memory, TLS exports).
 
-- `npm run build` — Build both WASM and TypeScript
+- `npm run build` — Build the WASM module and the React website
 - `npm run build:wasm` — Build only the Rust WASM module
-- `npm run build:app` — Build only the TypeScript app (`tsc`)
-- `npm run clean` — Remove dist/, pkg/, and target/
-- `npm run serve` — Start dev server (HTTP :3000 or HTTPS :8443 with TLS)
+- `npm run build:site` — Install deps and build the React website into website/dist
+- `npm run clean` — Remove pkg/, target/, and website/dist/
+- `npm run serve` — Serve the website + demo (HTTP :3000 or HTTPS :8443 with TLS)
 
 **Never run `cargo check` or `cargo test` directly** — they will fail because `web_sys` types like `WebTransport` are gated behind `web_sys_unstable_apis`. Use the npm scripts which pass the required flags:
 
@@ -65,8 +65,8 @@ When deleting or refactoring production code, delete its tests rather than porti
 - **`src/audio/params.rs`** — Atomic shared state for volume, gain, peaks across threads
 - **`src/api/`** — HTTP API client (reqwest) for JackTrip Virtual Studio REST API
 - **`src/models/`** — Typed data models with auto-generated TypeScript types via `tsify-next`
-- **`src/app.ts`** — TypeScript UI controller, initializes WASM, binds DOM elements
 - **`src/lib.rs`** — WASM entry point, exports `init()` and public types to JavaScript
+- **`website/`** — React SPA for webtrip.dev (Vite, own package.json); the demo lives at the `/demo` route (`website/src/pages/demo/`) and loads the wasm-pack output at runtime from `/pkg/` (unbundled — the WebTransport worker re-imports `{origin}/pkg/webtrip.js`, see `wasm_module_url`). `website/server.js` serves the built site plus repo-root `pkg/` with the COOP/COEP headers SharedArrayBuffer needs
 
 ## Rust/WASM Specifics
 

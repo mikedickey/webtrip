@@ -1,7 +1,19 @@
-const http = require('http');
-const https = require('https');
-const fs = require('fs');
-const path = require('path');
+// Static server for webtrip.dev: serves the built React site (website/dist)
+// and the demo's WASM artifacts (/pkg) from the repo root. Sets the COOP/COEP
+// headers required for SharedArrayBuffer.
+import http from 'node:http';
+import https from 'node:https';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  MIME_TYPES,
+  CROSS_ORIGIN_ISOLATION_HEADERS,
+  resolvePkgFile,
+  trailingSlashRedirectTarget
+} from './serve-common.cjs';
+
+const SITE_DIST = path.join(path.dirname(fileURLToPath(import.meta.url)), 'dist');
 
 // Parse --key and --cert arguments
 const args = process.argv.slice(2);
@@ -14,23 +26,25 @@ for (let i = 0; i < args.length; i++) {
 const useTLS = !!(keyFile && certFile);
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : (useTLS ? 8443 : 3000);
 
-const MIME_TYPES = {
-  '.html': 'text/html',
-  '.js': 'application/javascript',
-  '.wasm': 'application/wasm',
-  '.json': 'application/json',
-  '.css': 'text/css',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.gif': 'image/gif',
-  '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon'
-};
-
 const handler = (req, res) => {
-  let filePath = '.' + req.url;
-  if (filePath === './') {
-    filePath = './index.html';
+  const urlPath = path.posix.normalize(decodeURIComponent(req.url.split('?')[0]));
+  if (urlPath.includes('..')) {
+    res.writeHead(400);
+    res.end('Bad Request', 'utf-8');
+    return;
+  }
+
+  const redirect = trailingSlashRedirectTarget(urlPath);
+  if (redirect) {
+    res.writeHead(301, { Location: redirect });
+    res.end();
+    return;
+  }
+
+  let filePath = resolvePkgFile(urlPath) || path.join(SITE_DIST, urlPath === '/' ? 'index.html' : urlPath);
+  // SPA fallback: extensionless paths (e.g. /docs) are client-side routes.
+  if (!path.extname(filePath) && !fs.existsSync(filePath)) {
+    filePath = path.join(SITE_DIST, 'index.html');
   }
 
   const extname = String(path.extname(filePath)).toLowerCase();
@@ -51,8 +65,7 @@ const handler = (req, res) => {
       };
 
       if (extname === '.js' || extname === '.html') {
-        headers['Cross-Origin-Embedder-Policy'] = 'require-corp';
-        headers['Cross-Origin-Opener-Policy'] = 'same-origin';
+        Object.assign(headers, CROSS_ORIGIN_ISOLATION_HEADERS);
       }
 
       res.writeHead(200, headers);
@@ -71,4 +84,3 @@ server.listen(PORT, () => {
   const proto = useTLS ? 'https' : 'http';
   console.log(`Server running at ${proto}://localhost:${PORT}/`);
 });
-
