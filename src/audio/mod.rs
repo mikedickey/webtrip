@@ -22,6 +22,7 @@ pub mod audio_callback_loop;
 // Buffer modules
 pub mod ring_buffer;
 pub mod regulator;
+pub mod shared_ptr;
 
 // JackTrip protocol modules
 pub mod protocol;

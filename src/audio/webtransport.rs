@@ -183,8 +183,8 @@ fn assemble_error_event_message(event: &JsValue) -> String {
 fn build_worker_init_message(buffers: &AudioBufferConfig) -> serde_json::Value {
     serde_json::json!({
         "type": "init",
-        "ringBufferPtr": buffers.local_to_network_ptr as usize as f64,
-        "regulatorPtr": buffers.network_to_local_ptr as usize as f64,
+        "ringBufferPtr": buffers.local_to_network.addr() as f64,
+        "regulatorPtr": buffers.network_to_local.addr() as f64,
         "bufferSize": buffers.buffer_size as f64,
         "channels": buffers.channels as f64,
     })
@@ -707,8 +707,7 @@ impl Drop for WebTransportImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::ring_buffer::RingBuffer;
-    use crate::audio::regulator::Regulator;
+    use crate::audio::shared_ptr::SharedPtr;
 
     // ── Browser feature detection (web_sys) ──────────────────────────────────
     //
@@ -812,8 +811,8 @@ mod tests {
         // Null buffer pointers: they are only serialized as numbers into the
         // message and never dereferenced (no worker is created or posted to).
         transport.audio_buffers = Some(AudioBufferConfig {
-            local_to_network_ptr: std::ptr::null_mut::<RingBuffer>(),
-            network_to_local_ptr: std::ptr::null_mut::<Regulator>(),
+            local_to_network: SharedPtr::null(),
+            network_to_local: SharedPtr::null(),
             buffer_size: 128,
             channels: 2,
         });
@@ -1145,8 +1144,8 @@ mod tests {
     #[test]
     fn worker_init_message_has_expected_fields() {
         let config = AudioBufferConfig {
-            local_to_network_ptr: 0x1000 as *mut RingBuffer,
-            network_to_local_ptr: 0x2000 as *mut Regulator,
+            local_to_network: SharedPtr::from_addr(0x1000),
+            network_to_local: SharedPtr::from_addr(0x2000),
             buffer_size: 128,
             channels: 2,
         };

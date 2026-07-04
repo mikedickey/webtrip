@@ -6,6 +6,7 @@
 //! Note: Receiving is handled directly by the LockFreeJitterBuffer,
 //! which the worklet reads from directly - no intermediate buffer needed!
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use wasm_bindgen::prelude::*;
 
@@ -19,9 +20,20 @@ const RING_BUFFER_SIZE: usize = 4096;
 ///   Main thread: Atomics.waitAsync() -> read() -> WebRTC send
 #[wasm_bindgen]
 pub struct RingBuffer {
-    /// Ring buffer for audio going TO the network (local mic -> network)
-    buffer: Vec<f32>,
-    
+    /// Ring buffer for audio going TO the network (local mic -> network).
+    ///
+    /// Each sample sits in a [`Cell`] so `write`/`read` can take `&self` rather
+    /// than `&mut self`. That matters because the producer (AudioWorklet) and
+    /// consumer (main-thread tick) reach this buffer concurrently through a
+    /// shared pointer: a `&mut self` API would force both sides to materialise a
+    /// `&mut RingBuffer` to the *same* object, which is aliasing UB even though
+    /// they touch disjoint regions. With `&self` + interior mutability both sides
+    /// hold a freely-aliasable `&RingBuffer` instead. Producer and consumer only
+    /// ever touch disjoint indices — the range they write/read is bounded by the
+    /// `write_pos`/`read_pos` gap — and those positions are published with
+    /// Acquire/Release ordering, so no two threads access the same `Cell` at once.
+    buffer: Vec<Cell<f32>>,
+
     /// Write position (worklet writes, main thread reads)
     write_pos: AtomicU32,
     /// Read position (main thread updates after reading)
@@ -50,7 +62,7 @@ impl RingBuffer {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
         Self {
-            buffer: vec![0.0; RING_BUFFER_SIZE],
+            buffer: vec![Cell::new(0.0); RING_BUFFER_SIZE],
             write_pos: AtomicU32::new(0),
             read_pos: AtomicU32::new(0),
             overruns: AtomicU64::new(0),
@@ -117,7 +129,7 @@ impl RingBuffer {
     /// 
     /// After writing, sets the has_data_flag to signal waiting threads.
     /// AudioWorklet should call Atomics.notify() after this returns true.
-    pub fn write(&mut self, samples: &[f32]) -> bool {
+    pub fn write(&self, samples: &[f32]) -> bool {
         if !self.is_streaming() {
             return false;
         }
@@ -136,7 +148,7 @@ impl RingBuffer {
         let start = (write_pos as usize) % RING_BUFFER_SIZE;
         for (i, &sample) in samples.iter().enumerate() {
             let idx = (start + i) % RING_BUFFER_SIZE;
-            self.buffer[idx] = sample;
+            self.buffer[idx].set(sample);
         }
 
         self.write_pos.store(
@@ -160,12 +172,12 @@ impl RingBuffer {
     /// 
     /// Clears the has_data_flag when buffer becomes empty,
     /// allowing the main thread to sleep via Atomics.waitAsync().
-    pub fn read(&mut self, output: &mut [f32]) -> bool {
+    pub fn read(&self, output: &mut [f32]) -> bool {
         let write_pos = self.write_pos.load(Ordering::Acquire);
         let read_pos = self.read_pos.load(Ordering::Acquire);
-        
+
         let available = write_pos.wrapping_sub(read_pos) as usize;
-        
+
         if available < output.len() {
             output.fill(0.0);
             // No data available - clear flag so main thread can sleep
@@ -176,7 +188,7 @@ impl RingBuffer {
         let start = (read_pos as usize) % RING_BUFFER_SIZE;
         for (i, sample) in output.iter_mut().enumerate() {
             let idx = (start + i) % RING_BUFFER_SIZE;
-            *sample = self.buffer[idx];
+            *sample = self.buffer[idx].get();
         }
 
         self.read_pos.store(
@@ -195,8 +207,10 @@ impl RingBuffer {
     }
 
     /// Clear the buffer
-    pub fn clear(&mut self) {
-        self.buffer.fill(0.0);
+    pub fn clear(&self) {
+        for slot in &self.buffer {
+            slot.set(0.0);
+        }
         self.write_pos.store(0, Ordering::SeqCst);
         self.read_pos.store(0, Ordering::SeqCst);
     }
@@ -241,7 +255,7 @@ mod tests {
 
     #[test]
     fn push_pop_roundtrip_preserves_values() {
-        let mut rb = streaming_buffer();
+        let rb = streaming_buffer();
         let input = [0.1, -0.2, 0.3, -0.4, 0.5];
 
         assert!(rb.write(&input));
@@ -257,7 +271,7 @@ mod tests {
 
     #[test]
     fn fill_to_capacity_then_pop_all() {
-        let mut rb = streaming_buffer();
+        let rb = streaming_buffer();
         let input: Vec<f32> = (0..RING_BUFFER_SIZE).map(|i| i as f32).collect();
 
         // Buffer holds exactly RING_BUFFER_SIZE samples.
@@ -276,7 +290,7 @@ mod tests {
 
     #[test]
     fn wrap_around_across_boundary() {
-        let mut rb = streaming_buffer();
+        let rb = streaming_buffer();
 
         // Advance both positions close to the buffer boundary so the next
         // write/read pair straddles the end of the backing Vec.
@@ -298,7 +312,7 @@ mod tests {
 
     #[test]
     fn available_invariants_under_interleaved_push_pop() {
-        let mut rb = streaming_buffer();
+        let rb = streaming_buffer();
         let mut expected_used: i64 = 0;
 
         for round in 0..1000 {
@@ -324,7 +338,7 @@ mod tests {
 
     #[test]
     fn has_data_flag_reflects_state() {
-        let mut rb = streaming_buffer();
+        let rb = streaming_buffer();
         assert_eq!(rb.has_data_flag(), 0);
 
         assert!(rb.write(&[1.0, 2.0, 3.0, 4.0]));
@@ -343,7 +357,7 @@ mod tests {
 
     #[test]
     fn write_requires_streaming() {
-        let mut rb = RingBuffer::new();
+        let rb = RingBuffer::new();
         assert!(!rb.is_streaming());
         assert!(!rb.write(&[1.0, 2.0]), "write rejected while not streaming");
         assert_eq!(rb.available(), 0);
@@ -354,7 +368,7 @@ mod tests {
 
     #[test]
     fn read_with_insufficient_data_zeros_output() {
-        let mut rb = streaming_buffer();
+        let rb = streaming_buffer();
         assert!(rb.write(&[7.0, 8.0]));
 
         // Asking for more than is available fails and zero-fills the output.
@@ -368,7 +382,7 @@ mod tests {
 
     #[test]
     fn clear_resets_positions() {
-        let mut rb = streaming_buffer();
+        let rb = streaming_buffer();
         assert!(rb.write(&[1.0, 2.0, 3.0]));
         assert_eq!(rb.available(), 3);
 
@@ -384,7 +398,7 @@ mod tests {
 
     #[test]
     fn reset_stats_zeros_counters() {
-        let mut rb = streaming_buffer();
+        let rb = streaming_buffer();
         let full: Vec<f32> = vec![0.0; RING_BUFFER_SIZE];
         assert!(rb.write(&full));
         assert!(!rb.write(&[1.0])); // force an overrun
@@ -400,27 +414,29 @@ mod tests {
 
     #[test]
     fn concurrent_producer_consumer_preserves_order() {
-        // Share one buffer across two threads via a raw pointer wrapped in an
-        // `Arc<UnsafeCell<_>>`. This mirrors real usage where the buffer lives
-        // in a SharedArrayBuffer and the producer (worklet) and consumer (main
-        // thread) touch disjoint regions of it concurrently.
-        use std::cell::UnsafeCell;
+        // Share one buffer across two threads as a plain `&RingBuffer`. This
+        // mirrors real usage where the buffer lives in a SharedArrayBuffer and
+        // the producer (worklet) and consumer (main thread) touch disjoint
+        // regions of it concurrently. Because `write`/`read` take `&self`, no
+        // `&mut` aliasing (or `UnsafeCell`) is needed — the two threads simply
+        // hold a shared reference each.
         use std::sync::Arc;
 
-        struct Shared(UnsafeCell<RingBuffer>);
+        struct Shared(RingBuffer);
         // Safe: producer touches only the write half (write_pos + tail of buffer)
         // and consumer touches only the read half (read_pos + head of buffer);
-        // both halves are synchronised through Acquire/Release atomics.
+        // both halves are synchronised through Acquire/Release atomics. `RingBuffer`
+        // is `!Sync` (its samples sit in `Cell`s), so the assertion is made here.
         unsafe impl Sync for Shared {}
 
-        let shared = Arc::new(Shared(UnsafeCell::new(streaming_buffer())));
+        let shared = Arc::new(Shared(streaming_buffer()));
 
         const CHUNK: usize = 128;
         const TOTAL: usize = CHUNK * 2000;
 
         let producer_shared = Arc::clone(&shared);
         let producer = thread::spawn(move || {
-            let rb = unsafe { &mut *producer_shared.0.get() };
+            let rb = &producer_shared.0;
             let mut next: usize = 0;
             while next < TOTAL {
                 let chunk: Vec<f32> = (next..next + CHUNK).map(|i| i as f32).collect();
@@ -432,7 +448,7 @@ mod tests {
             }
         });
 
-        let rb = unsafe { &mut *shared.0.get() };
+        let rb = &shared.0;
         let mut received: usize = 0;
         let mut out = vec![0.0; CHUNK];
         while received < TOTAL {
@@ -454,7 +470,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     fn wasm_ringbuffer_basic_operations() {
-        let mut rb = RingBuffer::new();
+        let rb = RingBuffer::new();
         rb.set_streaming(true);
         
         assert!(rb.is_streaming());

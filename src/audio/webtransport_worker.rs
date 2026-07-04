@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 use crate::audio::ring_buffer::RingBuffer;
 use crate::audio::regulator::Regulator;
+use crate::audio::shared_ptr::SharedPtr;
 use crate::audio::protocol::{AudioPacket, make_exit_packet, HEADER_SIZE, ProtocolError, PacketHeader};
 
 /// Number of interleaved samples in one outgoing audio packet for the given
@@ -214,10 +215,10 @@ fn signal_connection_lost() {
 
 /// Worker state shared between message handler and transport loops
 struct WorkerState {
-    /// Raw pointer to RingBuffer (send path: AudioWorklet -> Network)
-    ring_buffer_ptr: *mut RingBuffer,
-    /// Raw pointer to Regulator (receive path: Network -> AudioWorklet)
-    regulator_ptr: *mut Regulator,
+    /// Shared pointer to RingBuffer (send path: AudioWorklet -> Network); `&self` API.
+    ring_buffer_ptr: SharedPtr<RingBuffer>,
+    /// Shared pointer to Regulator (receive path: Network -> AudioWorklet); still `&mut`.
+    regulator_ptr: SharedPtr<Regulator>,
     /// Audio buffer configuration
     buffer_size: usize,
     channels: u8,
@@ -235,16 +236,18 @@ struct WorkerState {
     has_data_int32_array: RefCell<Option<js_sys::Int32Array>>,
 }
 
-// Safety: Worker is single-threaded in WASM, and these pointers are to SharedArrayBuffer
-// which is designed for cross-thread access with atomics
+// Safety: the buffer pointers now carry their own Send/Sync assertion via
+// `SharedPtr`. What still forces a manual impl here is the cached
+// `js_sys::Int32Array` (a `JsValue` handle, which is `!Send`/`!Sync`); it is only
+// ever touched on the single worker thread that owns this state.
 unsafe impl Send for WorkerState {}
 unsafe impl Sync for WorkerState {}
 
 impl WorkerState {
     fn new() -> Self {
         Self {
-            ring_buffer_ptr: std::ptr::null_mut(),
-            regulator_ptr: std::ptr::null_mut(),
+            ring_buffer_ptr: SharedPtr::null(),
+            regulator_ptr: SharedPtr::null(),
             buffer_size: 128,
             channels: 2,
             sequence_number: AtomicU16::new(0),
@@ -258,8 +261,8 @@ impl WorkerState {
     }
 
     fn configure(&mut self, ring_ptr: usize, reg_ptr: usize, buffer_size: usize, channels: u8) {
-        self.ring_buffer_ptr = ring_ptr as *mut RingBuffer;
-        self.regulator_ptr = reg_ptr as *mut Regulator;
+        self.ring_buffer_ptr = SharedPtr::from_addr(ring_ptr);
+        self.regulator_ptr = SharedPtr::from_addr(reg_ptr);
         self.buffer_size = buffer_size;
         self.channels = channels;
         
@@ -273,16 +276,15 @@ impl WorkerState {
         *self.samples_buffer.borrow_mut() = Vec::with_capacity(samples_per_packet);
         
         // Set up Int32Array for Atomics.wait() on the ring buffer's has_data flag
-        if !self.ring_buffer_ptr.is_null() {
-            let ring_buffer = unsafe { &*self.ring_buffer_ptr };
+        if let Some(ring_buffer) = self.ring_buffer_ptr.as_ref() {
             let flag_ptr = ring_buffer.get_has_data_flag_ptr();
-            
+
             // Create Int32Array view of the has_data flag
             // Safety: The flag is an AtomicU32 at a valid memory location in SharedArrayBuffer
             let int32_array = unsafe {
                 js_sys::Int32Array::view_mut_raw(flag_ptr as *mut i32, 1)
             };
-            
+
             *self.has_data_int32_array.borrow_mut() = Some(int32_array);
         } else {
             // No ring buffer: drop any cached view so it always tracks the
@@ -472,13 +474,11 @@ async fn send_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(), 
         let packet_data = WORKER_STATE.with(|state| {
             let state = state.borrow();
             
-            if state.ring_buffer_ptr.is_null() {
+            // Sound shared borrow: `RingBuffer`'s read path is `&self`.
+            let Some(ring_buffer) = state.ring_buffer_ptr.as_ref() else {
                 return None;
-            }
+            };
 
-            // Safety: pointer is valid and RingBuffer uses atomics
-            let ring_buffer = unsafe { &mut *state.ring_buffer_ptr };
-            
             let samples_needed = samples_per_packet(state.buffer_size, state.channels);
             if send_decision(ring_buffer.available(), samples_needed) == SendDecision::Wait {
                 return None;
@@ -705,13 +705,10 @@ async fn receive_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(
                 WORKER_STATE.with(|state| {
                     let state = state.borrow();
 
-                    // Safety: pointer is valid for the session lifetime and the
-                    // Regulator uses atomics for cross-thread access.
-                    let regulator = if state.regulator_ptr.is_null() {
-                        None
-                    } else {
-                        Some(unsafe { &mut *state.regulator_ptr })
-                    };
+                    // SAFETY: `Regulator::push` is `&mut self`; see
+                    // `SharedPtr::as_mut`. Null (init/teardown race) yields None,
+                    // so the datagram is still counted but the push is skipped.
+                    let regulator = unsafe { state.regulator_ptr.as_mut() };
                     let mut samples = state.samples_buffer.borrow_mut();
                     STATS.with(|stats| {
                         handle_datagram(&data, regulator, &mut samples, &mut stats.borrow_mut());
@@ -1105,8 +1102,8 @@ mod tests {
         let mut state = WorkerState::new();
         state.configure(ring_ptr, reg_ptr, buffer_size, channels);
 
-        assert_eq!(state.ring_buffer_ptr as usize, ring_ptr, "ring buffer pointer must be stored");
-        assert_eq!(state.regulator_ptr as usize, reg_ptr, "regulator pointer must be stored");
+        assert_eq!(state.ring_buffer_ptr.addr(), ring_ptr, "ring buffer pointer must be stored");
+        assert_eq!(state.regulator_ptr.addr(), reg_ptr, "regulator pointer must be stored");
         assert_eq!(state.buffer_size, buffer_size);
         assert_eq!(state.channels, channels);
         assert_eq!(

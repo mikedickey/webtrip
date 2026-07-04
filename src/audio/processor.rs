@@ -3,6 +3,7 @@ use std::sync::atomic::Ordering;
 use crate::audio::params::{AudioParams, MAX_DB, MIN_DB, decode_db, decode_volume, encode_db};
 use crate::audio::regulator::Regulator;
 use crate::audio::ring_buffer::RingBuffer;
+use crate::audio::shared_ptr::SharedPtr;
 
 /// Peak hold time in process calls (~48kHz / 128 samples = ~375 calls/sec)
 /// Hold peak for about 1.5 seconds
@@ -86,10 +87,12 @@ pub(crate) fn compute_peak_update(current_db: f32, peak_db: f32, hold_counter: u
 /// Handles volume metering, gain control, monitoring, and network audio
 pub struct AudioProcessor {
     params: &'static AudioParams,
-    /// Ring buffer for sending local audio to network (audio device → worklet → main thread → network)
-    local_to_network_buffer: Option<*mut RingBuffer>,
-    /// Jitter buffer for receiving audio from network (network → main thread → jitter buffer → worklet → audio device)
-    network_to_local_buffer: Option<*mut Regulator>,
+    /// Ring buffer for sending local audio to network (audio device → worklet → main thread → network).
+    /// Null when no network is attached; reached via its `&self` API through [`SharedPtr::as_ref`].
+    local_to_network_buffer: SharedPtr<RingBuffer>,
+    /// Jitter buffer for receiving audio from network (network → main thread → jitter buffer → worklet → audio device).
+    /// Null when no network is attached; still `&mut`-accessed via [`SharedPtr::as_mut`].
+    network_to_local_buffer: SharedPtr<Regulator>,
     /// Temporary buffer for gained audio (mono from mic)
     gained_buffer: Vec<f32>,
     /// Temporary buffer for remote audio (mono, after downmix)
@@ -104,8 +107,8 @@ impl AudioProcessor {
     pub fn new(params: &'static AudioParams) -> Self {
         Self {
             params,
-            local_to_network_buffer: None,
-            network_to_local_buffer: None,
+            local_to_network_buffer: SharedPtr::null(),
+            network_to_local_buffer: SharedPtr::null(),
             gained_buffer: vec![0.0; 128],
             remote_buffer: vec![0.0; 128],
             stereo_buffer: vec![0.0; 256], // 128 samples * 2 channels
@@ -118,13 +121,13 @@ impl AudioProcessor {
     /// - network_to_local_buffer: jitter buffer for receiving audio from network
     pub fn with_network(
         params: &'static AudioParams,
-        local_to_network_buffer: *mut RingBuffer,
-        network_to_local_buffer: *mut Regulator,
+        local_to_network_buffer: SharedPtr<RingBuffer>,
+        network_to_local_buffer: SharedPtr<Regulator>,
     ) -> Self {
         Self {
             params,
-            local_to_network_buffer: if local_to_network_buffer.is_null() { None } else { Some(local_to_network_buffer) },
-            network_to_local_buffer: if network_to_local_buffer.is_null() { None } else { Some(network_to_local_buffer) },
+            local_to_network_buffer,
+            network_to_local_buffer,
             gained_buffer: vec![0.0; 128],
             remote_buffer: vec![0.0; 128],
             stereo_buffer: vec![0.0; 256], // 128 samples * 2 channels
@@ -208,12 +211,12 @@ impl AudioProcessor {
 
     /// Send local audio to network via ring buffer
     fn send_local_to_network(&mut self) {
-        let Some(buffer_ptr) = self.local_to_network_buffer else {
+        // Sound shared borrow: `RingBuffer`'s write path is `&self` (interior
+        // mutability), so producer and consumer may hold `&RingBuffer` at once.
+        let Some(buffer) = self.local_to_network_buffer.as_ref() else {
             return;
         };
 
-        let buffer = unsafe { &mut *buffer_ptr };
-        
         if !buffer.is_streaming() {
             return;
         }
@@ -251,7 +254,10 @@ impl AudioProcessor {
     /// and must NOT gate playback — concealed audio is the entire point of jitter
     /// buffering and must be played to avoid clicks.
     fn receive_from_network(&mut self) {
-        let Some(buffer_ptr) = self.network_to_local_buffer else {
+        // SAFETY: `Regulator::pop` is still `&mut self`, so we take a `&mut`
+        // through `SharedPtr::as_mut`. The push side runs on the network thread;
+        // this remains the not-yet-sound path documented on `SharedPtr::as_mut`.
+        let Some(regulator) = (unsafe { self.network_to_local_buffer.as_mut() }) else {
             self.remote_buffer.fill(0.0);
             return;
         };
@@ -270,7 +276,7 @@ impl AudioProcessor {
 
             // Read stereo from jitter buffer (always populates the buffer; pop()'s bool
             // distinguishes real vs concealed but is irrelevant for mixing)
-            unsafe { (*buffer_ptr).pop(&mut self.stereo_receive_buffer) };
+            regulator.pop(&mut self.stereo_receive_buffer);
 
             // Downmix stereo to mono (average L+R)
             for i in 0..mono_len {
@@ -280,7 +286,7 @@ impl AudioProcessor {
             }
         } else {
             // Read mono directly
-            unsafe { (*buffer_ptr).pop(&mut self.remote_buffer) };
+            regulator.pop(&mut self.remote_buffer);
         }
     }
 }

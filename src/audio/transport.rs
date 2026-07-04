@@ -8,6 +8,8 @@ use std::future::Future;
 use wasm_bindgen::prelude::*;
 use web_sys;
 
+use crate::audio::shared_ptr::SharedPtr;
+
 /// Transport type selection
 #[wasm_bindgen]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,21 +63,23 @@ pub enum TransportState {
     Closed,
 }
 
-/// Audio buffer configuration passed to transports that need internal tick loops
+/// Audio buffer configuration passed to transports that need internal tick loops.
+///
+/// The buffers live in shared WASM memory owned by [`WebTripSession`]; the
+/// transport reaches them through [`SharedPtr`], which carries the `Send`/`Sync`
+/// assertion so this struct needs no hand-rolled `unsafe impl`.
 #[derive(Debug, Clone, Copy)]
 pub struct AudioBufferConfig {
-    /// Pointer to ring buffer (local-to-network)
-    pub local_to_network_ptr: *mut crate::audio::ring_buffer::RingBuffer,
-    /// Pointer to jitter buffer (network-to-local) - mutable for Regulator
-    pub network_to_local_ptr: *mut crate::audio::regulator::Regulator,
+    /// Ring buffer (local-to-network); reached via its `&self` API.
+    pub local_to_network: SharedPtr<crate::audio::ring_buffer::RingBuffer>,
+    /// Jitter buffer (network-to-local); still `&mut`-accessed via
+    /// [`SharedPtr::as_mut`].
+    pub network_to_local: SharedPtr<crate::audio::regulator::Regulator>,
     /// Buffer size in samples per channel
     pub buffer_size: usize,
     /// Number of audio channels
     pub channels: u8,
 }
-
-// Safety: These pointers are only used by the transport layer which is single-threaded in WASM
-unsafe impl Send for AudioBufferConfig {}
 
 /// Log that audio buffers have been configured on a transport
 pub(crate) fn log_audio_buffers_set(transport_name: &str, channels: u8, buffer_size: usize) {
@@ -237,5 +241,4 @@ mod tests {
         assert_eq!(transport_state_str(TransportState::Failed),       "failed");
         assert_eq!(transport_state_str(TransportState::Closed),       "closed");
     }
-
 }

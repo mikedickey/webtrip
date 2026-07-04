@@ -377,9 +377,10 @@ impl WebRtcTransport {
 
         let samples_needed = (buffers.buffer_size * buffers.channels as usize) as u32;
 
-        // Safety: We're in single-threaded WASM, and these pointers are valid
-        // for the lifetime of the session.
-        let ring_buffer = unsafe { &mut *buffers.local_to_network_ptr };
+        // Sound shared borrow: `RingBuffer`'s read path is `&self`.
+        let Some(ring_buffer) = buffers.local_to_network.as_ref() else {
+            return;
+        };
 
         // NOTE: compute `have_receive` into a local *before* the match. Temporaries
         // created in a match scrutinee live until the end of the match expression,
@@ -404,7 +405,12 @@ impl WebRtcTransport {
             }
             TickDecision::Idle => {}
             TickDecision::Process { .. } => {
-                let jitter_buffer = unsafe { &mut *buffers.network_to_local_ptr };
+                // SAFETY: `Regulator::push` is still `&mut self`; see
+                // `SharedPtr::as_mut`. Distinct object from `ring_buffer` above,
+                // so no aliasing between the two borrows.
+                let Some(jitter_buffer) = (unsafe { buffers.network_to_local.as_mut() }) else {
+                    return;
+                };
 
                 // Interleaved send/receive for better latency balance.
                 loop {
@@ -883,8 +889,8 @@ impl WebRtcTransport {
     fn close_sync(&mut self) {
         // Disable streaming on ring buffer
         if let Some(buffers) = self.audio_buffers {
-            unsafe {
-                (*buffers.local_to_network_ptr).set_streaming(false);
+            if let Some(ring_buffer) = buffers.local_to_network.as_ref() {
+                ring_buffer.set_streaming(false);
             }
         }
 
@@ -1333,6 +1339,9 @@ mod tests {
     use crate::audio::regulator::Regulator;
     #[cfg(target_arch = "wasm32")]
     use crate::audio::ring_buffer::RingBuffer;
+    // Only the wasm-only `buffer_config` helper builds an `AudioBufferConfig`.
+    #[cfg(target_arch = "wasm32")]
+    use crate::audio::shared_ptr::SharedPtr;
     #[cfg(target_arch = "wasm32")]
     use crate::test_support::{assert_valid_sdp, recording_state_callback};
     #[cfg(target_arch = "wasm32")]
@@ -1351,8 +1360,8 @@ mod tests {
         channels: u8,
     ) -> AudioBufferConfig {
         AudioBufferConfig {
-            local_to_network_ptr: ring as *mut RingBuffer,
-            network_to_local_ptr: reg as *mut Regulator,
+            local_to_network: SharedPtr::new(ring as *mut RingBuffer),
+            network_to_local: SharedPtr::new(reg as *mut Regulator),
             buffer_size,
             channels,
         }

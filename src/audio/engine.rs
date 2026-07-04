@@ -4,6 +4,7 @@ use crate::audio::processor::AudioProcessor;
 use crate::audio::worklet::{create_worklet_node_with_flag, register_audio_worklet};
 use crate::audio::regulator::Regulator;
 use crate::audio::ring_buffer::RingBuffer;
+use crate::audio::shared_ptr::SharedPtr;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
@@ -177,15 +178,18 @@ impl AudioEngine {
         // Create source node from the stream
         let source_node = self.ctx.create_media_stream_source(&stream)?;
 
-        // Create processor with network support
+        // Create processor with network support. `AudioEngine` stores raw
+        // pointers (it is a `#[wasm_bindgen]` boundary type); wrap them in
+        // `SharedPtr` here so the processor and the flag read below go through
+        // the one audited deref.
         let params = unsafe { &*self.params_ptr };
-        let local_to_network_ptr = self.local_to_network_buffer_ptr;
-        let network_to_local_ptr = self.network_to_local_buffer_ptr;
-        
-        let mut processor = if local_to_network_ptr.is_null() && network_to_local_ptr.is_null() {
+        let local_to_network = SharedPtr::new(self.local_to_network_buffer_ptr);
+        let network_to_local = SharedPtr::new(self.network_to_local_buffer_ptr);
+
+        let mut processor = if local_to_network.is_null() && network_to_local.is_null() {
             AudioProcessor::new(params)
         } else {
-            AudioProcessor::with_network(params, local_to_network_ptr, network_to_local_ptr)
+            AudioProcessor::with_network(params, local_to_network, network_to_local)
         };
 
         let process = Box::new(move |input: &[f32], output: &mut [f32]| {
@@ -193,14 +197,9 @@ impl AudioEngine {
         });
 
         // Get ring buffer flag pointer for event-driven wake-up
-        let ring_buffer_flag_ptr = if !local_to_network_ptr.is_null() {
-            unsafe {
-                let ring_buffer = &*local_to_network_ptr;
-                Some(ring_buffer.get_has_data_flag_ptr())
-            }
-        } else {
-            None
-        };
+        let ring_buffer_flag_ptr = local_to_network
+            .as_ref()
+            .map(|ring_buffer| ring_buffer.get_has_data_flag_ptr());
 
         // Create worklet node for processing (with flag pointer for Atomics.notify)
         let worklet_node = create_worklet_node_with_flag(&self.ctx, process, ring_buffer_flag_ptr)?;
