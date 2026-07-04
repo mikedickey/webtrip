@@ -33,6 +33,17 @@ function resolvePkgFile(urlPath) {
   return urlPath.startsWith('/pkg/') ? path.join(REPO_ROOT, urlPath) : null;
 }
 
+// Returns the decoded, normalized URL path, or null if the percent-encoding
+// is malformed (decodeURIComponent throws) or the path attempts traversal.
+function safeUrlPath(url) {
+  try {
+    const p = path.posix.normalize(decodeURIComponent((url ?? '/').split('?')[0]));
+    return p.includes('..') ? null : p;
+  } catch {
+    return null;
+  }
+}
+
 // SPA routes are canonical without a trailing slash: the WASM worker URL is
 // resolved against the page path's directory, so serving the demo at `/demo/`
 // would make it look for `/demo/pkg/webtrip.js`. Returns the redirect target,
@@ -45,5 +56,6 @@ module.exports = {
   MIME_TYPES,
   CROSS_ORIGIN_ISOLATION_HEADERS,
   resolvePkgFile,
+  safeUrlPath,
   trailingSlashRedirectTarget
 };

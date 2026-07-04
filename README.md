@@ -43,7 +43,7 @@ Start a local web server:
 npm run serve
 ```
 
-Then point your browser at http://localhost:3000/demo for the demo app.
+Then point your browser at http://localhost:3000/demo (or https://localhost:8443/demo when serving with TLS) for the demo app.
 
 **Note**: The demo requires microphone permissions. You'll be prompted to allow microphone access when the page loads.
 

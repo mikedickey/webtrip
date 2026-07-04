@@ -38,11 +38,18 @@ let enginePromise: Promise<DemoEngine> | null = null;
 
 export function getDemoEngine(): Promise<DemoEngine> {
   enginePromise ??= (async () => {
-    const m = (await import(/* @vite-ignore */ WEBTRIP_PKG_URL)) as WebtripModule;
-    await m.default();
-    m.init();
-    const paramsPtr = m.createAudioParams();
-    return { m, paramsPtr, session: new m.WebTripSession(paramsPtr) };
+    try {
+      const m = (await import(/* @vite-ignore */ WEBTRIP_PKG_URL)) as WebtripModule;
+      await m.default();
+      m.init();
+      const paramsPtr = m.createAudioParams();
+      return { m, paramsPtr, session: new m.WebTripSession(paramsPtr) };
+    } catch (error) {
+      // Don't cache a rejected promise: a transient failure (e.g. fetching
+      // /pkg/webtrip.js) would otherwise poison every future load attempt.
+      enginePromise = null;
+      throw error;
+    }
   })();
   return enginePromise;
 }

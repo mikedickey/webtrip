@@ -10,6 +10,7 @@ import {
   MIME_TYPES,
   CROSS_ORIGIN_ISOLATION_HEADERS,
   resolvePkgFile,
+  safeUrlPath,
   trailingSlashRedirectTarget
 } from './serve-common.cjs';
 
@@ -27,8 +28,8 @@ const useTLS = !!(keyFile && certFile);
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : (useTLS ? 8443 : 3000);
 
 const handler = (req, res) => {
-  const urlPath = path.posix.normalize(decodeURIComponent(req.url.split('?')[0]));
-  if (urlPath.includes('..')) {
+  const urlPath = safeUrlPath(req.url);
+  if (!urlPath) {
     res.writeHead(400);
     res.end('Bad Request', 'utf-8');
     return;

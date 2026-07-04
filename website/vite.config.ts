@@ -9,6 +9,7 @@ const {
   MIME_TYPES,
   CROSS_ORIGIN_ISOLATION_HEADERS,
   resolvePkgFile,
+  safeUrlPath,
   trailingSlashRedirectTarget,
 } = require("./serve-common.cjs");
 
@@ -20,16 +21,19 @@ function demoAssets(): Plugin {
     name: "webtrip-demo-assets",
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
-        const urlPath = path.posix.normalize(
-          decodeURIComponent((req.url ?? "/").split("?")[0]),
-        );
+        const urlPath = safeUrlPath(req.url);
+        if (!urlPath) {
+          res.writeHead(400);
+          res.end("Bad Request");
+          return;
+        }
         const redirect = trailingSlashRedirectTarget(urlPath);
         if (redirect) {
           res.writeHead(301, { Location: redirect });
           res.end();
           return;
         }
-        const filePath = urlPath.includes("..") ? null : resolvePkgFile(urlPath);
+        const filePath = resolvePkgFile(urlPath);
         if (!filePath || !fs.existsSync(filePath)) {
           next();
           return;

@@ -11,7 +11,7 @@ import Slider from "./Slider";
 import StatsPanel from "./StatsPanel";
 import "./demo.css";
 
-type Phase = "loading" | "ready" | "mic-error";
+type Phase = "loading" | "ready" | "mic-error" | "engine-error";
 type TransportChoice = "auto" | "webrtc" | "webtransport";
 
 const SESSION_STATE_LABELS: Record<SessionState, string> = {
@@ -76,10 +76,21 @@ export default function Demo() {
 
   const engineRef = useRef<DemoEngine | null>(null);
 
+  // Bumped by the retry button on the engine-error screen; getDemoEngine()
+  // clears its cache on failure, so re-running the effect starts a fresh load.
+  const [loadAttempt, setLoadAttempt] = useState(0);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const eng = await getDemoEngine();
+      let eng: DemoEngine;
+      try {
+        eng = await getDemoEngine();
+      } catch (error) {
+        console.error("Failed to load WebTrip engine:", error);
+        if (!cancelled) setPhase("engine-error");
+        return;
+      }
       eng.session.set_on_state_change((state: string) => {
         // Ignore stale regressions that can arrive from late transport
         // callbacks after we've already reached connected.
@@ -107,7 +118,7 @@ export default function Demo() {
       cancelled = true;
       engineRef.current?.session.disconnect();
     };
-  }, []);
+  }, [loadAttempt]);
 
   const webTransportAvailable = engine?.m.WebTripSession.isWebTransportAvailable() ?? false;
 
@@ -198,6 +209,7 @@ export default function Demo() {
   };
 
   const handleOutputDeviceChange = async (deviceId: string) => {
+    const previousDeviceId = outputDeviceId;
     setOutputDeviceId(deviceId);
     if (!engine) return;
     try {
@@ -205,6 +217,7 @@ export default function Demo() {
     } catch (error) {
       console.error("Failed to set output device:", error);
       alert(`Failed to change output device: ${error}`);
+      setOutputDeviceId(previousDeviceId);
     }
   };
 
@@ -230,6 +243,26 @@ export default function Demo() {
         <div className="card loading">
           <div className="loading-spinner" />
           <div className="loading-text">Initializing audio...</div>
+        </div>
+      </div>
+    );
+  }
+
+  if (phase === "engine-error") {
+    return (
+      <div className="demo-page">
+        <div className="card error">
+          <h2>Failed to Load Audio Engine</h2>
+          <p>Check your network connection and try again.</p>
+          <button
+            className="action-btn primary"
+            onClick={() => {
+              setPhase("loading");
+              setLoadAttempt((attempt) => attempt + 1);
+            }}
+          >
+            Retry
+          </button>
         </div>
       </div>
     );
@@ -282,8 +315,9 @@ export default function Demo() {
 
         <div className="host-port-row">
           <div className="control-group host-group">
-            <label className="label">Server Host</label>
+            <label className="label" htmlFor="server-host">Server Host</label>
             <input
+              id="server-host"
               type="text"
               className="text-input"
               placeholder="studio.jacktrip.org"
@@ -292,8 +326,9 @@ export default function Demo() {
             />
           </div>
           <div className="control-group port-group">
-            <label className="label">Port</label>
+            <label className="label" htmlFor="server-port">Port</label>
             <input
+              id="server-port"
               type="number"
               className="text-input"
               placeholder="4464"
@@ -304,8 +339,9 @@ export default function Demo() {
         </div>
 
         <div className="control-group">
-          <label className="label">Client Name (Optional)</label>
+          <label className="label" htmlFor="client-name">Client Name (Optional)</label>
           <input
+            id="client-name"
             type="text"
             className="text-input"
             placeholder="Leave empty for anonymous"
@@ -315,8 +351,9 @@ export default function Demo() {
         </div>
 
         <div className="control-group">
-          <label className="label">Transport</label>
+          <label className="label" htmlFor="transport">Transport</label>
           <select
+            id="transport"
             className="select"
             value={transportChoice}
             onChange={(e) => setTransportChoice(e.target.value as TransportChoice)}
@@ -348,8 +385,9 @@ export default function Demo() {
 
         <div className="section-header">Audio Devices</div>
         <div className="control-group">
-          <label className="label">Input Device</label>
+          <label className="label" htmlFor="input-device">Input Device</label>
           <select
+            id="input-device"
             className="select"
             value={inputDeviceId}
             onChange={(e) => setInputDeviceId(e.target.value)}
@@ -362,9 +400,10 @@ export default function Demo() {
           </select>
         </div>
         <div className="control-group">
-          <label className="label">Output Device</label>
+          <label className="label" htmlFor="output-device">Output Device</label>
           {devices.outputDevices.length > 0 ? (
             <select
+              id="output-device"
               className="select"
               value={outputDeviceId}
               onChange={(e) => handleOutputDeviceChange(e.target.value)}
@@ -380,6 +419,7 @@ export default function Demo() {
               {/* iOS Safari (and some other mobile browsers) do not enumerate
                   audiooutput devices; show a disabled placeholder instead. */}
               <select
+                id="output-device"
                 className="select"
                 disabled
                 title="Output device selection is not supported on this browser"
