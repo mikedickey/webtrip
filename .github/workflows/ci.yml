@@ -1,8 +1,11 @@
 name: CI
 
+# push covers main only; branch work is covered by the pull_request trigger.
+# Listing branches under both (e.g. feat/**) would run the whole workflow
+# twice per push to a branch with an open PR.
 on:
   push:
-    branches: [main, "feat/**"]
+    branches: [main]
   pull_request:
     branches: [main]
 
