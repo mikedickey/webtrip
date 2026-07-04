@@ -1,4 +1,3 @@
-/dist
 /target
 /node_modules
 **/*.rs.bk
@@ -12,3 +11,5 @@ lcov.integration.info
 /coverage/
 # Local TLS cert/key for the integration server (never commit secrets)
 /certs/
+website/node_modules/
+website/dist/

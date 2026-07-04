@@ -189,7 +189,7 @@ jobs:
 
       # Run inside the prebuilt build image (nightly toolchain + chromium) on the
       # same host network so the browser reaches the JackTrip server.
-      # `npm run coverage:integration` builds an instrumented app (pkg/ + dist/),
+      # `npm run coverage:integration` builds an instrumented app (pkg/ + website/dist/),
       # serves it, drives both transports through a headless browser, then dumps
       # the live WASM coverage and exports lcov.integration.info. The dump covers
       # the WebTransport worker too: it shares the module's linear memory (where

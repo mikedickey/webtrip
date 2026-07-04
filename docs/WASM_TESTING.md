@@ -176,7 +176,7 @@ worker loops).
 
 ```bash
 npm run test:integration       # builds the app, then drives tests/integration/run.mjs
-npm run test:integration:run   # inner-loop: skip the build, reuse existing pkg/ + dist/
+npm run test:integration:run   # inner-loop: skip the build, reuse existing pkg/ + website/dist/
 ```
 
 ### How it works (served-app + browser driver)
@@ -187,7 +187,7 @@ worker loads the wasm module from `{origin}/pkg/webtrip.js`
 is served at the site root with `pkg/` present — something the
 `wasm-bindgen-test` harness origin does not do. So `tests/integration/run.mjs`:
 
-1. serves the real app via `server.js` over plain HTTP on `localhost` (a secure
+1. serves the real app via `website/server.js` over plain HTTP on `localhost` (a secure
    context, so its COOP/COEP headers still yield `crossOriginIsolated` +
    WebTransport — no cert needed for the page),
 2. drives it with a headless browser (`puppeteer-core`), and
@@ -388,7 +388,7 @@ container already satisfies every check). What it handles:
 
 The app proper needs `SharedArrayBuffer`, which requires a cross-origin-isolated
 page (`Cross-Origin-Opener-Policy: same-origin` +
-`Cross-Origin-Embedder-Policy: require-corp`, set by `server.js`).
+`Cross-Origin-Embedder-Policy: require-corp`, set by `website/server.js`).
 
 For `npm run test:wasm`, the current `wasm-pack`/`wasm-bindgen-test` harness
 serves a test page and module loader that already provide a shared

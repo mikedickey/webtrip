@@ -5,12 +5,12 @@
 // WebTransport worker loads the wasm module from `{origin}/pkg/webtrip.js`
 // (see `src/audio/webtransport.rs::wasm_module_url`), which only resolves when
 // the page is served at the site root with `pkg/` present. So we serve the real
-// app via `server.js`, point a headless browser at it, and run each transport
+// app via `website/server.js`, point a headless browser at it, and run each transport
 // through the actual exported session API
 // (`createAudioParams` → `WebTripSession` → `connectToStudio`).
 //
 // The page is served over plain HTTP on `localhost` — a "secure context" in
-// Chrome — so with the COOP/COEP headers `server.js` already sets we still get
+// Chrome — so with the COOP/COEP headers `website/server.js` already sets we still get
 // `crossOriginIsolated` (SharedArrayBuffer) and WebTransport. No cert is needed
 // for the page server. The only thing that needs the trusted `*.miked.io` cert
 // is the JackTrip server itself: the browser validates it on the
@@ -137,9 +137,10 @@ function waitForPort(host, port, timeoutMs) {
 async function inPageDrive({ transportName, host, port, connectTimeoutMs, sendPollMs }) {
   const m = await import("/pkg/webtrip.js");
 
-  // The served app (dist/app.js) normally initializes the wasm module. If it
-  // hasn't (e.g. dist not built), initialize it here. Probe before init to avoid
-  // a redundant second instantiation.
+  // The demo page (the SPA's /demo route) normally initializes the wasm
+  // module. If it hasn't (e.g. mic permission denied before device setup),
+  // initialize it here. Probe before init to avoid a redundant second
+  // instantiation.
   let ready = false;
   try {
     m.createAudioParams();
@@ -316,13 +317,19 @@ async function main() {
   if (!fs.existsSync(path.join(REPO_ROOT, "pkg", "webtrip.js"))) {
     throw new Error("pkg/webtrip.js missing — run `npm run build` first.");
   }
+  // The SPA build must exist: without it the demo route 404s, and the 404
+  // response carries no COOP/COEP headers, so the page never becomes
+  // crossOriginIsolated.
+  if (!fs.existsSync(path.join(REPO_ROOT, "website", "dist", "index.html"))) {
+    throw new Error("website/dist missing — run `npm run build:site` first.");
+  }
 
   // Serve the real app over plain HTTP on localhost (a secure context, so
-  // server.js's COOP/COEP still yield crossOriginIsolated + WebTransport). No
+  // website/server.js's COOP/COEP still yield crossOriginIsolated + WebTransport). No
   // cert needed here — only the JackTrip server needs a browser-trusted cert.
   // server.js reads PORT, so APP_PORT is honored.
   console.log(`▶ starting app server on http://${APP_HOST}:${APP_PORT}`);
-  const server = spawn("node", ["server.js"], {
+  const server = spawn("node", ["website/server.js"], {
     cwd: REPO_ROOT,
     stdio: "inherit",
     env: { ...process.env, PORT: String(APP_PORT) },
@@ -351,17 +358,47 @@ async function main() {
     });
 
     const page = await browser.newPage();
-    page.on("console", (msg) => console.log(`  [page:${msg.type()}] ${msg.text()}`));
-    page.on("pageerror", (err) => console.log(`  [page:error] ${err.message}`));
+    // A Rust panic in the page means wasm state is corrupted even if the
+    // driven flow happens to survive it (the double-init race showed exactly
+    // that: green runs with rc.rs refcount-underflow panics in the log), so
+    // any panic fails the run.
+    let pagePanicked = false;
+    const notePanic = (text) => {
+      if (text.includes("panicked at")) pagePanicked = true;
+    };
+    page.on("console", (msg) => {
+      console.log(`  [page:${msg.type()}] ${msg.text()}`);
+      notePanic(msg.text());
+    });
+    page.on("pageerror", (err) => {
+      console.log(`  [page:error] ${err.message}`);
+      notePanic(err.message || "");
+    });
 
-    const appUrl = `http://${APP_HOST}:${APP_PORT}/`;
+    const appUrl = `http://${APP_HOST}:${APP_PORT}/demo`;
     console.log(`▶ loading ${appUrl}`);
     await page.goto(appUrl, { waitUntil: "load", timeout: 30_000 });
+
+    // The demo route initializes the wasm module on mount, and the generated
+    // __wbg_init only guards a *completed* init — a concurrent m.default()
+    // from inPageDrive would instantiate the module a second time and rebind
+    // the glue's module-level state (wasm handle, memory caches, closure
+    // table) while the demo's objects still point into the first instance,
+    // which corrupts refcounts (observed as rc.rs subtract-with-overflow
+    // panics and memory-access-out-of-bounds). Wait for the demo to leave its
+    // loading phase — ready, mic-error, and engine-error all mean its init
+    // attempt has settled — before driving the session API in the same page.
+    console.log("▶ waiting for the demo page to finish initializing");
+    await page.waitForFunction(
+      () => document.querySelector(".card") && !document.querySelector(".card.loading"),
+      { timeout: 60_000 },
+    );
 
     // Opt-in: run ONLY the connect-failure check, then stop (kept separate from
     // the happy-path assertions so it can't destabilize them).
     if (FAILURE_CASE) {
       await runFailureCase(page);
+      if (pagePanicked) throw new Error("a Rust panic surfaced in the page during the run");
       console.log("\n✅ failure-case passed");
       return;
     }
@@ -423,6 +460,10 @@ async function main() {
       }
     }
 
+    if (pagePanicked) {
+      anyFailed = true;
+      fail("a Rust panic surfaced in the page during the run (see [page:*] logs above)");
+    }
     if (anyFailed) throw new Error("one or more transports failed");
     console.log("\n✅ integration tests passed");
   } finally {
