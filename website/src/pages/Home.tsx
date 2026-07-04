@@ -19,6 +19,36 @@ const FEATURES = [
   },
 ];
 
+const COMPARISON = [
+  {
+    dimension: "Fidelity",
+    webtrip: "Uncompressed PCM — lossless.",
+    webrtc: "Opus compression — lossy by design.",
+  },
+  {
+    dimension: "Latency",
+    webtrip: "2.7 ms audio chunks, zero codec delay.",
+    webrtc: "20 ms frames plus look-ahead — ~26 ms of codec delay built in.",
+  },
+  {
+    dimension: "Transport",
+    webtrip: "WebTransport — QUIC datagrams, no head-of-line blocking.",
+    webrtc: "SRTP, negotiated over SDP and ICE.",
+  },
+  {
+    dimension: "Loss & Jitter",
+    webtrip:
+      "Low-latency jitter buffer with Burg packet-loss concealment.",
+    webrtc: "Fixed adaptive buffer and codec concealment.",
+  },
+  {
+    dimension: "Processing",
+    webtrip:
+      "Optimized Rust/WASM engine in an AudioWorklet; network I/O in a dedicated worker.",
+    webrtc: "Opaque browser pipeline; varies by browser, can't be tuned.",
+  },
+];
+
 export default function Home() {
   return (
     <>
@@ -50,6 +80,40 @@ export default function Home() {
             <p>{f.body}</p>
           </article>
         ))}
+      </section>
+
+      <section className="comparison">
+        <h2>Why not just use WebRTC?</h2>
+        <p className="comparison-intro">
+          Browsers already ship real-time audio through WebRTC&rsquo;s media
+          stack. WebTrip takes a different path: raw, uncompressed audio,
+          skipping the browser&rsquo;s built-in pipeline for higher fidelity
+          and lower latency.
+        </p>
+        <div className="comparison-scroll">
+          <table className="comparison-table">
+            <thead>
+              <tr>
+                <th scope="col">
+                  <span className="visually-hidden">Dimension</span>
+                </th>
+                <th scope="col" className="col-webtrip">
+                  WebTrip
+                </th>
+                <th scope="col">WebRTC</th>
+              </tr>
+            </thead>
+            <tbody>
+              {COMPARISON.map((row) => (
+                <tr key={row.dimension}>
+                  <th scope="row">{row.dimension}</th>
+                  <td className="col-webtrip">{row.webtrip}</td>
+                  <td>{row.webrtc}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </section>
     </>
   );
