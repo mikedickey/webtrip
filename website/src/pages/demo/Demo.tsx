@@ -112,6 +112,11 @@ export default function Demo() {
         if (!cancelled) setPhase("engine-error");
         return;
       }
+      if (cancelled) return;
+      // Expose the engine to the unmount cleanup before any further awaits,
+      // so navigating away during the device permission prompt still chains
+      // the teardown (disconnect on an idle session is a no-op).
+      engineRef.current = eng;
       eng.session.set_on_state_change((state: string) => {
         // Ignore stale regressions that can arrive from late transport
         // callbacks after we've already reached connected.
@@ -127,7 +132,6 @@ export default function Demo() {
       try {
         const devs = (await eng.m.getAudioDevices()) as AudioDevices;
         if (cancelled) return;
-        engineRef.current = eng;
         setEngine(eng);
         setDevices(devs);
         setInputDeviceId(devs.inputDevices[0]?.deviceId ?? "");
