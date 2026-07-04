@@ -39,19 +39,21 @@ const CONNECT_TIMEOUT_MS = 45_000;
 let pendingDisconnect: Promise<void> | null = null;
 
 // The last connectToStudio call (always stored pre-caught). connectToStudio
-// is not cancellable, so an unmount during a connect chains its disconnect
-// after the connect settles — otherwise the link could finish (and deferred
-// capture start) with no demo UI mounted to tear it down.
+// is not cancellable, so every teardown chains after the connect settles —
+// otherwise the link could finish (and deferred capture start) behind a
+// racing disconnect, or with no demo UI mounted to tear it down.
 let connectInFlight: Promise<void> | null = null;
 
-// Every teardown goes through here: it chains behind any teardown already in
-// flight (disconnect() calls on the session must not overlap) and, on the
-// unmount path, behind an uncancellable in-flight connect, so the next
-// connect can await the whole chain via pendingDisconnect.
-function beginDisconnect(session: WebTripSession, afterConnect?: Promise<void> | null) {
+// Every teardown goes through here: it chains behind any uncancellable
+// in-flight connect (instant when none is pending or it already settled) and
+// behind any teardown already running (disconnect() calls on the session must
+// not overlap), so the next connect can await the whole chain via
+// pendingDisconnect.
+function beginDisconnect(session: WebTripSession) {
+  const priorConnect = connectInFlight; // stored pre-caught
   const prior = pendingDisconnect;
   pendingDisconnect = (async () => {
-    if (afterConnect) await afterConnect.catch(() => {});
+    if (priorConnect) await priorConnect;
     if (prior) await prior.catch(() => {});
     await session.disconnect();
   })();
@@ -163,18 +165,18 @@ export default function Demo() {
     return () => {
       cancelled = true;
       const session = engineRef.current?.session;
-      if (session) beginDisconnect(session, connectInFlight);
+      if (session) beginDisconnect(session);
     };
   }, [loadAttempt]);
 
   const webTransportAvailable = engine?.m.WebTripSession.isWebTransportAvailable() ?? false;
 
   // Keep the session's transport in sync with the selector ("auto" resolves
-  // to WebTransport when available, else WebRTC). Skipped while connected:
-  // setTransportType is ignored when the session isn't idle, and the label
-  // must keep reflecting the live session's transport (synced on mount).
+  // to WebTransport when available, else WebRTC). Applied only while idle:
+  // setTransportType is ignored in any other state, and the label must keep
+  // reflecting the transport the session is actually connecting with or using.
   useEffect(() => {
-    if (!engine || sessionState === "connected") return;
+    if (!engine || sessionState !== "idle") return;
     const resolved =
       transportChoice === "auto"
         ? webTransportAvailable
