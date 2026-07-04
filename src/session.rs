@@ -35,6 +35,7 @@ use crate::audio::engine::AudioEngine;
 use crate::audio::regulator::{Regulator, RegulatorStats};
 use crate::audio::params::AudioParams;
 use crate::audio::ring_buffer::RingBuffer;
+use crate::audio::shared_ptr::SharedPtr;
 use crate::audio::transport::{Transport, TransportType, AudioBufferConfig};
 use crate::audio::webrtc::{TransportConfig as WebRtcConfig, WebRtcTransport};
 use crate::audio::webtransport::{WebTransportImpl, is_webtransport_available};
@@ -392,7 +393,9 @@ impl WebTripSession {
         echo_cancellation: bool,
         noise_suppression: bool,
     ) -> Result<(), JsValue> {
-        // Get raw pointers to owned buffers
+        // Get raw pointers to owned buffers. `AudioEngine` is a `#[wasm_bindgen]`
+        // boundary type, so it takes raw pointers here and wraps them in
+        // `SharedPtr` internally when it builds the `AudioProcessor`.
         let local_to_network_ptr = &mut *self.local_to_network_buffer as *mut RingBuffer;
         let network_to_local_ptr = &mut *self.network_to_local_buffer as *mut Regulator;
 
@@ -505,8 +508,8 @@ impl WebTripSession {
 
         // Create buffer configuration for transports that need it
         let buffer_config = AudioBufferConfig {
-            local_to_network_ptr: &mut *self.local_to_network_buffer as *mut RingBuffer,
-            network_to_local_ptr: &mut *self.network_to_local_buffer as *mut Regulator,
+            local_to_network: SharedPtr::new(&mut *self.local_to_network_buffer),
+            network_to_local: SharedPtr::new(&mut *self.network_to_local_buffer),
             buffer_size: self.buffer_size,
             channels: self.channels,
         };

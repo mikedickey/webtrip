@@ -251,26 +251,32 @@ impl MockTransport {
         };
 
         let samples_needed = (buffers.buffer_size * buffers.channels as usize) as u32;
-        
-        // Safety: We're in single-threaded WASM, and these pointers are valid
-        // for the lifetime of the session
-        let ring_buffer = unsafe { &mut *buffers.local_to_network_ptr };
-        let jitter_buffer = unsafe { &mut *buffers.network_to_local_ptr };
-        
-        // Read from ring buffer (simulates sending)
-        if ring_buffer.available() >= samples_needed {
-            let mut audio_buffer = vec![0.0; samples_needed as usize];
-            let _ = ring_buffer.read(&mut audio_buffer);
-            // Audio is read but not sent anywhere (mock transport)
+
+        // Sound shared borrow for the ring buffer (`&self` API). `Regulator`
+        // still exposes `&mut self`, so its push side goes through the
+        // `unsafe` `SharedPtr::as_mut`.
+        let ring_buffer = buffers.local_to_network.as_ref();
+        // SAFETY: `Regulator::push` is `&mut self`; see `SharedPtr::as_mut`.
+        let jitter_buffer = unsafe { buffers.network_to_local.as_mut() };
+
+        // Read from ring buffer (simulates sending, stores for testing)
+        if let Some(ring_buffer) = ring_buffer {
+            if ring_buffer.available() >= samples_needed {
+                let mut audio_buffer = vec![0.0; samples_needed as usize];
+                let _ = ring_buffer.read(&mut audio_buffer);
+                // Audio is read but not sent anywhere (mock transport)
+            }
         }
-        
+
         // Generate sine wave packet if enabled
         let mut sine_state = self.sine_wave_state.borrow_mut();
         if sine_state.enabled {
             let packet = Self::generate_sine_wave_packet(&mut sine_state);
-            
+
             // Push directly to jitter buffer
-            jitter_buffer.push(packet.header.sequence_number, &packet.samples);
+            if let Some(jitter_buffer) = jitter_buffer {
+                jitter_buffer.push(packet.header.sequence_number, &packet.samples);
+            }
         }
     }
 
@@ -327,8 +333,8 @@ impl Transport for MockTransport {
     fn close(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
         // Disable streaming on ring buffer
         if let Some(buffers) = self.audio_buffers {
-            unsafe {
-                (*buffers.local_to_network_ptr).set_streaming(false);
+            if let Some(ring_buffer) = buffers.local_to_network.as_ref() {
+                ring_buffer.set_streaming(false);
             }
         }
 
