@@ -5,6 +5,7 @@ import {
   type AudioDevices,
   type DemoEngine,
   type SessionState,
+  type WebTripSession,
 } from "../../lib/webtrip";
 import LevelMeter from "./LevelMeter";
 import Slider from "./Slider";
@@ -30,12 +31,24 @@ const SESSION_STATE_LABELS: Record<SessionState, string> = {
 const CONNECT_TIMEOUT_MS = 45_000;
 
 // The session is a module-level singleton (see getDemoEngine), so a
-// disconnect started by an unmount can still be tearing down when the next
-// mount connects. Reconnecting before teardown quiesces races the regulator's
-// shared sequence-number state (see WebTripSession::disconnect), so the
-// promise lives at module scope — matching the session's lifetime — and
-// handleConnect awaits it before dialing.
+// disconnect can still be tearing down when the next connect is attempted.
+// Reconnecting before teardown quiesces races the regulator's shared
+// sequence-number state (see WebTripSession::disconnect), so these live at
+// module scope — matching the session's lifetime — and handleConnect awaits
+// pendingDisconnect before dialing.
 let pendingDisconnect: Promise<void> | null = null;
+
+// The last connectToStudio call (always stored pre-caught). connectToStudio
+// is not cancellable, so an unmount during a connect chains its disconnect
+// after the connect settles — otherwise the link could finish (and deferred
+// capture start) with no demo UI mounted to tear it down.
+let connectInFlight: Promise<void> | null = null;
+
+// Every immediate teardown goes through here so the next connect can await it.
+function beginDisconnect(session: WebTripSession) {
+  pendingDisconnect = session.disconnect();
+  pendingDisconnect.catch(() => {});
+}
 
 function ToggleButton({
   active,
@@ -128,7 +141,12 @@ export default function Demo() {
     return () => {
       cancelled = true;
       const session = engineRef.current?.session;
-      if (session) pendingDisconnect = session.disconnect();
+      if (session) {
+        pendingDisconnect = (connectInFlight ?? Promise.resolve()).then(() =>
+          session.disconnect(),
+        );
+        pendingDisconnect.catch(() => {});
+      }
     };
   }, [loadAttempt]);
 
@@ -153,7 +171,8 @@ export default function Demo() {
   // An error state from a transport callback means the connection dropped:
   // tear the session down so it returns to a reconnectable idle state.
   useEffect(() => {
-    if (sessionState === "error") engineRef.current?.session.disconnect();
+    const session = engineRef.current?.session;
+    if (sessionState === "error" && session) beginDisconnect(session);
   }, [sessionState]);
 
   const handleConnect = async () => {
@@ -168,22 +187,27 @@ export default function Demo() {
     setBusy(true);
     let timer: number | undefined;
     try {
-      if (pendingDisconnect) {
-        await pendingDisconnect.catch(() => {});
-        pendingDisconnect = null;
-      }
-      const connectPromise = engine.session.connectToStudio(
-        host,
-        port,
-        inputDeviceId || undefined,
-        agc,
-        echo,
-        noise,
-        clientName.trim() || undefined,
-      );
-      // If the timeout wins, the connect may still settle later; swallow it so
-      // the loser never fires a late unhandled rejection.
-      connectPromise.catch(() => {});
+      // The teardown wait runs inside the raced promise so the timeout also
+      // covers a disconnect that never settles.
+      const connectPromise = (async () => {
+        if (pendingDisconnect) {
+          await pendingDisconnect.catch(() => {});
+          pendingDisconnect = null;
+        }
+        await engine.session.connectToStudio(
+          host,
+          port,
+          inputDeviceId || undefined,
+          agc,
+          echo,
+          noise,
+          clientName.trim() || undefined,
+        );
+      })();
+      // If the timeout wins, the connect may still settle later; storing it
+      // pre-caught both tracks it for the unmount cleanup and keeps the loser
+      // from firing a late unhandled rejection.
+      connectInFlight = connectPromise.catch(() => {});
       await Promise.race([
         connectPromise,
         new Promise<never>((_, reject) => {
@@ -212,7 +236,7 @@ export default function Demo() {
       console.error("Failed to connect:", error);
       // connectToStudio failed before storing the transport, so the session is
       // still in "Connecting" state and needs to be reset to Idle.
-      engine.session.disconnect();
+      beginDisconnect(engine.session);
       alert(`Connection failed: ${error}`);
     } finally {
       clearTimeout(timer);
@@ -221,7 +245,7 @@ export default function Demo() {
   };
 
   const handleDisconnect = () => {
-    engine?.session.disconnect();
+    if (engine) beginDisconnect(engine.session);
   };
 
   const handleOutputDeviceChange = async (deviceId: string) => {
