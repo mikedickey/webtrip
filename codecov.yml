@@ -28,3 +28,13 @@ coverage:
     patch:
       default:
         informational: true
+
+# Test-only scaffolding: these files exist solely to support the test suites and
+# are compiled only under `cfg(test)`. The wasm coverage build still instruments
+# them, so without this list their helpers (e.g. a trait method a test never
+# calls, like `MockTransport::transport_type`) would count as uncovered and drag
+# the percentage down. They carry no production logic worth measuring.
+ignore:
+  - "src/test_support.rs"     # shared wasm-bindgen-test helpers + MockTransport
+  - "src/api/test_helpers.rs" # mockito HTTP-fixture builders
+  - "tests"                   # standalone integration/harness test binaries
