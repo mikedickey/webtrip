@@ -220,6 +220,101 @@ a:hover {
   color: var(--text-secondary);
 }
 
+/* WebTrip vs typical WebRTC apps comparison */
+.comparison {
+  margin-top: 64px;
+}
+
+.comparison h2 {
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.5px;
+}
+
+.comparison-intro {
+  margin-top: 12px;
+  max-width: 620px;
+  font-size: 15px;
+  font-weight: 300;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.comparison-scroll {
+  margin-top: 24px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* border-radius needs border-collapse: separate + overflow: hidden;
+   with collapse the radius is ignored in some browsers. */
+.comparison-table {
+  width: 100%;
+  min-width: 560px;
+  border-collapse: separate;
+  border-spacing: 0;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 16px;
+  overflow: hidden;
+}
+
+.comparison-table th,
+.comparison-table td {
+  padding: 14px 18px;
+  text-align: left;
+  vertical-align: top;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.comparison-table thead th {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.comparison-table tbody th,
+.comparison-table tbody td {
+  border-top: 1px solid var(--border-color);
+}
+
+.comparison-table tbody th {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.comparison-table td {
+  font-weight: 300;
+  color: var(--text-secondary);
+}
+
+.comparison-table .col-webtrip {
+  background: rgb(125 104 250 / 7%);
+}
+
+.comparison-table thead th.col-webtrip {
+  color: var(--accent);
+}
+
+@media (max-width: 640px) {
+  .comparison-table th,
+  .comparison-table td {
+    padding: 12px 14px;
+  }
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 /* Generic content page (docs, 404) */
 .page h1 {
   font-size: 32px;
