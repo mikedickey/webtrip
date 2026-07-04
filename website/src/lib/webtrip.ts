@@ -34,19 +34,39 @@ const WEBTRIP_PKG_URL = "/pkg/webtrip.js";
 // against its shared memory, and AudioParams allocations are never freed, so
 // remounting the demo route reuses the same session (which supports repeated
 // connect/disconnect cycles).
+let modulePromise: Promise<WebtripModule> | null = null;
 let enginePromise: Promise<DemoEngine> | null = null;
 
-export function getDemoEngine(): Promise<DemoEngine> {
-  enginePromise ??= (async () => {
+// Instantiation is cached separately from the engine because a default() that
+// succeeded must never re-run against the shared memory. Failures here happen
+// before instantiation completes (fetching/compiling the module), so clearing
+// the cache on rejection is safe to retry; init() only sets the panic hook
+// (set_once, idempotent).
+function getWebtripModule(): Promise<WebtripModule> {
+  modulePromise ??= (async () => {
     try {
       const m = (await import(/* @vite-ignore */ WEBTRIP_PKG_URL)) as WebtripModule;
       await m.default();
       m.init();
+      return m;
+    } catch (error) {
+      modulePromise = null;
+      throw error;
+    }
+  })();
+  return modulePromise;
+}
+
+export function getDemoEngine(): Promise<DemoEngine> {
+  enginePromise ??= (async () => {
+    try {
+      const m = await getWebtripModule();
       const paramsPtr = m.createAudioParams();
       return { m, paramsPtr, session: new m.WebTripSession(paramsPtr) };
     } catch (error) {
       // Don't cache a rejected promise: a transient failure (e.g. fetching
       // /pkg/webtrip.js) would otherwise poison every future load attempt.
+      // Retrying reuses the already-instantiated module when it loaded.
       enginePromise = null;
       throw error;
     }

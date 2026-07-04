@@ -44,9 +44,17 @@ let pendingDisconnect: Promise<void> | null = null;
 // capture start) with no demo UI mounted to tear it down.
 let connectInFlight: Promise<void> | null = null;
 
-// Every immediate teardown goes through here so the next connect can await it.
-function beginDisconnect(session: WebTripSession) {
-  pendingDisconnect = session.disconnect();
+// Every teardown goes through here: it chains behind any teardown already in
+// flight (disconnect() calls on the session must not overlap) and, on the
+// unmount path, behind an uncancellable in-flight connect, so the next
+// connect can await the whole chain via pendingDisconnect.
+function beginDisconnect(session: WebTripSession, afterConnect?: Promise<void> | null) {
+  const prior = pendingDisconnect;
+  pendingDisconnect = (async () => {
+    if (afterConnect) await afterConnect.catch(() => {});
+    if (prior) await prior.catch(() => {});
+    await session.disconnect();
+  })();
   pendingDisconnect.catch(() => {});
 }
 
@@ -127,8 +135,18 @@ export default function Demo() {
         );
       });
       // The singleton session may still be connected (or mid-teardown) from a
-      // previous mount; sync the UI to its real state instead of assuming idle.
-      setSessionState(eng.session.isConnected() ? "connected" : "idle");
+      // previous mount; sync the UI to its real state instead of assuming idle,
+      // including which transport the live session is actually using.
+      if (eng.session.isConnected()) {
+        setSessionState("connected");
+        setActiveTransport(
+          eng.session.getTransportType() === eng.m.TransportType.WebTransport
+            ? "webtransport"
+            : "webrtc",
+        );
+      } else {
+        setSessionState("idle");
+      }
       try {
         const devs = (await eng.m.getAudioDevices()) as AudioDevices;
         if (cancelled) return;
@@ -145,21 +163,18 @@ export default function Demo() {
     return () => {
       cancelled = true;
       const session = engineRef.current?.session;
-      if (session) {
-        pendingDisconnect = (connectInFlight ?? Promise.resolve()).then(() =>
-          session.disconnect(),
-        );
-        pendingDisconnect.catch(() => {});
-      }
+      if (session) beginDisconnect(session, connectInFlight);
     };
   }, [loadAttempt]);
 
   const webTransportAvailable = engine?.m.WebTripSession.isWebTransportAvailable() ?? false;
 
   // Keep the session's transport in sync with the selector ("auto" resolves
-  // to WebTransport when available, else WebRTC).
+  // to WebTransport when available, else WebRTC). Skipped while connected:
+  // setTransportType is ignored when the session isn't idle, and the label
+  // must keep reflecting the live session's transport (synced on mount).
   useEffect(() => {
-    if (!engine) return;
+    if (!engine || sessionState === "connected") return;
     const resolved =
       transportChoice === "auto"
         ? webTransportAvailable
@@ -170,7 +185,7 @@ export default function Demo() {
       resolved === "webtransport" ? engine.m.TransportType.WebTransport : engine.m.TransportType.WebRTC,
     );
     setActiveTransport(resolved);
-  }, [engine, transportChoice, webTransportAvailable]);
+  }, [engine, transportChoice, webTransportAvailable, sessionState]);
 
   // An error state from a transport callback means the connection dropped:
   // tear the session down so it returns to a reconnectable idle state.
