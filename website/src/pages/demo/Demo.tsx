@@ -112,6 +112,18 @@ export default function Demo() {
 
   const engineRef = useRef<DemoEngine | null>(null);
 
+  // Lets async handlers skip user-facing work after navigating away
+  // mid-operation: state setters are no-ops on an unmounted tree, but
+  // alert() is not, and post-connect setup would be wasted on a session the
+  // unmount cleanup is already tearing down.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   // Bumped by the retry button on the engine-error screen; getDemoEngine()
   // clears its cache on failure, so re-running the effect starts a fresh load.
   const [loadAttempt, setLoadAttempt] = useState(0);
@@ -248,6 +260,7 @@ export default function Demo() {
           );
         }),
       ]);
+      if (!mountedRef.current) return;
 
       try {
         await engine.session.setOutputDevice(outputDeviceId || undefined);
@@ -268,7 +281,7 @@ export default function Demo() {
       // connectToStudio failed before storing the transport, so the session is
       // still in "Connecting" state and needs to be reset to Idle.
       beginDisconnect(engine.session);
-      alert(`Connection failed: ${error}`);
+      if (mountedRef.current) alert(`Connection failed: ${error}`);
     } finally {
       dialing = false;
       clearTimeout(timer);
@@ -288,7 +301,7 @@ export default function Demo() {
       await engine.session.setOutputDevice(deviceId || undefined);
     } catch (error) {
       console.error("Failed to set output device:", error);
-      alert(`Failed to change output device: ${error}`);
+      if (mountedRef.current) alert(`Failed to change output device: ${error}`);
       setOutputDeviceId(previousDeviceId);
     }
   };
