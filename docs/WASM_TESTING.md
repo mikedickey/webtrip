@@ -164,12 +164,15 @@ the toolchain container (`containers/build/Containerfile`). The browser setup
 
 ## Integration tests (real JackTrip server)
 
-The unit tests above stop at the transport boundary (pure logic; there is no
-server-free transport). The **integration tests** drive the real WASM client against an actual
+The unit tests above stop at the real-network boundary: the session's connect
+lifecycle is driven over a test-only, server-free transport
+(`connect_with_test_transport` in `src/session.rs`, backed by
+`test_support::MockTransport`), which connects instantly and does no I/O. The
+**integration tests** drive the real WASM client against an actual
 `jacktrip/jacktrip:edge` hub server in Docker, for **both** the WebRTC and
-WebTransport transports — the live surface unit tests can't reach (WebRTC's
-WebSocket signaling + SDP/ICE + data-channel open; WebTransport's QUIC worker
-loops).
+WebTransport transports — the live, server-backed surface unit tests can't reach
+(WebRTC's WebSocket signaling + SDP/ICE + data-channel open; WebTransport's QUIC
+worker loops).
 
 ```bash
 npm run test:integration       # builds the app, then drives tests/integration/run.mjs
