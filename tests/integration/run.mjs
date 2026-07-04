@@ -358,17 +358,47 @@ async function main() {
     });
 
     const page = await browser.newPage();
-    page.on("console", (msg) => console.log(`  [page:${msg.type()}] ${msg.text()}`));
-    page.on("pageerror", (err) => console.log(`  [page:error] ${err.message}`));
+    // A Rust panic in the page means wasm state is corrupted even if the
+    // driven flow happens to survive it (the double-init race showed exactly
+    // that: green runs with rc.rs refcount-underflow panics in the log), so
+    // any panic fails the run.
+    let pagePanicked = false;
+    const notePanic = (text) => {
+      if (text.includes("panicked at")) pagePanicked = true;
+    };
+    page.on("console", (msg) => {
+      console.log(`  [page:${msg.type()}] ${msg.text()}`);
+      notePanic(msg.text());
+    });
+    page.on("pageerror", (err) => {
+      console.log(`  [page:error] ${err.message}`);
+      notePanic(err.message || "");
+    });
 
     const appUrl = `http://${APP_HOST}:${APP_PORT}/demo`;
     console.log(`▶ loading ${appUrl}`);
     await page.goto(appUrl, { waitUntil: "load", timeout: 30_000 });
 
+    // The demo route initializes the wasm module on mount, and the generated
+    // __wbg_init only guards a *completed* init — a concurrent m.default()
+    // from inPageDrive would instantiate the module a second time and rebind
+    // the glue's module-level state (wasm handle, memory caches, closure
+    // table) while the demo's objects still point into the first instance,
+    // which corrupts refcounts (observed as rc.rs subtract-with-overflow
+    // panics and memory-access-out-of-bounds). Wait for the demo to leave its
+    // loading phase — ready, mic-error, and engine-error all mean its init
+    // attempt has settled — before driving the session API in the same page.
+    console.log("▶ waiting for the demo page to finish initializing");
+    await page.waitForFunction(
+      () => document.querySelector(".card") && !document.querySelector(".card.loading"),
+      { timeout: 60_000 },
+    );
+
     // Opt-in: run ONLY the connect-failure check, then stop (kept separate from
     // the happy-path assertions so it can't destabilize them).
     if (FAILURE_CASE) {
       await runFailureCase(page);
+      if (pagePanicked) throw new Error("a Rust panic surfaced in the page during the run");
       console.log("\n✅ failure-case passed");
       return;
     }
@@ -430,6 +460,10 @@ async function main() {
       }
     }
 
+    if (pagePanicked) {
+      anyFailed = true;
+      fail("a Rust panic surfaced in the page during the run (see [page:*] logs above)");
+    }
     if (anyFailed) throw new Error("one or more transports failed");
     console.log("\n✅ integration tests passed");
   } finally {
