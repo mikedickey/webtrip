@@ -44,6 +44,11 @@ let pendingDisconnect: Promise<void> | null = null;
 // racing disconnect, or with no demo UI mounted to tear it down.
 let connectInFlight: Promise<void> | null = null;
 
+// Synchronous re-entrancy guard for handleConnect: the React `busy` state
+// disables the button only after a re-render, so two rapid clicks could both
+// dial the singleton session (connect_to_studio has no in-flight guard).
+let dialing = false;
+
 // Every teardown goes through here: it chains behind any uncancellable
 // in-flight connect (instant when none is pending or it already settled) and
 // behind any teardown already running (disconnect() calls on the session must
@@ -197,7 +202,7 @@ export default function Demo() {
   }, [sessionState]);
 
   const handleConnect = async () => {
-    if (!engine) return;
+    if (!engine || dialing) return;
     const host = serverHost.trim();
     if (!host) {
       alert("Please enter a server host.");
@@ -205,6 +210,7 @@ export default function Demo() {
     }
     const port = parseInt(serverPort, 10) || 4464;
 
+    dialing = true;
     setBusy(true);
     let timer: number | undefined;
     try {
@@ -264,6 +270,7 @@ export default function Demo() {
       beginDisconnect(engine.session);
       alert(`Connection failed: ${error}`);
     } finally {
+      dialing = false;
       clearTimeout(timer);
       setBusy(false);
     }
@@ -434,7 +441,11 @@ export default function Demo() {
         <div className="connection-buttons">
           <button
             className="action-btn primary"
-            disabled={busy || inProgress || connected}
+            // Also disabled during the transient "error" state: its teardown
+            // is scheduled by an effect, and a connect that sneaks in first
+            // would attach a transport while the Rust state machine drops the
+            // Error → Connecting transition, desyncing UI and session.
+            disabled={busy || inProgress || connected || sessionState === "error"}
             onClick={handleConnect}
           >
             {connected ? "Connected" : busy || inProgress ? "Connecting..." : "Connect to Studio"}
