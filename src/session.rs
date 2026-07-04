@@ -2,7 +2,7 @@
 //!
 //! High-level session management that coordinates all components:
 //! - AudioEngine (capture/playback via AudioWorklet)
-//! - Transport (abstraction for network layer - WebRTC, WebTransport, or Mock)
+//! - Transport (abstraction for network layer - WebRTC or WebTransport)
 //! - RingBuffer (send path: worklet -> network)
 //! - JitterBuffer (receive path: network -> worklet)
 //!
@@ -39,7 +39,6 @@ use crate::audio::shared_ptr::SharedPtr;
 use crate::audio::transport::{Transport, TransportType, AudioBufferConfig};
 use crate::audio::webrtc::{TransportConfig as WebRtcConfig, WebRtcTransport};
 use crate::audio::webtransport::{WebTransportImpl, is_webtransport_available};
-use crate::audio::mock_transport::MockTransport;
 use crate::audio::audio_callback_loop::AudioCallbackLoop;
 use wasm_bindgen::closure::Closure;
 
@@ -122,7 +121,7 @@ pub(crate) fn is_valid_channel_count(channels: u8) -> bool {
 /// ```text
 /// Idle        → Connecting
 /// Connecting  → Negotiating
-/// Connecting  → Connected   (e.g. Mock transport, no negotiation step)
+/// Connecting  → Connected   (transport with no separate negotiation step)
 /// Negotiating → Connected
 /// Idle        → Connected   (disconnect raced and reset to Idle while
 ///                            connect_to_studio was awaiting transport.connect();
@@ -277,6 +276,35 @@ impl WebTripSession {
             audio_callback_loop: None,
             tick_callback_closure: None,
         })
+    }
+
+    /// Connect the session over a caller-supplied, already-constructed transport,
+    /// bypassing the real per-type transport construction in `connect_to_studio`.
+    ///
+    /// Unit-test only. Mirrors `connect_to_studio`'s pre-transport steps (mark
+    /// `Connecting`, register default capture params) and then reuses the shared
+    /// [`finalize_connection`] tail, so a test can drive the full connect →
+    /// `AudioEngine`/worklet/callback-loop → `Connected` sequence against a mock
+    /// transport with no live hub. Pair with [`disconnect`] for the teardown half.
+    ///
+    /// [`finalize_connection`]: Self::finalize_connection
+    /// [`disconnect`]: Self::disconnect
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub(crate) async fn connect_with_test_transport(
+        &mut self,
+        mut transport: Box<dyn Transport>,
+    ) -> Result<(), JsValue> {
+        self.pending_capture_params = Some(PendingCaptureParams {
+            device_id: None,
+            auto_gain_control: false,
+            echo_cancellation: false,
+            noise_suppression: false,
+        });
+        self.set_state(SessionState::Connecting);
+
+        Transport::connect(transport.as_mut(), "test-host", DEFAULT_SIGNALING_PORT, "").await?;
+
+        self.finalize_connection(transport).await
     }
 
     /// Set callback for state changes
@@ -437,7 +465,7 @@ impl WebTripSession {
                 self.local_to_network_buffer.set_streaming(true);
             }
             _ => {
-                // WebRTC and Mock need the audio callback loop for tick()
+                // WebRTC needs the main-thread audio callback loop for tick()
                 self.start_audio_callback_loop();
             }
         }
@@ -558,26 +586,6 @@ impl WebTripSession {
                 
                 Box::new(webrtc_transport)
             }
-            TransportType::Mock => {
-                let mut mock_transport = MockTransport::new();
-                
-                // Configure audio buffers (Mock needs these for its internal tick loop)
-                mock_transport.set_audio_buffers(buffer_config);
-                
-                // Enable sine wave generation for mock transport
-                mock_transport.enable_sine_wave();
-                
-                // Connect (mock transport connects instantly)
-                // Use explicit trait method syntax to avoid ambiguity
-                Transport::connect(
-                    &mut mock_transport,
-                    &server_host,
-                    port,
-                    client_name_str,
-                ).await?;
-                
-                Box::new(mock_transport)
-            }
             TransportType::WebTransport => {
                 // Check if WebTransport is available in this browser
                 if !is_webtransport_available() {
@@ -633,6 +641,18 @@ impl WebTripSession {
             }
         };
 
+        self.finalize_connection(transport).await
+    }
+
+    /// Wire an already-connected transport into the session and bring audio up.
+    ///
+    /// Stores the transport, advances the session to `Connected`, and starts the
+    /// pending audio capture (which creates the `AudioEngine`, bootstraps the
+    /// worklet, and — for main-thread transports — starts the `Atomics.waitAsync`
+    /// audio-callback loop). This is the transport-agnostic tail shared by
+    /// `connect_to_studio` and the unit-test connect path, so both drive the same
+    /// bring-up sequence.
+    async fn finalize_connection(&mut self, transport: Box<dyn Transport>) -> Result<(), JsValue> {
         // Store the connected transport
         self.transport = Some(transport);
 
@@ -665,7 +685,7 @@ impl WebTripSession {
     /// high and causes the *next* connection's packets to be rejected by the
     /// wrap-distance check. Awaiting `transport.close()` establishes the
     /// happens-before ordering we need: for WebTransport the future only
-    /// resolves after `worker.terminate()`; for WebRTC/Mock the teardown is
+    /// resolves after `worker.terminate()`; for WebRTC the teardown is
     /// fully synchronous.
     pub async fn disconnect(&mut self) {
         if let Some(mut transport) = self.transport.take() {
@@ -944,23 +964,22 @@ mod tests {
     // the `AudioContext`-dependent audio controls, run in headless Chrome via
     // `npm run test:wasm`. The per-binary browser opt-in
     // (`wasm_bindgen_test_configure!(run_in_browser)`) lives once in
-    // `crate::test_support`; here we only import the attribute + `sleep_ms`.
+    // `crate::test_support`.
     //
     // The pure decision logic (`is_valid_channel_count`,
     // `is_valid_state_transition`, `build_session_stats`) is covered by the
-    // native tests above (WEB-18), and `MockTransport`'s sine-wave/packet
-    // behavior by its own native tests (WEB-7); neither is re-covered here.
+    // native tests above (WEB-18) and is not re-covered here.
     //
-    // Out of scope (a live JackTrip hub is required): the *successful* connect
-    // lifecycle of the WebRTC arm (`connect_to_studio` ~518-556) and the
-    // WebTransport arm (~578-629). Only the `MockTransport` arm is server-free,
-    // so it is the connect path exercised end-to-end below. The capture path
-    // inside connect calls `getUserMedia`; the synthetic-device Chrome flags in
-    // `webdriver.json` (`--use-fake-device-for-media-stream` /
-    // `--use-fake-ui-for-media-stream`) let it succeed headless.
+    // The *successful* connect lifecycle is driven over `test_support::
+    // MockTransport` via `connect_with_test_transport`, which reuses the same
+    // `finalize_connection` → `AudioEngine` → `disconnect` path as
+    // `connect_to_studio` without a live hub. The real WebRTC/WebTransport arms'
+    // network handshakes (SDP/ICE, QUIC) still require a live JackTrip hub and are
+    // covered by the integration tests; here they are only exercised on their
+    // failure paths.
 
     #[cfg(target_arch = "wasm32")]
-    use crate::test_support::{recording_state_callback, wait_until};
+    use crate::test_support::{recording_state_callback, wait_until, MockTransport};
     #[cfg(target_arch = "wasm32")]
     use std::cell::RefCell;
     #[cfg(target_arch = "wasm32")]
@@ -984,7 +1003,7 @@ mod tests {
     }
 
     /// Drive a full connect → audio-controls → disconnect cycle over the
-    /// server-free `MockTransport`.
+    /// server-free [`MockTransport`], via `connect_with_test_transport`.
     ///
     /// Asserts the `Idle → Connecting → Connected` progression (both via
     /// `state()` and the order of the `on_state_change` callbacks), exercises
@@ -992,7 +1011,7 @@ mod tests {
     /// now-live engine, then tears down via `disconnect()` and asserts the
     /// session returns to `Idle`. This runs the real async/await connect path,
     /// `AudioEngine::create`, worklet bootstrap, and the `Atomics.waitAsync`
-    /// audio-callback loop in the browser.
+    /// audio-callback loop in the browser — only the network transport is mocked.
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_mock_connect_disconnect_lifecycle() {
@@ -1002,24 +1021,13 @@ mod tests {
         let mut session = WebTripSession::new(&params as *const AudioParams)
             .expect("session construction should succeed");
 
-        session.set_transport_type(TransportType::Mock);
-        assert_eq!(session.get_transport_type(), TransportType::Mock);
-
         let (log, _cb) = attach_state_log(&mut session);
 
         assert_eq!(session.state(), SessionState::Idle);
         assert!(!session.is_connected());
 
         session
-            .connect_to_studio(
-                "mock-host".to_string(),
-                None,
-                None,
-                false,
-                false,
-                false,
-                None,
-            )
+            .connect_with_test_transport(Box::new(MockTransport::new()))
             .await
             .expect("mock connect should succeed");
 

@@ -30,7 +30,6 @@ pub mod protocol;
 // Transport and signaling modules
 pub mod transport;
 pub mod webrtc;
-pub mod mock_transport;
 pub mod webtransport;
 pub mod webtransport_worker;
 pub mod signaling;
@@ -64,7 +63,6 @@ pub use protocol::{AudioFormat, AudioPacket, PacketHeader, StreamStats};
 // Re-export transport types
 pub use transport::{Transport, TransportType, TransportState};
 pub use webrtc::{TransportConfig, WebRtcTransport};
-pub use mock_transport::{MockTransport, SineWaveConfig};
 pub use webtransport::WebTransportImpl;
 
 // Re-export signaling types

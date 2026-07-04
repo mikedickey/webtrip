@@ -291,11 +291,6 @@ class WebTripApp {
         name: "WebTransport",
         available: typeof (window as any).WebTransport !== "undefined",
       },
-      {
-        id: "mock",
-        name: "Mock",
-        available: true,
-      },
     ];
     return transports;
   }
@@ -327,9 +322,6 @@ class WebTripApp {
         break;
       case "webtransport":
         transportType = TransportType.WebTransport;
-        break;
-      case "mock":
-        transportType = TransportType.Mock;
         break;
       default:
         console.error("Unknown transport type:", transportId);
@@ -837,8 +829,6 @@ class WebTripApp {
         return "WebRTC";
       case "webtransport":
         return "WebTransport";
-      case "mock":
-        return "Mock";
       default:
         return "";
     }
