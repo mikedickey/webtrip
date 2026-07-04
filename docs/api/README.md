@@ -19,9 +19,11 @@ A clean, ergonomic API client for the JackTrip Virtual Studio platform. This lib
 | [Studios](./studios.md) | Virtual studio management |
 | [Devices](./devices.md) | JackTrip hardware devices |
 | [Events](./events.md) | Upcoming broadcasts and events |
-| [Streams](./streams.md) | Live streams and channels |
+| [Streams](./streams.md) | Live streams, channels, and conversations |
 | [Recordings](./recordings.md) | Recorded content management |
-| [Billing](./billing.md) | Subscriptions and payments |
+| [Billing](./billing.md) | Stripe billing, plans, redemptions, and usage |
+| [Subscriptions](./subscriptions.md) | Studio memberships (distinct from billing) |
+| [Tracks](./tracks.md) | Backing tracks for a studio |
 
 ## Quick Start
 

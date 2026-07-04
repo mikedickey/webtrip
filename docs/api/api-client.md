@@ -79,9 +79,11 @@ Access different API modules through these methods:
 | `studios()` | `StudiosApi` | Virtual studio management |
 | `devices()` | `DevicesApi` | JackTrip hardware devices |
 | `events()` | `EventsApi` | Upcoming broadcasts |
-| `streams()` | `StreamsApi` | Live streams and channels |
+| `streams()` | `StreamsApi` | Live streams, channels, and conversations |
 | `recordings()` | `RecordingsApi` | Recorded content |
-| `billing()` | `BillingApi` | Subscriptions and payments |
+| `billing()` | `BillingApi` | Stripe billing, plans, redemptions, and usage |
+| `subscriptions()` | `SubscriptionsApi` | Studio memberships (distinct from billing) |
+| `tracks()` | `TracksApi` | Backing tracks for a studio |
 
 ## Example
 
