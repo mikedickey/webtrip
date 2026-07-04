@@ -211,9 +211,13 @@ export default function Demo() {
       // The teardown wait runs inside the raced promise so the timeout also
       // covers a disconnect that never settles.
       const connectPromise = (async () => {
-        if (pendingDisconnect) {
-          await pendingDisconnect.catch(() => {});
-          pendingDisconnect = null;
+        // Drain teardowns until none are pending: a new disconnect can be
+        // registered while the previous one is being awaited, and it must not
+        // be dropped or the connect below would race its teardown.
+        while (pendingDisconnect) {
+          const prior = pendingDisconnect;
+          await prior.catch(() => {});
+          if (pendingDisconnect === prior) pendingDisconnect = null;
         }
         await engine.session.connectToStudio(
           host,
