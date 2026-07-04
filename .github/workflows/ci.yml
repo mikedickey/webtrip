@@ -9,6 +9,12 @@ on:
   pull_request:
     branches: [main]
 
+# One run per PR/branch at a time: a new push cancels the superseded run.
+# Main-push runs publish images, so they queue instead of cancelling.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   IMAGE: ghcr.io/mikedickey/webtrip-build
   WEBTRIP_IMAGE: ghcr.io/mikedickey/webtrip
@@ -260,7 +266,10 @@ jobs:
       contents: read
       packages: write
     steps:
+      # No git pushes from this job, so don't leave the token in .git/config.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
 
       # Restores pkg/ and website/dist/ where the Containerfile expects them.
       - name: Download site artifacts

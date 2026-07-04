@@ -99,12 +99,18 @@ server.listen(PORT, () => {
 // Optional plain-HTTP listener that 301s everything to the https server
 // (production runs it on port 80). Only meaningful alongside TLS.
 if (useTLS && redirectPort) {
-  http.createServer((req, res) => {
+  const redirectServer = http.createServer((req, res) => {
     const host = (req.headers.host || 'localhost').replace(/:\d+$/, '');
     const target = PORT === 443 ? `https://${host}` : `https://${host}:${PORT}`;
     res.writeHead(301, { Location: target + req.url });
     res.end();
-  }).listen(redirectPort, () => {
+  });
+  // A bind failure here (EADDRINUSE, EACCES) must not take down the https
+  // server — an unhandled 'error' event would crash the process.
+  redirectServer.on('error', (err) => {
+    console.error(`Redirect listener error on port ${redirectPort}:`, err.message);
+  });
+  redirectServer.listen(redirectPort, () => {
     console.log(`Redirecting http://localhost:${redirectPort}/ to https`);
   });
 }
