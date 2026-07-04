@@ -190,100 +190,89 @@ pub fn create_audio_params() -> *const AudioParams {
     params as *const AudioParams
 }
 
+/// Run `f` against the [`AudioParams`] behind `ptr`, returning `fallback` when
+/// the pointer is null.
+///
+/// This is the single place the cross-thread `AudioParams` pointer is
+/// dereferenced. Every exported `*FromPtr` accessor funnels through here so the
+/// null guard and the `unsafe` deref live in exactly one audited spot instead of
+/// being copy-pasted per accessor. All `AudioParams` methods take `&self` (state
+/// is atomic interior mutability), so setters pass a `()` fallback and mutate
+/// through the shared reference.
+fn with_params<R>(ptr: *const AudioParams, fallback: R, f: impl FnOnce(&AudioParams) -> R) -> R {
+    if ptr.is_null() {
+        return fallback;
+    }
+    // SAFETY: `ptr` is non-null here and, per `create_audio_params`, points at a
+    // `Box::leak`ed `AudioParams` living for the lifetime of the module in shared
+    // WASM linear memory, so the reference is valid for the duration of `f`.
+    f(unsafe { &*ptr })
+}
+
 /// Get volume level from params pointer (0.0 to 100.0)
 #[wasm_bindgen(js_name = getVolumeLevelFromPtr)]
 pub fn get_volume_level_from_ptr(ptr: *const AudioParams) -> f32 {
-    if ptr.is_null() {
-        return 0.0;
-    }
-    unsafe { (*ptr).get_volume_level() }
+    with_params(ptr, 0.0, |p| p.get_volume_level())
 }
 
 /// Get dB level from params pointer (-60.0 to 0.0)
 #[wasm_bindgen(js_name = getDbLevelFromPtr)]
 pub fn get_db_level_from_ptr(ptr: *const AudioParams) -> f32 {
-    if ptr.is_null() {
-        return -60.0;
-    }
-    unsafe { (*ptr).get_db_level() }
+    with_params(ptr, -60.0, |p| p.get_db_level())
 }
 
 /// Get peak level from params pointer (0.0 to 100.0)
 #[wasm_bindgen(js_name = getPeakLevelFromPtr)]
 pub fn get_peak_level_from_ptr(ptr: *const AudioParams) -> f32 {
-    if ptr.is_null() {
-        return 0.0;
-    }
-    unsafe { (*ptr).get_peak_level() }
+    with_params(ptr, 0.0, |p| p.get_peak_level())
 }
 
 /// Get peak dB level from params pointer (-60.0 to 0.0)
 #[wasm_bindgen(js_name = getPeakDbLevelFromPtr)]
 pub fn get_peak_db_level_from_ptr(ptr: *const AudioParams) -> f32 {
-    if ptr.is_null() {
-        return -60.0;
-    }
-    unsafe { (*ptr).get_peak_db_level() }
+    with_params(ptr, -60.0, |p| p.get_peak_db_level())
 }
 
 /// Set monitor volume from params pointer (0.0 to 1.0)
 #[wasm_bindgen(js_name = setMonitorVolumeFromPtr)]
 pub fn set_monitor_volume_from_ptr(ptr: *const AudioParams, volume: f32) {
-    if !ptr.is_null() {
-        unsafe { (*ptr).set_monitor_volume(volume) }
-    }
+    with_params(ptr, (), |p| p.set_monitor_volume(volume));
 }
 
 /// Get monitor volume from params pointer (0.0 to 1.0)
 #[wasm_bindgen(js_name = getMonitorVolumeFromPtr)]
 pub fn get_monitor_volume_from_ptr(ptr: *const AudioParams) -> f32 {
-    if ptr.is_null() {
-        return 0.0;
-    }
-    unsafe { (*ptr).get_monitor_volume() }
+    with_params(ptr, 0.0, |p| p.get_monitor_volume())
 }
 
 /// Set input gain from params pointer (-20.0 to +20.0 dB)
 #[wasm_bindgen(js_name = setInputGainFromPtr)]
 pub fn set_input_gain_from_ptr(ptr: *const AudioParams, gain_db: f32) {
-    if !ptr.is_null() {
-        unsafe { (*ptr).set_input_gain(gain_db) }
-    }
+    with_params(ptr, (), |p| p.set_input_gain(gain_db));
 }
 
 /// Get input gain from params pointer (dB)
 #[wasm_bindgen(js_name = getInputGainFromPtr)]
 pub fn get_input_gain_from_ptr(ptr: *const AudioParams) -> f32 {
-    if ptr.is_null() {
-        return 0.0;
-    }
-    unsafe { (*ptr).get_input_gain() }
+    with_params(ptr, 0.0, |p| p.get_input_gain())
 }
 
 /// Set output volume from params pointer (0.0 to 1.0)
 #[wasm_bindgen(js_name = setOutputVolumeFromPtr)]
 pub fn set_output_volume_from_ptr(ptr: *const AudioParams, volume: f32) {
-    if !ptr.is_null() {
-        unsafe { (*ptr).set_output_volume(volume) }
-    }
+    with_params(ptr, (), |p| p.set_output_volume(volume));
 }
 
 /// Get output volume from params pointer (0.0 to 1.0)
 #[wasm_bindgen(js_name = getOutputVolumeFromPtr)]
 pub fn get_output_volume_from_ptr(ptr: *const AudioParams) -> f32 {
-    if ptr.is_null() {
-        return 1.0;
-    }
-    unsafe { (*ptr).get_output_volume() }
+    with_params(ptr, 1.0, |p| p.get_output_volume())
 }
 
 /// Get callback count from params pointer
 #[wasm_bindgen(js_name = getCallbackCountFromPtr)]
 pub fn get_callback_count_from_ptr(ptr: *const AudioParams) -> u64 {
-    if ptr.is_null() {
-        return 0;
-    }
-    unsafe { (*ptr).get_callback_count() }
+    with_params(ptr, 0, |p| p.get_callback_count())
 }
 
 // ==============================================================================
