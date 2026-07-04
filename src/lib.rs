@@ -31,7 +31,7 @@ pub use audio::{
     Transport, TransportType, TransportState,
     TransportConfig,
     WebRtcTransport,
-    MockTransport, WebTransportImpl,
+    WebTransportImpl,
     // Signaling types
     HubSignaling, HubConnectionState, SignalingMessage,
 };

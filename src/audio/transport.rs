@@ -18,8 +18,6 @@ pub enum TransportType {
     WebRTC,
     /// WebTransport (future, Chrome/Edge only)
     WebTransport,
-    /// Mock transport for testing
-    Mock,
 }
 
 impl TransportType {
@@ -28,7 +26,6 @@ impl TransportType {
         match self {
             TransportType::WebRTC => "WebRTC Data Channels".to_string(),
             TransportType::WebTransport => "WebTransport (QUIC)".to_string(),
-            TransportType::Mock => "Mock (Testing)".to_string(),
         }
     }
 
@@ -37,7 +34,6 @@ impl TransportType {
         match self {
             TransportType::WebRTC => "webrtc".to_string(),
             TransportType::WebTransport => "webtransport".to_string(),
-            TransportType::Mock => "mock".to_string(),
         }
     }
 
@@ -46,7 +42,6 @@ impl TransportType {
         match id {
             "webrtc" => Some(TransportType::WebRTC),
             "webtransport" => Some(TransportType::WebTransport),
-            "mock" => Some(TransportType::Mock),
             _ => None,
         }
     }
@@ -209,12 +204,11 @@ mod tests {
         // Pins a cross-language contract: src/app.ts hardcodes these id strings.
         assert_eq!(TransportType::WebRTC.id(), "webrtc");
         assert_eq!(TransportType::WebTransport.id(), "webtransport");
-        assert_eq!(TransportType::Mock.id(), "mock");
     }
 
     #[test]
     fn transport_type_from_id_roundtrip() {
-        for t in [TransportType::WebRTC, TransportType::WebTransport, TransportType::Mock] {
+        for t in [TransportType::WebRTC, TransportType::WebTransport] {
             assert_eq!(
                 TransportType::from_id(&t.id()),
                 Some(t),

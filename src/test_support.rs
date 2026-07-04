@@ -125,3 +125,52 @@ pub(crate) fn assert_valid_sdp(sdp: &str) {
         "SDP must contain an m= (media) line, got:\n{sdp}"
     );
 }
+
+/// Minimal in-process [`Transport`] for driving the session's connect/disconnect
+/// lifecycle in unit tests without a live hub.
+///
+/// It performs no network I/O and touches no browser APIs: `connect` transitions
+/// synchronously to `Connected`, `close` to `Closed`, and `tick` is the trait's
+/// no-op default. Pass it to [`WebTripSession::connect_with_test_transport`] so a
+/// test can exercise the real connect → `AudioEngine` → `disconnect` path against
+/// a transport that always succeeds instantly.
+///
+/// [`WebTripSession::connect_with_test_transport`]: crate::session::WebTripSession::connect_with_test_transport
+pub(crate) struct MockTransport {
+    state: crate::audio::transport::TransportState,
+}
+
+impl MockTransport {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: crate::audio::transport::TransportState::Disconnected,
+        }
+    }
+}
+
+impl crate::audio::transport::Transport for MockTransport {
+    fn transport_type(&self) -> crate::audio::transport::TransportType {
+        // The concrete type is irrelevant to the lifecycle under test; report
+        // the default so no production `TransportType::Mock` variant is needed.
+        crate::audio::transport::TransportType::WebRTC
+    }
+
+    fn state(&self) -> crate::audio::transport::TransportState {
+        self.state
+    }
+
+    fn connect(
+        &mut self,
+        _server: &str,
+        _port: u16,
+        _client_name: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), JsValue>> + '_>> {
+        self.state = crate::audio::transport::TransportState::Connected;
+        Box::pin(async { Ok(()) })
+    }
+
+    fn close(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
+        self.state = crate::audio::transport::TransportState::Closed;
+        Box::pin(async {})
+    }
+}

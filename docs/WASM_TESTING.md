@@ -164,8 +164,8 @@ the toolchain container (`containers/build/Containerfile`). The browser setup
 
 ## Integration tests (real JackTrip server)
 
-The unit tests above stop at the transport boundary (`MockTransport` or pure
-logic). The **integration tests** drive the real WASM client against an actual
+The unit tests above stop at the transport boundary (pure logic; there is no
+server-free transport). The **integration tests** drive the real WASM client against an actual
 `jacktrip/jacktrip:edge` hub server in Docker, for **both** the WebRTC and
 WebTransport transports — the live surface unit tests can't reach (WebRTC's
 WebSocket signaling + SDP/ICE + data-channel open; WebTransport's QUIC worker
@@ -487,12 +487,10 @@ The test requires threading support. Either:
   fake-device flags above)
 - `src/test_support.rs`: shared browser-test scaffolding (`run_in_browser`
   opt-in for the lib binary, `assert_valid_sdp`, `sleep_ms` async yield helper)
-- `src/session.rs`: the async connect/disconnect state machine over the
-  server-free `MockTransport` — a full `Idle → Connecting → Connected → Idle`
-  cycle (via `state()` and the `on_state_change` callback order), the
-  `AudioContext`-backed `is_audio_suspended`/`resume_audio` both with a live
-  engine (after a mock connect) and on the no-engine branch, plus the
-  invalid-host fast-fail path. The capture path inside connect uses
-  `getUserMedia`, enabled headless by the synthetic-device flags in
-  `webdriver.json` (`--use-fake-device-for-media-stream` /
-  `--use-fake-ui-for-media-stream`)
+- `src/session.rs`: the async connect state machine on its failure paths (with
+  no server-free transport, the successful connect lifecycle needs a live hub
+  and is covered by the integration tests). Asserts the invalid-host fast-fail
+  path (an empty host yields an invalid signaling URL that fails without a
+  server, and the session must not report `Connected`) and the
+  `AudioContext`-backed `is_audio_suspended`/`resume_audio` on the no-engine
+  branch
