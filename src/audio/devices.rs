@@ -218,29 +218,6 @@ mod tests {
     }
 
     #[test]
-    fn test_categorize_empty() {
-        let (inputs, outputs) = categorize_devices_core(&[]);
-        assert!(inputs.is_empty());
-        assert!(outputs.is_empty());
-    }
-
-    #[test]
-    fn test_categorize_inputs_only() {
-        let devices = vec![input("in-1", "Mic A"), input("in-2", "Mic B")];
-        let (inputs, outputs) = categorize_devices_core(&devices);
-        assert_devices(&inputs, &[("in-1", "Mic A"), ("in-2", "Mic B")]);
-        assert!(outputs.is_empty());
-    }
-
-    #[test]
-    fn test_categorize_outputs_only() {
-        let devices = vec![output("out-1", "Speakers"), output("out-2", "Headphones")];
-        let (inputs, outputs) = categorize_devices_core(&devices);
-        assert!(inputs.is_empty());
-        assert_devices(&outputs, &[("out-1", "Speakers"), ("out-2", "Headphones")]);
-    }
-
-    #[test]
     fn test_categorize_mixed_partitions_and_maps() {
         // Interleaved inputs/outputs so we also confirm correct partitioning.
         let devices = vec![
@@ -321,29 +298,6 @@ mod tests {
             .as_string()
             .expect("label must be a string");
         (device_id, label)
-    }
-
-    /// `get_media_devices` must hand back the browser's `navigator.mediaDevices`.
-    /// This works even without the fake-device flags — it only reaches the API,
-    /// it does not enumerate or capture.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    fn get_media_devices_succeeds() {
-        get_media_devices().expect("navigator.mediaDevices must be available in the browser");
-    }
-
-    /// `request_audio_permission` exercises the production `getUserMedia` +
-    /// internal `stop_media_stream` path: with the fake-UI flag the permission
-    /// is auto-granted and the synthetic mic stream resolves, then its tracks
-    /// are stopped. It must resolve without error.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    async fn request_audio_permission_resolves_with_fake_device() {
-        let media_devices =
-            get_media_devices().expect("navigator.mediaDevices must be available");
-        request_audio_permission(&media_devices)
-            .await
-            .expect("getUserMedia should resolve with fake-device flags");
     }
 
     /// Read a `MediaStreamTrack`'s `readyState` (`"live"`/`"ended"`) via JS

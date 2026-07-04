@@ -256,47 +256,5 @@ mod tests {
         assert!(s.contains("\"ownerId\":\"u1\""));
         assert!(!s.contains("\"metadata\":"));
     }
-
-    #[test]
-    fn recording_download_roundtrip() {
-        let json = r#"{"url":"https://storage.example.com/signed?token=abc"}"#;
-        let d: RecordingDownload = serde_json::from_str(json).unwrap();
-        assert_eq!(d.url.as_deref(), Some("https://storage.example.com/signed?token=abc"));
-        let out = roundtrip(&d);
-        assert!(out.contains("\"url\":\"https://storage.example.com/signed?token=abc\""));
-    }
-
-    #[test]
-    fn recordings_quota_nests_private_recordings() {
-        let json = r#"{"privateRecordings":{"count":3,"limit":10}}"#;
-        let q: RecordingsQuota = serde_json::from_str(json).unwrap();
-        let private = q.private_recordings.as_ref().expect("privateRecordings present");
-        assert_eq!(private.count, Some(3));
-        assert_eq!(private.limit, Some(10));
-        let out = roundtrip(&q);
-        assert!(out.contains("\"privateRecordings\":"));
-        assert!(out.contains("\"count\":3"));
-        assert!(out.contains("\"limit\":10"));
-    }
-
-    #[test]
-    fn stem_summary_fixture_known_good() {
-        let json = r#"{
-          "clients": [
-            {"id": 1, "name": "vocals", "filename": "stem-1.wav"},
-            {"id": 2, "name": "guitar", "filename": "stem-2.wav"}
-          ]
-        }"#;
-        let s: StemSummary = serde_json::from_str(json).unwrap();
-        let clients = s.clients.as_ref().expect("clients present");
-        assert_eq!(clients.len(), 2);
-        assert_eq!(clients[0].id, Some(1));
-        assert_eq!(clients[0].name.as_deref(), Some("vocals"));
-        assert_eq!(clients[1].filename.as_deref(), Some("stem-2.wav"));
-
-        let out = roundtrip(&s);
-        assert!(out.contains("\"clients\":"));
-        assert!(out.contains("\"filename\":"));
-    }
 }
 

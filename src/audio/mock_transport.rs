@@ -64,7 +64,6 @@
 //!
 //! - **Packet Loss Simulation**: Use `set_packet_loss_rate()` to simulate network packet loss
 //! - **Manual Packet Injection**: Use `simulate_receive()` to inject specific test packets
-//! - **Queue Inspection**: Use `get_sent_packets()` to verify what was sent
 
 use super::transport::{Transport, TransportState, TransportType, AudioBufferConfig, notify_transport_state};
 use crate::audio::protocol::{AudioPacket, PacketHeader, SampleRateCode, DEFAULT_BUFFER_SIZE, DEFAULT_SAMPLE_RATE};
@@ -127,7 +126,6 @@ impl Default for SineWaveState {
 /// Mock transport for testing
 pub struct MockTransport {
     state: TransportState,
-    send_queue: Rc<RefCell<VecDeque<Vec<u8>>>>,
     receive_queue: Rc<RefCell<VecDeque<Vec<u8>>>>,
     
     // Callbacks
@@ -149,7 +147,6 @@ impl MockTransport {
     pub fn new() -> Self {
         Self {
             state: TransportState::Disconnected,
-            send_queue: Rc::new(RefCell::new(VecDeque::new())),
             receive_queue: Rc::new(RefCell::new(VecDeque::new())),
             on_state_change: None,
             packet_loss_rate: 0.0,
@@ -247,8 +244,8 @@ impl MockTransport {
     /// Process one audio callback tick
     /// 
     /// Called by the session layer when the audio worklet's process() callback runs.
-    /// Reads from the ring buffer (and optionally stores for testing) and
-    /// generates sine wave packets to push to the jitter buffer.
+    /// Reads from the ring buffer (discarding the audio) and generates sine wave
+    /// packets to push to the jitter buffer.
     fn do_tick(&mut self) {
         // Only process if we have buffers configured
         let buffers = match self.audio_buffers {
@@ -263,7 +260,7 @@ impl MockTransport {
         let ring_buffer = unsafe { &mut *buffers.local_to_network_ptr };
         let jitter_buffer = unsafe { &mut *buffers.network_to_local_ptr };
         
-        // Read from ring buffer (simulates sending, stores for testing)
+        // Read from ring buffer (simulates sending)
         if ring_buffer.available() >= samples_needed {
             let mut audio_buffer = vec![0.0; samples_needed as usize];
             let _ = ring_buffer.read(&mut audio_buffer);
@@ -292,14 +289,6 @@ impl MockTransport {
     pub fn simulate_receive(&self, data: Vec<u8>) {
         self.receive_queue.borrow_mut().push_back(data);
     }
-
-    /// Get packets from send queue (for testing/verification)
-    pub fn get_sent_packets(&self) -> Vec<Vec<u8>> {
-        let mut queue = self.send_queue.borrow_mut();
-        let packets: Vec<_> = queue.drain(..).collect();
-        packets
-    }
-
 
     /// Set callback for state changes
     pub fn set_on_state_change(&mut self, callback: js_sys::Function) {
@@ -352,7 +341,6 @@ impl Transport for MockTransport {
         }
 
         self.state = TransportState::Closed;
-        self.send_queue.borrow_mut().clear();
         self.receive_queue.borrow_mut().clear();
         self.notify_state_change();
 
@@ -370,7 +358,6 @@ impl Default for MockTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::protocol::{HEADER_SIZE, AudioPacket};
 
     #[test]
     fn test_sine_wave_generates_correct_frequency() {
@@ -407,48 +394,6 @@ mod tests {
             "Expected ~{:.1} cycles, got {:.1} (zero crossings: {})",
             expected_cycles, measured_cycles, zero_crossings
         );
-    }
-
-    #[test]
-    fn test_sine_wave_sample_rate_switching() {
-        let test_cases = vec![
-            (22050, 220.0, 128),
-            (44100, 220.0, 128),
-            (48000, 220.0, 128),
-            (96000, 220.0, 128),
-        ];
-        
-        for (sample_rate, frequency, buffer_size) in test_cases {
-            let mut transport = MockTransport::new();
-            
-            let config = SineWaveConfig {
-                frequency,
-                amplitude: 0.3,
-                channels: 1,
-                sample_rate,
-                buffer_size,
-            };
-            
-            transport.enable_sine_wave_with_config(config);
-            let mut state = transport.sine_wave_state.borrow_mut();
-            
-            let packet = MockTransport::generate_sine_wave_packet(&mut state);
-            
-            assert_eq!(packet.samples.len(), buffer_size as usize);
-            assert_eq!(packet.header.sample_rate.to_hz(), sample_rate);
-            
-            let expected_period_samples = sample_rate as f32 / frequency;
-            let zero_crossings = count_zero_crossings(&packet.samples);
-            let measured_cycles = zero_crossings as f32 / 2.0;
-            let expected_cycles = buffer_size as f32 / expected_period_samples;
-            
-            let tolerance = expected_cycles * 0.2 + 0.5;
-            assert!(
-                (measured_cycles - expected_cycles).abs() < tolerance,
-                "Sample rate {} Hz: expected {:.2} cycles, got {:.2}",
-                sample_rate, expected_cycles, measured_cycles
-            );
-        }
     }
 
     #[test]
@@ -494,94 +439,6 @@ mod tests {
             let right = stereo_packet.samples[i * 2 + 1];
             assert!((left - right).abs() < 1e-6, "Stereo channels should have identical samples");
         }
-    }
-
-    #[test]
-    fn test_packet_header_size_and_boundaries() {
-        let mut transport = MockTransport::new();
-        
-        let config = SineWaveConfig {
-            frequency: 440.0,
-            amplitude: 0.3,
-            channels: 1,
-            sample_rate: 48000,
-            buffer_size: 128,
-        };
-        
-        transport.enable_sine_wave_with_config(config);
-        let mut state = transport.sine_wave_state.borrow_mut();
-        
-        let packet = MockTransport::generate_sine_wave_packet(&mut state);
-        
-        let mut buffer = vec![0u8; 4096];
-        let bytes_written = packet.serialize_into(&mut buffer).unwrap();
-        
-        let expected_audio_bytes = 128 * 1 * 2;
-        let expected_total = HEADER_SIZE + expected_audio_bytes;
-        
-        assert_eq!(HEADER_SIZE, 16, "Header must be exactly 16 bytes");
-        assert_eq!(bytes_written, expected_total);
-        assert_eq!(packet.header.total_packet_size_out(), expected_total);
-        
-        let header = PacketHeader::deserialize(&buffer[..HEADER_SIZE]).unwrap();
-        assert_eq!(header.sequence_number, packet.header.sequence_number);
-        assert_eq!(header.timestamp, packet.header.timestamp);
-        assert_eq!(header.buffer_size, 128);
-        
-        let stereo_config = SineWaveConfig {
-            frequency: 440.0,
-            amplitude: 0.3,
-            channels: 2,
-            sample_rate: 48000,
-            buffer_size: 256,
-        };
-        
-        state.config = stereo_config;
-        state.phase = 0.0;
-        let stereo_packet = MockTransport::generate_sine_wave_packet(&mut state);
-        
-        let stereo_bytes_written = stereo_packet.serialize_into(&mut buffer).unwrap();
-        let expected_stereo_audio = 256 * 2 * 2;
-        let expected_stereo_total = HEADER_SIZE + expected_stereo_audio;
-        
-        assert_eq!(stereo_bytes_written, expected_stereo_total);
-    }
-
-    #[test]
-    fn test_loopback_send_receive() {
-        let transport = MockTransport::new();
-        
-        let test_data1 = vec![1, 2, 3, 4, 5];
-        let test_data2 = vec![10, 20, 30];
-        let test_data3 = vec![100, 150, 200, 250];
-        
-        transport.simulate_receive(test_data1.clone());
-        transport.simulate_receive(test_data2.clone());
-        transport.simulate_receive(test_data3.clone());
-        
-        let received = transport.receive_queue.borrow();
-        assert_eq!(received.len(), 3);
-        
-        assert_eq!(received[0], test_data1);
-        assert_eq!(received[1], test_data2);
-        assert_eq!(received[2], test_data3);
-        
-        drop(received);
-        
-        let header = PacketHeader::new(42, 1000);
-        let samples = vec![0.1, 0.2, 0.3, 0.4];
-        let packet = AudioPacket::new(header, samples);
-        let serialized = packet.serialize().unwrap();
-        
-        transport.send_queue.borrow_mut().push_back(serialized.clone());
-        transport.send_queue.borrow_mut().push_back(vec![255; 16]);
-        
-        let sent_packets = transport.get_sent_packets();
-        assert_eq!(sent_packets.len(), 2);
-        assert_eq!(sent_packets[0], serialized);
-        assert_eq!(sent_packets[1], vec![255; 16]);
-        
-        assert_eq!(transport.send_queue.borrow().len(), 0);
     }
 
     #[test]

@@ -151,26 +151,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_fixture_known_good() {
-        let json = r#"{
-          "id": "pro",
-          "name": "Pro",
-          "price": 1999,
-          "maxMusicians": 10,
-          "studioMinutes": 6000
-        }"#;
-        let p: Plan = serde_json::from_str(json).unwrap();
-        assert_eq!(p.id.as_deref(), Some("pro"));
-        assert_eq!(p.price, Some(1999.0));
-        assert_eq!(p.max_musicians, Some(10));
-        assert_eq!(p.studio_minutes, Some(6000.0));
-
-        let out = roundtrip(&p);
-        assert!(out.contains("\"maxMusicians\":"));
-        assert!(out.contains("\"studioMinutes\":"));
-    }
-
-    #[test]
     fn plan_price_renames_price_id() {
         let json = r#"{"plan":"pro","priceID":"price_abc"}"#;
         let p: PlanPrice = serde_json::from_str(json).unwrap();
@@ -201,23 +181,5 @@ mod tests {
         assert!(out.contains("\"ownerID\":"));
         assert!(out.contains("\"monthlyMinutes\":"));
         assert!(!out.contains("\"ownerId\":"));
-    }
-
-    #[test]
-    fn usage_and_usage_response_roundtrip() {
-        let json = r#"{
-          "summary": {"earliest": "2026-06-01T00:00:00Z", "latest": "2026-06-30T00:00:00Z", "total": 34.5},
-          "details": [
-            {"earliest": "2026-06-01T00:00:00Z", "latest": "2026-06-02T00:00:00Z", "total": 1.5}
-          ]
-        }"#;
-        let u: UsageResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(u.summary.as_ref().and_then(|s| s.total), Some(34.5));
-        assert_eq!(u.details.as_ref().map(|d| d.len()), Some(1));
-
-        let out = roundtrip(&u);
-        assert!(out.contains("\"summary\":"));
-        assert!(out.contains("\"details\":"));
-        assert!(out.contains("\"earliest\":"));
     }
 }

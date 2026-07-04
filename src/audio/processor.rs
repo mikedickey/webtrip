@@ -329,16 +329,6 @@ mod tests {
     // --- apply_gain -------------------------------------------------------------
 
     #[test]
-    fn test_apply_gain_unity() {
-        let input = [0.25f32, -0.5, 0.75, -1.0, 1.0];
-        let mut output = [0.0f32; 5];
-        apply_gain(&input, 1.0, &mut output);
-        for (i, (&inp, &out)) in input.iter().zip(output.iter()).enumerate() {
-            assert!((out - inp).abs() < EPS, "unity gain mismatch at index {i}");
-        }
-    }
-
-    #[test]
     fn test_apply_gain_clamped_above_full_scale() {
         // At full scale (±1.0) with any gain > 1.0, the result must clamp to ±1.0.
         let mut out = [0.0f32; 1];
@@ -363,16 +353,6 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_gain_silence() {
-        let input = [1.0f32, -1.0, 0.5];
-        let mut output = [0.0f32; 3];
-        apply_gain(&input, 0.0, &mut output);
-        for &s in &output {
-            assert!(s.abs() < EPS, "zero gain must produce silence");
-        }
-    }
-
-    #[test]
     #[should_panic(expected = "apply_gain: output buffer")]
     fn test_apply_gain_panics_when_output_shorter_than_input() {
         let input = [0.5f32; 4];
@@ -381,12 +361,6 @@ mod tests {
     }
 
     // --- compute_rms ------------------------------------------------------------
-
-    #[test]
-    fn test_rms_silence() {
-        let silence = vec![0.0f32; 128];
-        assert!(compute_rms(&silence).abs() < EPS, "RMS of silence must be 0.0");
-    }
 
     #[test]
     fn test_rms_empty_slice() {
@@ -420,31 +394,6 @@ mod tests {
     }
 
     // --- compute_peak_update ----------------------------------------------------
-
-    #[test]
-    fn test_peak_new_peak_resets_hold_counter() {
-        let (new_peak, new_counter) = compute_peak_update(-10.0, -20.0, 0);
-        assert!((new_peak - (-10.0)).abs() < EPS, "new peak must be adopted");
-        assert_eq!(new_counter, PEAK_HOLD_FRAMES, "hold counter must reset to PEAK_HOLD_FRAMES");
-    }
-
-    #[test]
-    fn test_peak_hold_phase_decrements_counter() {
-        // While hold_counter > 0 the peak stays and counter decrements.
-        let (peak_after, counter_after) = compute_peak_update(-20.0, -10.0, 5);
-        assert!((peak_after - (-10.0)).abs() < EPS, "peak must be held");
-        assert_eq!(counter_after, 4, "counter must decrement by 1");
-    }
-
-    #[test]
-    fn test_peak_decay_phase_applies_decay_rate() {
-        // When hold_counter == 0 and no new peak, the peak decays by PEAK_DECAY_RATE.
-        let peak_db = -10.0f32;
-        let (decayed, counter) = compute_peak_update(-30.0, peak_db, 0);
-        let expected = (peak_db - PEAK_DECAY_RATE).max(MIN_DB);
-        assert!((decayed - expected).abs() < EPS, "peak must decay by PEAK_DECAY_RATE");
-        assert_eq!(counter, 0, "counter stays at 0 during decay");
-    }
 
     #[test]
     fn test_peak_decay_does_not_go_below_min_db() {

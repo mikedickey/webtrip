@@ -220,40 +220,6 @@ mod tests {
     }
 
     #[test]
-    fn error_response_known_good_fixture() {
-        // Fixture modeled after docs/api/error-handling.md.
-        let json = r#"{
-          "code": "not_found",
-          "message": "Studio not found",
-          "status": 404,
-          "details": {"resource": "studio", "id": "missing"}
-        }"#;
-        let e: Error = serde_json::from_str(json).unwrap();
-        assert_eq!(e.code.as_deref(), Some("not_found"));
-        assert_eq!(e.status, Some(404));
-        assert!(e.details.is_some());
-        let s = roundtrip(&e);
-        assert!(s.contains("\"code\":\"not_found\""));
-        assert!(s.contains("\"status\":404"));
-    }
-
-    #[test]
-    fn hubspot_token_roundtrips() {
-        let t = HubSpotToken {
-            token: Some("hs-visitor-123".into()),
-        };
-        let s = roundtrip(&t);
-        assert!(s.contains("\"token\":\"hs-visitor-123\""));
-
-        let parsed: HubSpotToken = serde_json::from_str(r#"{"token":"abc"}"#).unwrap();
-        assert_eq!(parsed.token.as_deref(), Some("abc"));
-
-        // Empty body deserializes to a token-less response.
-        let empty: HubSpotToken = serde_json::from_str("{}").unwrap();
-        assert_eq!(empty.token, None);
-    }
-
-    #[test]
     fn server_with_subscription_flattens_server() {
         let s = ServerWithSubscription {
             server: super::super::Server {

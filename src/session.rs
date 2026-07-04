@@ -823,22 +823,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn valid_channel_counts_accepted() {
-        for ch in 1u8..=8 {
-            assert!(is_valid_channel_count(ch), "channel {ch} should be valid");
-        }
-    }
-
-    #[test]
-    fn zero_channels_rejected() {
+    fn channel_count_validation_boundaries() {
         assert!(!is_valid_channel_count(0));
-    }
-
-    #[test]
-    fn out_of_range_high_channels_rejected() {
-        for ch in 9u8..=255 {
-            assert!(!is_valid_channel_count(ch), "channel {ch} should be invalid");
-        }
+        assert!(is_valid_channel_count(1));
+        assert!(is_valid_channel_count(8));
+        assert!(!is_valid_channel_count(9));
     }
 
     // -----------------------------------------------------------------------
@@ -900,21 +889,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn stats_default_is_all_zero() {
-        let s = SessionStats::default();
-        assert_eq!(s.packets_sent, 0);
-        assert_eq!(s.packets_received, 0);
-        assert_eq!(s.send_buffer_available, 0);
-        assert_eq!(s.ring_buffer_writes, 0);
-        assert_eq!(s.ring_buffer_samples_written, 0);
-        assert_eq!(s.ring_buffer_overruns, 0);
-        assert_eq!(s.regulator_depth, 0);
-        assert!((s.regulator_latency_ms - 0.0).abs() < 1e-6);
-        assert!(!s.regulator_initialized);
-        assert_eq!(s.regulator_last_seq, 0);
-    }
-
-    #[test]
     fn build_session_stats_maps_all_fields() {
         let reg = RegulatorStats {
             tolerance_ms: 12.5,
@@ -957,23 +931,6 @@ mod tests {
         assert_eq!(s.ring_buffer_writes, 200);
         assert_eq!(s.ring_buffer_samples_written, 25_600);
         assert_eq!(s.ring_buffer_overruns, 0);
-    }
-
-    #[test]
-    fn build_session_stats_zero_regulator() {
-        let s = build_session_stats(
-            RegulatorStats::default(),
-            0,
-            0.0,
-            false,
-            0,
-            0,
-            0,
-            0,
-        );
-        assert_eq!(s.packets_received, 0);
-        assert_eq!(s.regulator_depth, 0);
-        assert!(!s.regulator_initialized);
     }
 
     // -----------------------------------------------------------------------

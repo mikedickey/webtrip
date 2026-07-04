@@ -30,6 +30,29 @@ This applies equally to test helpers, serialization utilities, fixture builders,
 
 **Note**: WASM tests require a properly configured browser environment. See the testing guide for requirements and troubleshooting.
 
+## Testing Guidelines
+
+Every test must be able to fail on a plausible bug in production logic. Before adding a test, ask: "what realistic mistake would this catch that no existing test catches?" If the answer is "someone edited a constant on purpose" or "serde/std/the browser is broken", don't write it. Coverage percentage is never a reason by itself to add a test — no zero-assertion tests, no "doesn't throw" tests.
+
+**Do not write:**
+
+- Tests asserting `Default`/constructor field values, derived trait output, or getter/setter round-trips with no logic in between.
+- Tests that restate a constant, a one-line `matches!`, a format string, or an enum-to-string literal. (Exception: strings that form a cross-language or wire contract — e.g. transport state strings matched by JS, the 63-byte exit packet — should be pinned, with a comment saying which contract they pin.)
+- Tests of another module's code from your module's test file. Packet serialization tests belong in `protocol.rs`, not in transport tests; a thin wrapper only needs a test for the logic it adds.
+- Tests of mocks, fixtures, or test helpers themselves, and tests that simulate the algorithm under test inside the test body and then assert a bare load.
+- Point tests on a code path that an existing matrix/boundary/sequence test already exercises. Prefer one thorough test (full permutation matrix, both sides of each boundary, a multi-step sequence) over several single-value tests; when adding a case, extend the existing test.
+- Bare atomic store/load tests, and "cross-thread" tests whose synchronization (e.g. `thread::join`) makes them unable to fail.
+
+**Do write:**
+
+- Wire-format pins: explicit serde renames (`priceID`, `type`, `_meta`), `flatten` shapes, `serde_repr` integer values, absolute byte layouts. A round-trip alone is not enough — serialize and deserialize can share a symmetric bug; assert the actual bytes/JSON. Conversely, a model test whose only content is re-verifying `rename_all = "camelCase"` adds nothing after the first one.
+- Distinct branches and edges: validation boundaries (both sides), error paths, wraparound (`u16` sequence numbers, ring indices), empty-input early returns, null-pointer guards.
+- Regression tests for fixed bugs, with a comment referencing the bug/commit.
+- Browser (wasm) tests that drive real handlers with synthetic events and assert observable contracts (callback payloads, teardown ordering, promise rejection) — not browser-provided initial states or `web_sys` echoes.
+- Exactly one trivial canary test per `tests/*.rs` wasm binary — a binary whose tests all fail to register is silently skipped (see [docs/WASM_TESTING.md](docs/WASM_TESTING.md)).
+
+When deleting or refactoring production code, delete its tests rather than porting low-value ones forward.
+
 ## Architecture
 
 ### Key Modules

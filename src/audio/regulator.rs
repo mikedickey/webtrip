@@ -1271,13 +1271,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_burg_algorithm_creation() {
-        let burg = BurgAlgorithm::new(128);
-        assert_eq!(burg.order, 127);
-        assert_eq!(burg.input_size, 128);
-    }
-
-    #[test]
     fn test_burg_training_and_prediction() {
         let mut burg = BurgAlgorithm::new(64);
         let mut coeffs = vec![0.0f32; 63];
@@ -1298,34 +1291,6 @@ mod tests {
         // Check that prediction was made (non-zero values after input)
         let has_predictions = tail[64..].iter().any(|&x| x.abs() > 1e-10);
         assert!(has_predictions, "Burg should produce non-zero predictions");
-    }
-
-    #[test]
-    fn test_regulator_creation() {
-        let reg = Regulator::with_params(2, 128, 48000, -1.0);
-        assert_eq!(reg.num_channels, 2);
-        assert_eq!(reg.fpp, 128);
-        assert_eq!(reg.sample_rate, 48000);
-        assert!(reg.auto_mode);
-    }
-
-    #[test]
-    fn test_regulator_push_pop() {
-        let mut reg = Regulator::with_params(1, 128, 48000, 10.0);
-
-        // Push a packet
-        let samples: Vec<f32> = (0..128).map(|i| (i as f32 * 0.01).sin()).collect();
-        reg.push_internal(0, &samples, 0.0);
-
-        // Pop (should get silence during startup)
-        let mut output = vec![0.0f32; 128];
-        let result = reg.pop_internal(&mut output, 5.0);
-        assert!(!result); // Still in startup
-
-        // Pop after tolerance met
-        reg.push_internal(1, &samples, 15.0);
-        let _result = reg.pop_internal(&mut output, 15.0);
-        // May or may not have data depending on timing
     }
 
     #[test]
@@ -1575,33 +1540,6 @@ mod tests {
         let result = reg.pop_internal(&mut out, 1.0); // still inside tolerance window
         assert!(!result, "should not replay the pre-reset stash");
         assert!(out.iter().all(|s| *s == 0.0));
-    }
-
-    /// Once the buffer is drained, additional pops with no new input must
-    /// increment the underrun counter exactly once per call and stay below the
-    /// long-stall threshold so PLC concealment continues to run.
-    #[test]
-    fn test_underrun_counter_increments_when_no_new_packets() {
-        let mut reg = Regulator::with_params(1, 32, 48_000, 5.0);
-        let samples = vec![0.25f32; reg.fpp];
-
-        reg.push_internal(0, &samples, 0.0);
-        let mut out = vec![0.0f32; reg.fpp];
-
-        // First pop consumes the only buffered packet.
-        let r1 = reg.pop_internal(&mut out, 10.0);
-        assert!(r1, "first pop should return the real packet");
-        assert_eq!(reg.pull_stats.underruns, 0);
-
-        // Subsequent pops with no new pushes must increment the underrun
-        // counter and report concealment (returns false).
-        for i in 0..5 {
-            let pop_time = 12.0 + i as f64 * 2.0;
-            let result = reg.pop_internal(&mut out, pop_time);
-            assert!(!result, "pop {i} should be an underrun");
-        }
-        assert_eq!(reg.pull_stats.underruns, 5);
-        assert_eq!(reg.pull_stats.overruns, 0);
     }
 
     /// Push two packets with a 2-packet gap, then pop. The regulator should
@@ -1956,35 +1894,6 @@ mod tests {
         stats.long_term_std_dev = 5.0;
         stats.long_term_max = AUTO_MAX_MS + 100.0;
         assert_eq!(stats.calc_auto(), 5.0 + AUTO_MAX_MS);
-    }
-
-    /// `ewma()` is a fixed point when current equals the running average, and
-    /// repeated steps toward a higher target converge upward to it without
-    /// overshooting.
-    #[test]
-    fn test_timing_stats_ewma_fixed_point_and_convergence() {
-        // Fixed point: ewma(x, x) == x for any x.
-        for &x in &[0.0, 1.5, 42.0, AUTO_MAX_MS] {
-            assert_eq!(TimingStats::ewma(x, x), x);
-        }
-
-        // A single step matches the closed-form and moves toward (not past) the
-        // target.
-        let (avg, current) = (10.0, 20.0);
-        let stepped = TimingStats::ewma(avg, current);
-        assert!((stepped - (avg + AUTO_SMOOTHING_FACTOR * (current - avg))).abs() < 1e-12);
-        assert!(stepped > avg && stepped < current);
-
-        // Repeated calls with a constant higher target converge upward to it.
-        let target = 100.0;
-        let mut converging = 0.0;
-        for _ in 0..200_000 {
-            converging = TimingStats::ewma(converging, target);
-        }
-        assert!(
-            converging > target - 1e-6 && converging <= target,
-            "ewma should converge toward the target, got {converging}"
-        );
     }
 
     /// After the simple-average startup region ends

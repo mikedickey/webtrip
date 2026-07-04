@@ -159,16 +159,6 @@ pub struct AgentCredentials {
     pub api_secret: Option<String>,
 }
 
-/// Device heartbeat data
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct DeviceHeartbeat {
-    /// Network and RTT statistics
-    #[serde(flatten)]
-    pub net: super::DeviceNetworkStats,
-}
-
 /// ALSA audio device configuration
 #[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
@@ -194,8 +184,6 @@ pub struct AlsaConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use super::super::test_utils::roundtrip;
 
     #[test]
     fn device_fixture_known_good() {
@@ -229,33 +217,6 @@ mod tests {
         assert!(s.contains("\"ownerId\":"));
         assert!(s.contains("\"inputChannels\":2"));
         assert!(s.contains("\"captureVolume\":80"));
-    }
-
-    #[test]
-    fn device_heartbeat_renames_type_field() {
-        let h = DeviceHeartbeat {
-            net: super::super::DeviceNetworkStats {
-                mac: Some("00:11:22:33:44:55".into()),
-                version: Some("1.0".into()),
-                device_type: Some("usb-x2".into()),
-                api_prefix: Some("pref".into()),
-                api_secret: Some("sec".into()),
-                pkts_recv: Some(1000),
-                pkts_sent: Some(1001),
-                rtt: super::super::RttStats {
-                    min_rtt: Some(10),
-                    max_rtt: Some(30),
-                    avg_rtt: Some(15),
-                    stddev_rtt: Some(2),
-                    latest_rtt: Some(14),
-                    stats_updated_at: Some("2026-06-14T00:00:00Z".into()),
-                },
-            },
-        };
-        let s = roundtrip(&h);
-        // device_type field is serialized as "type"
-        assert!(s.contains("\"type\":\"usb-x2\""));
-        assert!(!s.contains("deviceType"));
     }
 }
 

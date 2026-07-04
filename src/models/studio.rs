@@ -361,29 +361,6 @@ mod tests {
     }
 
     #[test]
-    fn server_access_fixture_known_good() {
-        let json = r#"{
-          "serverId": "studio-1",
-          "userId": "user-1",
-          "admin": true,
-          "owner": false,
-          "permissions": [
-            {"name": "edit", "value": true, "explanation": "Can edit studio"}
-          ]
-        }"#;
-        let a: ServerAccess = serde_json::from_str(json).unwrap();
-        assert_eq!(a.server_id.as_deref(), Some("studio-1"));
-        assert_eq!(a.user_id.as_deref(), Some("user-1"));
-        assert_eq!(a.admin, Some(true));
-        assert_eq!(a.owner, Some(false));
-        assert_eq!(a.permissions.as_ref().map(|p| p.len()), Some(1));
-
-        let out = roundtrip(&a);
-        assert!(out.contains("\"serverId\":"));
-        assert!(out.contains("\"userId\":"));
-    }
-
-    #[test]
     fn mixer_fixture_known_good() {
         let json = r#"{
           "type": "sclang",
