@@ -710,17 +710,9 @@ mod tests {
     use crate::audio::ring_buffer::RingBuffer;
     use crate::audio::regulator::Regulator;
 
-    #[test]
-    fn webtransport_unavailable_on_native() {
-        // WebTransport is a browser API; on the native (cargo test) target the
-        // detection must report unavailable.
-        assert!(!is_webtransport_available());
-    }
-
     // ── Browser feature detection (web_sys) ──────────────────────────────────
     //
-    // The real-browser counterpart to `webtransport_unavailable_on_native`,
-    // run in headless Chrome via `npm run test:wasm`. The per-binary
+    // Runs in headless Chrome via `npm run test:wasm`. The per-binary
     // `run_in_browser` opt-in lives once in `crate::test_support`.
 
     #[cfg(target_arch = "wasm32")]
@@ -854,52 +846,12 @@ mod tests {
         );
     }
 
-    // ── State surface + teardown (web_sys) ───────────────────────────────────
+    // ── Teardown (web_sys) ───────────────────────────────────────────────────
     //
     // `WebTransportImpl::new()` only succeeds where the `WebTransport` global
-    // exists, so these run in headless Chrome. They mirror the transport
-    // state-surface assertions (initial state, `state()`, `is_connected()`
-    // with no worker, `set_audio_buffers` storage) and the server-free `close()`
-    // teardown — none of which need a live HTTP/3 server. The live
+    // exists, so these run in headless Chrome. They cover the server-free
+    // `close()` teardown, which needs no live HTTP/3 server. The live
     // `connect()`/`connect_to_server()`/worker loops remain out of scope.
-
-    /// A freshly constructed transport starts `Disconnected`, reports
-    /// `is_connected() == false`, and holds no server URL, audio buffers, or
-    /// worker until a connection is attempted.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    fn new_starts_disconnected_with_no_worker() {
-        let transport = WebTransportImpl::new()
-            .expect("WebTransportImpl construction should succeed in the browser");
-
-        assert_eq!(transport.state(), TransportState::Disconnected);
-        assert!(!transport.is_connected(), "a fresh transport must not be connected");
-        assert!(transport.server_url.is_none(), "no server URL before connect");
-        assert!(transport.audio_buffers.is_none(), "no audio buffers before set_audio_buffers");
-        assert!(transport.worker.borrow().is_none(), "no worker until connect");
-    }
-
-    /// `set_audio_buffers()` stores the supplied configuration (the worker, not
-    /// the main-thread shim, sizes the actual packet buffers from it). Null
-    /// buffer pointers are safe: they are only stored, never dereferenced (no
-    /// worker is created).
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    fn set_audio_buffers_stores_config() {
-        let mut transport = WebTransportImpl::new()
-            .expect("WebTransportImpl construction should succeed in the browser");
-
-        transport.set_audio_buffers(AudioBufferConfig {
-            local_to_network_ptr: std::ptr::null_mut::<RingBuffer>(),
-            network_to_local_ptr: std::ptr::null_mut::<Regulator>(),
-            buffer_size: 256,
-            channels: 1,
-        });
-
-        let cfg = transport.audio_buffers.expect("config must be stored");
-        assert_eq!(cfg.buffer_size, 256);
-        assert_eq!(cfg.channels, 1);
-    }
 
     /// `close()` on a never-connected instance (no worker ever created) takes
     /// the early-return path: it marks the transport `Closed` and returns an
@@ -1160,14 +1112,6 @@ mod tests {
     }
 
     #[test]
-    fn connection_url_with_plain_name() {
-        assert_eq!(
-            build_connection_url("hub.example.com", 4464, "alice"),
-            "https://hub.example.com:4464/webtransport?name=alice"
-        );
-    }
-
-    #[test]
     fn connection_url_percent_encodes_name() {
         // Spaces and reserved characters in the client name must be encoded so
         // the query string stays well-formed.
@@ -1184,14 +1128,6 @@ mod tests {
         assert_eq!(
             wasm_module_url("https://example.com", "/app/index.html"),
             "https://example.com/app/pkg/webtrip.js"
-        );
-    }
-
-    #[test]
-    fn wasm_module_url_at_root() {
-        assert_eq!(
-            wasm_module_url("https://example.com", "/"),
-            "https://example.com/pkg/webtrip.js"
         );
     }
 

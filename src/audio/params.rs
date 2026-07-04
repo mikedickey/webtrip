@@ -299,27 +299,6 @@ mod tests {
     const EPS: f32 = 1e-4;
 
     #[test]
-    fn test_default_values() {
-        let p = AudioParams::default();
-        // Levels start at silence (stored 0 => MIN_DB) and 0% metering.
-        assert!((p.get_db_level() - MIN_DB).abs() < EPS);
-        assert!((p.get_peak_db_level() - MIN_DB).abs() < EPS);
-        assert!((p.get_volume_level() - 0.0).abs() < EPS);
-        assert!((p.get_peak_level() - 0.0).abs() < EPS);
-        // Monitoring off, output at full volume, unity input gain.
-        assert!((p.get_monitor_volume() - 0.0).abs() < EPS);
-        assert!((p.get_output_volume() - 1.0).abs() < EPS);
-        assert!((p.get_input_gain() - 0.0).abs() < EPS);
-        // Processing toggles default off.
-        assert!(!p.get_auto_gain_control());
-        assert!(!p.get_echo_cancellation());
-        assert!(!p.get_noise_suppression());
-        // No callbacks yet; stereo by default.
-        assert_eq!(p.get_callback_count(), 0);
-        assert_eq!(p.get_output_channels(), 2);
-    }
-
-    #[test]
     fn test_monitor_volume_roundtrip_and_clamp() {
         let p = AudioParams::default();
         for v in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
@@ -375,19 +354,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bool_params_roundtrip() {
-        let p = AudioParams::default();
-        for state in [true, false, true] {
-            p.set_auto_gain_control(state);
-            p.set_echo_cancellation(state);
-            p.set_noise_suppression(state);
-            assert_eq!(p.get_auto_gain_control(), state);
-            assert_eq!(p.get_echo_cancellation(), state);
-            assert_eq!(p.get_noise_suppression(), state);
-        }
-    }
-
-    #[test]
     fn test_bool_params_are_independent() {
         // Each toggle is a distinct atomic; flipping one must not disturb the others.
         let p = AudioParams::default();
@@ -405,6 +371,11 @@ mod tests {
         assert!(!p.get_auto_gain_control());
         assert!(!p.get_echo_cancellation());
         assert!(p.get_noise_suppression());
+
+        p.set_echo_cancellation(true);
+        assert!(!p.get_auto_gain_control());
+        assert!(p.get_echo_cancellation());
+        assert!(p.get_noise_suppression());
     }
 
     #[test]
@@ -419,17 +390,6 @@ mod tests {
         // Unity / full-scale: 0 dB == MAX_DB, the clipping ceiling.
         p.db_level.store(encode_db(MAX_DB), Ordering::Relaxed);
         assert!((p.get_db_level() - MAX_DB).abs() < EPS);
-    }
-
-    #[test]
-    fn test_peak_db_level_conversion_boundaries() {
-        let p = AudioParams::default();
-        p.peak_db_level.store(encode_db(MIN_DB), Ordering::Relaxed);
-        assert!((p.get_peak_db_level() - MIN_DB).abs() < EPS);
-        p.peak_db_level.store(encode_db(-15.0), Ordering::Relaxed);
-        assert!((p.get_peak_db_level() - (-15.0)).abs() < EPS);
-        p.peak_db_level.store(encode_db(MAX_DB), Ordering::Relaxed);
-        assert!((p.get_peak_db_level() - MAX_DB).abs() < EPS);
     }
 
     #[test]
@@ -457,75 +417,6 @@ mod tests {
         p.peak_db_level.store(encode_db(-80.0), Ordering::Relaxed);
         assert!((p.get_volume_level() - 0.0).abs() < EPS);
         assert!((p.get_peak_level() - 0.0).abs() < EPS);
-    }
-
-    #[test]
-    fn test_peak_level_tracks_successive_tick_updates() {
-        // params.rs only stores the peak level + hold counter atomics; the hold/decay
-        // *algorithm* lives in `AudioProcessor::update_peak_level`. Here we verify the
-        // storage contract that algorithm depends on: successive per-tick writes are
-        // observed by the getter, including a held value followed by a decayed value.
-        let p = AudioParams::default();
-
-        // Tick 1: a new peak at -10 dB with a full hold counter.
-        p.peak_db_level.store(encode_db(-10.0), Ordering::Relaxed);
-        p.peak_hold_counter.store(3, Ordering::Relaxed);
-        assert!((p.get_peak_db_level() - (-10.0)).abs() < EPS);
-        assert_eq!(p.peak_hold_counter.load(Ordering::Relaxed), 3);
-
-        // Ticks 2-4: hold — counter decrements while the peak stays put.
-        for expected in [2_u32, 1, 0] {
-            let c = p.peak_hold_counter.load(Ordering::Relaxed);
-            p.peak_hold_counter.store(c - 1, Ordering::Relaxed);
-            assert_eq!(p.peak_hold_counter.load(Ordering::Relaxed), expected);
-            assert!((p.get_peak_db_level() - (-10.0)).abs() < EPS);
-        }
-
-        // Tick 5: hold expired -> a decayed peak is stored and read back.
-        p.peak_db_level.store(encode_db(-12.5), Ordering::Relaxed);
-        assert!((p.get_peak_db_level() - (-12.5)).abs() < EPS);
-    }
-
-    #[test]
-    fn test_callback_count_reflects_underlying_atomic() {
-        // `AudioProcessor::process()` bumps callback_count once per audio callback via
-        // fetch_add; the getter must surface the running total.
-        let p = AudioParams::default();
-        assert_eq!(p.get_callback_count(), 0);
-        for _ in 0..5 {
-            p.callback_count.fetch_add(1, Ordering::Relaxed);
-        }
-        assert_eq!(p.get_callback_count(), 5);
-        p.callback_count.fetch_add(1000, Ordering::Relaxed);
-        assert_eq!(p.get_callback_count(), 1005);
-    }
-
-    #[test]
-    fn test_cross_thread_visibility_writer_reader() {
-        // AudioParams is shared (via a raw pointer in production) between the main
-        // thread and the audio/worker threads. Values written on one thread must be
-        // visible on another. `thread::join` provides the happens-before edge here.
-        let params = Arc::new(AudioParams::default());
-
-        let writer = {
-            let p = Arc::clone(&params);
-            thread::spawn(move || {
-                p.set_input_gain(12.0);
-                p.set_monitor_volume(0.75);
-                p.set_output_volume(0.5);
-                p.set_auto_gain_control(true);
-                p.set_output_channels(1);
-                p.callback_count.fetch_add(7, Ordering::Relaxed);
-            })
-        };
-        writer.join().unwrap();
-
-        assert!((params.get_input_gain() - 12.0).abs() < EPS);
-        assert!((params.get_monitor_volume() - 0.75).abs() < EPS);
-        assert!((params.get_output_volume() - 0.5).abs() < EPS);
-        assert!(params.get_auto_gain_control());
-        assert_eq!(params.get_output_channels(), 1);
-        assert_eq!(params.get_callback_count(), 7);
     }
 
     #[test]

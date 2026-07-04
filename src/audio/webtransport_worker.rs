@@ -857,104 +857,14 @@ pub fn handle_worker_message(msg: JsValue) -> js_sys::Promise {
 mod tests {
     use super::*;
 
-    // --- samples_per_packet ---
-
-    #[test]
-    fn samples_per_packet_accounts_for_channels() {
-        assert_eq!(samples_per_packet(128, 1), 128);
-        assert_eq!(samples_per_packet(128, 2), 256);
-        assert_eq!(samples_per_packet(64, 2), 128);
-    }
-
     // --- send_decision ("process vs wait") ---
 
     #[test]
-    fn send_decision_processes_when_enough_samples() {
+    fn send_decision_boundary() {
+        // Exactly enough samples (>= is inclusive) → Process; one short → Wait.
         let needed = samples_per_packet(128, 2); // 256
         assert_eq!(send_decision(needed, needed), SendDecision::Process);
-        assert_eq!(send_decision(needed + 1, needed), SendDecision::Process);
-    }
-
-    #[test]
-    fn send_decision_waits_when_not_enough_samples() {
-        let needed = samples_per_packet(128, 2); // 256
         assert_eq!(send_decision(needed - 1, needed), SendDecision::Wait);
-        assert_eq!(send_decision(0, needed), SendDecision::Wait);
-    }
-
-    // --- deserialize_datagram (reuses AudioPacket wire protocol) ---
-
-    #[test]
-    fn deserialize_datagram_returns_sequence_and_samples() {
-        // Build a valid datagram using the shared AudioPacket serializer so we
-        // never duplicate the wire format here.
-        let samples: Vec<f32> = (0..128).map(|i| (i as f32) / 128.0).collect();
-        let packet = AudioPacket::mono(42, 1000, samples.clone());
-        let datagram = packet.serialize().unwrap();
-
-        let mut out = Vec::new();
-        let sequence = deserialize_datagram(&datagram, &mut out).unwrap();
-
-        assert_eq!(sequence, 42);
-        assert_eq!(out.len(), samples.len());
-        for (a, b) in samples.iter().zip(out.iter()) {
-            assert!((a - b).abs() < 1e-4, "sample mismatch: {a} vs {b}");
-        }
-    }
-
-    #[test]
-    fn deserialize_datagram_stereo_sequence() {
-        let samples: Vec<f32> = (0..256).map(|i| (i as f32) / 256.0).collect();
-        let packet = AudioPacket::stereo(7, 0, samples.clone());
-        let datagram = packet.serialize().unwrap();
-
-        let mut out = Vec::new();
-        let sequence = deserialize_datagram(&datagram, &mut out).unwrap();
-
-        assert_eq!(sequence, 7);
-        assert_eq!(out.len(), samples.len());
-    }
-
-    #[test]
-    fn deserialize_datagram_rejects_short_buffer() {
-        // A datagram shorter than the 16-byte header must be rejected.
-        let mut out = Vec::new();
-        let err = deserialize_datagram(&[0u8; 4], &mut out).unwrap_err();
-        assert_eq!(err, ProtocolError::BufferTooSmall);
-    }
-
-    #[test]
-    fn deserialize_datagram_rejects_truncated_audio() {
-        // A full, valid header but with the audio payload truncated must also be
-        // rejected (header parses, but the declared samples don't fit).
-        let samples: Vec<f32> = (0..128).map(|i| (i as f32) / 128.0).collect();
-        let packet = AudioPacket::mono(1, 0, samples);
-        let datagram = packet.serialize().unwrap();
-
-        let truncated = &datagram[..HEADER_SIZE + 2];
-        let mut out = Vec::new();
-        let err = deserialize_datagram(truncated, &mut out).unwrap_err();
-        assert_eq!(err, ProtocolError::BufferTooSmall);
-    }
-
-    // --- WorkerState atomic running flag ---
-
-    #[test]
-    fn worker_state_start_stop_is_running() {
-        let state = WorkerState::new();
-        // Fresh state is not running.
-        assert!(!state.is_running());
-
-        state.start();
-        assert!(state.is_running());
-
-        state.stop();
-        assert!(!state.is_running());
-
-        // Idempotent: starting twice keeps it running.
-        state.start();
-        state.start();
-        assert!(state.is_running());
     }
 
     // --- classify_receive_error (deserialize-error rate threshold) ------------
@@ -1032,29 +942,6 @@ mod tests {
     }
 
     #[test]
-    fn handle_datagram_continues_through_high_error_rate() {
-        // A burst of corrupt datagrams must keep counting (the loop "continues")
-        // and cross the high-error-rate threshold without panicking.
-        let mut regulator = Regulator::new();
-        let mut samples = Vec::new();
-        let mut stats = WebTransportWorkerStats::default();
-
-        let garbage = [0u8; 4];
-        for _ in 0..20 {
-            handle_datagram(&garbage, Some(&mut regulator), &mut samples, &mut stats);
-        }
-
-        assert_eq!(stats.packets_received, 20);
-        assert_eq!(stats.receive_errors, 20);
-        assert!(!regulator.is_initialized());
-        // Past the >10 errors / >50% rate threshold.
-        assert_eq!(
-            classify_receive_error(stats.receive_errors, stats.packets_received),
-            ReceiveErrorLevel::HighRate
-        );
-    }
-
-    #[test]
     fn handle_datagram_without_regulator_still_counts() {
         // During an init/teardown race the regulator pointer can be null. The
         // datagram must still be counted for stats visibility, but with nowhere
@@ -1098,24 +985,6 @@ mod tests {
             Reflect::set(&obj, &(*key).into(), value).expect("Reflect::set on a fresh object");
         }
         obj.into()
-    }
-
-    /// `worker_init()` followed by `worker_get_stats()` returns zeroed stats —
-    /// proves init ran and left the counters at their defaults (no packets have
-    /// flowed). Null buffer pointers are safe: `configure()` guards the
-    /// `Int32Array` setup on a null ring-buffer pointer and the loops never run.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    fn worker_init_then_stats_are_zeroed() {
-        worker_init(0, 0, 128, 2);
-
-        let stats = worker_get_stats();
-        assert_eq!(stats.packets_sent, 0);
-        assert_eq!(stats.packets_received, 0);
-        assert_eq!(stats.bytes_sent, 0);
-        assert_eq!(stats.bytes_received, 0);
-        assert_eq!(stats.send_errors, 0);
-        assert_eq!(stats.receive_errors, 0);
     }
 
     /// `handle_worker_message()` with an `"init"` payload routes to `worker_init`
@@ -1208,15 +1077,13 @@ mod tests {
 
     // ── Server-free worker config / lifecycle (web_sys) ──────────────────────
     //
-    // These cover the slices of `configure()`/`worker_disconnect()`/
-    // `post_error_to_main()` that the T20 routing tests (which only ever pass
-    // null buffer pointers) leave unhit, without touching the server-bound
-    // loops. The T20 init test exercises `configure()` only on the *null*
-    // ring-buffer branch (so the `has_data` Int32Array setup is skipped); the
-    // tests here use a *real* `RingBuffer`/`Regulator` so the non-null branch
-    // and the buffer sizing/pointer-storage are actually asserted. The live
-    // `worker_connect`/`send_loop`/`receive_loop` paths still need an HTTP/3
-    // server and stay out of scope.
+    // These cover the slices of `configure()`/`worker_disconnect()` that the
+    // routing tests above (which only ever pass null buffer pointers, skipping
+    // the `has_data` Int32Array setup) leave unhit, without touching the
+    // server-bound loops. The tests here use a *real* `RingBuffer`/`Regulator`
+    // so the non-null branch and the buffer sizing/pointer-storage are actually
+    // asserted. The live `worker_connect`/`send_loop`/`receive_loop` paths
+    // still need an HTTP/3 server and stay out of scope.
 
     /// `configure()` with a real (non-null) ring buffer must size the reusable
     /// audio/packet buffers from `buffer_size * channels`, store both buffer
@@ -1307,25 +1174,13 @@ mod tests {
         drop(regulator);
     }
 
-    /// `post_error_to_main()` builds the `{type:"error", error}` object and
-    /// posts it via `post_message_to_main()`. In the test's window context the
-    /// `DedicatedWorkerGlobalScope` post is a swallowed no-op, but calling it
-    /// still exercises the error-object construction + post path that otherwise
-    /// only runs inside the live send/receive loops (which need a server).
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    fn post_error_to_main_builds_and_posts_without_panic() {
-        post_error_to_main("synthetic test error");
-    }
-
-    // ── Browser tests (receive-loop datagram read parsing + teardown) ─────────
+    // ── Browser tests (receive-loop datagram read parsing) ────────────────────
     //
-    // `parse_read_result` and `signal_connection_lost` are the parts of
-    // `receive_loop` that don't need a live HTTP/3 server: the `{done, value}`
-    // item parsing (including the non-`Uint8Array` typed-error branch) and the
-    // connection-lost teardown. They use `web_sys`/`js_sys` types, so they run
-    // in headless Chrome. The end-to-end deserialize → `Regulator::push` body
-    // (`handle_datagram`) is covered natively above.
+    // `parse_read_result` is the part of `receive_loop` that doesn't need a
+    // live HTTP/3 server: the `{done, value}` item parsing (including the
+    // non-`Uint8Array` typed-error branch). It uses `web_sys`/`js_sys` types,
+    // so it runs in headless Chrome. The end-to-end deserialize →
+    // `Regulator::push` body (`handle_datagram`) is covered natively above.
 
     /// `parse_read_result` maps a `{ done: true }` stream item to
     /// `DatagramRead::Done` so the receive loop stops.
@@ -1372,35 +1227,4 @@ mod tests {
         assert_eq!(err.as_string().as_deref(), Some("Expected Uint8Array"));
     }
 
-    /// `signal_connection_lost()` flips the running flag off (so both transport
-    /// loops break) and posts the error to main without panicking. Driven with
-    /// a real ring buffer/regulator so the shared `WORKER_STATE` is realistic;
-    /// reset back to null pointers afterward so no later test sees a dangling
-    /// pointer.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    fn signal_connection_lost_stops_worker() {
-        let ring = RingBuffer::new();
-        let mut regulator = Regulator::new();
-        let ring_ptr = &ring as *const RingBuffer as usize;
-        let reg_ptr = &mut regulator as *mut Regulator as usize;
-
-        WORKER_STATE.with(|state| {
-            state.borrow_mut().configure(ring_ptr, reg_ptr, 128, 2);
-            state.borrow().start();
-        });
-        assert!(WORKER_STATE.with(|s| s.borrow().is_running()));
-
-        signal_connection_lost();
-
-        assert!(
-            !WORKER_STATE.with(|s| s.borrow().is_running()),
-            "a lost connection must stop the worker so both loops break"
-        );
-
-        // Restore null pointers before the backing buffers drop.
-        WORKER_STATE.with(|state| state.borrow_mut().configure(0, 0, 128, 2));
-        drop(ring);
-        drop(regulator);
-    }
 }

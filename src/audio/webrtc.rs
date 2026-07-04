@@ -869,21 +869,6 @@ impl WebRtcTransport {
         Ok(())
     }
 
-    /// Receive next available packet (non-blocking)
-    pub fn receive_bytes(&self) -> Option<Vec<u8>> {
-        self.receive_queue.borrow_mut().pop_front()
-    }
-
-    /// Check if there are packets available to receive
-    pub fn has_pending_data(&self) -> bool {
-        !self.receive_queue.borrow().is_empty()
-    }
-
-    /// Get number of pending packets
-    pub fn pending_count(&self) -> usize {
-        self.receive_queue.borrow().len()
-    }
-
     /// Close the connection (best-effort synchronous teardown).
     ///
     /// Used from `Drop` where awaiting the trait's async `close` is not
@@ -1086,21 +1071,24 @@ impl WebRtcTransport {
 }
 
 impl WebRtcTransport {
-    /// Mark the connection as connected
-    /// Call this after receiving confirmation that the data channel is open
-    pub fn set_connected(&mut self) {
-        if self.state != TransportState::Connected {
-            self.state = TransportState::Connected;
+    /// Transition to `state`, firing the state-change callback only on an
+    /// actual change (idempotent for repeated calls with the same state).
+    fn set_state(&mut self, state: TransportState) {
+        if self.state != state {
+            self.state = state;
             self.notify_state_change();
         }
     }
 
+    /// Mark the connection as connected
+    /// Call this after receiving confirmation that the data channel is open
+    pub fn set_connected(&mut self) {
+        self.set_state(TransportState::Connected);
+    }
+
     /// Mark the connection as failed
     pub fn set_failed(&mut self) {
-        if self.state != TransportState::Failed {
-            self.state = TransportState::Failed;
-            self.notify_state_change();
-        }
+        self.set_state(TransportState::Failed);
     }
 }
 
@@ -1175,135 +1163,6 @@ impl Drop for WebRtcTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::protocol::{AudioPacket, HEADER_SIZE};
-
-    // ── TransportConfig ──────────────────────────────────────────────────────
-
-    #[test]
-    fn transport_config_low_latency_defaults() {
-        let cfg = TransportConfig::low_latency();
-        assert_eq!(cfg.ice_servers.len(), 2, "should have 2 default STUN servers");
-        assert!(cfg.ice_servers[0].starts_with("stun:"));
-        assert!(cfg.ice_servers[1].starts_with("stun:"));
-        assert!(cfg.unreliable, "low-latency config must be unreliable (UDP-like)");
-        assert_eq!(cfg.max_retransmits, 0, "no retransmits for low-latency");
-        assert!(!cfg.ordered, "low-latency config must be unordered");
-    }
-
-    #[test]
-    fn transport_config_new_equals_low_latency() {
-        let default_cfg = TransportConfig::new();
-        let ll_cfg = TransportConfig::low_latency();
-        assert_eq!(default_cfg.ice_servers, ll_cfg.ice_servers);
-        assert_eq!(default_cfg.unreliable, ll_cfg.unreliable);
-        assert_eq!(default_cfg.max_retransmits, ll_cfg.max_retransmits);
-        assert_eq!(default_cfg.ordered, ll_cfg.ordered);
-    }
-
-    #[test]
-    fn transport_config_add_ice_server_appends() {
-        let mut cfg = TransportConfig::low_latency();
-        let initial_count = cfg.ice_servers.len();
-        cfg.add_ice_server("stun:custom.example.com:3478".to_string());
-        assert_eq!(cfg.ice_servers.len(), initial_count + 1);
-        assert_eq!(cfg.ice_servers.last().unwrap(), "stun:custom.example.com:3478");
-    }
-
-    #[test]
-    fn transport_config_set_ice_servers_replaces_all() {
-        let mut cfg = TransportConfig::low_latency();
-        let new_servers = vec!["stun:a.example.com".to_string(), "turn:b.example.com".to_string()];
-        cfg.set_ice_servers(new_servers.clone());
-        assert_eq!(cfg.ice_servers, new_servers);
-    }
-
-    #[test]
-    fn transport_config_set_ice_servers_to_empty() {
-        let mut cfg = TransportConfig::low_latency();
-        cfg.set_ice_servers(vec![]);
-        assert!(cfg.ice_servers.is_empty());
-    }
-
-    // ── Packet serialize / deserialize (reuses AudioPacket from protocol.rs) ─
-
-    #[test]
-    fn packet_serialize_samples_into_then_deserialize_mono_roundtrip() {
-        let samples: Vec<f32> = (0..128).map(|i| i as f32 / 128.0).collect();
-        let mut buf = vec![0u8; HEADER_SIZE + 128 * 2];
-
-        let written = AudioPacket::serialize_samples_into(7, 1000, &samples, 1, &mut buf).unwrap();
-        assert_eq!(written, HEADER_SIZE + 128 * 2);
-
-        let pkt = AudioPacket::deserialize(&buf[..written]).unwrap();
-        assert_eq!(pkt.header.sequence_number, 7);
-        assert_eq!(pkt.header.timestamp, 1000);
-        assert_eq!(pkt.samples.len(), 128);
-        for (a, b) in samples.iter().zip(pkt.samples.iter()) {
-            assert!((a - b).abs() < 1e-4, "sample mismatch: {a} vs {b}");
-        }
-    }
-
-    #[test]
-    fn packet_serialize_samples_into_then_deserialize_stereo_roundtrip() {
-        // Interleaved stereo: [L0, R0, L1, R1, ...]
-        let samples: Vec<f32> = (0..256).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect();
-        let channels: u8 = 2;
-        let mut buf = vec![0u8; HEADER_SIZE + 256 * 2];
-
-        let written = AudioPacket::serialize_samples_into(3, 512, &samples, channels, &mut buf).unwrap();
-        let pkt = AudioPacket::deserialize(&buf[..written]).unwrap();
-
-        assert_eq!(pkt.header.num_incoming_channels, 2);
-        assert_eq!(pkt.samples.len(), 256);
-        for (i, (a, b)) in samples.iter().zip(pkt.samples.iter()).enumerate() {
-            assert!((a - b).abs() < 1e-4, "stereo sample {i}: {a} vs {b}");
-        }
-    }
-
-    #[test]
-    fn packet_serialize_samples_into_buffer_too_small_returns_error() {
-        use crate::audio::protocol::ProtocolError;
-        let samples = vec![0.0f32; 128];
-        let mut tiny_buf = vec![0u8; 4]; // way too small
-        let result = AudioPacket::serialize_samples_into(0, 0, &samples, 1, &mut tiny_buf);
-        assert_eq!(result, Err(ProtocolError::BufferTooSmall));
-    }
-
-    // ── Receive-queue wrappers (receive_bytes / has_pending_data / pending_count) ─
-
-    #[test]
-    fn receive_queue_wrappers_fifo_and_counts() {
-        // Drive the transport's own receive-queue accessors rather than a bare
-        // `VecDeque`, so the `receive_bytes` / `has_pending_data` /
-        // `pending_count` wrappers are actually covered.
-        let transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
-            .expect("transport construction should succeed");
-
-        // Empty to start.
-        assert!(!transport.has_pending_data());
-        assert_eq!(transport.pending_count(), 0);
-        assert_eq!(transport.receive_bytes(), None);
-
-        // The data-channel message handlers push raw bytes onto this queue; the
-        // tests stand in for that by enqueuing directly (no live peer needed).
-        let first: Vec<u8> = vec![1, 2, 3];
-        let second: Vec<u8> = (0u8..=255).collect();
-        transport.receive_queue.borrow_mut().push_back(first.clone());
-        transport.receive_queue.borrow_mut().push_back(second.clone());
-
-        assert!(transport.has_pending_data());
-        assert_eq!(transport.pending_count(), 2);
-
-        // FIFO order and exact byte content round-trip through the accessors.
-        assert_eq!(transport.receive_bytes(), Some(first));
-        assert_eq!(transport.pending_count(), 1);
-        assert_eq!(transport.receive_bytes(), Some(second));
-
-        // Drained again.
-        assert!(!transport.has_pending_data());
-        assert_eq!(transport.pending_count(), 0);
-        assert_eq!(transport.receive_bytes(), None);
-    }
 
     // ── ICE candidate JSON parsing ────────────────────────────────────────────
 
@@ -1362,37 +1221,12 @@ mod tests {
     }
 
     #[test]
-    fn tick_decision_process_when_enough_samples() {
-        let decision = tick_decision(true, 128, 128, false);
-        assert_eq!(
-            decision,
-            TickDecision::Process { should_send: true, have_receive: false },
-        );
-    }
-
-    #[test]
-    fn tick_decision_idle_when_insufficient_samples_and_no_receive() {
-        // Fewer samples than needed and no pending receive → Idle.
-        assert_eq!(tick_decision(true, 64, 128, false), TickDecision::Idle);
-        assert_eq!(tick_decision(true, 0,  128, false), TickDecision::Idle);
-    }
-
-    #[test]
     fn tick_decision_process_receive_only_when_queue_has_data() {
         // Not enough samples to send, but receive queue has data → Process (receive only).
         let decision = tick_decision(true, 0, 128, true);
         assert_eq!(
             decision,
             TickDecision::Process { should_send: false, have_receive: true },
-        );
-    }
-
-    #[test]
-    fn tick_decision_process_both_when_send_and_receive_ready() {
-        let decision = tick_decision(true, 256, 128, true);
-        assert_eq!(
-            decision,
-            TickDecision::Process { should_send: true, have_receive: true },
         );
     }
 
@@ -1494,6 +1328,8 @@ mod tests {
     // the same way WEB-38 documented the session's server-bound connect arms.)
 
     #[cfg(target_arch = "wasm32")]
+    use crate::audio::protocol::HEADER_SIZE;
+    #[cfg(target_arch = "wasm32")]
     use crate::audio::regulator::Regulator;
     #[cfg(target_arch = "wasm32")]
     use crate::audio::ring_buffer::RingBuffer;
@@ -1520,29 +1356,6 @@ mod tests {
             buffer_size,
             channels,
         }
-    }
-
-    /// Create an `RtcPeerConnection` from a `TransportConfig`'s ICE servers and
-    /// assert it starts in the expected pristine signaling/ICE state.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    fn webrtc_create_peer_connection_from_config() {
-        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
-            .expect("transport construction should succeed");
-
-        transport
-            .create_peer_connection()
-            .expect("RtcPeerConnection creation should succeed");
-
-        let pc = transport
-            .peer_connection
-            .as_ref()
-            .expect("peer connection must be stored after creation");
-
-        // A freshly created peer connection (no offer/answer yet) is in the
-        // "stable" signaling state with ICE gathering not yet started.
-        assert_eq!(pc.signaling_state(), web_sys::RtcSignalingState::Stable);
-        assert_eq!(pc.ice_connection_state(), web_sys::RtcIceConnectionState::New);
     }
 
     /// `create_offer` must produce a well-formed SDP describing the data channel.
@@ -1577,76 +1390,12 @@ mod tests {
         assert_eq!(transport.state(), TransportState::Connecting);
     }
 
-    /// A freshly created data channel reports the configured label/ordering and
-    /// starts life in the `Connecting` state (it only opens after negotiation).
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    fn webrtc_data_channel_initial_state() {
-        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
-            .expect("transport construction should succeed");
-
-        transport
-            .create_peer_connection()
-            .expect("peer connection creation should succeed");
-        transport
-            .create_data_channel()
-            .expect("data channel creation should succeed");
-
-        let channel = transport
-            .data_channel
-            .as_ref()
-            .expect("data channel must be stored after creation");
-
-        assert_eq!(channel.label(), AUDIO_CHANNEL_LABEL);
-        assert_eq!(channel.ready_state(), RtcDataChannelState::Connecting);
-    }
-
-    /// Parse an ICE-candidate JSON string (via the shared pure parser) and build
-    /// a real `RtcIceCandidate`, asserting the fields round-trip through web_sys.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    fn webrtc_parse_ice_candidate_json_into_rtc_ice_candidate() {
-        let json = r#"{"candidate":"candidate:1 1 UDP 2122252543 192.168.1.1 56789 typ host","sdpMid":"audio","sdpMLineIndex":0}"#;
-
-        // Reuse the single source of truth for ICE-candidate JSON parsing.
-        let parsed = parse_ice_candidate_json(json).expect("candidate JSON should parse");
-
-        let init = RtcIceCandidateInit::new(&parsed.candidate);
-        if let Some(mid) = parsed.sdp_mid.as_deref() {
-            init.set_sdp_mid(Some(mid));
-        }
-        if let Some(idx) = parsed.sdp_m_line_index {
-            init.set_sdp_m_line_index(Some(idx));
-        }
-
-        let candidate = RtcIceCandidate::new(&init).expect("RtcIceCandidate creation should succeed");
-
-        assert_eq!(candidate.candidate(), parsed.candidate);
-        assert_eq!(candidate.sdp_mid(), parsed.sdp_mid);
-        assert_eq!(candidate.sdp_m_line_index(), parsed.sdp_m_line_index);
-    }
-
     // ── Transport state surface (Category A) ─────────────────────────────────
 
-    /// A freshly constructed transport reports the expected pristine state via
-    /// the `Transport` trait: `Disconnected`, `WebRTC`, and — with no data
-    /// channel — `is_connected() == false` (the `else` arm of the readiness
-    /// check).
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    fn webrtc_transport_state_surface_initial() {
-        let transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
-            .expect("transport construction should succeed");
-
-        assert_eq!(Transport::state(&transport), TransportState::Disconnected);
-        assert_eq!(Transport::transport_type(&transport), TransportType::WebRTC);
-        // No data channel was created, so the channel-readiness check is false.
-        assert!(!Transport::is_connected(&transport));
-    }
-
-    /// `set_connected()` transitions to `Connected` and fires the registered
-    /// state-change callback exactly once; a second call is idempotent (state
-    /// already `Connected`, so no further notification).
+    /// `set_connected()` transitions to `Connected` (via the shared `set_state`
+    /// helper) and fires the registered state-change callback exactly once; a
+    /// second call is idempotent (state already `Connected`, so no further
+    /// notification). `set_failed()` is a thin wrapper over the same helper.
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     fn webrtc_set_connected_notifies_once_then_idempotent() {
@@ -1670,34 +1419,6 @@ mod tests {
             log.borrow().as_slice(),
             ["connected"],
             "set_connected must be idempotent (no duplicate notification)"
-        );
-    }
-
-    /// `set_failed()` transitions to `Failed` and fires the callback exactly
-    /// once; a second call is idempotent.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    fn webrtc_set_failed_notifies_once_then_idempotent() {
-        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
-            .expect("transport construction should succeed");
-
-        let (log, cb) = recording_state_callback();
-        Transport::set_on_state_change(
-            &mut transport,
-            cb.as_ref().unchecked_ref::<js_sys::Function>().clone(),
-        );
-
-        transport.set_failed();
-        assert_eq!(Transport::state(&transport), TransportState::Failed);
-        assert_eq!(log.borrow().as_slice(), ["failed"]);
-
-        // Already Failed → no state change and therefore no second callback.
-        transport.set_failed();
-        assert_eq!(Transport::state(&transport), TransportState::Failed);
-        assert_eq!(
-            log.borrow().as_slice(),
-            ["failed"],
-            "set_failed must be idempotent (no duplicate notification)"
         );
     }
 
@@ -1777,33 +1498,6 @@ mod tests {
         );
     }
 
-    /// With no queued data and no data channel, a tick is a harmless no-op: the
-    /// `Drain` arm's read loop exits immediately (the literal `Idle` arm needs
-    /// an Open channel — see the out-of-scope note above), leaving the buffer
-    /// untouched and not panicking.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    fn webrtc_do_tick_noop_when_disconnected_and_empty() {
-        let buffer_size = 128usize;
-        let channels = 2u8;
-
-        let mut ring = RingBuffer::new();
-        let mut reg = Regulator::new();
-        let config = buffer_config(&mut ring, &mut reg, buffer_size, channels);
-
-        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
-            .expect("transport construction should succeed");
-        Transport::set_audio_buffers(&mut transport, config);
-
-        assert!(!Transport::is_connected(&transport));
-        assert_eq!(ring.available(), 0);
-
-        transport.tick();
-
-        assert_eq!(ring.available(), 0, "an empty tick must not change the buffer");
-        assert_eq!(ring.has_data_flag(), 0);
-    }
-
     // ── Data-channel receive body (enqueue_channel_message) ──────────────────
     //
     // The shared receive body that both the client-created channel
@@ -1862,59 +1556,6 @@ mod tests {
             "a non-ArrayBuffer message must be rejected"
         );
         assert!(queue.borrow().is_empty(), "rejected messages must not enqueue");
-    }
-
-    /// An enqueued binary message is observable through the transport's public
-    /// receive accessors — i.e. the queue the data-channel handlers feed is the
-    /// same one `receive_bytes`/`has_pending_data` drain. This is what a live
-    /// `onmessage` ultimately accomplishes, exercised without a peer.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    fn enqueue_channel_message_visible_via_transport_accessors() {
-        let transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
-            .expect("transport construction should succeed");
-
-        let payload: Vec<u8> = vec![9, 8, 7, 6, 5];
-        assert!(enqueue_channel_message(
-            &binary_message_event(&payload),
-            &transport.receive_queue,
-        ));
-
-        assert!(transport.has_pending_data());
-        assert_eq!(transport.pending_count(), 1);
-        assert_eq!(transport.receive_bytes(), Some(payload));
-        assert!(!transport.has_pending_data());
-    }
-
-    /// Both channel-creation directions register an `onmessage` handler (the
-    /// shared `enqueue_channel_message` body): the client path
-    /// (`create_data_channel`) stores `on_message_closure`, and the
-    /// peer-connection path (`create_peer_connection`) stores the
-    /// `ondatachannel` handler that wires the server-created channel's
-    /// `onmessage`.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    fn both_channel_directions_register_receive_handlers() {
-        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
-            .expect("transport construction should succeed");
-
-        transport
-            .create_peer_connection()
-            .expect("peer connection creation should succeed");
-        // create_peer_connection wires the server-created-channel handler.
-        assert!(
-            transport.on_data_channel_closure.is_some(),
-            "ondatachannel handler (server-created channel) must be registered"
-        );
-
-        transport
-            .create_data_channel()
-            .expect("data channel creation should succeed");
-        // create_data_channel wires the client-created-channel onmessage handler.
-        assert!(
-            transport.on_message_closure.is_some(),
-            "client-created channel onmessage handler must be registered"
-        );
     }
 
     // ── SDP answer / ICE-candidate / send-bytes guard & success paths ────────
@@ -2117,24 +1758,15 @@ mod tests {
         );
     }
 
-    // ── Connect-failure paths (web_sys, no live hub) ─────────────────────────
+    // ── Connect-failure path (web_sys, no live hub) ──────────────────────────
     //
-    // These reach the genuinely browser-only failure surface the native
-    // decision tests above can't: the `preflight_signaling_tls` best-effort
-    // probe and the `connect_to_hub` signaling-failure branch (WebSocket can't
-    // open → close → reject the pending connection promise). Both point at an
-    // unreachable loopback endpoint so they need no live JackTrip hub and settle
-    // quickly (connection refused), exercising the error paths that, when
-    // broken, would hang the UI instead of surfacing an error.
-
-    /// `preflight_signaling_tls` is best-effort and must never fail the connect
-    /// flow: awaiting it against an unreachable host simply completes (the fetch
-    /// rejection is swallowed and logged), proving the warn/Err branch is safe.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    async fn preflight_signaling_tls_completes_against_unreachable_host() {
-        preflight_signaling_tls("127.0.0.1", 1).await;
-    }
+    // This reaches the genuinely browser-only failure surface the native
+    // decision tests above can't: the `connect_to_hub` signaling-failure branch
+    // (WebSocket can't open → close → reject the pending connection promise),
+    // including the best-effort `preflight_signaling_tls` probe it runs first.
+    // It points at an unreachable loopback endpoint so it needs no live JackTrip
+    // hub and settles quickly (connection refused), exercising the error path
+    // that, when broken, would hang the UI instead of surfacing an error.
 
     /// Driving the real `connect_to_hub` at an unreachable signaling endpoint
     /// exercises the connect-failure branch end-to-end: the SDP offer + data

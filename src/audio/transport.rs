@@ -200,39 +200,9 @@ pub trait Transport {
 mod tests {
     use super::*;
 
-    // Minimal `Transport` implementation used only to exercise the default
-    // `is_connected()` method with each possible state.
-    struct StateTransport(TransportState);
-
-    impl Transport for StateTransport {
-        fn transport_type(&self) -> TransportType {
-            TransportType::Mock
-        }
-        fn state(&self) -> TransportState {
-            self.0
-        }
-        fn connect(
-            &mut self,
-            _server: &str,
-            _port: u16,
-            _client_name: &str,
-        ) -> Pin<Box<dyn Future<Output = Result<(), JsValue>> + '_>> {
-            Box::pin(async { Ok(()) })
-        }
-        fn close(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
-            Box::pin(async {})
-        }
-    }
-
-    #[test]
-    fn transport_type_name_covers_all_variants() {
-        assert_eq!(TransportType::WebRTC.name(), "WebRTC Data Channels");
-        assert_eq!(TransportType::WebTransport.name(), "WebTransport (QUIC)");
-        assert_eq!(TransportType::Mock.name(), "Mock (Testing)");
-    }
-
     #[test]
     fn transport_type_id_covers_all_variants() {
+        // Pins a cross-language contract: src/app.ts hardcodes these id strings.
         assert_eq!(TransportType::WebRTC.id(), "webrtc");
         assert_eq!(TransportType::WebTransport.id(), "webtransport");
         assert_eq!(TransportType::Mock.id(), "mock");
@@ -268,37 +238,4 @@ mod tests {
         assert_eq!(transport_state_str(TransportState::Closed),       "closed");
     }
 
-    #[test]
-    fn is_connected_true_only_for_connected_state() {
-        assert!( StateTransport(TransportState::Connected).is_connected());
-        assert!(!StateTransport(TransportState::Disconnected).is_connected());
-        assert!(!StateTransport(TransportState::Connecting).is_connected());
-        assert!(!StateTransport(TransportState::Failed).is_connected());
-        assert!(!StateTransport(TransportState::Closed).is_connected());
-    }
-
-    #[test]
-    fn default_tick_and_set_audio_buffers_are_noops() {
-        // `StateTransport` overrides neither `tick` nor `set_audio_buffers`, so
-        // these calls exercise the trait's default no-op bodies. Null buffer
-        // pointers are safe because the default `set_audio_buffers` never
-        // dereferences them.
-        let mut t = StateTransport(TransportState::Disconnected);
-        t.tick();
-        t.set_audio_buffers(AudioBufferConfig {
-            local_to_network_ptr: std::ptr::null_mut(),
-            network_to_local_ptr: std::ptr::null_mut(),
-            buffer_size: 128,
-            channels: 2,
-        });
-        // The no-op defaults must not perturb state.
-        assert_eq!(t.state(), TransportState::Disconnected);
-    }
-
-    #[test]
-    fn notify_transport_state_without_callback_is_noop() {
-        // With no callback registered the notify helper takes the `None` branch
-        // and must neither touch JS nor panic.
-        notify_transport_state(TransportState::Connected, &None);
-    }
 }

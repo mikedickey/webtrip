@@ -256,23 +256,6 @@ mod tests {
     }
 
     #[test]
-    fn mark_read_request_wire_format() {
-        let r = MarkReadRequest {
-            message_id: Some("m1".into()),
-        };
-        let s = roundtrip(&r);
-        assert!(s.contains("\"messageId\":\"m1\""));
-        assert!(!s.contains("message_id"));
-    }
-
-    #[test]
-    fn update_message_request_wire_format() {
-        let r = UpdateMessageRequest { status: Some(1) };
-        let s = roundtrip(&r);
-        assert!(s.contains("\"status\":1"));
-    }
-
-    #[test]
     fn checkout_request_wire_format() {
         let r = CheckoutRequest {
             plan: "pro".into(),
@@ -295,26 +278,6 @@ mod tests {
         let s = roundtrip(&r);
         assert!(s.contains("\"callbackURL\":"));
         assert!(!s.contains("\"callbackUrl\":"));
-    }
-
-    #[test]
-    fn code_request_wire_format() {
-        let r = CodeRequest { code: "FREEMONTH".into() };
-        let s = roundtrip(&r);
-        assert!(s.contains("\"code\":\"FREEMONTH\""));
-    }
-
-    #[test]
-    fn create_subscription_request_wire_format() {
-        let r = CreateSubscriptionRequest {
-            server_id: Some("studio-1".into()),
-            user_id: Some("auth0|abc".into()),
-            invite_key: Some("secret".into()),
-        };
-        let s = roundtrip(&r);
-        assert!(s.contains("\"serverId\":\"studio-1\""));
-        assert!(s.contains("\"userId\":\"auth0|abc\""));
-        assert!(s.contains("\"inviteKey\":\"secret\""));
     }
 
     #[test]

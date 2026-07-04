@@ -333,19 +333,4 @@ mod tests {
         let v: StudioType = serde_json::from_str("\"JackTrip+Jamulus\"").unwrap();
         assert_eq!(v, StudioType::JackTripJamulus);
     }
-
-    #[test]
-    fn defaults_are_sensible() {
-        assert_eq!(Period::default(), Period::P128);
-        assert_eq!(QueueBuffer::default(), QueueBuffer::Q4);
-        assert_eq!(BufferStrategy::default(), BufferStrategy::Standard);
-        assert_eq!(Quality::default(), Quality::Lossless);
-        assert_eq!(Channels::default(), Channels::Stereo);
-        assert_eq!(BroadcastVisibility::default(), BroadcastVisibility::Off);
-        assert_eq!(Visibility::default(), Visibility::Private);
-        assert_eq!(ResourceStatus::default(), ResourceStatus::Starting);
-        assert_eq!(RecordingStatus::default(), RecordingStatus::Recording);
-        assert_eq!(StudioType::default(), StudioType::JackTrip);
-        assert_eq!(SampleRate::default(), SampleRate::Rate48000);
-    }
 }

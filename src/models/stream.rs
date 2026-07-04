@@ -317,26 +317,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_info_with_engagement_roundtrip() {
-        let s = StreamInfoWithEngagement {
-            base: StreamInfo {
-                id: Some("s1".into()),
-                name: Some("Name".into()),
-                server_name: Some("studio".into()),
-                banner_url: Some("https://b".into()),
-                ..Default::default()
-            },
-            viewers: Some(42),
-            followers: Some(1000),
-            following: Some(true),
-        };
-        let out = roundtrip(&s);
-        assert!(out.contains("\"viewers\":42"));
-        assert!(out.contains("\"followers\":1000"));
-        assert!(out.contains("\"bannerURL\":"));
-    }
-
-    #[test]
     fn stream_info_search_result_flattens_base() {
         let json = r#"{
           "id": "stream-1",

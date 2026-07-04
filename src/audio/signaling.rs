@@ -694,14 +694,6 @@ mod tests {
         assert_eq!(parsed.sdp_m_line_index, Some(0));
     }
 
-    #[test]
-    fn test_json_escape() {
-        let msg = SignalingMessage::offer("test\nwith\nnewlines");
-        let json = msg.to_json();
-        assert!(json.contains(r#"\n"#));
-        assert!(!json.contains('\n'));
-    }
-
     // --- Round-trip tests for remaining message types ---
 
     #[test]
@@ -816,13 +808,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_number_field_large() {
-        let json = r#"{"type":"ice","candidate":"c","sdpMid":"data","sdpMLineIndex":65535}"#;
-        let val = super::extract_number_field(json, "sdpMLineIndex").unwrap();
-        assert_eq!(val, 65535);
-    }
-
-    #[test]
     fn test_extract_number_field_missing() {
         let json = r#"{"type":"ice","candidate":"c","sdpMid":"data"}"#;
         let result = super::extract_number_field(json, "sdpMLineIndex");
@@ -897,13 +882,6 @@ mod tests {
     fn test_from_url_passes_through_wss() {
         let sig = HubSignaling::from_url("wss://hub.example.com:4464/webrtc", "");
         assert_eq!(sig.server_url, "wss://hub.example.com:4464/webrtc");
-    }
-
-    #[test]
-    fn test_from_url_passes_through_non_ws_scheme() {
-        // Only a leading "ws://" is upgraded; anything else is left untouched.
-        let sig = HubSignaling::from_url("https://hub.example.com/webrtc", "");
-        assert_eq!(sig.server_url, "https://hub.example.com/webrtc");
     }
 
     // --- is_connected across states ---

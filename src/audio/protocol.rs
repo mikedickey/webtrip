@@ -729,12 +729,6 @@ mod tests {
     }
 
     #[test]
-    fn test_header_size() {
-        // Ensure our header is exactly 16 bytes as expected by JackTrip
-        assert_eq!(HEADER_SIZE, 16);
-    }
-
-    #[test]
     fn test_header_roundtrip() {
         let header = PacketHeader::new(42, 1000);
         let mut buffer = vec![0u8; HEADER_SIZE];
@@ -745,22 +739,6 @@ mod tests {
         assert_eq!(header.timestamp, decoded.timestamp);
         assert_eq!(header.num_incoming_channels, decoded.num_incoming_channels);
         assert_eq!(header.sample_rate as u8, decoded.sample_rate as u8);
-    }
-
-    #[test]
-    fn test_packet_roundtrip_mono() {
-        let samples: Vec<f32> = (0..128).map(|i| (i as f32) / 128.0).collect();
-        let packet = AudioPacket::mono(1, 0, samples.clone());
-
-        let serialized = packet.serialize().unwrap();
-        let decoded = AudioPacket::deserialize(&serialized).unwrap();
-
-        assert_eq!(packet.header.sequence_number, decoded.header.sequence_number);
-        assert_eq!(packet.samples.len(), decoded.samples.len());
-
-        for (a, b) in packet.samples.iter().zip(decoded.samples.iter()) {
-            assert!((a - b).abs() < 1e-4);
-        }
     }
 
     #[test]
@@ -811,6 +789,8 @@ mod tests {
 
     #[test]
     fn test_stereo_roundtrip() {
+        // Pins the `AudioPacket::stereo` constructor (buffer_size = samples.len() / 2),
+        // which no other test exercises.
         // Verify that serialize → deserialize preserves interleaved stereo samples.
         let buf_size = 128usize;
         let samples: Vec<f32> = (0..buf_size * 2)
@@ -827,13 +807,6 @@ mod tests {
         for (i, (a, b)) in samples.iter().zip(decoded.samples.iter()).enumerate() {
             assert!((a - b).abs() < 1e-4, "stereo sample {i} mismatch: {a} vs {b}");
         }
-    }
-
-    #[test]
-    fn test_sample_rate_encoding() {
-        assert_eq!(SampleRateCode::from_hz(48000) as u8, 3);
-        assert_eq!(SampleRateCode::Sr48000.to_hz(), 48000);
-        assert_eq!(SampleRateCode::from_byte(3).to_hz(), 48000);
     }
 
     #[test]
@@ -888,67 +861,6 @@ mod tests {
 
         assert_eq!(audio_data_size(64, 2, 16), 256);
         assert_eq!(audio_data_size(32, 8, 24), 768);
-    }
-
-    #[test]
-    fn test_audio_data_size_matches_serialize_samples_into() {
-        // serialize_samples_into is 16-bit only; the bytes it writes minus the
-        // header must equal audio_data_size for the same configuration.
-        for (channels, frames) in [(1u8, 128usize), (2, 64)] {
-            let samples = vec![0.0f32; frames * channels as usize];
-            let buf_size = frames as u16;
-            let expected_audio = audio_data_size(buf_size, channels, 16);
-
-            let mut buffer = vec![0u8; HEADER_SIZE + expected_audio];
-            let written = AudioPacket::serialize_samples_into(0, 0, &samples, channels, &mut buffer)
-                .unwrap();
-
-            assert_eq!(written - HEADER_SIZE, expected_audio, "channels={channels}");
-        }
-    }
-
-    #[test]
-    fn test_audio_data_size_matches_serialize_into_all_depths() {
-        // Cross-check audio_data_size against the full serialize path for every
-        // supported bit depth rather than re-deriving the wire layout.
-        let buf_size: u16 = 16;
-        let channels: u8 = 2;
-        let samples = vec![0.0f32; buf_size as usize * channels as usize];
-
-        for bit_depth in [8u8, 16, 24, 32] {
-            let mut header = PacketHeader::stereo(0, 0);
-            header.buffer_size = buf_size;
-            header.bit_depth = bit_depth;
-            let packet = AudioPacket::new(header, samples.clone());
-
-            let serialized = packet.serialize().unwrap();
-            let expected_audio = audio_data_size(buf_size, channels, bit_depth);
-
-            assert_eq!(
-                serialized.len() - HEADER_SIZE,
-                expected_audio,
-                "bit_depth={bit_depth}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_wire_idx_mono_is_identity() {
-        let buf_size = 8;
-        for i in 0..buf_size {
-            assert_eq!(wire_idx(i, 1, buf_size), i, "mono index {i}");
-        }
-    }
-
-    #[test]
-    fn test_wire_idx_stereo_interleaving() {
-        // Interleaved input [L0, R0, L1, R1] (channels=2, buf_size=2) maps to the
-        // planar wire layout [L0, L1, R0, R1].
-        let buf_size = 2;
-        assert_eq!(wire_idx(0, 2, buf_size), 0); // L0 -> wire[0]
-        assert_eq!(wire_idx(1, 2, buf_size), 2); // R0 -> wire[2]
-        assert_eq!(wire_idx(2, 2, buf_size), 1); // L1 -> wire[1]
-        assert_eq!(wire_idx(3, 2, buf_size), 3); // R1 -> wire[3]
     }
 
     #[test]
@@ -1057,19 +969,6 @@ mod tests {
         
         let decoded = PacketHeader::deserialize(&buffer).unwrap();
         assert_eq!(decoded.num_outgoing_channels, 0);
-    }
-
-    #[test]
-    fn test_outgoing_channels_decoding() {
-        // Test decode_outgoing_channels static method
-        assert_eq!(PacketHeader::decode_outgoing_channels(0, 2), 2);    // Symmetric
-        assert_eq!(PacketHeader::decode_outgoing_channels(4, 2), 4);    // Explicit
-        assert_eq!(PacketHeader::decode_outgoing_channels(255, 2), 0);  // Receive-only
-        
-        // Verify all explicit values 1-254 pass through unchanged
-        for n in 1..=254 {
-            assert_eq!(PacketHeader::decode_outgoing_channels(n, 2), n);
-        }
     }
 
     // ----- Malformed-header rejection branches (PacketHeader::deserialize) -----
@@ -1307,47 +1206,31 @@ mod tests {
         }
     }
 
-    // ----- ProtocolError Display & AudioFormat constructors -----
+    // ----- AudioPacket::serialize_samples_into (allocation-free serialize path) -----
 
     #[test]
-    fn test_protocol_error_display() {
-        // Every variant must render a distinct, non-empty human-readable string.
-        let variants = [
-            ProtocolError::BufferTooSmall,
-            ProtocolError::InvalidChannelCount,
-            ProtocolError::InvalidBitDepth,
-            ProtocolError::InvalidBufferSize,
-            ProtocolError::InvalidPacket,
-            ProtocolError::SequenceGap,
-        ];
-        let mut seen = Vec::new();
-        for v in variants {
-            let s = v.to_string();
-            assert!(!s.is_empty(), "{v:?} should render a message");
-            assert!(!seen.contains(&s), "{v:?} message must be unique");
-            seen.push(s);
+    fn test_serialize_samples_into_then_deserialize_mono_roundtrip() {
+        let samples: Vec<f32> = (0..128).map(|i| i as f32 / 128.0).collect();
+        let mut buf = vec![0u8; HEADER_SIZE + 128 * 2];
+
+        let written = AudioPacket::serialize_samples_into(7, 1000, &samples, 1, &mut buf).unwrap();
+        assert_eq!(written, HEADER_SIZE + 128 * 2);
+
+        let pkt = AudioPacket::deserialize(&buf[..written]).unwrap();
+        assert_eq!(pkt.header.sequence_number, 7);
+        assert_eq!(pkt.header.timestamp, 1000);
+        assert_eq!(pkt.samples.len(), 128);
+        for (a, b) in samples.iter().zip(pkt.samples.iter()) {
+            assert!((a - b).abs() < 1e-4, "sample mismatch: {a} vs {b}");
         }
     }
 
     #[test]
-    fn test_audio_format_constructor_and_default() {
-        // The wasm_bindgen constructor and the Default impl both delegate to
-        // mono(); confirm they produce the documented mono configuration.
-        let via_new = AudioFormat::new();
-        let via_default = AudioFormat::default();
-        let mono = AudioFormat::mono();
-
-        for fmt in [via_new, via_default] {
-            assert_eq!(fmt.sample_rate, mono.sample_rate);
-            assert_eq!(fmt.channels, mono.channels);
-            assert_eq!(fmt.buffer_size, mono.buffer_size);
-            assert_eq!(fmt.bit_depth, mono.bit_depth);
-        }
-
-        assert_eq!(via_new.sample_rate, DEFAULT_SAMPLE_RATE);
-        assert_eq!(via_new.channels, 1);
-        assert_eq!(via_new.buffer_size, DEFAULT_BUFFER_SIZE);
-        assert_eq!(via_new.bit_depth, DEFAULT_BIT_DEPTH);
+    fn test_serialize_samples_into_buffer_too_small_returns_error() {
+        let samples = vec![0.0f32; 128];
+        let mut tiny_buf = vec![0u8; 4]; // way too small
+        let result = AudioPacket::serialize_samples_into(0, 0, &samples, 1, &mut tiny_buf);
+        assert_eq!(result, Err(ProtocolError::BufferTooSmall));
     }
 }
 

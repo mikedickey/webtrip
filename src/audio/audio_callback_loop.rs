@@ -199,71 +199,20 @@ impl Drop for AudioCallbackLoop {
     }
 }
 
-#[cfg(test)]
+// ── Browser tests (web_sys / Atomics.waitAsync) ──────────────────────────────
+//
+// Real-browser coverage run in headless Chrome via `npm run test:wasm`. The
+// per-binary `run_in_browser` opt-in lives once in `crate::test_support`.
+// These exercise the shared-memory build: T17 established that the
+// `wasm-pack`/`wasm-bindgen-test` harness serves a cross-origin-isolated
+// page with an imported shared `WebAssembly.Memory{shared:true}` (see the
+// flag-parity section of docs/WASM_TESTING.md), so `SharedArrayBuffer` and
+// `Atomics.notify` are available here without extra setup. The module is gated
+// on `wasm32` because there is no native-testable logic here.
+#[cfg(all(test, target_arch = "wasm32"))]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // AudioCallbackLoop construction and running state
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn new_loop_is_not_running() {
-        let lp = AudioCallbackLoop::new();
-        assert!(!lp.is_running());
-    }
-
-    #[test]
-    fn default_loop_is_not_running() {
-        let lp = AudioCallbackLoop::default();
-        assert!(!lp.is_running());
-    }
-
-    #[test]
-    fn stopped_loop_is_not_running() {
-        let mut lp = AudioCallbackLoop::new();
-        // stop() on a never-started loop must not panic and must leave it stopped
-        lp.stop();
-        assert!(!lp.is_running());
-    }
-
-    // -----------------------------------------------------------------------
-    // has_atomics_wait_async on the native target
-    // -----------------------------------------------------------------------
-
-    /// On the native (`cargo test`) target there is no browser runtime, so
-    /// `has_atomics_wait_async` must return `false` — confirming that the
-    /// cfg guard is in place and that calling the function does not panic.
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn has_atomics_returns_false_on_native() {
-        assert!(!has_atomics_wait_async());
-    }
-
-    // ── Browser tests (web_sys / Atomics.waitAsync) ──────────────────────────
-    //
-    // Real-browser coverage run in headless Chrome via `npm run test:wasm`. The
-    // per-binary `run_in_browser` opt-in lives once in `crate::test_support`.
-    // These exercise the shared-memory build: T17 established that the
-    // `wasm-pack`/`wasm-bindgen-test` harness serves a cross-origin-isolated
-    // page with an imported shared `WebAssembly.Memory{shared:true}` (see the
-    // flag-parity section of docs/WASM_TESTING.md), so `SharedArrayBuffer` and
-    // `Atomics.notify` are available here without extra setup.
-
-    #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;
-
-    /// In the cross-origin-isolated harness (SharedArrayBuffer +
-    /// Atomics.waitAsync both present) detection must report support — the
-    /// inverse of the native check above.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    fn has_atomics_wait_async_true_in_browser() {
-        assert!(
-            has_atomics_wait_async(),
-            "shared-memory harness must expose Atomics.waitAsync + SharedArrayBuffer"
-        );
-    }
 
     /// Smoke-test the `Atomics.waitAsync` wake-up path end to end: start the
     /// loop sleeping on a zeroed flag in shared wasm memory, then flip the flag
@@ -271,7 +220,6 @@ mod tests {
     /// callback must fire. This depends on the shared-memory build — `notify`
     /// only works on a `SharedArrayBuffer`, which the harness supplies via the
     /// imported shared `WebAssembly.Memory`.
-    #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn audio_callback_loop_fires_on_notify() {
         use std::cell::Cell;

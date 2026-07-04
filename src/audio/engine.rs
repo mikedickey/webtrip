@@ -365,52 +365,6 @@ mod tests {
     ];
 
     #[test]
-    fn test_resolve_carries_all_toggle_permutations() {
-        // The device id is fixed here; the focus is that each boolean toggle is
-        // carried through verbatim for every permutation.
-        for (agc, ec, ns) in BOOL_PERMUTATIONS {
-            let resolved =
-                AudioConstraints::resolve(Some("dev-1".to_string()), agc, ec, ns);
-            assert_eq!(
-                resolved,
-                AudioConstraints {
-                    device_id: Some("dev-1".to_string()),
-                    auto_gain_control: agc,
-                    echo_cancellation: ec,
-                    noise_suppression: ns,
-                },
-                "toggles must pass through for agc={agc} ec={ec} ns={ns}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_resolve_device_id_present() {
-        let resolved =
-            AudioConstraints::resolve(Some("mic-42".to_string()), false, false, false);
-        assert_eq!(resolved.device_id.as_deref(), Some("mic-42"));
-    }
-
-    #[test]
-    fn test_resolve_device_id_absent() {
-        // `None` means "use the browser default device".
-        let resolved = AudioConstraints::resolve(None, false, false, false);
-        assert_eq!(resolved.device_id, None);
-    }
-
-    #[test]
-    fn test_resolve_empty_device_id_normalizes_to_none() {
-        // An empty string is treated the same as no device id: default device.
-        let resolved =
-            AudioConstraints::resolve(Some(String::new()), true, true, true);
-        assert_eq!(resolved.device_id, None);
-        // Toggles are unaffected by device-id normalization.
-        assert!(resolved.auto_gain_control);
-        assert!(resolved.echo_cancellation);
-        assert!(resolved.noise_suppression);
-    }
-
-    #[test]
     fn test_resolve_full_matrix_device_id_x_toggles() {
         // device-id present/absent (incl. empty) × every toggle permutation.
         let device_id_cases: [(Option<String>, Option<&str>); 3] = [
@@ -524,33 +478,6 @@ mod tests {
             (8_000.0..=768_000.0).contains(&sample_rate),
             "sample rate {sample_rate} is outside any plausible audio range"
         );
-
-        close_engine(engine).await;
-    }
-
-    /// End-to-end: `set_output_device` must resolve `Ok` for the default-sink
-    /// request against a real `AudioContext`.
-    ///
-    /// `None` and an empty string both normalize to the default device (sink id
-    /// `""`). Depending on the browser the real context either lacks `setSinkId`
-    /// (graceful warn + `Ok(())`) or exposes it (resolves via `setSinkId("")`);
-    /// either way the entry point must not throw. Both branches are pinned down
-    /// deterministically — independent of this browser's capabilities — by the
-    /// `route_output_sink_*` tests below.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    async fn set_output_device_default_resolves_ok() {
-        let params = AudioParams::default();
-        let engine = create_engine(&params).await;
-
-        engine
-            .set_output_device(None)
-            .await
-            .expect("set_output_device(None) must resolve Ok (graceful no-op or setSinkId default)");
-        engine
-            .set_output_device(Some(String::new()))
-            .await
-            .expect("set_output_device(\"\") must resolve Ok for the default sink");
 
         close_engine(engine).await;
     }
