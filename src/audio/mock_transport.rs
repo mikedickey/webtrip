@@ -68,7 +68,6 @@
 use super::transport::{Transport, TransportState, TransportType, AudioBufferConfig, notify_transport_state};
 use crate::audio::protocol::{AudioPacket, PacketHeader, SampleRateCode, DEFAULT_BUFFER_SIZE, DEFAULT_SAMPLE_RATE};
 use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -126,8 +125,7 @@ impl Default for SineWaveState {
 /// Mock transport for testing
 pub struct MockTransport {
     state: TransportState,
-    receive_queue: Rc<RefCell<VecDeque<Vec<u8>>>>,
-    
+
     // Callbacks
     #[allow(dead_code)]
     on_state_change: Option<js_sys::Function>,
@@ -147,7 +145,6 @@ impl MockTransport {
     pub fn new() -> Self {
         Self {
             state: TransportState::Disconnected,
-            receive_queue: Rc::new(RefCell::new(VecDeque::new())),
             on_state_change: None,
             packet_loss_rate: 0.0,
             sine_wave_state: Rc::new(RefCell::new(SineWaveState::default())),
@@ -285,11 +282,6 @@ impl MockTransport {
         Ok(())
     }
 
-    /// Simulate receiving a packet (for testing)
-    pub fn simulate_receive(&self, data: Vec<u8>) {
-        self.receive_queue.borrow_mut().push_back(data);
-    }
-
     /// Set callback for state changes
     pub fn set_on_state_change(&mut self, callback: js_sys::Function) {
         self.on_state_change = Some(callback);
@@ -341,7 +333,6 @@ impl Transport for MockTransport {
         }
 
         self.state = TransportState::Closed;
-        self.receive_queue.borrow_mut().clear();
         self.notify_state_change();
 
         // Mock transport has no async teardown; shutdown is fully synchronous.

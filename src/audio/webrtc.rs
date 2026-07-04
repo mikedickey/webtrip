@@ -869,21 +869,6 @@ impl WebRtcTransport {
         Ok(())
     }
 
-    /// Receive next available packet (non-blocking)
-    pub fn receive_bytes(&self) -> Option<Vec<u8>> {
-        self.receive_queue.borrow_mut().pop_front()
-    }
-
-    /// Check if there are packets available to receive
-    pub fn has_pending_data(&self) -> bool {
-        !self.receive_queue.borrow().is_empty()
-    }
-
-    /// Get number of pending packets
-    pub fn pending_count(&self) -> usize {
-        self.receive_queue.borrow().len()
-    }
-
     /// Close the connection (best-effort synchronous teardown).
     ///
     /// Used from `Drop` where awaiting the trait's async `close` is not

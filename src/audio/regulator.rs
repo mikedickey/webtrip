@@ -1451,6 +1451,66 @@ mod tests {
         );
     }
 
+    /// When exactly one good packet would be skipped and an older good packet
+    /// is still buffered, `find_best_packet` defers the latency adjustment:
+    /// it plays the stale packet instead of concealing, stashes the fresh
+    /// packet for the next callback, and records no glitch. Latency
+    /// adjustments only happen once they are at least 2 packets wide.
+    #[test]
+    fn test_single_skipped_packet_defers_latency_adjustment() {
+        let mut reg = Regulator::with_params(1, 32, 48_000, 10.0);
+        let fpp_duration_ms = 1000.0 * reg.fpp as f64 / reg.sample_rate as f64;
+        let stale_packet = vec![0.25f32; reg.fpp];
+        let fresh_packet = vec![0.5f32; reg.fpp];
+        let last_seq = 10u16;
+        let stale_seq = last_seq.wrapping_add(1);
+        let fresh_seq = last_seq.wrapping_add(2);
+
+        reg.start_time_ms = 0.0;
+        reg.last_seq_out = Some(last_seq);
+        reg.last_seq_in.store(fresh_seq as i32, Ordering::Release);
+
+        // Previously-played packet, reference point for the out-of-order check.
+        if let Some(slot) = &mut reg.slots[(last_seq as usize) % NUM_SLOTS] {
+            slot.timestamp = 40.0;
+            slot.sample_count = reg.fpp;
+        }
+        // Stale but valid packet: misses tolerance at now=60 (41 + 10 < 60),
+        // so the scan records it as `first_good_skipped` instead of playing it.
+        if let Some(slot) = &mut reg.slots[(stale_seq as usize) % NUM_SLOTS] {
+            slot.timestamp = 41.0;
+            slot.sample_count = reg.fpp;
+            slot.data[..reg.fpp].copy_from_slice(&stale_packet);
+        }
+        // Fresh packet within tolerance (55 + 10 >= 60); playing it would skip
+        // exactly one good packet, which triggers the deferral.
+        if let Some(slot) = &mut reg.slots[(fresh_seq as usize) % NUM_SLOTS] {
+            slot.timestamp = 55.0;
+            slot.sample_count = reg.fpp;
+            slot.data[..reg.fpp].copy_from_slice(&fresh_packet);
+        }
+
+        let mut output = vec![0.0f32; reg.fpp];
+        let first_result = reg.pop_internal(&mut output, 60.0);
+        assert!(
+            first_result,
+            "deferral should play the stale packet as real audio, not concealment"
+        );
+        assert_eq!(reg.last_seq_out, Some(stale_seq));
+        assert_eq!(reg.last_stashed.map(|(seq, _)| seq), Some(fresh_seq));
+        assert_eq!(reg.skipped, 0, "no packet may be counted as skipped");
+        assert_eq!(reg.pull_stats.overruns, 0, "no glitch may be recorded");
+        assert_eq!(reg.packet_count, 1);
+
+        let second_result = reg.pop_internal(&mut output, 60.0 + fpp_duration_ms);
+        assert!(second_result);
+        assert_eq!(reg.last_stashed, None);
+        assert_eq!(reg.last_seq_out, Some(fresh_seq));
+        assert_eq!(reg.packet_count, 2);
+        assert_eq!(reg.skipped, 0);
+        assert_eq!(reg.pull_stats.overruns, 0);
+    }
+
     /// After a full push/pop cycle that accumulates state (stats, sequence
     /// numbers, timing), `reset()` must scrub the regulator back to a
     /// freshly-constructed state. This covers the field-by-field cleanup
