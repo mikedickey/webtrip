@@ -29,6 +29,14 @@ const SESSION_STATE_LABELS: Record<SessionState, string> = {
 // might stall.
 const CONNECT_TIMEOUT_MS = 45_000;
 
+// The session is a module-level singleton (see getDemoEngine), so a
+// disconnect started by an unmount can still be tearing down when the next
+// mount connects. Reconnecting before teardown quiesces races the regulator's
+// shared sequence-number state (see WebTripSession::disconnect), so the
+// promise lives at module scope — matching the session's lifetime — and
+// handleConnect awaits it before dialing.
+let pendingDisconnect: Promise<void> | null = null;
+
 function ToggleButton({
   active,
   line1,
@@ -100,6 +108,9 @@ export default function Demo() {
             : (state as SessionState),
         );
       });
+      // The singleton session may still be connected (or mid-teardown) from a
+      // previous mount; sync the UI to its real state instead of assuming idle.
+      setSessionState(eng.session.isConnected() ? "connected" : "idle");
       try {
         const devs = (await eng.m.getAudioDevices()) as AudioDevices;
         if (cancelled) return;
@@ -116,7 +127,8 @@ export default function Demo() {
     })().catch(console.error);
     return () => {
       cancelled = true;
-      engineRef.current?.session.disconnect();
+      const session = engineRef.current?.session;
+      if (session) pendingDisconnect = session.disconnect();
     };
   }, [loadAttempt]);
 
@@ -156,6 +168,10 @@ export default function Demo() {
     setBusy(true);
     let timer: number | undefined;
     try {
+      if (pendingDisconnect) {
+        await pendingDisconnect.catch(() => {});
+        pendingDisconnect = null;
+      }
       const connectPromise = engine.session.connectToStudio(
         host,
         port,
