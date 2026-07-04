@@ -1,0 +1,12 @@
+# Overrides the root .dockerignore (which excludes pkg/ and dist/) for this
+# image only: it COPYs prebuilt artifacts. Docker BuildKit picks this file up
+# automatically as <Dockerfile-path>.dockerignore; podman needs
+# --ignorefile containers/webtrip/Containerfile.dockerignore.
+#
+# Whitelist style: exclude everything, then re-include only what the
+# Containerfile COPYs — keeps .git/target/node_modules out of the context.
+*
+!pkg/
+!website/dist/
+!website/server.js
+!website/serve-common.cjs

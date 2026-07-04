@@ -1,0 +1,46 @@
+# WebTrip production image: node:22-slim running website/server.js — the same
+# static server `npm run serve` uses locally and the integration-test harness
+# drives in CI — serving the built webtrip.dev site over TLS on 443, with
+# port 80 redirecting to https.
+#
+# The jacktrip hub is NOT part of this image; run it separately from
+# jacktrip/jacktrip:edge (see tests/integration/docker-compose.integration.yml
+# for the option set webtrip is tested against).
+#
+# Prebuilt artifacts are COPYed in — run `npm run build` first, then build
+# from the repo root:
+#
+#   npm run build:container:webtrip
+#   # or: podman build --ignorefile containers/webtrip/Containerfile.dockerignore \
+#   #       -t webtrip/webtrip -f containers/webtrip/Containerfile .
+#
+# Requires TLS cert mounts at runtime:
+#
+#   /certs/server.crt  (full chain)
+#   /certs/server.key
+#
+# See docs/CONTAINER.md for run examples and pitfalls.
+ARG NODE_MAJOR=22
+FROM node:${NODE_MAJOR}-slim
+
+# Layout mirrors the repo checkout: server.js serves <its dir>/dist as the
+# site and <repo root>/pkg at /pkg/ (see website/serve-common.cjs). No npm
+# install — server.js uses only node builtins.
+WORKDIR /app
+COPY website/server.js website/serve-common.cjs website/
+COPY website/dist/ website/dist/
+COPY pkg/ pkg/
+
+# Fail fast if `npm run build` wasn't run before the image build.
+RUN test -f website/dist/index.html \
+    && test -f pkg/webtrip.js \
+    && test -f pkg/webtrip_bg.wasm
+
+# Runs as root (the node image default) so it can bind 80/443 and read a
+# root-owned 0600 key mount. PORT is server.js's https port; the port-80
+# listener only issues redirects to it.
+ENV PORT=443
+EXPOSE 80/tcp 443/tcp
+CMD ["node", "website/server.js", \
+     "--cert", "/certs/server.crt", "--key", "/certs/server.key", \
+     "--redirect-http", "80"]

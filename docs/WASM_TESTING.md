@@ -158,7 +158,7 @@ silently skipped (see
 ## Continuous Integration
 
 WASM tests run in CI via the `build` job in `.github/workflows/ci.yml`, inside
-the toolchain container (`containers/build/Containerfile`). The browser setup
+the toolchain container (`containers/builder/Containerfile`). The browser setup
 (`chromium` + `chromium-driver`, `CHROMEDRIVER`, and the root-level
 `webdriver.json` flags) is documented at those sources.
 
@@ -280,7 +280,7 @@ The mechanism, encoded in the npm script:
 
 All of the above (and the shared `web_sys`/`+atomics` blocks) live in the
 `config` section of `package.json` as the single source of truth. The build
-container (`containers/build/Containerfile`) installs `clang` for minicov's C
+container (`containers/builder/Containerfile`) installs `clang` for minicov's C
 runtime and pre-warms the `test:wasm` dep graph, but **not** the coverage
 profile — a test-less stub can't link the instrumented build (it lacks the
 minicov `__llvm_profile_runtime` reference a real harness provides), so
