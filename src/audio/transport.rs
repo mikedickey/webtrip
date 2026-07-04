@@ -276,4 +276,29 @@ mod tests {
         assert!(!StateTransport(TransportState::Failed).is_connected());
         assert!(!StateTransport(TransportState::Closed).is_connected());
     }
+
+    #[test]
+    fn default_tick_and_set_audio_buffers_are_noops() {
+        // `StateTransport` overrides neither `tick` nor `set_audio_buffers`, so
+        // these calls exercise the trait's default no-op bodies. Null buffer
+        // pointers are safe because the default `set_audio_buffers` never
+        // dereferences them.
+        let mut t = StateTransport(TransportState::Disconnected);
+        t.tick();
+        t.set_audio_buffers(AudioBufferConfig {
+            local_to_network_ptr: std::ptr::null_mut(),
+            network_to_local_ptr: std::ptr::null_mut(),
+            buffer_size: 128,
+            channels: 2,
+        });
+        // The no-op defaults must not perturb state.
+        assert_eq!(t.state(), TransportState::Disconnected);
+    }
+
+    #[test]
+    fn notify_transport_state_without_callback_is_noop() {
+        // With no callback registered the notify helper takes the `None` branch
+        // and must neither touch JS nor panic.
+        notify_transport_state(TransportState::Connected, &None);
+    }
 }

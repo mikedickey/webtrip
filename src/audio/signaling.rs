@@ -856,6 +856,85 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // --- from_json protocol-response detection ---
+
+    #[test]
+    fn test_from_json_protocol_response() {
+        // Any payload containing a "protocol" key is treated as the handshake
+        // response and short-circuits to a Protocol message with all fields None.
+        let msg = SignalingMessage::from_json(r#"{"protocol":"webrtc","version":1}"#).unwrap();
+        assert_eq!(msg.msg_type, SignalingMessageType::Protocol);
+        assert!(msg.sdp.is_none());
+        assert!(msg.candidate.is_none());
+        assert!(msg.sdp_mid.is_none());
+        assert!(msg.sdp_m_line_index.is_none());
+        assert!(msg.error.is_none());
+    }
+
+    // --- extract_string_field escape-sequence decoding ---
+
+    #[test]
+    fn test_extract_string_field_unescape_sequences() {
+        // Hand-crafted JSON (not a to_json round-trip) so every backslash escape
+        // branch in the unescape loop is exercised directly:
+        //   \n \r \t          -> the corresponding control chars
+        //   é            -> 'é' (unicode-escape branch)
+        //   \x                -> literal backslash + 'x' (unknown-escape fallback)
+        let json = r#"{"sdp":"a\nb\rc\tdé\xz"}"#;
+        let decoded = super::extract_string_field(json, "sdp").unwrap();
+        assert_eq!(decoded, "a\nb\rc\td\u{00e9}\\xz");
+    }
+
+    // --- from_url scheme upgrade ---
+
+    #[test]
+    fn test_from_url_upgrades_ws_to_wss() {
+        let sig = HubSignaling::from_url("ws://hub.example.com:4464/webrtc", "");
+        assert_eq!(sig.server_url, "wss://hub.example.com:4464/webrtc");
+    }
+
+    #[test]
+    fn test_from_url_passes_through_wss() {
+        let sig = HubSignaling::from_url("wss://hub.example.com:4464/webrtc", "");
+        assert_eq!(sig.server_url, "wss://hub.example.com:4464/webrtc");
+    }
+
+    #[test]
+    fn test_from_url_passes_through_non_ws_scheme() {
+        // Only a leading "ws://" is upgraded; anything else is left untouched.
+        let sig = HubSignaling::from_url("https://hub.example.com/webrtc", "");
+        assert_eq!(sig.server_url, "https://hub.example.com/webrtc");
+    }
+
+    // --- is_connected across states ---
+
+    #[test]
+    fn test_is_connected_true_for_active_states() {
+        for state in [
+            HubConnectionState::Handshaking,
+            HubConnectionState::Negotiating,
+            HubConnectionState::Connected,
+        ] {
+            let mut sig = HubSignaling::from_url("wss://hub.example.com/webrtc", "");
+            sig.state = state;
+            assert!(sig.is_connected(), "{:?} should count as connected", state);
+        }
+    }
+
+    #[test]
+    fn test_is_connected_false_for_inactive_states() {
+        for state in [
+            HubConnectionState::Disconnected,
+            HubConnectionState::Connecting,
+            HubConnectionState::Failed,
+            HubConnectionState::Closed,
+        ] {
+            let mut sig = HubSignaling::from_url("wss://hub.example.com/webrtc", "");
+            sig.state = state;
+            assert!(!sig.is_connected(), "{:?} should not count as connected", state);
+        }
+    }
+
     // ── Browser tests (web_sys WebSocket glue) ────────────────────────────────
     //
     // These exercise the genuinely browser-only surface of `HubSignaling` —

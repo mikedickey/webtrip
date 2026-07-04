@@ -1474,9 +1474,17 @@ mod tests {
     // server is required — construction, the `Transport` state surface, and the
     // tick loop's `Drain` path are all reachable without a live peer.
     //
+    // Reachable without a live hub and covered below: `create_offer` (including
+    // its `Connecting` state advance), the guard / early-return branches of
+    // `handle_answer`, `add_ice_candidate`, and `add_ice_candidate_explicit`,
+    // `handle_answer`'s *success* path (driven by a second local
+    // `RtcPeerConnection` producing a real answer — a pure SDP exchange that
+    // needs no network), and `send_bytes`'s two guard branches (no channel /
+    // channel not yet Open).
+    //
     // Out of scope (a live JackTrip hub/peer is required — skipped here):
-    // `connect_to_hub`, `create_data_channel`'s open/close handlers firing,
-    // `handle_answer`, `add_ice_candidate`, `send_bytes`, and the `do_tick`
+    // `connect_to_hub`'s success path, `create_data_channel`'s open/close
+    // handlers firing, `send_bytes`'s *success* path, and the `do_tick`
     // `Process` arm together with the `Idle` arm — all of which need an *Open*
     // `RtcDataChannel` (so `is_connected()` returns `true`), which only happens
     // after a full DTLS/SCTP handshake with a remote peer. With no channel,
@@ -1544,17 +1552,29 @@ mod tests {
         let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
             .expect("transport construction should succeed");
 
+        // Pristine transport reports `Disconnected` via the inherent getter.
+        assert_eq!(transport.state(), TransportState::Disconnected);
+
         let sdp = transport
             .create_offer()
             .await
             .expect("create_offer should succeed");
 
         assert_valid_sdp(&sdp);
+        // The `v=0` preamble is the RFC 4566 session-version line (`assert_valid_sdp`
+        // checks the `v=` prefix; a WebRTC offer always emits version 0).
+        assert!(
+            sdp.lines().any(|line| line == "v=0"),
+            "offer SDP must open with the v=0 preamble, got:\n{sdp}"
+        );
         // The offer carries exactly one data-channel (SCTP) media section.
         assert!(
             sdp.lines().any(|line| line.starts_with("m=application")),
             "data-channel offer must contain an m=application section, got:\n{sdp}"
         );
+        // create_offer advances the transport out of `Disconnected` into
+        // `Connecting` (observed through the inherent `state()` getter).
+        assert_eq!(transport.state(), TransportState::Connecting);
     }
 
     /// A freshly created data channel reports the configured label/ordering and
@@ -1894,6 +1914,206 @@ mod tests {
         assert!(
             transport.on_message_closure.is_some(),
             "client-created channel onmessage handler must be registered"
+        );
+    }
+
+    // ── SDP answer / ICE-candidate / send-bytes guard & success paths ────────
+    //
+    // These reach the WebRTC-specific `handle_answer`, `add_ice_candidate`,
+    // `add_ice_candidate_explicit`, and `send_bytes` methods without a live hub:
+    // their guard / early-return branches need no peer, and `handle_answer`'s
+    // success path is driven by a second *local* `RtcPeerConnection` that
+    // produces a real answer (a pure SDP exchange — no ICE/network required).
+
+    /// `handle_answer` with no peer connection hits the `ok_or("No peer
+    /// connection")` guard and returns `Err` (rather than panicking on the
+    /// `unwrap`-free path).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn webrtc_handle_answer_without_peer_connection_errors() {
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+
+        let result = transport.handle_answer("v=0\r\n").await;
+        let err = result.expect_err("handle_answer must error without a peer connection");
+        assert_eq!(
+            err.as_string().as_deref(),
+            Some("No peer connection"),
+            "the guard must surface the \"No peer connection\" error"
+        );
+    }
+
+    /// `handle_answer` success path: `create_offer` puts the transport's peer
+    /// connection in `have-local-offer`; a second local `RtcPeerConnection`
+    /// consumes that offer and produces a matching answer, which
+    /// `handle_answer` applies as the remote description — driving the transport
+    /// back to the `Stable` signaling state. Exercises `set_remote_description`
+    /// end-to-end with no signaling server or ICE.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn webrtc_handle_answer_applies_loopback_answer() {
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+
+        let offer_sdp = transport
+            .create_offer()
+            .await
+            .expect("create_offer should succeed");
+
+        // After create_offer the transport's peer connection awaits the answer.
+        assert_eq!(
+            transport.peer_connection.as_ref().unwrap().signaling_state(),
+            web_sys::RtcSignalingState::HaveLocalOffer,
+        );
+
+        // A second, purely-local peer connection answers the offer. Producing
+        // the answer SDP only needs set_remote_description(offer) + create_answer;
+        // no ICE gathering or set_local_description is required to read the SDP.
+        let answerer = RtcPeerConnection::new().expect("answerer peer connection");
+        let offer_desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
+        offer_desc.set_sdp(&offer_sdp);
+        JsFuture::from(answerer.set_remote_description(&offer_desc))
+            .await
+            .expect("answerer should accept the offer");
+        let answer = JsFuture::from(answerer.create_answer())
+            .await
+            .expect("answerer should create an answer");
+        let answer_sdp = Reflect::get(&answer, &"sdp".into())
+            .expect("answer must expose sdp")
+            .as_string()
+            .expect("answer sdp must be a string");
+        assert_valid_sdp(&answer_sdp);
+
+        transport
+            .handle_answer(&answer_sdp)
+            .await
+            .expect("handle_answer should apply the loopback answer");
+
+        // Applying the remote answer completes negotiation → back to Stable.
+        assert_eq!(
+            transport.peer_connection.as_ref().unwrap().signaling_state(),
+            web_sys::RtcSignalingState::Stable,
+            "handle_answer must drive the peer connection to the Stable state"
+        );
+
+        answerer.close();
+    }
+
+    /// `add_ice_candidate` with no peer connection hits the guard and returns
+    /// `Err` — the peer check runs *before* the empty-candidate short-circuit,
+    /// so even a non-empty candidate errors when there is no connection.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn webrtc_add_ice_candidate_without_peer_connection_errors() {
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+
+        let json = r#"{"candidate":"candidate:1 1 UDP 2122252543 192.168.1.1 56789 typ host","sdpMid":"audio","sdpMLineIndex":0}"#;
+        let err = transport
+            .add_ice_candidate(json)
+            .await
+            .expect_err("add_ice_candidate must error without a peer connection");
+        assert_eq!(err.as_string().as_deref(), Some("No peer connection"));
+    }
+
+    /// `add_ice_candidate` with a peer connection but an empty candidate string
+    /// short-circuits to `Ok(())` (end-of-candidates sentinel) without touching
+    /// the JSON parser or `web_sys`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn webrtc_add_ice_candidate_empty_is_ok_with_peer() {
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+        transport
+            .create_peer_connection()
+            .expect("peer connection creation should succeed");
+
+        transport
+            .add_ice_candidate("")
+            .await
+            .expect("an empty candidate must be a no-op Ok(())");
+    }
+
+    /// `add_ice_candidate_explicit` with no peer connection hits the guard and
+    /// returns `Err`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn webrtc_add_ice_candidate_explicit_without_peer_connection_errors() {
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+
+        let err = transport
+            .add_ice_candidate_explicit(
+                "candidate:1 1 UDP 2122252543 192.168.1.1 56789 typ host",
+                "audio",
+                0,
+            )
+            .await
+            .expect_err("add_ice_candidate_explicit must error without a peer connection");
+        assert_eq!(err.as_string().as_deref(), Some("No peer connection"));
+    }
+
+    /// `add_ice_candidate_explicit` with a peer connection but an empty
+    /// candidate string short-circuits to `Ok(())` without building an
+    /// `RtcIceCandidate`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn webrtc_add_ice_candidate_explicit_empty_is_ok_with_peer() {
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+        transport
+            .create_peer_connection()
+            .expect("peer connection creation should succeed");
+
+        transport
+            .add_ice_candidate_explicit("", "audio", 0)
+            .await
+            .expect("an empty explicit candidate must be a no-op Ok(())");
+    }
+
+    /// `send_bytes` with no data channel hits the `ok_or("No data channel")`
+    /// guard and returns `Err`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn webrtc_send_bytes_without_data_channel_errors() {
+        let transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+
+        let err = transport
+            .send_bytes(&[1, 2, 3])
+            .expect_err("send_bytes must error with no data channel");
+        assert_eq!(err.as_string().as_deref(), Some("No data channel"));
+    }
+
+    /// `send_bytes` with a freshly-created (not-yet-open) data channel hits the
+    /// readiness guard: a client-created channel starts in `Connecting`, so the
+    /// `state != Open` branch returns an `Err` naming the state.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn webrtc_send_bytes_before_channel_open_errors() {
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+        transport
+            .create_peer_connection()
+            .expect("peer connection creation should succeed");
+        transport
+            .create_data_channel()
+            .expect("data channel creation should succeed");
+
+        // The channel exists but has not completed the handshake, so it is in
+        // the Connecting state, not Open.
+        assert_eq!(
+            transport.data_channel.as_ref().unwrap().ready_state(),
+            RtcDataChannelState::Connecting,
+        );
+
+        let err = transport
+            .send_bytes(&[4, 5, 6])
+            .expect_err("send_bytes must error before the channel is Open");
+        let msg = err.as_string().expect("error should be a string message");
+        assert!(
+            msg.contains("not open"),
+            "error must explain the channel is not open, got: {msg}"
         );
     }
 

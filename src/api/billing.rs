@@ -223,6 +223,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_portal_error() {
+        let (mut server, client) = mock_api().await;
+        let mock = mock_json(&mut server, "POST", "/users/u1/billing", 500, "boom").await;
+
+        let req = models::BillingPortalRequest::default();
+        let err = api(&client).get_portal("u1", &req).await.unwrap_err();
+        assert_http_status(err, 500);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn test_create_checkout_success() {
         let (mut server, client) = mock_api().await;
         let mock = mock_json(
