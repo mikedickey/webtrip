@@ -16,12 +16,13 @@ import {
 
 const SITE_DIST = path.join(path.dirname(fileURLToPath(import.meta.url)), 'dist');
 
-// Parse --key and --cert arguments
+// Parse --key, --cert, and --redirect-http arguments
 const args = process.argv.slice(2);
-let keyFile, certFile;
+let keyFile, certFile, redirectPort;
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--key' && args[i + 1]) keyFile = args[++i];
   else if (args[i] === '--cert' && args[i + 1]) certFile = args[++i];
+  else if (args[i] === '--redirect-http' && args[i + 1]) redirectPort = parseInt(args[++i], 10);
 }
 
 const useTLS = !!(keyFile && certFile);
@@ -69,6 +70,15 @@ const handler = (req, res) => {
         Object.assign(headers, CROSS_ORIGIN_ISOLATION_HEADERS);
       }
 
+      // Vite-hashed /assets/ can cache hard; wasm-pack's /pkg/ output is NOT
+      // content-hashed and the SPA shell's asset URLs change per build, so
+      // both must revalidate.
+      if (urlPath.startsWith('/assets/')) {
+        headers['Cache-Control'] = 'public, max-age=31536000, immutable';
+      } else if (urlPath.startsWith('/pkg/') || extname === '.html') {
+        headers['Cache-Control'] = 'no-cache';
+      }
+
       res.writeHead(200, headers);
 
       const isText = ['.html', '.js', '.json', '.css', '.svg'].includes(extname);
@@ -85,3 +95,22 @@ server.listen(PORT, () => {
   const proto = useTLS ? 'https' : 'http';
   console.log(`Server running at ${proto}://localhost:${PORT}/`);
 });
+
+// Optional plain-HTTP listener that 301s everything to the https server
+// (production runs it on port 80). Only meaningful alongside TLS.
+if (useTLS && redirectPort) {
+  const redirectServer = http.createServer((req, res) => {
+    const host = (req.headers.host || 'localhost').replace(/:\d+$/, '');
+    const target = PORT === 443 ? `https://${host}` : `https://${host}:${PORT}`;
+    res.writeHead(301, { Location: target + req.url });
+    res.end();
+  });
+  // A bind failure here (EADDRINUSE, EACCES) must not take down the https
+  // server — an unhandled 'error' event would crash the process.
+  redirectServer.on('error', (err) => {
+    console.error(`Redirect listener error on port ${redirectPort}:`, err.message);
+  });
+  redirectServer.listen(redirectPort, () => {
+    console.log(`Redirecting http://localhost:${redirectPort}/ to https`);
+  });
+}

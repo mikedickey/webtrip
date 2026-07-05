@@ -8,11 +8,11 @@
 #
 # Build from the repo root (the build context must be the repo root so the
 # dependency pre-build can COPY Cargo.toml/Cargo.lock/package.json):
-#   podman build -t ghcr.io/mikedickey/webtrip-build:latest -f containers/build/Containerfile .
+#   podman build -t ghcr.io/mikedickey/webtrip-build:latest -f containers/builder/Containerfile .
 #
 # Bump a tool without editing the file:
 #   podman build --build-arg RUST_NIGHTLY=nightly-2026-07-01 \
-#       -f containers/build/Containerfile -t webtrip-build .
+#       -f containers/builder/Containerfile -t webtrip-build .
 #
 # NOTE: RUST_NIGHTLY must stay in sync with rust-toolchain.toml's channel,
 # otherwise rustup will download a different nightly at build time and the
@@ -187,7 +187,24 @@ RUN set -eux; \
     cd /; \
     rm -rf /opt/prewarm
 
-# 8. Login shells (`bash -lc ...`) re-source /etc/profile and would otherwise
+# 8. Prewarm the npm download cache for website/'s dependencies (React, Vite,
+#    Rollup, etc.), so a real `npm --prefix website install` at runtime hits
+#    the shared cache instead of the registry. Only the manifests are copied
+#    (no application source) into a scratch dir outside /workspace so it can't
+#    collide with the real source mounted there at runtime. `npm ci` is used
+#    (not `install`) because it requires the lockfile to exactly match
+#    package.json — the resulting node_modules is discarded since it must live
+#    under the mounted /workspace/website at runtime, not baked into the
+#    image; only $npm_config_cache is kept.
+COPY website/package.json website/package-lock.json /opt/prewarm-website/
+RUN set -eux; \
+    umask 000; \
+    cd /opt/prewarm-website; \
+    npm ci; \
+    cd /; \
+    rm -rf /opt/prewarm-website
+
+# 9. Login shells (`bash -lc ...`) re-source /etc/profile and would otherwise
 #    drop the cargo bin dir from PATH, so add it there too. ENV PATH above
 #    already covers non-login and exec-form invocations.
 RUN printf 'export PATH=%s/bin:$PATH\n' "${CARGO_HOME}" > /etc/profile.d/rust.sh
