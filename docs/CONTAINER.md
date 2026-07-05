@@ -101,8 +101,9 @@ container works whether run as root (typical for CI) or as a non-root uid
 `containers/webtrip/Containerfile` is a `node:22-slim` image running
 `website/server.js` — the same static server `npm run serve` uses locally and
 the integration-test harness (`tests/integration/run.mjs`) drives in CI —
-serving the built website over TLS on port 443, with port 80 redirecting to
-https. Production, local serving, and CI all exercise the same code path.
+serving the built website. With TLS certs mounted it serves https on port 443
+with port 80 redirecting; without certs it serves plain http on port 80.
+Production, local serving, and CI all exercise the same code path.
 
 The jacktrip hub is **not** part of this image. Run it separately from
 `jacktrip/jacktrip:edge` — the image the integration tests use; see
@@ -138,24 +139,35 @@ pass (the `webtrip-image` job in `.github/workflows/ci.yml`).
 
 ## Running
 
-The image **requires** a TLS key and full-chain certificate mounted at:
+`entrypoint.sh` picks the mode from what's mounted at `/certs`:
 
-- `/certs/server.crt` — full chain
-- `/certs/server.key`
+- **https** — both `/certs/server.crt` (full chain) and `/certs/server.key`
+  mounted: serves https on 443, with a port-80 listener that only issues
+  redirects to it.
+- **http** — no certs mounted: serves plain http on 80. Use this behind a
+  TLS-terminating proxy or load balancer. Note the demo needs a secure context
+  (SharedArrayBuffer/crossOriginIsolated), so something in front must still
+  provide https for anything other than `localhost`.
+- Mounting only one of the two files is treated as a broken mount and the
+  container exits with an error rather than silently falling back to http.
 
 ```bash
+# https (certs mounted)
 docker run -d --name webtrip -p 80:80 -p 443:443 \
   -v "$CERT_DIR/fullchain.pem:/certs/server.crt:ro" \
   -v "$CERT_DIR/privkey.pem:/certs/server.key:ro" \
   webtrip/webtrip
+
+# http only (e.g. behind a TLS-terminating proxy)
+docker run -d --name webtrip -p 80:80 webtrip/webtrip
 ```
 
 Notes:
 
 - Plain port mapping works everywhere, including macOS — no host networking,
   `--privileged`, or systemd involved.
-- `PORT` overrides the https port (`-e PORT=8443`); the port-80 listener only
-  issues redirects to it.
+- `PORT` overrides the serving port in either mode (`-e PORT=8443`); in https
+  mode the port-80 listener only issues redirects to it.
 - On SELinux hosts add `,z` to the cert volume mounts (prefer `,z` over `:Z`,
   which relabels the host files).
 - A root-owned `0600` key is fine: node runs as root (the node image default),
