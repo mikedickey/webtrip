@@ -1,8 +1,9 @@
 # WebTrip production image: node:22-slim running website/server.js — the same
 # static server `npm run serve` uses locally and the integration-test harness
 # drives in CI — serving the built webtrip.dev site. With TLS certs mounted it
-# serves https on 443 with port 80 redirecting; without certs it serves plain
-# http on 80 (for running behind a TLS-terminating proxy/load balancer).
+# serves https on HTTPS_PORT (default 8443) with HTTP_PORT (default 8080)
+# redirecting to it; without certs it serves plain http on HTTP_PORT (for
+# running behind a TLS-terminating proxy/load balancer).
 #
 # The jacktrip hub is NOT part of this image; run it separately from
 # jacktrip/jacktrip:edge (see tests/integration/docker-compose.integration.yml
@@ -38,8 +39,7 @@ RUN test -f website/dist/index.html \
     && test -f pkg/webtrip.js \
     && test -f pkg/webtrip_bg.wasm
 
-# Runs as root (the node image default) so it can bind 80/443 and read a
-# root-owned 0600 key mount. entrypoint.sh defaults PORT per mode (443 https,
-# 80 http); an explicit PORT env overrides the serving port in either mode.
-EXPOSE 80/tcp 443/tcp
+# Runs as root (the node image default) so it can read a root-owned 0600 key
+# mount and bind 80/443 when HTTP_PORT/HTTPS_PORT are overridden below 1024.
+EXPOSE 8080/tcp 8443/tcp
 CMD ["./entrypoint.sh"]
