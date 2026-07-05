@@ -6,6 +6,7 @@
 # Whitelist style: exclude everything, then re-include only what the
 # Containerfile COPYs — keeps .git/target/node_modules out of the context.
 *
+!containers/webtrip/entrypoint.sh
 !pkg/
 !website/dist/
 !website/server.js

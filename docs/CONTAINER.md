@@ -101,8 +101,10 @@ container works whether run as root (typical for CI) or as a non-root uid
 `containers/webtrip/Containerfile` is a `node:22-slim` image running
 `website/server.js` — the same static server `npm run serve` uses locally and
 the integration-test harness (`tests/integration/run.mjs`) drives in CI —
-serving the built website over TLS on port 443, with port 80 redirecting to
-https. Production, local serving, and CI all exercise the same code path.
+serving the built website. With TLS certs mounted it serves https on
+`HTTPS_PORT` (default 8443) with `HTTP_PORT` (default 8080) redirecting to it;
+without certs it serves plain http on `HTTP_PORT`. Production, local serving,
+and CI all exercise the same code path.
 
 The jacktrip hub is **not** part of this image. Run it separately from
 `jacktrip/jacktrip:edge` — the image the integration tests use; see
@@ -138,25 +140,42 @@ pass (the `webtrip-image` job in `.github/workflows/ci.yml`).
 
 ## Running
 
-The image **requires** a TLS key and full-chain certificate mounted at:
+`entrypoint.sh` picks the mode from what's mounted at `/certs`, and two env
+vars pick the ports: `HTTP_PORT` (default 8080) and `HTTPS_PORT` (default
+8443).
 
-- `/certs/server.crt` — full chain
-- `/certs/server.key`
+- **https** — both `/certs/server.crt` (full chain) and `/certs/server.key`
+  mounted: serves https on `HTTPS_PORT`, with a listener on `HTTP_PORT` that
+  only issues redirects to it. The two ports must differ or the container
+  exits with an error.
+- **http** — no certs mounted: serves plain http on `HTTP_PORT`
+  (`HTTPS_PORT` is ignored). Use this behind a TLS-terminating proxy or load
+  balancer. Note the demo needs a secure context
+  (SharedArrayBuffer/crossOriginIsolated), so something in front must still
+  provide https for anything other than `localhost`.
+- Mounting only one of the two files is treated as a broken mount and the
+  container exits with an error rather than silently falling back to http.
 
 ```bash
+# https on the standard ports
 docker run -d --name webtrip -p 80:80 -p 443:443 \
+  -e HTTP_PORT=80 -e HTTPS_PORT=443 \
   -v "$CERT_DIR/fullchain.pem:/certs/server.crt:ro" \
   -v "$CERT_DIR/privkey.pem:/certs/server.key:ro" \
   webtrip/webtrip
+
+# http only (e.g. behind a TLS-terminating proxy)
+docker run -d --name webtrip -p 80:8080 webtrip/webtrip
 ```
 
 Notes:
 
 - Plain port mapping works everywhere, including macOS — no host networking,
   `--privileged`, or systemd involved.
-- `PORT` overrides the https port (`-e PORT=8443`); the port-80 listener only
-  issues redirects to it.
+- The redirect target is `https://<host>:$HTTPS_PORT` (port omitted when it's
+  443), so in https mode publish `HTTPS_PORT` to the same host port (as in the
+  example above) — remapping it breaks the redirects.
 - On SELinux hosts add `,z` to the cert volume mounts (prefer `,z` over `:Z`,
   which relabels the host files).
 - A root-owned `0600` key is fine: node runs as root (the node image default),
-  which is also what lets it bind 80/443.
+  which is also what lets it bind 80/443 when the ports are overridden.

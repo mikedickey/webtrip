@@ -1,7 +1,9 @@
 # WebTrip production image: node:22-slim running website/server.js — the same
 # static server `npm run serve` uses locally and the integration-test harness
-# drives in CI — serving the built webtrip.dev site over TLS on 443, with
-# port 80 redirecting to https.
+# drives in CI — serving the built webtrip.dev site. With TLS certs mounted it
+# serves https on HTTPS_PORT (default 8443) with HTTP_PORT (default 8080)
+# redirecting to it; without certs it serves plain http on HTTP_PORT (for
+# running behind a TLS-terminating proxy/load balancer).
 #
 # The jacktrip hub is NOT part of this image; run it separately from
 # jacktrip/jacktrip:edge (see tests/integration/docker-compose.integration.yml
@@ -14,7 +16,7 @@
 #   # or: podman build --ignorefile containers/webtrip/Containerfile.dockerignore \
 #   #       -t webtrip/webtrip -f containers/webtrip/Containerfile .
 #
-# Requires TLS cert mounts at runtime:
+# For https, mount TLS certs at runtime (entrypoint.sh auto-detects them):
 #
 #   /certs/server.crt  (full chain)
 #   /certs/server.key
@@ -27,6 +29,7 @@ FROM node:${NODE_MAJOR}-slim
 # site and <repo root>/pkg at /pkg/ (see website/serve-common.cjs). No npm
 # install — server.js uses only node builtins.
 WORKDIR /app
+COPY containers/webtrip/entrypoint.sh ./
 COPY website/server.js website/serve-common.cjs website/
 COPY website/dist/ website/dist/
 COPY pkg/ pkg/
@@ -36,11 +39,7 @@ RUN test -f website/dist/index.html \
     && test -f pkg/webtrip.js \
     && test -f pkg/webtrip_bg.wasm
 
-# Runs as root (the node image default) so it can bind 80/443 and read a
-# root-owned 0600 key mount. PORT is server.js's https port; the port-80
-# listener only issues redirects to it.
-ENV PORT=443
-EXPOSE 80/tcp 443/tcp
-CMD ["node", "website/server.js", \
-     "--cert", "/certs/server.crt", "--key", "/certs/server.key", \
-     "--redirect-http", "80"]
+# Runs as root (the node image default) so it can read a root-owned 0600 key
+# mount and bind 80/443 when HTTP_PORT/HTTPS_PORT are overridden below 1024.
+EXPOSE 8080/tcp 8443/tcp
+CMD ["./entrypoint.sh"]
