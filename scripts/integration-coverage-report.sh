@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Turn the integration harness's coverage dump (coverage/integration.profraw,
 # written by tests/integration/run.mjs when INTEGRATION_COVERAGE is set) into an
-# lcov report Codecov can union with lcov.info / lcov.wasm.info.
+# lcov report Codecov can union with coverage/lcov.info / coverage/lcov.wasm.info.
 #
 # The instrumented module is built by `build:wasm:coverage`; the counters are
 # captured from the live browser via the `__coverageDump` export. This step just
@@ -11,7 +11,7 @@ set -euo pipefail
 PROFRAW=coverage/integration.profraw
 PROFDATA=coverage/integration.profdata
 WASM=pkg/webtrip_bg.wasm
-OUT=lcov.integration.info
+OUT=coverage/lcov.integration.info
 
 [ -f "$PROFRAW" ] || { echo "error: $PROFRAW missing — run the harness with INTEGRATION_COVERAGE set" >&2; exit 1; }
 [ -f "$WASM" ]    || { echo "error: $WASM missing — run 'npm run build:wasm:coverage' first" >&2; exit 1; }

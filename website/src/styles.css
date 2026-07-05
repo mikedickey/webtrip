@@ -96,6 +96,7 @@ a:hover {
 
 .site-nav {
   display: flex;
+  align-items: center;
   gap: 20px;
   font-family: "JetBrains Mono", monospace;
   font-size: 13px;
@@ -112,6 +113,23 @@ a:hover {
 }
 
 .site-nav a.active {
+  color: var(--accent);
+}
+
+.site-nav a.github-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  transition: all 0.2s ease;
+}
+
+.site-nav a.github-btn:hover {
+  border-color: var(--accent);
   color: var(--accent);
 }
 
@@ -185,59 +203,64 @@ a:hover {
   color: var(--accent);
 }
 
-/* Feature cards */
-.features {
+/* Card grids (features, use cases) */
+.card-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
   gap: 16px;
-  margin-top: 64px;
 }
 
 @media (max-width: 640px) {
-  .features {
+  .card-grid {
     grid-template-columns: 1fr;
   }
 }
 
-.feature-card {
+.card {
   background: var(--bg-card);
   border: 1px solid var(--border-color);
   border-radius: 16px;
   padding: 24px;
 }
 
-.feature-card h2 {
+.card h2,
+.card h3 {
   font-size: 16px;
   font-weight: 600;
   color: var(--accent);
   margin-bottom: 10px;
 }
 
-.feature-card p {
+.card p {
   font-size: 14px;
   font-weight: 300;
   line-height: 1.6;
   color: var(--text-secondary);
 }
 
-/* WebTrip vs typical WebRTC apps comparison */
+.features,
+.use-cases,
 .comparison {
   margin-top: 64px;
 }
 
-.comparison h2 {
+.section-title {
   font-size: 24px;
   font-weight: 600;
   letter-spacing: -0.5px;
 }
 
-.comparison-intro {
+.section-intro {
   margin-top: 12px;
   max-width: 620px;
   font-size: 15px;
   font-weight: 300;
   line-height: 1.6;
   color: var(--text-secondary);
+}
+
+.use-cases .card-grid {
+  margin-top: 24px;
 }
 
 .comparison-scroll {
@@ -299,11 +322,129 @@ a:hover {
   color: var(--accent);
 }
 
+/* Below 640px the 3-column table can't fit, so each row reflows into a
+   stacked block: dimension heading, then the two cells with ::before labels
+   standing in for the hidden column headers. */
 @media (max-width: 640px) {
-  .comparison-table th,
-  .comparison-table td {
-    padding: 12px 14px;
+  .comparison-table {
+    display: block;
+    min-width: 0;
   }
+
+  .comparison-table thead {
+    display: none;
+  }
+
+  .comparison-table tbody,
+  .comparison-table tbody tr,
+  .comparison-table tbody th,
+  .comparison-table tbody td {
+    display: block;
+  }
+
+  .comparison-table tbody th {
+    padding: 14px 16px 0;
+  }
+
+  .comparison-table tbody tr:first-child th {
+    border-top: none;
+  }
+
+  .comparison-table tbody td {
+    border-top: none;
+    padding: 10px 16px;
+  }
+
+  .comparison-table tbody td:last-child {
+    padding-bottom: 16px;
+  }
+
+  .comparison-table td::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 2px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .comparison-table td.col-webtrip::before {
+    color: var(--accent);
+  }
+}
+
+/* Benchmark bar panels (below the comparison table) */
+.bench-grid {
+  margin-top: 24px;
+}
+
+.bench-panel h3 {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.bench-hint {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-muted);
+}
+
+.bench-row {
+  margin-top: 14px;
+}
+
+.bench-row-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+
+.bench-name {
+  color: var(--text-secondary);
+}
+
+.bench-value {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.bench-row-webtrip .bench-name {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.bench-row-webtrip .bench-value {
+  color: var(--text-primary);
+}
+
+.bench-track {
+  height: 10px;
+  background: var(--border-color);
+  border-radius: 0 4px 4px 0;
+}
+
+/* De-emphasis gray checked at 3.4:1 against the card surface; the accent
+   measures 4.5:1. Bars stay square at the baseline, rounded at the data end. */
+.bench-bar {
+  height: 100%;
+  background: #6a6a82;
+  border-radius: 0 4px 4px 0;
+}
+
+.bench-row-webtrip .bench-bar {
+  background: var(--accent);
+}
+
+.bench-note {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
 .visually-hidden {

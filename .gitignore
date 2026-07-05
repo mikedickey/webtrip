@@ -4,10 +4,7 @@
 bin/
 pkg/
 wasm-pack.log
-lcov.info
-lcov.wasm.info
-lcov.integration.info
-# Integration-coverage artifacts (profraw dump + merged report)
+# Coverage artifacts (lcov reports, profraw dump, merged profdata)
 /coverage/
 # Local TLS cert/key for the integration server (never commit secrets)
 /certs/
