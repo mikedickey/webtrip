@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 const FEATURES = [
   {
     title: "Zero install",
-    body: "Runs entirely in any modern browser on any popular device. No apps, no drivers, no setup — just open a link and play.",
+    body: "Runs entirely in any modern browser on any popular device. Nothing to download or buy. No apps, no drivers, no setup — just open a link and connect.",
   },
   {
     title: "Built for low latency",
@@ -16,6 +16,33 @@ const FEATURES = [
   {
     title: "Lossless audio",
     body: "Uncompressed audio over the JackTrip wire protocol, with a jitter buffer and Burg packet-loss concealment ported from JackTrip.",
+  },
+];
+
+const USE_CASES = [
+  {
+    title: "Natural conversations",
+    body: "Tone, inflection, pauses — the cues that carry meaning beyond words — are exactly what lossy compression flattens. And when the round trip is short, turn-taking just works: no talking over each other, no awkward gaps.",
+  },
+  {
+    title: "AI voice",
+    body: "Cleaner audio in means more accurate speech-to-text out — fewer misheard words, fewer wrong answers. Lower latency cuts the wait for a response, so talking to an agent feels like a conversation instead of a walkie-talkie.",
+  },
+  {
+    title: "Music lessons",
+    body: "A teacher has to hear exactly what the student played — the full spectrum, every dynamic and overtone. Codecs tuned for speech discard the detail that useful feedback depends on.",
+  },
+  {
+    title: "Writing songs together",
+    body: "Trading riffs, finding a harmony, feeling out a groove — collaboration this immediate falls apart with even modest delay. And a rough idea's character lives in nuances that speech codecs strip away.",
+  },
+  {
+    title: "Therapy & guided meditation",
+    body: "These sessions work because of how a voice sounds: calm, warm, present. Compression artifacts and dropouts break the connection that the session is trying to build.",
+  },
+  {
+    title: "Prayer & chanting",
+    body: "Voices joined in chant or prayer have to stay together. Degraded audio disrupts the flow, and high latency makes a shared rhythm impossible.",
   },
 ];
 
@@ -49,6 +76,71 @@ const COMPARISON = [
   },
 ];
 
+function CardGrid({
+  items,
+  heading: Heading = "h3",
+}: {
+  items: { title: string; body: string }[];
+  heading?: "h2" | "h3";
+}) {
+  return (
+    <div className="card-grid">
+      {items.map((item) => (
+        <article className="card" key={item.title}>
+          <Heading>{item.title}</Heading>
+          <p>{item.body}</p>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+const BENCH_SYSTEMS = [
+  { name: "Zoom", quality: 192, latency: 155 },
+  { name: "Google Meet", quality: 128, latency: 160 },
+  { name: "WebRTC", quality: 64, latency: 160 },
+  { name: "WebTrip", quality: 1536, latency: 35, isWebTrip: true },
+];
+
+function BenchPanel({
+  title,
+  hint,
+  metric,
+  format,
+}: {
+  title: string;
+  hint: string;
+  metric: "quality" | "latency";
+  format: (value: number) => string;
+}) {
+  const max = Math.max(...BENCH_SYSTEMS.map((s) => s[metric]));
+  return (
+    <article className="card bench-panel">
+      <h3>
+        {title}
+        <span className="bench-hint">{hint}</span>
+      </h3>
+      {BENCH_SYSTEMS.map((s) => (
+        <div
+          className={s.isWebTrip ? "bench-row bench-row-webtrip" : "bench-row"}
+          key={s.name}
+        >
+          <div className="bench-row-head">
+            <span className="bench-name">{s.name}</span>
+            <span className="bench-value">{format(s[metric])}</span>
+          </div>
+          <div className="bench-track">
+            <div
+              className="bench-bar"
+              style={{ width: `${(s[metric] / max) * 100}%` }}
+            />
+          </div>
+        </div>
+      ))}
+    </article>
+  );
+}
+
 export default function Home() {
   return (
     <>
@@ -56,7 +148,7 @@ export default function Home() {
         <h1>
           Lossless, low&#8209;latency audio collaboration.
           <br />
-          <span className="hero-accent">In your browser.</span>
+          <span className="hero-accent">In your web browser.</span>
         </h1>
         <p className="lede">
           WebTrip is a software development toolkit for real-time audio over
@@ -74,21 +166,29 @@ export default function Home() {
       </section>
 
       <section className="features">
-        {FEATURES.map((f) => (
-          <article className="feature-card" key={f.title}>
-            <h2>{f.title}</h2>
-            <p>{f.body}</p>
-          </article>
-        ))}
+        <CardGrid items={FEATURES} heading="h2" />
+      </section>
+
+      <section className="use-cases">
+        <h2 className="section-title">More than words</h2>
+        <p className="section-intro">
+          The human voice carries far more information than the words alone —
+          emotion, tone, inflection, timing. High-fidelity audio preserves
+          those cues, and low latency keeps the exchange natural. Both are
+          essential wherever people (or machines) really listen.
+        </p>
+        <CardGrid items={USE_CASES} />
       </section>
 
       <section className="comparison">
-        <h2>Why not just use WebRTC?</h2>
-        <p className="comparison-intro">
+        <h2 className="section-title">Why not just use WebRTC?</h2>
+        <p className="section-intro">
           Browsers already ship real-time audio through WebRTC&rsquo;s media
-          stack. WebTrip takes a different path: raw, uncompressed audio,
-          skipping the browser&rsquo;s built-in pipeline for higher fidelity
-          and lower latency.
+          stack — but it&rsquo;s optimized for speech, compressed and tuned to
+          keep voices intelligible rather than faithful. WebTrip takes a
+          different path: raw, uncompressed audio, skipping the
+          browser&rsquo;s built-in pipeline for higher fidelity and lower
+          latency.
         </p>
         <div className="comparison-scroll">
           <table className="comparison-table">
@@ -107,13 +207,33 @@ export default function Home() {
               {COMPARISON.map((row) => (
                 <tr key={row.dimension}>
                   <th scope="row">{row.dimension}</th>
-                  <td className="col-webtrip">{row.webtrip}</td>
-                  <td>{row.webrtc}</td>
+                  <td className="col-webtrip" data-label="WebTrip">
+                    {row.webtrip}
+                  </td>
+                  <td data-label="WebRTC">{row.webrtc}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
+        <div className="card-grid bench-grid">
+          <BenchPanel
+            title="Audio quality"
+            hint="higher is better"
+            metric="quality"
+            format={(v) => `${v.toLocaleString("en-US")} kbps`}
+          />
+          <BenchPanel
+            title="Audio latency"
+            hint="lower is better"
+            metric="latency"
+            format={(v) => `${v} ms`}
+          />
+        </div>
+        <p className="bench-note">
+          Typical figures; actual performance varies with hardware and network
+          conditions.
+        </p>
       </section>
     </>
   );
