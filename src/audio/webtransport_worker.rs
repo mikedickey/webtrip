@@ -446,6 +446,63 @@ pub fn worker_get_stats() -> WebTransportWorkerStats {
 ///   dispatched promptly. `worker_disconnect()` additionally calls
 ///   `Atomics.notify` on the same flag to unblock the wait on shutdown
 ///   even if the AudioWorklet has stopped producing new data.
+/// Assemble the next outgoing datagram from the ring buffer, or `None` when
+/// there is nothing to send yet.
+///
+/// Returns the serialized JackTrip packet as a `Uint8Array` (ready to hand to
+/// `WritableStreamDefaultWriter::write_with_chunk`) plus its byte length, and
+/// advances the sequence number and timestamp once per packet *read out of the
+/// ring buffer*. `None` covers every "don't send now" case: no ring buffer
+/// configured, fewer than a full packet's worth of samples buffered, a losing
+/// race with the reader, or a serialization failure. The first three leave the
+/// counters untouched — spurious gaps in the sequence numbers make the
+/// receiving regulator conceal packets that were never dropped.
+///
+/// Split out of [`send_loop`] so this per-packet step is reachable from tests
+/// without a live `WebTransport` session.
+fn build_next_packet(state: &WorkerState) -> Option<(Uint8Array, usize)> {
+    // Sound shared borrow: `RingBuffer`'s read path is `&self`.
+    let ring_buffer = state.ring_buffer_ptr.as_ref()?;
+
+    let samples_needed = samples_per_packet(state.buffer_size, state.channels);
+    if send_decision(ring_buffer.available(), samples_needed) == SendDecision::Wait {
+        return None;
+    }
+
+    // Read audio samples
+    let mut audio_buffer = state.audio_buffer.borrow_mut();
+    if !ring_buffer.read(&mut audio_buffer) {
+        return None;
+    }
+
+    // Serialize packet
+    let seq = state.sequence_number.fetch_add(1, Ordering::Relaxed);
+    let ts = state.timestamp.fetch_add(state.buffer_size as u64, Ordering::Relaxed);
+
+    let mut packet_buffer = state.packet_buffer.borrow_mut();
+    match AudioPacket::serialize_samples_into(
+        seq,
+        ts,
+        &audio_buffer,
+        state.channels,
+        &mut packet_buffer,
+    ) {
+        Ok(bytes_written) => {
+            // Convert to Uint8Array for browser API
+            let array = Uint8Array::new_with_length(bytes_written as u32);
+            array.copy_from(&packet_buffer[..bytes_written]);
+            Some((array, bytes_written))
+        }
+        Err(e) => {
+            web_sys::console::error_1(&format!(
+                "[WebTransport Worker] Serialize error: {:?}",
+                e
+            ).into());
+            None
+        }
+    }
+}
+
 async fn send_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(), JsValue> {
     // Get the writable datagram stream
     let datagrams = transport.borrow().datagrams();
@@ -471,52 +528,7 @@ async fn send_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(), 
         }
 
         // Try to read from ring buffer
-        let packet_data = WORKER_STATE.with(|state| {
-            let state = state.borrow();
-            
-            // Sound shared borrow: `RingBuffer`'s read path is `&self`.
-            let Some(ring_buffer) = state.ring_buffer_ptr.as_ref() else {
-                return None;
-            };
-
-            let samples_needed = samples_per_packet(state.buffer_size, state.channels);
-            if send_decision(ring_buffer.available(), samples_needed) == SendDecision::Wait {
-                return None;
-            }
-
-            // Read audio samples
-            let mut audio_buffer = state.audio_buffer.borrow_mut();
-            if !ring_buffer.read(&mut audio_buffer) {
-                return None;
-            }
-
-            // Serialize packet
-            let seq = state.sequence_number.fetch_add(1, Ordering::Relaxed);
-            let ts = state.timestamp.fetch_add(state.buffer_size as u64, Ordering::Relaxed);
-            
-            let mut packet_buffer = state.packet_buffer.borrow_mut();
-            match AudioPacket::serialize_samples_into(
-                seq,
-                ts,
-                &audio_buffer,
-                state.channels,
-                &mut packet_buffer,
-            ) {
-                Ok(bytes_written) => {
-                    // Convert to Uint8Array for browser API
-                    let array = Uint8Array::new_with_length(bytes_written as u32);
-                    array.copy_from(&packet_buffer[..bytes_written]);
-                    Some((array, bytes_written))
-                }
-                Err(e) => {
-                    web_sys::console::error_1(&format!(
-                        "[WebTransport Worker] Serialize error: {:?}",
-                        e
-                    ).into());
-                    None
-                }
-            }
-        });
+        let packet_data = WORKER_STATE.with(|state| build_next_packet(&state.borrow()));
 
         if let Some((data, data_len)) = packet_data {
             // Send as unreliable datagram using browser API
@@ -1122,6 +1134,94 @@ mod tests {
         );
 
         // Keep the backing buffers alive until after configure has read them.
+        drop(ring);
+        drop(regulator);
+    }
+
+    /// `build_next_packet` — the send loop's per-packet step — must withhold a
+    /// packet until a full `buffer_size * channels` frame is buffered, then
+    /// serialize exactly that frame and advance the sequence number by 1 and the
+    /// timestamp by `buffer_size` per packet.
+    ///
+    /// Driving it with a real `RingBuffer` covers what the pure `send_decision`
+    /// test can't: that the assembled bytes really are the samples that were
+    /// written, and that the counters advance per *packet* (a `+= 1` on the
+    /// timestamp, or an increment on every loop iteration rather than every
+    /// packet, would desynchronize the receiver's jitter buffer).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn build_next_packet_serializes_full_frames_and_advances_counters() {
+        let ring = RingBuffer::new();
+        let mut regulator = Regulator::new();
+        let buffer_size: usize = 64;
+        let channels: u8 = 2;
+        let frame = buffer_size * channels as usize;
+
+        let mut state = WorkerState::new();
+        state.configure(
+            &ring as *const RingBuffer as usize,
+            &mut regulator as *mut Regulator as usize,
+            buffer_size,
+            channels,
+        );
+
+        // Empty ring buffer → nothing to send, counters untouched.
+        assert!(build_next_packet(&state).is_none(), "an empty ring buffer must not produce a packet");
+
+        ring.set_streaming(true);
+
+        // One sample short of a full frame → still nothing to send.
+        let partial: Vec<f32> = vec![0.25; frame - 1];
+        assert!(ring.write(&partial), "ring buffer write should succeed");
+        assert!(
+            build_next_packet(&state).is_none(),
+            "a partial frame must not be sent"
+        );
+        assert_eq!(
+            state.sequence_number.load(Ordering::Relaxed),
+            0,
+            "withheld packets must not consume a sequence number"
+        );
+
+        // Top the buffer up to two full frames and drain both.
+        let rest: Vec<f32> = (0..frame + 1).map(|i| i as f32 / 1000.0).collect();
+        assert!(ring.write(&rest), "ring buffer write should succeed");
+
+        let (first, first_len) = build_next_packet(&state).expect("a full frame must produce a packet");
+        let (_second, second_len) =
+            build_next_packet(&state).expect("the second full frame must produce a packet");
+        assert!(
+            build_next_packet(&state).is_none(),
+            "the ring buffer is drained: no third packet"
+        );
+
+        assert_eq!(
+            first_len,
+            HEADER_SIZE + frame * 2,
+            "a packet is the header plus one 16-bit sample per channel-sample"
+        );
+        assert_eq!(second_len, first_len);
+        assert_eq!(first.length() as usize, first_len, "the Uint8Array must be exactly the packet");
+
+        // The first packet carries the samples written first (0.25 repeated),
+        // proving the ring buffer's contents — not a stale reusable buffer —
+        // were serialized.
+        let mut bytes = vec![0u8; first_len];
+        first.copy_to(&mut bytes);
+        let packet = AudioPacket::deserialize(&bytes).expect("the assembled packet must deserialize");
+        assert_eq!(packet.samples.len(), frame);
+        // 0.25 survives the f32 → i16 → f32 round trip within one LSB.
+        assert!(
+            packet.samples[..frame - 1].iter().all(|s| (s - 0.25).abs() < 1e-4),
+            "the first packet must carry the first-written samples"
+        );
+        assert_eq!(packet.header.sequence_number, 0);
+        assert_eq!(packet.header.timestamp, 0);
+
+        // Counters advanced once per packet, not once per sample or iteration.
+        assert_eq!(state.sequence_number.load(Ordering::Relaxed), 2);
+        assert_eq!(state.timestamp.load(Ordering::Relaxed), 2 * buffer_size as u64);
+
         drop(ring);
         drop(regulator);
     }

@@ -1567,6 +1567,88 @@ mod tests {
         assert!(queue.borrow().is_empty(), "rejected messages must not enqueue");
     }
 
+    // ── Server-created data channel (`ondatachannel`) ────────────────────────
+    //
+    // The hub server may open its own data channel instead of accepting the one
+    // we create, so `create_peer_connection` installs an `ondatachannel`
+    // handler that must wire that channel up identically. A synthetic
+    // `RtcDataChannelEvent` carrying a locally-created channel drives the real
+    // handler without a remote peer: the channel never reaches the Open state,
+    // but the handler's wiring (binary type, `onmessage` bound to *this*
+    // transport's receive queue, state-change notification) all runs.
+
+    /// `ondatachannel` must adopt the server-created channel: switch it to
+    /// `arraybuffer` binary type, register an `onmessage` handler that feeds
+    /// this transport's receive queue, and report `"connected"`.
+    ///
+    /// Regression guard for the wiring itself — a handler that cloned the wrong
+    /// queue, forgot `Closure::forget` (dropping the handler at the end of the
+    /// event), or skipped `set_binary_type` would leave inbound audio from a
+    /// server-created channel silently discarded while the connection looked
+    /// healthy.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn ondatachannel_adopts_server_created_channel() {
+        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
+            .expect("transport construction should succeed");
+
+        let (log, cb) = recording_state_callback();
+        transport.on_state_change =
+            Some(cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+
+        transport
+            .create_peer_connection()
+            .expect("peer connection creation should succeed");
+        let pc = transport
+            .peer_connection
+            .as_ref()
+            .expect("peer connection must be stored")
+            .clone();
+
+        // Stand in for the channel the server would have created. Force it to
+        // "blob" first (Chrome's default is already "arraybuffer") so the
+        // handler's `set_binary_type` is actually observable.
+        let server_channel = pc.create_data_channel("server-created");
+        server_channel.set_binary_type(web_sys::RtcDataChannelType::Blob);
+
+        let init = web_sys::RtcDataChannelEventInit::new(&server_channel);
+        let event = RtcDataChannelEvent::new("datachannel", &init)
+            .expect("RtcDataChannelEvent construction should succeed");
+        pc.dispatch_event(&event)
+            .expect("dispatching the datachannel event should succeed");
+
+        assert_eq!(
+            server_channel.binary_type(),
+            web_sys::RtcDataChannelType::Arraybuffer,
+            "the adopted channel must be switched to arraybuffer"
+        );
+        assert!(
+            server_channel.onmessage().is_some(),
+            "the adopted channel must have an onmessage handler registered"
+        );
+        assert_eq!(
+            log.borrow().as_slice(),
+            ["connected"],
+            "adopting a server-created channel must report \"connected\""
+        );
+
+        // The registered handler must feed *this* transport's receive queue.
+        // Dispatching to the channel invokes the real handler (which the
+        // production code `forget`s, so it is still alive here).
+        let payload: Vec<u8> = vec![9, 8, 7, 0, 255];
+        server_channel
+            .dispatch_event(&binary_message_event(&payload))
+            .expect("dispatching the message event should succeed");
+
+        assert_eq!(
+            transport.receive_queue.borrow_mut().pop_front(),
+            Some(payload),
+            "messages on the server-created channel must land on the transport's receive queue"
+        );
+
+        drop(cb);
+    }
+
     // ── SDP answer / ICE-candidate / send-bytes guard & success paths ────────
     //
     // These reach the WebRTC-specific `handle_answer`, `add_ice_candidate`,
