@@ -154,6 +154,42 @@ pub(crate) fn is_valid_state_transition(from: SessionState, to: SessionState) ->
     )
 }
 
+/// Map a transport-level state string onto the session state string reported to
+/// the app, or `None` when the transport state must not be forwarded at all.
+///
+/// Both `connect_to_studio` transport arms install a state-change callback that
+/// performs this translation; the mapping lives here so it is written once and
+/// is testable without a live transport.
+///
+/// The two transports deliberately differ on `"disconnected"`:
+///
+/// * **WebRTC** reports `"disconnected"`/`"closed"` only when the peer
+///   connection or data channel drops, which from the session's point of view is
+///   a failure → `"error"`.
+/// * **WebTransport** posts `"disconnected"` from the worker after a *graceful*,
+///   user-initiated close (once the JackTrip exit packets have been flushed);
+///   genuine failures arrive separately as `{type:"error"}` and reach here as
+///   `"failed"`. Treating `"disconnected"` as an error there flips the UI from
+///   "Not Connected" to "Connection Error" ~20 ms after the user clicks
+///   Disconnect, so it must be dropped instead.
+///
+/// Transport-level `"connecting"` is dropped for WebRTC because the session
+/// already emits `"connecting"` before the transport connect starts, and a late
+/// transport-level `"connecting"` would regress the UI after a successful
+/// connect.
+pub(crate) fn session_state_for_transport_state(
+    transport_type: TransportType,
+    transport_state: &str,
+) -> Option<&'static str> {
+    match (transport_type, transport_state) {
+        (_, "connected") => Some("connected"),
+        (_, "failed") => Some("error"),
+        (TransportType::WebRTC, "disconnected" | "closed") => Some("error"),
+        (TransportType::WebTransport, "connecting") => Some("connecting"),
+        _ => None,
+    }
+}
+
 /// Construct a [`SessionStats`] from its raw component values.
 ///
 /// This is the single authoritative mapping point; [`WebTripSession::get_stats`]
@@ -557,16 +593,15 @@ impl WebTripSession {
                 if let Some(ref callback) = self.on_state_change {
                     let callback_clone = callback.clone();
                     let state_change_cb = Closure::wrap(Box::new(move |state: String| {
-                        // Map transport states to session states
-                        let session_state = match state.as_str() {
-                            "failed" | "disconnected" | "closed" => "error",
-                            "connected" => "connected",
-                            // Session already emits "connecting" before transport connect starts.
-                            // Ignore transport-level "connecting" to avoid stale callbacks
-                            // regressing the UI back to Connecting after a successful connect.
-                            _ => return,
+                        // Map transport states to session states (see
+                        // `session_state_for_transport_state` for why WebRTC's
+                        // mapping differs from WebTransport's).
+                        let Some(session_state) =
+                            session_state_for_transport_state(TransportType::WebRTC, &state)
+                        else {
+                            return;
                         };
-                        
+
                         // Notify the app
                         let _ = callback_clone.call1(&JsValue::NULL, &JsValue::from_str(session_state));
                     }) as Box<dyn FnMut(String)>);
@@ -602,23 +637,16 @@ impl WebTripSession {
                 if let Some(ref callback) = self.on_state_change {
                     let callback_clone = callback.clone();
                     let state_change_cb = Closure::wrap(Box::new(move |state: String| {
-                        // Map transport states to session states.
-                        //
-                        // Note: the WebTransport worker only posts "disconnected" after a
-                        // graceful, user-initiated close (i.e. once it has finished
-                        // flushing the JackTrip exit packet). Unexpected connection
-                        // failures are reported separately as {type:"error"}, which the
-                        // WebTransport main-thread handler forwards as "failed". So
-                        // "disconnected" must NOT be treated as an error — doing so
-                        // causes the UI to flip from "Not Connected" to "Connection
-                        // Error" ~20 ms after the user clicks Disconnect.
-                        let session_state = match state.as_str() {
-                            "failed" => "error",
-                            "connected" => "connected",
-                            "connecting" => "connecting",
-                            _ => return,
+                        // Map transport states to session states. Note in
+                        // particular that the worker's graceful "disconnected"
+                        // must NOT become an error here — see
+                        // `session_state_for_transport_state`.
+                        let Some(session_state) =
+                            session_state_for_transport_state(TransportType::WebTransport, &state)
+                        else {
+                            return;
                         };
-                        
+
                         // Notify the app
                         let _ = callback_clone.call1(&JsValue::NULL, &JsValue::from_str(session_state));
                     }) as Box<dyn FnMut(String)>);
@@ -903,6 +931,53 @@ mod tests {
             assert!(
                 !is_valid_state_transition(from, to),
                 "{from:?} → {to:?} should be an illegal transition"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Transport-state → session-state mapping
+    // -----------------------------------------------------------------------
+
+    /// Full matrix over both transports and every state string either of them
+    /// can emit. The two rows that matter most:
+    ///
+    /// * WebTransport `"disconnected"` must map to `None` (regression: a
+    ///   graceful user-initiated disconnect flipped the UI to "Connection
+    ///   Error" ~20 ms after the exit packets were flushed).
+    /// * WebRTC `"disconnected"`/`"closed"` must map to `"error"` (the peer
+    ///   connection really did drop).
+    #[test]
+    fn transport_state_maps_to_session_state_per_transport() {
+        use TransportType::{WebRTC, WebTransport};
+
+        let cases: &[(TransportType, &str, Option<&str>)] = &[
+            // Shared across transports.
+            (WebRTC, "connected", Some("connected")),
+            (WebTransport, "connected", Some("connected")),
+            (WebRTC, "failed", Some("error")),
+            (WebTransport, "failed", Some("error")),
+            // Divergent: a dropped peer connection vs. a graceful worker close.
+            (WebRTC, "disconnected", Some("error")),
+            (WebRTC, "closed", Some("error")),
+            (WebTransport, "disconnected", None),
+            (WebTransport, "closed", None),
+            // Divergent: WebRTC drops the late transport-level "connecting"
+            // (the session already emitted it); WebTransport forwards it.
+            (WebRTC, "connecting", None),
+            (WebTransport, "connecting", Some("connecting")),
+            // Anything unrecognized is dropped rather than guessed at.
+            (WebRTC, "negotiating", None),
+            (WebTransport, "negotiating", None),
+            (WebRTC, "", None),
+            (WebTransport, "", None),
+        ];
+
+        for &(transport, state, expected) in cases {
+            assert_eq!(
+                session_state_for_transport_state(transport, state),
+                expected,
+                "{transport:?} transport state {state:?} mapped incorrectly"
             );
         }
     }

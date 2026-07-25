@@ -1083,6 +1083,133 @@ mod tests {
         drop(cb);
     }
 
+    /// The `"ready"` worker message gates `connect_to_server`'s first await: it
+    /// must resolve the worker-ready promise and nothing else. In particular it
+    /// must NOT resolve the connection promise (a caller would then post
+    /// `connect` and treat the transport as live before the worker has even
+    /// opened a session) and must not emit a state change.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn ready_message_resolves_only_the_worker_ready_gate() {
+        let mut transport = WebTransportImpl::new().expect("construction in browser");
+
+        let (log, cb) = recording_state_callback();
+        transport.set_on_state_change(cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        transport.create_worker().expect("create_worker should build the worker");
+
+        // Stash both startup promises exactly as `connect_to_server` would.
+        let (ready_promise, ready_resolve, _ready_reject) = crate::audio::make_promise();
+        *transport.worker_ready_resolve.borrow_mut() = Some(ready_resolve);
+        let (_conn_promise, conn_resolve, _conn_reject) = crate::audio::make_promise();
+        *transport.connection_promise_resolve.borrow_mut() = Some(conn_resolve);
+
+        let worker = transport.worker.borrow().clone().expect("worker present");
+        dispatch_message_event(worker.as_ref(), &JsValue::from_str("ready"));
+
+        teardown_worker(&transport);
+
+        JsFuture::from(ready_promise)
+            .await
+            .expect("worker_ready promise must resolve on \"ready\"");
+        assert!(
+            transport.connection_promise_resolve.borrow().is_some(),
+            "\"ready\" must leave the connection promise pending"
+        );
+        assert!(
+            log.borrow().is_empty(),
+            "\"ready\" is an internal gate and must not emit a state change, got {:?}",
+            log.borrow()
+        );
+        drop(cb);
+    }
+
+    /// The `"connected"` worker message must resolve the pending connection
+    /// promise (so `connect_worker`'s await completes) and emit exactly one
+    /// `"connected"` state change.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn connected_message_resolves_connection_promise_and_emits_connected() {
+        let mut transport = WebTransportImpl::new().expect("construction in browser");
+
+        let (log, cb) = recording_state_callback();
+        transport.set_on_state_change(cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        transport.create_worker().expect("create_worker should build the worker");
+
+        let (conn_promise, conn_resolve, _conn_reject) = crate::audio::make_promise();
+        *transport.connection_promise_resolve.borrow_mut() = Some(conn_resolve);
+
+        let worker = transport.worker.borrow().clone().expect("worker present");
+        dispatch_message_event(worker.as_ref(), &JsValue::from_str("connected"));
+
+        teardown_worker(&transport);
+
+        JsFuture::from(conn_promise)
+            .await
+            .expect("connection promise must resolve on \"connected\"");
+        assert_eq!(log.borrow().as_slice(), ["connected"]);
+        drop(cb);
+    }
+
+    /// Messages the handler doesn't recognize — an unknown string, an object
+    /// with an unknown `type`, an object with no `type` at all, and a non-string
+    /// `type` — must all be inert: no promise settled, no state change. A
+    /// mis-ordered match arm that let one of these fall through into the
+    /// `"error"` or `"disconnected"` handling would fail a live connection.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn unrecognized_worker_messages_are_inert() {
+        let mut transport = WebTransportImpl::new().expect("construction in browser");
+
+        let (log, cb) = recording_state_callback();
+        transport.set_on_state_change(cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        transport.create_worker().expect("create_worker should build the worker");
+
+        let (_ready_promise, ready_resolve, ready_reject) = crate::audio::make_promise();
+        *transport.worker_ready_resolve.borrow_mut() = Some(ready_resolve);
+        *transport.worker_ready_reject.borrow_mut() = Some(ready_reject);
+        let (_conn_promise, conn_resolve, conn_reject) = crate::audio::make_promise();
+        *transport.connection_promise_resolve.borrow_mut() = Some(conn_resolve);
+        *transport.connection_promise_reject.borrow_mut() = Some(conn_reject);
+        let (_close_promise, close_resolve, _close_reject) = crate::audio::make_promise();
+        *transport.close_promise_resolve.borrow_mut() = Some(close_resolve);
+
+        let stats_msg = Object::new();
+        Reflect::set(&stats_msg, &"type".into(), &"stats".into()).unwrap();
+        let unknown_type_msg = Object::new();
+        Reflect::set(&unknown_type_msg, &"type".into(), &"nonsense".into()).unwrap();
+        let typeless_msg = Object::new();
+        Reflect::set(&typeless_msg, &"payload".into(), &JsValue::from_f64(1.0)).unwrap();
+        let non_string_type_msg = Object::new();
+        Reflect::set(&non_string_type_msg, &"type".into(), &JsValue::from_f64(7.0)).unwrap();
+
+        let worker = transport.worker.borrow().clone().expect("worker present");
+        for data in [
+            JsValue::from_str("something-else"),
+            stats_msg.into(),
+            unknown_type_msg.into(),
+            typeless_msg.into(),
+            non_string_type_msg.into(),
+        ] {
+            dispatch_message_event(worker.as_ref(), &data);
+        }
+
+        teardown_worker(&transport);
+
+        // Every resolver/rejecter is `take()`n by the branch that fires it, so
+        // "still present" proves no branch ran.
+        assert!(transport.worker_ready_resolve.borrow().is_some());
+        assert!(transport.worker_ready_reject.borrow().is_some());
+        assert!(transport.connection_promise_resolve.borrow().is_some());
+        assert!(transport.connection_promise_reject.borrow().is_some());
+        assert!(transport.close_promise_resolve.borrow().is_some());
+        assert!(
+            log.borrow().is_empty(),
+            "unrecognized messages must not emit state changes, got {:?}",
+            log.borrow()
+        );
+        drop(cb);
+    }
+
     // --- encode_uri_component ---
 
     #[test]
