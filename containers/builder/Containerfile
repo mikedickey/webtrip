@@ -27,7 +27,7 @@ ARG WASM_PACK_VERSION=0.15.0
 # Cargo.lock. wasm-pack only uses a local wasm-bindgen if its version matches
 # the one the crate links against; a mismatch makes it fall back to downloading
 # a prebuilt binary (which is linked against a newer glibc than bookworm ships).
-ARG WASM_BINDGEN_VERSION=0.2.118
+ARG WASM_BINDGEN_VERSION=0.2.126
 ARG CARGO_LLVM_COV_VERSION=0.8.7
 
 LABEL org.opencontainers.image.title="webtrip-build" \
