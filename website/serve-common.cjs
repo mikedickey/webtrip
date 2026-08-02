@@ -33,11 +33,16 @@ function resolvePkgFile(urlPath) {
   return urlPath.startsWith('/pkg/') ? path.join(REPO_ROOT, urlPath) : null;
 }
 
-// Returns the decoded, normalized URL path, or null if the percent-encoding
-// is malformed (decodeURIComponent throws) or the path attempts traversal.
+// Returns the decoded, normalized URL path, or null if the percent-encoding is
+// malformed (decodeURIComponent throws), the path attempts traversal, or it
+// contains a NUL byte. Scanners probe paths like `/.env%00.html`; passing the
+// decoded NUL to fs makes Node throw ERR_INVALID_ARG_VALUE synchronously out of
+// the request handler, which crashes the process.
 function safeUrlPath(url) {
   try {
-    const p = path.posix.normalize(decodeURIComponent((url ?? '/').split('?')[0]));
+    const decoded = decodeURIComponent((url ?? '/').split('?')[0]);
+    if (decoded.includes('\0')) return null;
+    const p = path.posix.normalize(decoded);
     return p.includes('..') ? null : p;
   } catch {
     return null;

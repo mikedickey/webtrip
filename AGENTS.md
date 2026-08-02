@@ -70,7 +70,7 @@ When deleting or refactoring production code, delete its tests rather than porti
 
 ## Rust/WASM Specifics
 
-- **Nightly toolchain** required (see `rust-toolchain.toml`) — needed for `-Zbuild-std` and atomics
+- **Nightly toolchain** required (see `rust-toolchain.toml`) — needed for the unstable cargo flags `-Zbuild-std` (rebuild `std` with atomics/bulk-memory so it can link against shared memory) and `-Zno-profiler-runtime` (wasm coverage builds). The crate itself is stable Rust; no `#![feature(...)]` anywhere. See [Toolchain Requirements](README.md#toolchain-requirements) for what would have to change to drop nightly.
 - **Target**: `wasm32-unknown-unknown`
 - **Crate type**: `cdylib` — produces WASM binary, not a Rust library
 - JS interop via `wasm-bindgen`; browser APIs via `web-sys` (feature-gated, see Cargo.toml)

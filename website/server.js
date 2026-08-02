@@ -28,7 +28,32 @@ for (let i = 0; i < args.length; i++) {
 const useTLS = !!(keyFile && certFile);
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : (useTLS ? 8443 : 3000);
 
+// headersSent is checked because a failure can also surface from the async
+// readFile callback, by which point a response may already be in flight.
+const sendServerError = (res, detail) => {
+  if (!res.headersSent) res.writeHead(500);
+  res.end(detail ? `Server Error: ${detail}` : 'Server Error', 'utf-8');
+};
+
+// A synchronous throw out of the request handler is an uncaught exception that
+// kills the process, so no single malformed request may escape this wrapper.
 const handler = (req, res) => {
+  try {
+    serve(req, res);
+  } catch (err) {
+    // req.url is attacker-controlled: drop the query string so its contents
+    // never reach the log, and JSON-escape what remains.
+    const loggedPath = JSON.stringify((req.url ?? '').split('?')[0]);
+    // A `null`/`undefined` or non-Error throw would make `err.message` throw a
+    // second time — out of the catch, past this wrapper, and into the uncaught
+    // handler the wrapper exists to prevent. Pass the value to console.error
+    // rather than stringifying it, so formatting can't throw either.
+    console.error(`Request failed for ${loggedPath}:`, err?.message ?? err);
+    sendServerError(res);
+  }
+};
+
+const serve = (req, res) => {
   const urlPath = safeUrlPath(req.url);
   if (!urlPath) {
     res.writeHead(400);
@@ -58,8 +83,7 @@ const handler = (req, res) => {
         res.writeHead(404, { 'Content-Type': 'text/html' });
         res.end('<h1>404 Not Found</h1>', 'utf-8');
       } else {
-        res.writeHead(500);
-        res.end('Server Error: ' + error.code, 'utf-8');
+        sendServerError(res, error.code);
       }
     } else {
       const headers = {
