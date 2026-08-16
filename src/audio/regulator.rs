@@ -8,6 +8,41 @@
 //! - https://metacpan.org/source/SYP/Algorithm-Burg-0.001/README
 //!
 //! Original C++ implementation by Chris Chafe, CCRMA Stanford University.
+//!
+//! # Sequence space vs. slot space
+//!
+//! Two things wrap around in this file, at different periods, and they are not
+//! interchangeable:
+//!
+//! - **Sequence space** is the full `u16` the wire protocol carries (65536
+//!   values; see `protocol::AudioPacket`). It answers *identity and ordering*:
+//!   which packet is this, and is it newer than the one before it
+//!   ([`seq_is_newer`])?
+//! - **Slot space** is [`NUM_SLOTS`] entries deep ([`slot_index`]). It answers
+//!   *storage*: where does this packet's audio live, and is it still there?
+//!
+//! Sequence space is 16x larger, so the seam between them has two rules:
+//!
+//! - Every `NUM_SLOTS`th sequence number aliases onto the same slot, so a slot
+//!   holds only the most recent packet congruent to its index. Reading one is
+//!   meaningful only for a sequence number already known to be within
+//!   `NUM_SLOTS` of the write pointer.
+//! - A span wider than the ring is representable in sequence space but not
+//!   retrievable from slot space. When the read pointer falls that far behind
+//!   the write pointer it has lost contact with the stream permanently — no
+//!   amount of waiting brings those packets back — and the only recovery is to
+//!   drop it and resynchronize. That is the single place the seam is handled;
+//!   see [`Regulator::find_best_packet`].
+//!
+//! Upstream JackTrip has no seam: it folds `seq_num %= NumSlots` on arrival,
+//! collapsing the two spaces into one. That makes an unretrievable span
+//! unrepresentable, but it also shrinks the window over which [`seq_is_newer`]
+//! can tell a forward jump from a reordered straggler, from ~32768 packets
+//! (~87 s at fpp=128/48 kHz) down to 2048 (~5.5 s) — which is why upstream then
+//! needs a wall-clock escape hatch to unstick a pinned write pointer
+//! (`gUdpWaitTimeout`, jacktrip/jacktrip#1500). We keep the full `u16` and its
+//! unambiguous ordering, and handle the one case folding would have prevented
+//! explicitly instead.
 
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -22,7 +57,9 @@ const SEQ_NONE: i32 = -1;
 const HIST: usize = 2;
 /// Default FPP used for calibrating burg window
 const HIST_FPP: usize = 128;
-/// Maximum number of slots for packet storage
+/// Depth of the packet ring, and with it the horizon over which a packet stays
+/// retrievable: ~10.9 s at fpp=128/48 kHz. Not the sequence-number space — see
+/// the module header.
 const NUM_SLOTS: usize = 4096;
 /// Maximum samples per packet (8 channels * 1024 frames)
 const MAX_PACKET_SAMPLES: usize = 8192;
@@ -40,6 +77,42 @@ const AUTO_HEADROOM_GLITCH_TOLERANCE: f64 = 0.006;
 const AUTO_HISTORY_WINDOW: f64 = 60.0;
 /// EWMA smoothing factor for auto tolerance
 const AUTO_SMOOTHING_FACTOR: f64 = 1.0 / (WINDOW_DIVISOR as f64 * AUTO_HISTORY_WINDOW);
+
+// ============================================================================
+// The sequence/slot seam
+// ============================================================================
+
+/// Map a sequence number onto its slot in the packet ring.
+///
+/// Lossy by construction: every `NUM_SLOTS`th sequence number lands on the same
+/// slot, so the packet found there is the one asked for only when that sequence
+/// number is within `NUM_SLOTS` of the write pointer. Callers establish that
+/// first — see the module header.
+#[inline]
+fn slot_index(seq: u16) -> usize {
+    seq as usize % NUM_SLOTS
+}
+
+/// Is `seq` newer than `reference` in sequence space?
+///
+/// Serial-number arithmetic: a forward distance of less than half the space
+/// reads as newer, anything else as a reordered straggler. Unambiguous for gaps
+/// up to 32767 packets (~87 s at fpp=128/48 kHz), which is far beyond any
+/// outage the ring itself can survive.
+#[inline]
+fn seq_is_newer(seq: u16, reference: u16) -> bool {
+    seq.wrapping_sub(reference) < u16::MAX / 2
+}
+
+/// How many sequence numbers the inclusive span `first..=last` covers.
+///
+/// Zero means `last` is exactly one before `first` — nothing new. Any larger
+/// backwards relationship reads as a near-full-space span, which is precisely
+/// how a read pointer that has lost contact with the stream is detected.
+#[inline]
+fn seq_span(first: u16, last: u16) -> usize {
+    last.wrapping_sub(first).wrapping_add(1) as usize
+}
 
 // ============================================================================
 // Burg Algorithm
@@ -691,24 +764,27 @@ impl Regulator {
             self.start_time_ms = now_ms;
         }
 
-        let slot_idx = (seq_num as usize) % NUM_SLOTS;
+        let relative_now = now_ms - self.start_time_ms;
 
-        // Copy packet data into pre-allocated slot (NO allocation)
-        if let Some(ref mut slot) = self.slots[slot_idx] {
+        // Store the audio unconditionally, even for a packet the ordering check
+        // below rejects: it is still the freshest thing that belongs in this
+        // slot, and a straggler the read side has not passed yet is playable.
+        if let Some(ref mut slot) = self.slots[slot_index(seq_num)] {
             let sample_count = samples.len().min(self.samples_per_packet).min(MAX_PACKET_SAMPLES);
-            slot.timestamp = now_ms - self.start_time_ms;
+            slot.timestamp = relative_now;
             slot.sample_count = sample_count;
             slot.data[..sample_count].copy_from_slice(&samples[..sample_count]);
         }
 
-        // Update last sequence number using wrapping comparison
-        // A packet is "newer" if the wrapping distance forward is less than half the space
-        let should_update = if current == SEQ_NONE {
-            true
-        } else {
-            let delta = seq_num.wrapping_sub(current as u16);
-            delta < u16::MAX / 2
-        };
+        // Advance the write pointer only for packets that are actually newer;
+        // reordered stragglers leave it where it is. Sequence numbers on the
+        // wire only ever count up, and both transports we run over authenticate
+        // their payloads (WebTransport over QUIC, WebRTC data channels over
+        // SCTP/DTLS), so a sequence number far enough ahead to read as a
+        // straggler and pin this pointer cannot reach here. Upstream JackTrip
+        // runs over bare UDP with an optional 16-bit checksum and does need a
+        // wall-clock escape hatch for exactly that (jacktrip/jacktrip#1500).
+        let should_update = current == SEQ_NONE || seq_is_newer(seq_num, current as u16);
         if should_update {
             self.last_seq_in.store(seq_num as i32, Ordering::Release);
         }
@@ -818,7 +894,7 @@ impl Regulator {
 
         // Check for stuck client (no packets for a long time)
         if let Some(last_out) = self.last_seq_out {
-            let slot_idx = (last_out as usize) % NUM_SLOTS;
+            let slot_idx = slot_index(last_out);
             if let Some(ref slot) = self.slots[slot_idx] {
                 if now - slot.timestamp > 10000.0 {
                     // Stuck - output silence
@@ -865,9 +941,26 @@ impl Regulator {
             last_seq_in
         };
 
-        // Use wrapping arithmetic to handle sequence number wraparound (u16 wraps at 65535)
-        let new_pkts = last_seq_in.wrapping_sub(start_seq).wrapping_add(1) as usize;
-        if new_pkts == 0 || new_pkts > NUM_SLOTS {
+        let new_pkts = seq_span(start_seq, last_seq_in);
+        if new_pkts == 0 {
+            return None;
+        }
+        if new_pkts > NUM_SLOTS {
+            // The seam: this span is representable in sequence space but not
+            // retrievable from slot space, because every slot it names has been
+            // overwritten by a later packet. Waiting cannot bring those packets
+            // back, so the read pointer has lost contact with the stream —
+            // reached by an inbound outage longer than the ring's ~10.9 s
+            // horizon, or by a wild `last_seq_out` dragged forward by a bad
+            // candidate below. Holding the stale pointer conceals until the
+            // stream counts all the way around to it (tens of seconds); drop it
+            // and resynchronize onto the newest packet on the next callback
+            // instead.
+            //
+            // The reset lives on this side of the buffer so that `last_seq_out`
+            // keeps its single-writer (audio thread) property — `last_seq_in` is
+            // atomic precisely because it is the one pointer both agents touch.
+            self.last_seq_out = None;
             return None;
         }
 
@@ -879,7 +972,7 @@ impl Regulator {
 
         for i in (0..new_pkts).rev() {
             let seq = last_seq_in.wrapping_sub(i as u16);
-            let slot_idx = (seq as usize) % NUM_SLOTS;
+            let slot_idx = slot_index(seq);
 
             let timestamp = match &self.slots[slot_idx] {
                 Some(slot) => slot.timestamp,
@@ -888,7 +981,7 @@ impl Regulator {
 
             // Skip packets that arrived too early (out of order)
             if let Some(last_out) = self.last_seq_out {
-                let last_out_idx = (last_out as usize) % NUM_SLOTS;
+                let last_out_idx = slot_index(last_out);
                 if let Some(ref last_slot) = &self.slots[last_out_idx] {
                     if timestamp < last_slot.timestamp
                         && last_slot.timestamp - timestamp > self.tolerance_ms
@@ -955,7 +1048,7 @@ impl Regulator {
 
         // Estimate previous packet timing (use wrapping arithmetic for u16)
         let pkts = seq.wrapping_sub(last_out.wrapping_add(1)) as usize;
-        let last_out_idx = (last_out as usize) % NUM_SLOTS;
+        let last_out_idx = slot_index(last_out);
 
         if let Some(ref last_slot) = &self.slots[last_out_idx] {
             let prev_time = last_slot.timestamp + (pkts as f64 + 1.0) * fpp_duration_ms;
@@ -1350,6 +1443,85 @@ mod tests {
         assert!(reg.last_seq_out.is_some());
     }
 
+    /// An inbound outage longer than the ring's horizon strands the read
+    /// pointer: the peer keeps counting (sequence numbers on the wire only ever
+    /// go up), so when packets resume the span from `last_seq_out` to
+    /// `last_seq_in` is wider than NUM_SLOTS and every slot it names has been
+    /// overwritten by a later packet.
+    ///
+    /// Nothing detects that on its own — the scan still finds *data* at those
+    /// slot indices, just the wrong packets, aliases from before the outage.
+    /// Without the seam check (commit 10a3b37) the buffer therefore keeps
+    /// running while playing audio a full ring behind the live stream, and
+    /// crawls forward far slower than the stream advances: measured at
+    /// `last_seq_out` = 1612 after 600 packets of a stream at 5709, i.e. ~10.7 s
+    /// of permanent added latency. The span check must drop the pointer instead
+    /// and resynchronize onto the live stream within a couple of callbacks.
+    #[test]
+    fn test_loss_burst_wider_than_ring_resyncs_read_pointer() {
+        let mut reg = Regulator::with_params(1, 128, 48_000, 5.0);
+        let samples = vec![0.5f32; reg.fpp];
+        let dt = 1000.0 * reg.fpp as f64 / reg.sample_rate as f64;
+        let mut out = vec![0.0f32; reg.fpp];
+
+        // A stream that is playing out normally.
+        let mut t = 0.0;
+        for i in 0..10u16 {
+            reg.push_internal(100 + i, &samples, t);
+            t += dt;
+        }
+        let mut pop_t = 10.0;
+        for _ in 0..10 {
+            reg.pop_internal(&mut out, pop_t);
+            pop_t += dt;
+        }
+        assert_eq!(reg.last_seq_out, Some(109), "stream should be playing out");
+
+        // Nothing arrives for 5000 packets — 13.3 s at fpp=128, past the ring's
+        // 4096-packet (10.9 s) horizon. An ordinary wifi roam, not an exotic
+        // event. The peer never renumbers; it just keeps counting.
+        let gap = 5_000u16;
+        let resume_t = t + gap as f64 * dt;
+        let first_resumed = 109 + gap + 1;
+
+        let mut first_real_pkt = None;
+        let mut tail_real = 0;
+        for k in 0..600u16 {
+            let now = resume_t + k as f64 * dt;
+            reg.push_internal(first_resumed + k, &samples, now);
+            let real = reg.pop_internal(&mut out, now + 1.0);
+            if real && first_real_pkt.is_none() {
+                first_real_pkt = Some(k);
+            }
+            if k >= 550 && real {
+                tail_real += 1;
+            }
+        }
+
+        let first_real_pkt =
+            first_real_pkt.expect("real audio must resume after a loss burst wider than the ring");
+        assert!(
+            first_real_pkt <= 4,
+            "the read pointer must resync within a couple of callbacks \
+             (first real audio {first_real_pkt} packets in)"
+        );
+        assert!(
+            tail_real >= 45,
+            "playback must be sustained once resynced, not intermittent ({tail_real}/50)"
+        );
+        assert_eq!(
+            reg.last_seq_out,
+            Some(first_resumed + 599),
+            "the read pointer must be on the live stream, not replaying slot aliases \
+             from before the outage"
+        );
+        assert_eq!(
+            reg.depth(),
+            0,
+            "resync must clear the backlog, not leave a ring's worth of latency behind"
+        );
+    }
+
     #[test]
     fn test_burg_priming_uses_plc_iterations() {
         let mut reg = Regulator::with_params(1, 32, 48_000, 10.0);
@@ -1416,13 +1588,13 @@ mod tests {
         reg.last_seq_out = Some(last_seq);
         reg.last_seq_in.store(good_seq as i32, Ordering::Release);
 
-        if let Some(slot) = &mut reg.slots[(last_seq as usize) % NUM_SLOTS] {
+        if let Some(slot) = &mut reg.slots[slot_index(last_seq)] {
             slot.timestamp = 40.0;
             slot.sample_count = reg.fpp;
             slot.data[..reg.fpp].copy_from_slice(&last_packet);
         }
 
-        if let Some(slot) = &mut reg.slots[(good_seq as usize) % NUM_SLOTS] {
+        if let Some(slot) = &mut reg.slots[slot_index(good_seq)] {
             slot.timestamp = 45.0;
             slot.sample_count = reg.fpp;
             slot.data[..reg.fpp].copy_from_slice(&packet);
@@ -1471,20 +1643,20 @@ mod tests {
         reg.last_seq_in.store(fresh_seq as i32, Ordering::Release);
 
         // Previously-played packet, reference point for the out-of-order check.
-        if let Some(slot) = &mut reg.slots[(last_seq as usize) % NUM_SLOTS] {
+        if let Some(slot) = &mut reg.slots[slot_index(last_seq)] {
             slot.timestamp = 40.0;
             slot.sample_count = reg.fpp;
         }
         // Stale but valid packet: misses tolerance at now=60 (41 + 10 < 60),
         // so the scan records it as `first_good_skipped` instead of playing it.
-        if let Some(slot) = &mut reg.slots[(stale_seq as usize) % NUM_SLOTS] {
+        if let Some(slot) = &mut reg.slots[slot_index(stale_seq)] {
             slot.timestamp = 41.0;
             slot.sample_count = reg.fpp;
             slot.data[..reg.fpp].copy_from_slice(&stale_packet);
         }
         // Fresh packet within tolerance (55 + 10 >= 60); playing it would skip
         // exactly one good packet, which triggers the deferral.
-        if let Some(slot) = &mut reg.slots[(fresh_seq as usize) % NUM_SLOTS] {
+        if let Some(slot) = &mut reg.slots[slot_index(fresh_seq)] {
             slot.timestamp = 55.0;
             slot.sample_count = reg.fpp;
             slot.data[..reg.fpp].copy_from_slice(&fresh_packet);
@@ -1577,8 +1749,8 @@ mod tests {
         // primer connection seq 7, stash for "next-good" seq 9.
         reg.last_seq_in.store(9, Ordering::Release);
         reg.last_seq_out = Some(7);
-        reg.last_stashed = Some((9, (9usize) % NUM_SLOTS));
-        if let Some(slot) = &mut reg.slots[9 % NUM_SLOTS] {
+        reg.last_stashed = Some((9, slot_index(9)));
+        if let Some(slot) = &mut reg.slots[slot_index(9)] {
             slot.timestamp = 100.0;
             slot.sample_count = reg.fpp;
             slot.data[..reg.fpp].copy_from_slice(&samples);
