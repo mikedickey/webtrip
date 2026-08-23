@@ -507,6 +507,12 @@ struct PacketSlot {
     timestamp: f64,
     /// One packet of audio (interleaved channels), `samples_per_packet` long
     data: Vec<f32>,
+    /// The sequence number whose data currently occupies this slot, or
+    /// `None` if never written or just reset. Because every `NUM_SLOTS`th
+    /// sequence number aliases onto the same slot (see the module header),
+    /// `data` alone doesn't say *which* packet it belongs to — this is the
+    /// identity check the read side verifies before trusting it.
+    seq: Option<u16>,
 }
 
 impl PacketSlot {
@@ -514,6 +520,7 @@ impl PacketSlot {
         Self {
             timestamp: 0.0,
             data: vec![0.0; samples_per_packet],
+            seq: None,
         }
     }
 }
@@ -787,6 +794,7 @@ impl Regulator {
         if let Some(ref mut slot) = self.slots[slot_index(seq_num)] {
             slot.timestamp = relative_now;
             slot.data.copy_from_slice(samples);
+            slot.seq = Some(seq_num);
         }
 
         // Advance the write pointer only for packets that are actually newer;
@@ -986,8 +994,8 @@ impl Regulator {
             let slot_idx = slot_index(seq);
 
             let timestamp = match &self.slots[slot_idx] {
-                Some(slot) => slot.timestamp,
-                None => continue,
+                Some(slot) if slot.seq == Some(seq) => slot.timestamp,
+                _ => continue,
             };
 
             // Skip packets that arrived too early (out of order)
@@ -1301,6 +1309,7 @@ impl Regulator {
             if let Some(ref mut s) = slot {
                 s.timestamp = 0.0;
                 s.data.fill(0.0);
+                s.seq = None;
             }
         }
 
@@ -1387,6 +1396,7 @@ mod tests {
             .expect("slots are pre-allocated at configure time");
         slot.timestamp = timestamp;
         slot.data.copy_from_slice(samples);
+        slot.seq = Some(seq);
     }
 
     #[test]
@@ -1545,6 +1555,50 @@ mod tests {
             reg.depth(),
             0,
             "resync must clear the backlog, not leave a ring's worth of latency behind"
+        );
+    }
+
+    /// If a candidate sequence number's packet was actually lost (never
+    /// arrived), but a slot from `NUM_SLOTS` sequence numbers earlier — which
+    /// aliases onto the same slot index — is still sitting there
+    /// unoverwritten, `find_best_packet` must not mistake that stale data for
+    /// the candidate. The stale timestamp is deliberately kept close to the
+    /// last-played one so the timestamp-proximity heuristic alone would not
+    /// catch it — only a direct seq check can.
+    #[test]
+    fn test_stale_aliased_slot_is_not_played_as_missing_packet() {
+        let mut reg = Regulator::with_params(1, 32, 48_000, 10.0);
+        let last_seq = 5u16;
+        let candidate_seq = last_seq.wrapping_add(1); // 6 — genuinely lost, never planted
+        let stale_seq = candidate_seq.wrapping_sub(NUM_SLOTS as u16); // aliases to same slot
+        let last_packet = vec![0.1f32; reg.fpp];
+        let stale_packet = vec![0.9f32; reg.fpp];
+
+        reg.start_time_ms = 0.0;
+        reg.last_seq_out = Some(last_seq);
+        reg.last_seq_in.store(candidate_seq as i32, Ordering::Release);
+
+        plant_packet(&mut reg, last_seq, 40.0, &last_packet);
+        plant_packet(&mut reg, stale_seq, 41.0, &stale_packet); // candidate_seq never planted
+
+        let mut output = vec![0.0f32; reg.fpp];
+        let result = reg.pop_internal(&mut output, 50.0);
+
+        assert!(
+            !result,
+            "a slot whose stored seq doesn't match the candidate must not be \
+             played back as real audio"
+        );
+        assert_eq!(
+            reg.last_seq_out,
+            Some(last_seq),
+            "read pointer must not advance onto a candidate whose slot \
+             actually holds a stale, aliased packet"
+        );
+        assert_ne!(
+            output, stale_packet,
+            "the stale aliased packet's data must never be echoed back as \
+             candidate_seq's audio"
         );
     }
 
