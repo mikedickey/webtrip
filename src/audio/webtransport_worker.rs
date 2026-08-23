@@ -232,16 +232,11 @@ struct WorkerState {
     audio_buffer: RefCell<Vec<f32>>,
     packet_buffer: RefCell<Vec<u8>>,
     samples_buffer: RefCell<Vec<f32>>,
-    /// Cached Int32Array for Atomics.wait() operations
+    /// Cached Int32Array for Atomics.wait() operations.
+    /// Only touched on the single worker thread that owns this state
+    /// (lives in the `WORKER_STATE` thread-local below).
     has_data_int32_array: RefCell<Option<js_sys::Int32Array>>,
 }
-
-// Safety: the buffer pointers now carry their own Send/Sync assertion via
-// `SharedPtr`. What still forces a manual impl here is the cached
-// `js_sys::Int32Array` (a `JsValue` handle, which is `!Send`/`!Sync`); it is only
-// ever touched on the single worker thread that owns this state.
-unsafe impl Send for WorkerState {}
-unsafe impl Sync for WorkerState {}
 
 impl WorkerState {
     fn new() -> Self {
