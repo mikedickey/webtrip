@@ -61,6 +61,11 @@ const HIST_FPP: usize = 128;
 /// retrievable: ~10.9 s at fpp=128/48 kHz. Not the sequence-number space — see
 /// the module header.
 const NUM_SLOTS: usize = 4096;
+/// Maximum channels a single stream may claim. A local mirror of
+/// `protocol::MAX_CHANNELS`, not an import of it: this module deliberately has
+/// no `crate::` imports (see the module header) so a native host can reuse it
+/// against a different wire format with its own limit.
+const MAX_CHANNELS: usize = 8;
 /// Maximum auto tolerance in milliseconds
 const AUTO_MAX_MS: f64 = 250.0;
 /// Duration before auto mode kicks in
@@ -541,6 +546,9 @@ pub struct RegulatorStats {
     pub packets_played: u64,
     /// Last packet sequence number received (u16, wraps at 65535)
     pub last_seq_received: u16,
+    /// Packets rejected by `push` (bad channel count, size mismatch, or a
+    /// channel count that changed mid-stream) since the last `reset()`.
+    pub packets_rejected: u64,
 }
 
 /// Regulator: Adaptive jitter buffer with Burg-based packet loss concealment.
@@ -594,6 +602,7 @@ pub struct Regulator {
     // Statistics
     packet_count: u64,
     plc_packet_count: u64,
+    packets_rejected: u64,
     skipped: u64,
     last_skipped: u64,
     last_glitches: u64,
@@ -612,6 +621,30 @@ pub struct Regulator {
 enum PacketDecision {
     Packet { seq: u16, slot_idx: usize },
     ConcealSkippedPacket { skipped: u64 },
+}
+
+/// Outcome of [`Regulator::push`].
+///
+/// A JackTrip stream fixes frames-per-packet locally but *adopts* its channel
+/// count from the peer's first packet ([`Regulator::adopt_channel_count`]).
+/// Every variant other than `Stored` means the packet was dropped before it
+/// could reach a slot or move the write pointer.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// The packet was stored (including the first-packet adoption case).
+    Stored,
+    /// `channels` was `0` or greater than [`MAX_CHANNELS`].
+    UnsupportedChannelCount { got: usize },
+    /// `channels` differs from the count already adopted from an earlier
+    /// packet in this stream. Unlike the first-packet case, this is rejected
+    /// rather than re-adopted: a mid-stream change is either a peer bug or a
+    /// renegotiation this regulator was never told about, and silently
+    /// resizing state to match would corrupt whatever a concurrent `pop` is
+    /// reading (see [`Regulator::adopt_channel_count`]'s concurrency note).
+    ChannelCountChanged { adopted: usize, got: usize },
+    /// `samples.len()` was not exactly `channels * fpp`.
+    WrongPacketSize { expected: usize, got: usize },
 }
 
 impl Regulator {
@@ -723,6 +756,7 @@ impl Regulator {
 
             packet_count: 0,
             plc_packet_count: 0,
+            packets_rejected: 0,
             skipped: 0,
             last_skipped: 0,
             last_glitches: 0,
@@ -748,35 +782,61 @@ impl Regulator {
     }
 
     /// Push a received packet into the buffer (with explicit timestamp).
-    /// This method performs NO heap allocations - all buffers are pre-allocated.
+    /// This method performs NO heap allocations on the `Stored` path — all
+    /// buffers involved are pre-allocated. Adoption
+    /// ([`adopt_channel_count`](Self::adopt_channel_count)) is the one
+    /// exception, and it only ever runs once per stream, on the first packet.
     ///
     /// # Arguments
     /// * `seq_num` - Packet sequence number (u16 wraps at 65535)
+    /// * `channels` - The channel count this packet claims to carry, from the
+    ///   wire header. Taken explicitly rather than inferred from
+    ///   `samples.len() / fpp`: e.g. 4ch×64 and 2ch×128 are both 256 samples,
+    ///   and inference would silently adopt the wrong stride.
     /// * `samples` - Interleaved audio samples
     /// * `now_ms` - Current timestamp in milliseconds
     ///
     /// # Returns
-    /// `true` if the packet was stored, `false` if it was rejected for
-    /// carrying the wrong number of samples.
-    fn push_internal(&mut self, seq_num: u16, samples: &[f32], now_ms: f64) -> bool {
-        // Frames-per-packet and channel count are negotiated once, when the
-        // connection is established, and every packet on the wire carries
-        // exactly that many samples. Anything else did not come from this
-        // stream's configuration — a peer that renegotiated without us, or a
-        // header whose `buffer_size`/channel count disagrees with ours — and
-        // there is no honest way to place it in the timeline: a short packet
+    /// See [`PushOutcome`].
+    fn push_internal(&mut self, seq_num: u16, channels: usize, samples: &[f32], now_ms: f64) -> PushOutcome {
+        if channels == 0 || channels > MAX_CHANNELS {
+            self.packets_rejected += 1;
+            return PushOutcome::UnsupportedChannelCount { got: channels };
+        }
+
+        // Frames-per-packet is fixed locally for the life of this regulator;
+        // channel count is instead adopted from the peer's first packet
+        // (below), which is why this checks `channels * self.fpp` rather than
+        // `self.samples_per_packet` — the latter may not reflect `channels`
+        // yet on the very packet that is about to establish it. Either way,
+        // every packet on the wire must carry exactly that many samples:
+        // anything else did not come from this stream's configuration, and
+        // there is no honest way to place it in the timeline. A short packet
         // would play as a dropout in the middle of good audio, and a long one
         // would be silently truncated. Reject it before it can occupy a slot
         // or move the write pointer.
-        if samples.len() != self.samples_per_packet {
-            return false;
+        let expected = channels * self.fpp;
+        if samples.len() != expected {
+            self.packets_rejected += 1;
+            return PushOutcome::WrongPacketSize { expected, got: samples.len() };
         }
 
         let current = self.last_seq_in.load(Ordering::Acquire);
 
-        // Initialize on first packet
         if current == SEQ_NONE {
+            // First packet of a stream: adopt its channel count rather than
+            // rejecting a mismatch against whatever this regulator happened
+            // to be constructed with.
+            if channels != self.num_channels {
+                self.adopt_channel_count(channels);
+            }
             self.start_time_ms = now_ms;
+        } else if channels != self.num_channels {
+            // A later packet disagreeing with the already-adopted count is a
+            // peer bug or an unsignaled renegotiation, not something to
+            // re-adopt into — see `PushOutcome::ChannelCountChanged`.
+            self.packets_rejected += 1;
+            return PushOutcome::ChannelCountChanged { adopted: self.num_channels, got: channels };
         }
 
         let relative_now = now_ms - self.start_time_ms;
@@ -802,22 +862,77 @@ impl Regulator {
             self.last_seq_in.store(seq_num as i32, Ordering::Release);
         }
 
-        true
+        PushOutcome::Stored
+    }
+
+    /// Rebuild the channel-derived state to match a peer's first packet.
+    ///
+    /// Only ever called from [`push_internal`](Self::push_internal) while
+    /// `last_seq_in == SEQ_NONE`, i.e. before this stream has stored anything.
+    /// Rebuilds `num_channels`, `samples_per_packet`, the per-channel
+    /// Burg/ring state (via `ChannelState::new`), and every slot's `data`
+    /// buffer — resized **and zeroed**, for the same reason `reset()` zeroes
+    /// slot data: a slot left over from a previous, differently-sized stream
+    /// must not leak into this one as a burst of garbage.
+    ///
+    /// Left untouched: `burg`, `up_to_now`/`beyond_now` (these depend only on
+    /// `fpp`, which does not change here), the fade ramps, `push_stats`/
+    /// `pull_stats`, and the whole auto-tolerance/headroom policy. That is
+    /// what distinguishes this from [`configure`](Self::configure), which is
+    /// `*self = Self::with_params(...)` and would reset the jitter policy on
+    /// every stream's first packet.
+    ///
+    /// # Concurrency
+    ///
+    /// This runs on the network thread, inside `push`, and resizes
+    /// [`NUM_SLOTS`] slot `Vec`s and the per-channel state while the audio
+    /// thread may concurrently be inside `pop`. It is sound only because it
+    /// happens strictly before the `Release` store of `last_seq_in` in
+    /// `push_internal`: `pop_internal`'s `SEQ_NONE` early return touches none
+    /// of the state rebuilt here — it reads only `start_time_ms`/
+    /// `tolerance_ms`, fills the output with zeros, and returns. Any code path
+    /// past that early return is reached only after an `Acquire` load has
+    /// observed this call's later `Release` store, so it always sees the
+    /// fully rebuilt state, never a partial one.
+    ///
+    /// This does **not** cover a `pop` still running the *previous* stream's
+    /// real (non-`SEQ_NONE`) path when `reset()` re-arms `SEQ_NONE` and a new
+    /// peer then adopts a different channel count here — that `pop` could read
+    /// a slot or channel buffer already resized out from under it.
+    /// `WebTripSession::disconnect` orders `close().await` → `stop_capture()`
+    /// → `reset()`, but the worklet's final render call is not synchronously
+    /// joinable with that ordering, so this window is believed narrow but not
+    /// proven closed. This is the same open concurrency question documented on
+    /// `SharedPtr::as_mut`; it is tracked there, not claimed solved here.
+    fn adopt_channel_count(&mut self, channels: usize) {
+        self.num_channels = channels;
+        self.samples_per_packet = self.fpp * channels;
+
+        self.channels = (0..channels)
+            .map(|_| ChannelState::new(self.fpp, self.up_to_now, self.packets_in_past))
+            .collect();
+
+        for slot in &mut self.slots {
+            if let Some(ref mut s) = slot {
+                s.data.clear();
+                s.data.resize(self.samples_per_packet, 0.0);
+            }
+        }
     }
 
     /// Push a received packet into the buffer.
     ///
     /// # Arguments
     /// * `sequence` - Packet sequence number (u16 wraps at 65535)
+    /// * `channels` - The channel count this packet claims to carry, from the
+    ///   wire header
     /// * `samples` - Interleaved audio samples
     ///
     /// # Returns
-    /// `true` if the packet was accepted, `false` if it was rejected because
-    /// `samples.len()` is not the `fpp * channels` this regulator was
-    /// configured for.
-    pub fn push(&mut self, sequence: u16, samples: &[f32]) -> bool {
+    /// See [`PushOutcome`].
+    pub fn push(&mut self, sequence: u16, channels: usize, samples: &[f32]) -> PushOutcome {
         let now_ms = Self::now_ms();
-        self.push_internal(sequence, samples, now_ms)
+        self.push_internal(sequence, channels, samples, now_ms)
     }
 
     /// Pop samples for playback (internal with explicit timestamp).
@@ -1250,6 +1365,7 @@ impl Regulator {
             packets_received: self.packet_count, // Use packet_count for total packets received
             packets_played: self.packet_count,
             last_seq_received: last_seq,
+            packets_rejected: self.packets_rejected,
         }
     }
 
@@ -1264,6 +1380,7 @@ impl Regulator {
         self.last_stashed = None;
         self.packet_count = 0;
         self.plc_packet_count = 0;
+        self.packets_rejected = 0;
         self.skipped = 0;
         self.last_skipped = 0;
         self.last_glitches = 0;
@@ -1358,8 +1475,11 @@ impl Regulator {
     /// Get approximate latency in milliseconds.
     pub fn latency_ms(&self) -> f32 {
         let depth = self.depth();
-        let total_samples = depth * self.samples_per_packet as u32;
-        (total_samples as f32 / self.sample_rate as f32) * 1000.0
+        // `depth` counts packets (sequence numbers), each `fpp` frames long —
+        // not `samples_per_packet`, which also carries the channel count and
+        // would double-count latency for anything wider than mono.
+        let total_frames = depth * self.fpp as u32;
+        (total_frames as f32 / self.sample_rate as f32) * 1000.0
     }
 }
 
@@ -1447,11 +1567,11 @@ mod tests {
         let near_max: u16 = u16::MAX - 2;
         
         // Push packets near wraparound boundary with proper timing
-        reg.push_internal(near_max, &samples, 0.0);
-        reg.push_internal(near_max.wrapping_add(1), &samples, 3.0);
-        reg.push_internal(near_max.wrapping_add(2), &samples, 6.0); // This wraps to 0
-        reg.push_internal(0, &samples, 9.0); // Already wrapped
-        reg.push_internal(1, &samples, 12.0);
+        reg.push_internal(near_max, 1, &samples, 0.0);
+        reg.push_internal(near_max.wrapping_add(1), 1, &samples, 3.0);
+        reg.push_internal(near_max.wrapping_add(2), 1, &samples, 6.0); // This wraps to 0
+        reg.push_internal(0, 1, &samples, 9.0); // Already wrapped
+        reg.push_internal(1, 1, &samples, 12.0);
         
         let mut output = vec![0.0f32; 128];
         
@@ -1493,7 +1613,7 @@ mod tests {
         // A stream that is playing out normally.
         let mut t = 0.0;
         for i in 0..10u16 {
-            reg.push_internal(100 + i, &samples, t);
+            reg.push_internal(100 + i, 1, &samples, t);
             t += dt;
         }
         let mut pop_t = 10.0;
@@ -1514,7 +1634,7 @@ mod tests {
         let mut tail_real = 0;
         for k in 0..600u16 {
             let now = resume_t + k as f64 * dt;
-            reg.push_internal(first_resumed + k, &samples, now);
+            reg.push_internal(first_resumed + k, 1, &samples, now);
             let real = reg.pop_internal(&mut out, now + 1.0);
             if real && first_real_pkt.is_none() {
                 first_real_pkt = Some(k);
@@ -1696,13 +1816,13 @@ mod tests {
     /// required for safe stream reconnection.
     #[test]
     fn test_reset_clears_state_after_active_stream() {
-        let mut reg = Regulator::with_params(1, 32, 48_000, 5.0);
-        let samples = vec![0.25f32; reg.fpp];
+        let mut reg = Regulator::with_params(2, 32, 48_000, 5.0);
+        let samples = vec![0.25f32; reg.samples_per_packet];
 
         // Drive a small stream through the regulator.
-        reg.push_internal(0, &samples, 0.0);
-        reg.push_internal(1, &samples, 2.0);
-        let mut out = vec![0.0f32; reg.fpp];
+        reg.push_internal(0, 2, &samples, 0.0);
+        reg.push_internal(1, 2, &samples, 2.0);
+        let mut out = vec![0.0f32; reg.samples_per_packet];
         let _ = reg.pop_internal(&mut out, 10.0);
         let _ = reg.pop_internal(&mut out, 12.0);
         let _ = reg.pop_internal(&mut out, 14.0); // forces underrun -> PLC
@@ -1740,6 +1860,15 @@ mod tests {
             assert!(channel.output_now_packet.iter().all(|s| *s == 0.0));
             assert_eq!(channel.ring_wptr, channel.ring_size / 2);
         }
+
+        // A reconnect on a new stream with a different channel count must be
+        // able to adopt again — reset() re-arms SEQ_NONE, which is the only
+        // gate on adoption.
+        let mono = vec![0.5f32; reg.fpp];
+        let outcome = reg.push_internal(0, 1, &mono, 0.0);
+        assert_eq!(outcome, PushOutcome::Stored);
+        assert_eq!(reg.channels(), 1, "reconnect must re-adopt the new peer's channel count");
+        assert_eq!(reg.samples_per_packet, reg.fpp);
     }
 
     /// The 7def5fc race fix: a `last_stashed` slot left from a prior connection
@@ -1770,7 +1899,7 @@ mod tests {
 
         // After reset, the first pop on a fresh stream should return silence
         // (startup), not the stale stashed buffer.
-        reg.push_internal(0, &samples, 0.0);
+        reg.push_internal(0, 1, &samples, 0.0);
         let mut out = vec![0.0f32; reg.fpp];
         let result = reg.pop_internal(&mut out, 1.0); // still inside tolerance window
         assert!(!result, "should not replay the pre-reset stash");
@@ -1785,7 +1914,7 @@ mod tests {
         let mut reg = Regulator::with_params(1, 32, 48_000, 5.0);
         let samples = vec![0.5f32; reg.fpp];
 
-        reg.push_internal(0, &samples, 0.0);
+        reg.push_internal(0, 1, &samples, 0.0);
         let mut out = vec![0.0f32; reg.fpp];
         let r1 = reg.pop_internal(&mut out, 10.0);
         assert!(r1);
@@ -1794,7 +1923,7 @@ mod tests {
         // Skip seq 1, 2 — push seq 3 directly. With `skipped = 2`, the
         // regulator should treat this as a glitch, conceal, stash, and bump
         // overruns.
-        reg.push_internal(3, &samples, 20.0);
+        reg.push_internal(3, 1, &samples, 20.0);
         let r2 = reg.pop_internal(&mut out, 40.0);
         assert!(!r2, "skipped-gap path returns concealment (false)");
         assert_eq!(reg.pull_stats.overruns, 2, "overrun counter tracks skip distance");
@@ -1817,7 +1946,7 @@ mod tests {
         let mut reg = Regulator::with_params(1, 32, 48_000, 5.0);
         let samples = vec![0.5f32; reg.fpp];
 
-        reg.push_internal(0, &samples, 0.0);
+        reg.push_internal(0, 1, &samples, 0.0);
         let mut out = vec![0.0f32; reg.fpp];
         let r0 = reg.pop_internal(&mut out, 10.0);
         assert!(r0);
@@ -1842,7 +1971,7 @@ mod tests {
         );
 
         // Real packet arrives — next pop should be real audio again.
-        reg.push_internal(1, &samples, 25.0);
+        reg.push_internal(1, 1, &samples, 25.0);
         let r_resume = reg.pop_internal(&mut out, 30.0);
         assert!(r_resume, "PLC must disengage once a real packet is available");
         assert_eq!(reg.last_seq_out, Some(1));
@@ -1850,7 +1979,7 @@ mod tests {
         let underruns_after = reg.pull_stats.underruns;
 
         // No further underruns when consumption keeps pace.
-        reg.push_internal(2, &samples, 32.0);
+        reg.push_internal(2, 1, &samples, 32.0);
         let r_next = reg.pop_internal(&mut out, 38.0);
         assert!(r_next);
         assert_eq!(reg.pull_stats.underruns, underruns_after);
@@ -1869,8 +1998,8 @@ mod tests {
         let samples = vec![0.1f32; reg.samples_per_packet];
 
         // Before any pop, last_seq_out is None so depth treats read == write.
-        reg.push_internal(0, &samples, 0.0);
-        reg.push_internal(1, &samples, 2.0);
+        reg.push_internal(0, 2, &samples, 0.0);
+        reg.push_internal(1, 2, &samples, 2.0);
         assert_eq!(reg.depth(), 0, "with no pop, read==write so depth is zero");
 
         // First pop sets last_seq_out; the in-flight buffer is consumed.
@@ -1882,7 +2011,7 @@ mod tests {
         // Push more packets without popping — depth grows by one per push.
         for (i, t) in (1u16..=3).zip([12.0_f64, 14.0, 16.0]) {
             let seq = seq_after_first_pop.wrapping_add(i);
-            reg.push_internal(seq, &samples, t);
+            reg.push_internal(seq, 2, &samples, t);
             assert_eq!(
                 reg.depth() as u16,
                 i,
@@ -1890,13 +2019,15 @@ mod tests {
             );
         }
 
-        // Latency = depth * samples_per_packet / sample_rate (in ms).
+        // Latency = depth * fpp / sample_rate (in ms) — frames, not
+        // samples_per_packet, which also carries the channel count and would
+        // double-count latency at 2ch.
         let depth = reg.depth();
         let expected_ms =
-            (depth as f32 * reg.samples_per_packet as f32 / reg.sample_rate as f32) * 1000.0;
+            (depth as f32 * reg.fpp as f32 / reg.sample_rate as f32) * 1000.0;
         assert!(
             (reg.latency_ms() - expected_ms).abs() < 1e-3,
-            "latency_ms ({}) should match depth*samples/sr ({expected_ms})",
+            "latency_ms ({}) should match depth*fpp/sr ({expected_ms})",
             reg.latency_ms()
         );
 
@@ -1926,8 +2057,8 @@ mod tests {
     fn test_stats_reflect_internal_counters_and_state() {
         let mut reg = Regulator::with_params(1, 32, 48_000, 7.5);
         let samples = vec![0.0f32; reg.fpp];
-        reg.push_internal(42, &samples, 0.0);
-        reg.push_internal(43, &samples, 2.0);
+        reg.push_internal(42, 1, &samples, 0.0);
+        reg.push_internal(43, 1, &samples, 2.0);
 
         let mut out = vec![0.0f32; reg.fpp];
         let _ = reg.pop_internal(&mut out, 15.0);
@@ -1957,6 +2088,7 @@ mod tests {
         assert_eq!(fs.glitches, 0);
         assert_eq!(fs.skipped, 0);
         assert_eq!(fs.last_seq_received, 0);
+        assert_eq!(fs.packets_rejected, 0);
         assert_eq!(fs.tolerance_ms, fresh.tolerance_ms);
         assert_eq!(fs.headroom_ms, fresh.current_headroom);
     }
@@ -2216,6 +2348,39 @@ mod tests {
         assert_eq!(auto.tolerance_ms(), 64.0 * AUTO_INIT_VAL_FACTOR);
     }
 
+    /// The first packet of a stream adopts the peer's channel count rather
+    /// than being validated against whatever this regulator happened to be
+    /// constructed with. This only passes if the deinterleave stride, the
+    /// `ChannelState` count, and the slot length all moved together — a
+    /// partial adoption would either panic on a length mismatch or silently
+    /// scramble channels.
+    #[test]
+    fn test_first_packet_adopts_peer_channel_count_and_plays_back_at_that_stride() {
+        let mut reg = Regulator::with_params(2, 32, 48_000, 5.0);
+        let original_fpp = reg.fpp();
+        let original_tolerance = reg.tolerance_ms();
+
+        // Peer sends 1 channel; this regulator was constructed for 2.
+        let ramp: Vec<f32> = (0..reg.fpp).map(|i| i as f32).collect();
+        assert_eq!(reg.push_internal(0, 1, &ramp, 0.0), PushOutcome::Stored);
+        assert_eq!(reg.channels(), 1, "first packet must adopt the peer's channel count");
+
+        let mut out = vec![0.0f32; reg.fpp];
+        let real = reg.pop_internal(&mut out, 10.0); // past the 5ms tolerance
+        assert!(real, "the adopted-stride packet must play back as real audio");
+        assert_eq!(
+            out, ramp,
+            "deinterleave stride, ChannelState count, and slot length must all match the adopted count"
+        );
+
+        // Adoption is not `configure()`: fpp and the jitter policy are untouched.
+        assert_eq!(reg.fpp(), original_fpp, "fpp must be unchanged by adoption");
+        assert_eq!(
+            reg.tolerance_ms(), original_tolerance,
+            "adopt_channel_count must not touch the jitter policy, unlike configure()"
+        );
+    }
+
     /// A connection fixes frames-per-packet and channel count when it is
     /// established, so a packet carrying any other number of samples cannot
     /// belong to this stream. `push` must reject it outright rather than fit
@@ -2227,7 +2392,7 @@ mod tests {
     fn test_push_rejects_packets_that_are_not_exactly_one_packet_long() {
         let mut reg = Regulator::with_params(2, 64, 48_000, 5.0);
         let good = vec![0.5f32; reg.samples_per_packet];
-        assert!(reg.push_internal(10, &good, 0.0));
+        assert_eq!(reg.push_internal(10, 2, &good, 0.0), PushOutcome::Stored);
         assert_eq!(reg.last_seq_in.load(Ordering::Acquire), 10);
 
         let wrong_sizes = [
@@ -2240,8 +2405,9 @@ mod tests {
         ];
         for len in wrong_sizes {
             let packet = vec![0.25f32; len];
-            assert!(
-                !reg.push_internal(11, &packet, 1.0),
+            assert_eq!(
+                reg.push_internal(11, 2, &packet, 1.0),
+                PushOutcome::WrongPacketSize { expected: reg.samples_per_packet, got: len },
                 "accepted a {len}-sample packet on a {}-sample stream",
                 reg.samples_per_packet
             );
@@ -2256,5 +2422,55 @@ mod tests {
             .expect("slots are pre-allocated at configure time");
         assert_eq!(slot.timestamp, 0.0);
         assert!(slot.data.iter().all(|&s| s == 0.0));
+        assert_eq!(reg.packets_rejected, wrong_sizes.len() as u64);
+
+        // Channel count 0, or beyond MAX_CHANNELS, is rejected before the size
+        // check even runs.
+        let rejected_before = reg.packets_rejected;
+        assert_eq!(
+            reg.push_internal(12, 0, &[], 2.0),
+            PushOutcome::UnsupportedChannelCount { got: 0 }
+        );
+        assert_eq!(
+            reg.push_internal(12, MAX_CHANNELS + 1, &[0.0], 2.0),
+            PushOutcome::UnsupportedChannelCount { got: MAX_CHANNELS + 1 }
+        );
+        assert_eq!(reg.packets_rejected, rejected_before + 2);
+
+        // A packet claiming a channel count that differs from the count
+        // already adopted for this stream is rejected outright, not
+        // re-adopted — see `PushOutcome::ChannelCountChanged`.
+        let mismatched = vec![0.5f32; reg.fpp]; // 1ch-sized; this stream adopted 2ch
+        assert_eq!(
+            reg.push_internal(13, 1, &mismatched, 3.0),
+            PushOutcome::ChannelCountChanged { adopted: 2, got: 1 }
+        );
+        assert_eq!(
+            reg.last_seq_in.load(Ordering::Acquire), 10,
+            "a rejected packet must not move the write pointer"
+        );
+    }
+
+    /// `push`'s explicit `channels` argument (rather than inferring it as
+    /// `samples.len() / fpp`) exists to prevent exactly this ambiguity: 4
+    /// channels at fpp=64 and 2 channels at fpp=128 both total 256 samples.
+    /// With `fpp` fixed locally and `channels` read from the wire header, a
+    /// packet claiming 4 channels on a 128-fpp stream must be rejected for
+    /// its size — never silently reinterpreted as a valid 2-channel packet
+    /// just because the sample count happens to match.
+    #[test]
+    fn test_push_channel_count_is_explicit_not_inferred_from_sample_count() {
+        let mut reg = Regulator::with_params(2, 128, 48_000, 5.0);
+        let first = vec![0.1f32; 256]; // 2ch * 128fpp
+        assert_eq!(reg.push_internal(0, 2, &first, 0.0), PushOutcome::Stored);
+
+        // Same total sample count as a valid 2ch*128fpp packet, but claiming
+        // 4 channels — must be rejected for its size (4*128=512 != 256), not
+        // accepted as if it were secretly the 2ch stride.
+        let same_len_but_4ch = vec![0.2f32; 256];
+        assert_eq!(
+            reg.push_internal(1, 4, &same_len_but_4ch, 1.0),
+            PushOutcome::WrongPacketSize { expected: 4 * 128, got: 256 }
+        );
     }
 }
