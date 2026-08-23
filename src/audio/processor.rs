@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::audio::params::{AudioParams, MAX_DB, MIN_DB, decode_db, decode_volume, encode_db};
+use crate::audio::protocol::MAX_CHANNELS;
 use crate::audio::regulator::Regulator;
 use crate::audio::ring_buffer::RingBuffer;
 use crate::audio::shared_ptr::SharedPtr;
@@ -58,6 +59,25 @@ pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
     (sum_squares / samples.len() as f32).sqrt()
 }
 
+/// Downmix `channels`-wide interleaved audio to mono by averaging each
+/// frame's channels, writing one sample per frame into `mono_out`.
+///
+/// Reads defensively past the end of `interleaved` as silence (treats a short
+/// final frame as zero-padded) rather than panicking — this runs on the
+/// realtime audio thread, where a malformed buffer must degrade gracefully,
+/// not crash playback.
+pub(crate) fn downmix_to_mono(interleaved: &[f32], channels: usize, mono_out: &mut [f32]) {
+    let channels = channels.max(1);
+    for (frame, out) in mono_out.iter_mut().enumerate() {
+        let base = frame * channels;
+        let mut sum = 0.0f32;
+        for ch in 0..channels {
+            sum += interleaved.get(base + ch).copied().unwrap_or(0.0);
+        }
+        *out = sum / channels as f32;
+    }
+}
+
 /// Compute the next peak-hold/decay state given the current audio level and
 /// the previously stored peak state.
 ///
@@ -99,8 +119,10 @@ pub struct AudioProcessor {
     remote_buffer: Vec<f32>,
     /// Buffer for stereo send (mono duplicated to both channels)
     stereo_buffer: Vec<f32>,
-    /// Buffer for stereo receive (before downmix to mono)
-    stereo_receive_buffer: Vec<f32>,
+    /// Buffer for the regulator's interleaved output, before downmix to mono.
+    /// Preallocated at `128 * MAX_CHANNELS` so a widening `receive_from_network`
+    /// resize never allocates on the render thread.
+    remote_interleaved: Vec<f32>,
 }
 
 impl AudioProcessor {
@@ -112,7 +134,7 @@ impl AudioProcessor {
             gained_buffer: vec![0.0; 128],
             remote_buffer: vec![0.0; 128],
             stereo_buffer: vec![0.0; 256], // 128 samples * 2 channels
-            stereo_receive_buffer: vec![0.0; 256], // 128 samples * 2 channels
+            remote_interleaved: vec![0.0; 128 * MAX_CHANNELS as usize],
         }
     }
 
@@ -131,7 +153,7 @@ impl AudioProcessor {
             gained_buffer: vec![0.0; 128],
             remote_buffer: vec![0.0; 128],
             stereo_buffer: vec![0.0; 256], // 128 samples * 2 channels
-            stereo_receive_buffer: vec![0.0; 256], // 128 samples * 2 channels
+            remote_interleaved: vec![0.0; 128 * MAX_CHANNELS as usize],
         }
     }
 
@@ -262,31 +284,27 @@ impl AudioProcessor {
             return;
         };
 
-        let output_channels = self.params.get_output_channels();
+        // The pop width is the regulator's own — it is the peer's channel
+        // count (adopted from their first packet) and fpp, not a local
+        // playback-device setting. `AudioParams::output_channels` governs
+        // only the send path (Phase 2 renames it to make that explicit).
+        let channels = regulator.channels();
+        let fpp = regulator.fpp();
+        let interleaved_len = fpp * channels;
 
-        if output_channels >= 2 {
-            // Read stereo packet, then downmix to mono for playback
-            let mono_len = self.remote_buffer.len();
-            let stereo_len = mono_len * 2;
+        if self.remote_interleaved.len() < interleaved_len {
+            self.remote_interleaved.resize(interleaved_len, 0.0);
+        }
 
-            // Ensure stereo receive buffer is correct size
-            if self.stereo_receive_buffer.len() != stereo_len {
-                self.stereo_receive_buffer.resize(stereo_len, 0.0);
-            }
+        // Read the regulator's output (always populates the buffer; pop()'s
+        // bool distinguishes real vs concealed but is irrelevant for mixing).
+        regulator.pop(&mut self.remote_interleaved[..interleaved_len]);
 
-            // Read stereo from jitter buffer (always populates the buffer; pop()'s bool
-            // distinguishes real vs concealed but is irrelevant for mixing)
-            regulator.pop(&mut self.stereo_receive_buffer);
-
-            // Downmix stereo to mono (average L+R)
-            for i in 0..mono_len {
-                let left = self.stereo_receive_buffer[i * 2];
-                let right = self.stereo_receive_buffer[i * 2 + 1];
-                self.remote_buffer[i] = (left + right) * 0.5;
-            }
+        if channels == 1 {
+            let len = self.remote_buffer.len().min(fpp);
+            self.remote_buffer[..len].copy_from_slice(&self.remote_interleaved[..len]);
         } else {
-            // Read mono directly
-            regulator.pop(&mut self.remote_buffer);
+            downmix_to_mono(&self.remote_interleaved[..interleaved_len], channels, &mut self.remote_buffer);
         }
     }
 }
@@ -364,6 +382,51 @@ mod tests {
         let input = [0.5f32; 4];
         let mut output = [0.0f32; 3]; // shorter than input — must panic
         apply_gain(&input, 1.0, &mut output);
+    }
+
+    // --- downmix_to_mono ----------------------------------------------------
+
+    #[test]
+    fn test_downmix_to_mono_averages_each_channel_count() {
+        // For each channel count 1..=8, build 2 frames of per-channel-distinct
+        // interleaved audio (channel `ch` always carries value `ch + 1`), and
+        // assert the downmix is the exact average.
+        for channels in 1..=8usize {
+            let frame: Vec<f32> = (0..channels).map(|ch| (ch + 1) as f32).collect();
+            let mut interleaved = frame.clone();
+            interleaved.extend_from_slice(&frame); // 2 identical frames
+
+            let mut mono_out = vec![-1.0f32; 2];
+            downmix_to_mono(&interleaved, channels, &mut mono_out);
+
+            let expected: f32 = frame.iter().sum::<f32>() / channels as f32;
+            for (i, &sample) in mono_out.iter().enumerate() {
+                assert!(
+                    (sample - expected).abs() < EPS,
+                    "channels={channels} frame={i}: expected {expected}, got {sample}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_downmix_to_mono_mono_is_identity() {
+        let interleaved = [0.25f32, -0.5, 1.0];
+        let mut mono_out = vec![0.0f32; 3];
+        downmix_to_mono(&interleaved, 1, &mut mono_out);
+        assert_eq!(mono_out, interleaved);
+    }
+
+    #[test]
+    fn test_downmix_to_mono_short_input_treated_as_silence() {
+        // Fewer samples than `mono_out.len() * channels` — the missing
+        // channels of the last frame must read as zero, not panic or read
+        // out of bounds.
+        let interleaved = [1.0f32, 1.0]; // one full stereo frame, second frame missing
+        let mut mono_out = vec![-1.0f32; 2];
+        downmix_to_mono(&interleaved, 2, &mut mono_out);
+        assert!((mono_out[0] - 1.0).abs() < EPS, "full frame must average normally");
+        assert!((mono_out[1] - 0.0).abs() < EPS, "missing frame must read as silence");
     }
 
     // --- compute_rms ------------------------------------------------------------

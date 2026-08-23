@@ -39,7 +39,10 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use crate::audio::ring_buffer::RingBuffer;
 use crate::audio::regulator::Regulator;
 use crate::audio::shared_ptr::SharedPtr;
-use crate::audio::protocol::{AudioPacket, make_exit_packet, HEADER_SIZE, ProtocolError, PacketHeader};
+use crate::audio::protocol::{AudioPacket, make_exit_packet, HEADER_SIZE};
+#[cfg(target_arch = "wasm32")]
+use crate::audio::transport::HIGH_RATE_WARN_INTERVAL;
+use crate::audio::transport::deliver_received_packet;
 
 /// Number of interleaved samples in one outgoing audio packet for the given
 /// buffer size (samples per channel) and channel count.
@@ -74,18 +77,6 @@ fn send_decision(available_samples: u32, samples_needed: u32) -> SendDecision {
     }
 }
 
-/// Deserialize a received QUIC datagram into audio samples, returning the
-/// packet's sequence number.
-///
-/// Reuses [`AudioPacket::deserialize_into`] (the single source of truth for the
-/// JackTrip wire format) to fill `samples` and extract the sequence number that
-/// the receive loop hands to the regulator. Returns the same [`ProtocolError`]
-/// as the underlying parser for malformed or short datagrams.
-fn deserialize_datagram(data: &[u8], samples: &mut Vec<f32>) -> Result<u16, ProtocolError> {
-    let header: PacketHeader = AudioPacket::deserialize_into(data, samples)?;
-    Ok(header.sequence_number)
-}
-
 /// How a deserialize error should be surfaced, based on the running error
 /// accounting.
 ///
@@ -103,13 +94,6 @@ enum ReceiveErrorLevel {
     HighRate,
 }
 
-/// In the high-error-rate regime, emit at most one warning per this many
-/// deserialize errors so a degraded link can't flood the console from the
-/// realtime receive loop. Only the browser build logs, so the constant is
-/// wasm-only (it would be dead code in the native test build otherwise).
-#[cfg(target_arch = "wasm32")]
-const HIGH_RATE_WARN_INTERVAL: u64 = 50;
-
 /// Classify a deserialize error against the cumulative receive counters.
 ///
 /// Returns [`ReceiveErrorLevel::HighRate`] once more than 10 errors have
@@ -126,9 +110,8 @@ fn classify_receive_error(receive_errors: u64, packets_received: u64) -> Receive
 }
 
 /// Process one received datagram: account for it in `stats`, then (when a
-/// `regulator` is present) deserialize and either push the decoded samples into
-/// it (the network → jitter buffer feed that triggers PLC) or record the
-/// deserialize error.
+/// `regulator` is present) deserialize and deliver it (the network → jitter
+/// buffer feed that triggers PLC) or record the deserialize error.
 ///
 /// The packet/byte counters are bumped unconditionally so worker stats stay
 /// accurate even during an init/teardown race where the regulator pointer is
@@ -136,10 +119,15 @@ fn classify_receive_error(receive_errors: u64, packets_received: u64) -> Receive
 /// audio in that window, so deserialization is skipped.
 ///
 /// This is the per-datagram body of [`receive_loop`], lifted out so the
-/// realtime-correctness logic (deserialize → `Regulator::push`, error
-/// accounting, high-error-rate classification) is unit-testable without a live
+/// realtime-correctness logic (deserialize → deliver, error accounting,
+/// high-error-rate classification) is unit-testable without a live
 /// WebTransport connection. The `unsafe` raw-pointer deref of the regulator
 /// stays at the [`receive_loop`] call site; here it is an ordinary `&mut`.
+/// Deserialize-and-push itself lives in
+/// [`deliver_received_packet`](crate::audio::transport::deliver_received_packet),
+/// shared with the WebRTC transport's receive path; a rejected push outcome is
+/// already warned on there, so only the deserialize `Err` case needs handling
+/// here.
 fn handle_datagram(
     data: &[u8],
     regulator: Option<&mut Regulator>,
@@ -153,10 +141,8 @@ fn handle_datagram(
         return;
     };
 
-    match deserialize_datagram(data, samples) {
-        Ok(sequence_number) => {
-            regulator.push(sequence_number, samples);
-        }
+    match deliver_received_packet(regulator, data, samples) {
+        Ok(_outcome) => {}
         Err(_e) => {
             stats.receive_errors += 1;
 
@@ -902,7 +888,11 @@ mod tests {
 
     #[test]
     fn handle_datagram_valid_pushes_to_regulator_and_counts() {
-        let mut regulator = Regulator::new();
+        // Constructed for 2 channels; the datagram below is mono. Before the
+        // regulator adopted its channel count from the peer, this fixture
+        // reproduced the production bug: the local toggle's channel count
+        // permanently silenced a peer whose count differed from it.
+        let mut regulator = Regulator::with_params(2, 128, 48_000, 5.0);
         let mut samples = Vec::new();
         let mut stats = WebTransportWorkerStats::default();
         assert!(!regulator.is_initialized());
@@ -914,16 +904,39 @@ mod tests {
 
         handle_datagram(&datagram, Some(&mut regulator), &mut samples, &mut stats);
 
-        // The decoded packet reached the regulator (initialized + seq recorded).
+        // The decoded packet reached the regulator (initialized + seq recorded),
+        // adopting the peer's mono count rather than being rejected for
+        // disagreeing with local construction.
         assert!(
             regulator.is_initialized(),
             "a valid datagram must be pushed into the regulator"
         );
+        assert_eq!(regulator.channels(), 1, "first packet must adopt the peer's channel count");
         assert_eq!(regulator.stats().last_seq_received, 5);
+        assert_eq!(regulator.stats().packets_rejected, 0);
         // Stats account for the received packet, no errors.
         assert_eq!(stats.packets_received, 1);
         assert_eq!(stats.bytes_received, datagram.len() as u64);
         assert_eq!(stats.receive_errors, 0);
+
+        // A follow-up datagram claiming a different channel count than the
+        // now-adopted stream is rejected by the regulator (not re-adopted),
+        // so it must not move `last_seq_received` — though `handle_datagram`
+        // still counts it, since deserialization itself succeeded.
+        let audio2: Vec<f32> = (0..128).map(|i| (i as f32) / 128.0).collect();
+        let stereo: Vec<f32> = audio2.iter().flat_map(|&s| [s, s]).collect();
+        let datagram2 = AudioPacket::stereo(6, 0, stereo).serialize().unwrap();
+        handle_datagram(&datagram2, Some(&mut regulator), &mut samples, &mut stats);
+
+        assert_eq!(stats.packets_received, 2);
+        assert_eq!(
+            regulator.stats().last_seq_received, 5,
+            "a rejected packet must not move last_seq_received"
+        );
+        assert_eq!(
+            regulator.stats().packets_rejected, 1,
+            "a mid-stream channel-count mismatch must be counted as a rejection"
+        );
     }
 
     #[test]

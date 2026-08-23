@@ -315,6 +315,10 @@ pub struct WebRtcTransport {
     /// Buffers for packet processing (reused to avoid allocations)
     audio_to_send_buffer: Vec<f32>,
     packet_serialize_buffer: Vec<u8>,
+    /// Reusable buffer for received-and-deserialized samples, mirroring
+    /// `audio_to_send_buffer` on the send side. Passed to
+    /// `deliver_received_packet`, which clears and refills it per packet.
+    received_samples: Vec<f32>,
 }
 
 #[wasm_bindgen]
@@ -350,6 +354,7 @@ impl WebRtcTransport {
             timestamp: 0,
             audio_to_send_buffer,
             packet_serialize_buffer,
+            received_samples: Vec::new(),
         })
     }
 
@@ -424,7 +429,7 @@ impl WebRtcTransport {
 
                             if should_send {
                                 if ring_buffer.read(&mut self.audio_to_send_buffer) {
-                                    match crate::audio::protocol::AudioPacket::serialize_samples_into(
+                                    match AudioPacket::serialize_samples_into(
                                         self.sequence_number,
                                         self.timestamp,
                                         &self.audio_to_send_buffer,
@@ -452,9 +457,12 @@ impl WebRtcTransport {
 
                             if do_receive {
                                 if let Some(data) = self.receive_queue.borrow_mut().pop_front() {
-                                    match AudioPacket::deserialize(&data) {
-                                        Ok(packet) => {
-                                            jitter_buffer.push(packet.header.sequence_number, &packet.samples);
+                                    match crate::audio::transport::deliver_received_packet(
+                                        jitter_buffer,
+                                        &data,
+                                        &mut self.received_samples,
+                                    ) {
+                                        Ok(_outcome) => {
                                             processed_receive = true;
                                         }
                                         Err(e) => {

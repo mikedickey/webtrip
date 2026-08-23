@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use wasm_bindgen::prelude::*;
 
+use crate::audio::protocol::MAX_CHANNELS;
+
 /// Minimum dB level (silence threshold)
 pub const MIN_DB: f32 = -60.0;
 /// Maximum dB level (clipping)
@@ -63,7 +65,7 @@ impl Default for AudioParams {
 impl AudioParams {
     /// Set output channels (1=mono, 2=stereo)
     pub fn set_output_channels(&self, channels: u32) {
-        self.output_channels.store(channels.clamp(1, 8), Ordering::Relaxed);
+        self.output_channels.store(channels.clamp(1, MAX_CHANNELS as u32), Ordering::Relaxed);
     }
 
     /// Get output channels

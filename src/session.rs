@@ -32,6 +32,7 @@
 use wasm_bindgen::prelude::*;
 
 use crate::audio::engine::AudioEngine;
+use crate::audio::protocol::MAX_CHANNELS;
 use crate::audio::regulator::{Regulator, RegulatorStats};
 use crate::audio::params::AudioParams;
 use crate::audio::ring_buffer::RingBuffer;
@@ -95,6 +96,9 @@ pub struct SessionStats {
     pub regulator_skipped: u64,
     /// Last packet sequence number received (u16, wraps at 65535)
     pub regulator_last_seq: u16,
+    /// Packets rejected by the regulator (bad channel count, a channel count
+    /// that changed mid-stream, or a size mismatch)
+    pub regulator_packets_rejected: u64,
 }
 
 #[wasm_bindgen]
@@ -110,9 +114,9 @@ impl SessionStats {
 // Pure decision helpers (no browser APIs — fully testable with `cargo test`)
 // ============================================================================
 
-/// Returns `true` when `channels` is within the supported range [1, 8].
+/// Returns `true` when `channels` is within the supported range [1, `MAX_CHANNELS`].
 pub(crate) fn is_valid_channel_count(channels: u8) -> bool {
-    channels >= 1 && channels <= 8
+    channels >= 1 && channels <= MAX_CHANNELS
 }
 
 /// Returns `true` when the state transition `from → to` is permitted.
@@ -224,6 +228,7 @@ pub(crate) fn build_session_stats(
         regulator_plc_count: reg_stats.glitches,
         regulator_skipped: reg_stats.skipped,
         regulator_last_seq: reg_stats.last_seq_received,
+        regulator_packets_rejected: reg_stats.packets_rejected,
     }
 }
 
@@ -246,7 +251,6 @@ pub struct WebTripSession {
     state: SessionState,
 
     // Configuration
-    sample_rate: u32,
     buffer_size: usize,
     channels: u8,
 
@@ -303,7 +307,6 @@ impl WebTripSession {
             transport: None,
             transport_type: TransportType::WebRTC, // Default to WebRTC
             state: SessionState::Idle,
-            sample_rate,
             buffer_size,
             channels,
             on_state_change: None,
@@ -378,20 +381,30 @@ impl WebTripSession {
     }
 
     /// Set the number of audio channels (1 for mono, 2 for stereo)
-    /// Must be called before connecting
+    ///
+    /// Must be called before connecting: it is rejected outside `Idle`. This
+    /// only sets the local send width; the receive width is the peer's to
+    /// declare and is adopted from its first packet
+    /// ([`Regulator::push`](crate::audio::regulator::Regulator::push)).
+    /// Reconfiguring the regulator here used to reset its jitter policy and
+    /// leave the transport's snapshotted channel count stale mid-session — a
+    /// click on the demo's Stereo button while connected would silently
+    /// desync producer and consumer on the channel-agnostic `RingBuffer`.
     #[wasm_bindgen(js_name = setChannels)]
     pub fn set_channels(&mut self, channels: u8) {
+        if self.state != SessionState::Idle {
+            web_sys::console::warn_1(&"⚠️ Cannot change channels while connected".into());
+            return;
+        }
         if is_valid_channel_count(channels) {
             self.channels = channels;
-            
+
             // Sync to AudioParams so processor knows to duplicate mono to stereo
             if !self.audio_params_ptr.is_null() {
                 unsafe {
                     (*self.audio_params_ptr).set_output_channels(channels as u32);
                 }
             }
-            // Reconfigure regulator with new channel count
-            self.network_to_local_buffer.configure(channels as usize, self.buffer_size, self.sample_rate, -1.0);
         }
     }
 
@@ -997,6 +1010,7 @@ mod tests {
             packets_received: 1000,
             packets_played: 997,
             last_seq_received: 42,
+            packets_rejected: 7,
         };
 
         let s = build_session_stats(
@@ -1021,6 +1035,7 @@ mod tests {
         assert_eq!(s.regulator_skipped, 1);
         assert_eq!(s.regulator_packets_played, 997);
         assert_eq!(s.regulator_last_seq, 42);
+        assert_eq!(s.regulator_packets_rejected, 7);
         assert_eq!(s.regulator_depth, 5);
         assert!((s.regulator_latency_ms - 15.0).abs() < 1e-4);
         assert!(s.regulator_initialized);

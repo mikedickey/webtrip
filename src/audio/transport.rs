@@ -8,7 +8,51 @@ use std::future::Future;
 use wasm_bindgen::prelude::*;
 use web_sys;
 
+use crate::audio::protocol::{AudioPacket, PacketHeader, ProtocolError};
+use crate::audio::regulator::{PushOutcome, Regulator};
 use crate::audio::shared_ptr::SharedPtr;
+
+/// In the high-error/reject-rate regime, emit at most one warning per this
+/// many occurrences, so a degraded link or a persistently mismatched peer
+/// can't flood the console from a realtime receive loop. Only the browser
+/// build logs, so the constant is wasm-only (dead code in the native test
+/// build otherwise). Shared by [`deliver_received_packet`]'s rejection
+/// warnings and the WebTransport worker's deserialize-error accounting.
+#[cfg(target_arch = "wasm32")]
+pub(crate) const HIGH_RATE_WARN_INTERVAL: u64 = 50;
+
+/// Deserialize one received wire packet and deliver it to the regulator.
+///
+/// The single receive-side entry point shared by both transports: WebRTC's
+/// main-thread tick loop and the WebTransport worker's datagram receive loop
+/// both reuse this instead of duplicating deserialize-then-push. Deserializes
+/// `data` via [`AudioPacket::deserialize_into`] into `samples`, then pushes it
+/// with the header's declared incoming channel count. On any non-`Stored`
+/// [`PushOutcome`] (bad channel count, a channel count that changed
+/// mid-stream, or a size mismatch — see `Regulator::push`), emits a throttled
+/// `console::warn` so a persistently silent stream is diagnosable instead of
+/// failing with no stat and no log.
+pub(crate) fn deliver_received_packet(
+    regulator: &mut Regulator,
+    data: &[u8],
+    samples: &mut Vec<f32>,
+) -> Result<PushOutcome, ProtocolError> {
+    let header: PacketHeader = AudioPacket::deserialize_into(data, samples)?;
+    let outcome = regulator.push(header.sequence_number, header.num_incoming_channels as usize, samples);
+
+    #[cfg(target_arch = "wasm32")]
+    if outcome != PushOutcome::Stored {
+        let rejected = regulator.stats().packets_rejected;
+        if rejected % HIGH_RATE_WARN_INTERVAL == 0 {
+            web_sys::console::warn_1(&format!(
+                "⚠️ Regulator rejected a received packet: {:?} ({} rejected so far)",
+                outcome, rejected
+            ).into());
+        }
+    }
+
+    Ok(outcome)
+}
 
 /// Transport type selection
 #[wasm_bindgen]
