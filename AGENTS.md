@@ -2,9 +2,84 @@
 
 For general project background see [README.md](README.md). For the threading model, audio data flow, browser API constraints, and transport architecture see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Answering Questions vs. Changing Code
+
+**A question is not a work order.** "Would it make sense to…", "is this
+correct?", "I'm not sure this reviewer is right", "what would it take to…" ask
+for a finding. Deliver the finding and stop. Confirming that a problem is real
+is not authorization to fix it — whether it is worth a change, and what shape
+that change takes, is the user's call.
+
+Investigation is unrestricted: read anything, run `npm run test` / `npm run
+check`, and write throwaway code to settle a question empirically rather than
+reasoning about what the code probably does. But an experiment that touched
+tracked files is reverted before the turn ends; the answer reports what the
+experiment showed instead of leaving the change behind.
+
+**Git operations require an instruction in the user's most recent message.**
+`git commit`, `git push`, `gh pr create`, and `gh pr edit` are outward-facing —
+they publish to a branch that other people and CI can see. Authorization does
+not carry forward. "Create and push a PR" authorizes that PR, not the next
+commit to it three questions later. A new finding about an already-pushed
+branch is reported, not pushed.
+
+**When work is the obvious next step, offer it in one line and wait.** End with
+"want me to fix it?", not with the fix already applied.
+
 ## Release Status Policy
 
 This project has not been released yet. Do not preserve or design for backward compatibility; prefer the simplest clean changes and avoid paying compatibility costs before first release.
+
+## Threading Model and Portability
+
+**"WASM is single-threaded" is false — never reason from it.** WebAssembly has had a
+threads proposal for years, and this project *builds with it enabled*: see
+`wasm_rustflags` in `package.json` (`-Ctarget-feature=+atomics`, `--shared-memory`,
+the `__wasm_init_tls`/`__tls_*` exports). What is single-threaded is an individual
+JavaScript *agent* (a page or a worker) and its event loop — not the WASM module, and
+not this code. At runtime WebTrip already has three agents executing the same WASM
+instance over one shared linear memory: the main thread, the AudioWorklet render
+thread, and the WebTransport worker. Real concurrent access is happening today.
+
+**WASM is also not the only target.** WebTrip is a reusable Rust library that happens
+to ship a browser artifact first. Future iterations compile natively for desktop
+operating systems and get wrapped in CLIs and other host applications, where OS
+threads — not workers — will drive the same audio path. `crate-type = ["cdylib"]` and
+the browser-only `web-sys` gating describe today's *build*, not the design contract.
+(`npm run test` already runs the unit tests natively, off wasm32.)
+
+Therefore:
+
+- **Core logic must carry its own thread-safety guarantees.** Audio buffers, the
+  jitter buffer/regulator, the protocol codec, and shared parameter state are
+  concurrent data structures. Their soundness must follow from atomics and the
+  `Send`/`Sync` contract, not from "only one thread runs anyway."
+- **`Rc`, `RefCell`, `Cell`, `thread_local!`, and other non-atomic interior
+  mutability are justified by a confinement argument, never by a file's name.** The
+  only such argument we currently have is: *this value is captured by a JS event
+  handler and is only ever touched from the one agent that registered it* — which is
+  why the existing uses are the `web_sys` callback wiring inside `session.rs`,
+  `audio/webrtc.rs`, `audio/webtransport.rs`, and `audio/signaling.rs`. That is a
+  description of where the argument holds today, **not an allowlist**: those same
+  modules also contain portable logic — the session state machine and `SessionStats`,
+  `SignalingMessage`/`HubConnectionState`, `tick_decision`,
+  `parse_ice_candidate_json` — that a native host will reuse against OS threads and a
+  non-`web_sys` transport. Keep that logic free of thread-affine types, and keep the
+  `Rc`/`RefCell` at the callback boundary rather than letting it leak inward. If a
+  value can be reached from more than one agent or thread, it uses atomics regardless
+  of which file it lives in.
+- **Cross-thread pointers go through `SharedPtr` (`src/audio/shared_ptr.rs`).** It
+  carries the `Send`/`Sync` assertion once, in an audited place. Do not add a
+  hand-rolled `unsafe impl Send`/`Sync` to a struct to silence the compiler — that
+  asserts a guarantee the type may not have. If a type genuinely cannot be shared,
+  fix the sharing, don't assert it away.
+- **Do not weaken or remove synchronization on the grounds that the browser is
+  single-threaded, and do not `cfg(target_arch = "wasm32")` around a correctness
+  concern.** A data race that a browser happens to tolerate is still a data race on a
+  native build.
+- When a structure is *not* yet provably sound under concurrent access, say so
+  explicitly in its docs and link the tracking work (see `SharedPtr::as_mut` for the
+  house style) rather than leaving a silent assumption behind.
 
 ## No Code Duplication
 
@@ -72,7 +147,10 @@ When deleting or refactoring production code, delete its tests rather than porti
 
 - **Nightly toolchain** required (see `rust-toolchain.toml`) — needed for the unstable cargo flags `-Zbuild-std` (rebuild `std` with atomics/bulk-memory so it can link against shared memory) and `-Zno-profiler-runtime` (wasm coverage builds). The crate itself is stable Rust; no `#![feature(...)]` anywhere. See [Toolchain Requirements](README.md#toolchain-requirements) for what would have to change to drop nightly.
 - **Target**: `wasm32-unknown-unknown`
-- **Crate type**: `cdylib` — produces WASM binary, not a Rust library
+- **Crate type**: `cdylib` — the current build produces a WASM binary rather than an
+  rlib. This is a property of today's artifact, not a design constraint; write the
+  code as a portable, thread-safe library (see [Threading Model and
+  Portability](#threading-model-and-portability))
 - JS interop via `wasm-bindgen`; browser APIs via `web-sys` (feature-gated, see Cargo.toml)
 - The hub server may create its own WebRTC data channel — both client and server-created channels need message handlers
 
