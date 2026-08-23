@@ -61,8 +61,6 @@ const HIST_FPP: usize = 128;
 /// retrievable: ~10.9 s at fpp=128/48 kHz. Not the sequence-number space — see
 /// the module header.
 const NUM_SLOTS: usize = 4096;
-/// Maximum samples per packet (8 channels * 1024 frames)
-const MAX_PACKET_SAMPLES: usize = 8192;
 /// Maximum auto tolerance in milliseconds
 const AUTO_MAX_MS: f64 = 250.0;
 /// Duration before auto mode kicks in
@@ -496,22 +494,26 @@ impl TimingStats {
 // Packet Slot
 // ============================================================================
 
-/// A slot for storing an incoming packet (pre-allocated, no heap allocations)
+/// A slot for storing an incoming packet.
+///
+/// A JackTrip connection fixes frames-per-packet and channel count when it is
+/// established, so every packet belonging to the stream carries exactly
+/// [`Regulator::samples_per_packet`] samples. `data` is sized to that once, at
+/// configure time, and is always full: a packet of any other size is rejected
+/// before it reaches a slot ([`Regulator::push`]). That leaves no
+/// partially-filled state to track and no allocation on the audio path.
 struct PacketSlot {
     /// Arrival timestamp in milliseconds
     timestamp: f64,
-    /// Number of valid samples in the data array
-    sample_count: usize,
-    /// Audio data (interleaved channels) - pre-allocated fixed size
-    data: [f32; MAX_PACKET_SAMPLES],
+    /// One packet of audio (interleaved channels), `samples_per_packet` long
+    data: Vec<f32>,
 }
 
 impl PacketSlot {
-    fn new() -> Self {
+    fn new(samples_per_packet: usize) -> Self {
         Self {
             timestamp: 0.0,
-            sample_count: 0,
-            data: [0.0; MAX_PACKET_SAMPLES],
+            data: vec![0.0; samples_per_packet],
         }
     }
 }
@@ -686,7 +688,7 @@ impl Regulator {
         // Create packet slots (pre-allocated to avoid allocations in audio path)
         let mut slots = Vec::with_capacity(NUM_SLOTS);
         for _ in 0..NUM_SLOTS {
-            slots.push(Some(PacketSlot::new()));
+            slots.push(Some(PacketSlot::new(samples_per_packet)));
         }
 
         Self {
@@ -752,9 +754,22 @@ impl Regulator {
     /// * `seq_num` - Packet sequence number (u16 wraps at 65535)
     /// * `samples` - Interleaved audio samples
     /// * `now_ms` - Current timestamp in milliseconds
-    fn push_internal(&mut self, seq_num: u16, samples: &[f32], now_ms: f64) {
-        if samples.len() > MAX_PACKET_SAMPLES {
-            return;
+    ///
+    /// # Returns
+    /// `true` if the packet was stored, `false` if it was rejected for
+    /// carrying the wrong number of samples.
+    fn push_internal(&mut self, seq_num: u16, samples: &[f32], now_ms: f64) -> bool {
+        // Frames-per-packet and channel count are negotiated once, when the
+        // connection is established, and every packet on the wire carries
+        // exactly that many samples. Anything else did not come from this
+        // stream's configuration — a peer that renegotiated without us, or a
+        // header whose `buffer_size`/channel count disagrees with ours — and
+        // there is no honest way to place it in the timeline: a short packet
+        // would play as a dropout in the middle of good audio, and a long one
+        // would be silently truncated. Reject it before it can occupy a slot
+        // or move the write pointer.
+        if samples.len() != self.samples_per_packet {
+            return false;
         }
 
         let current = self.last_seq_in.load(Ordering::Acquire);
@@ -770,10 +785,8 @@ impl Regulator {
         // below rejects: it is still the freshest thing that belongs in this
         // slot, and a straggler the read side has not passed yet is playable.
         if let Some(ref mut slot) = self.slots[slot_index(seq_num)] {
-            let sample_count = samples.len().min(self.samples_per_packet).min(MAX_PACKET_SAMPLES);
             slot.timestamp = relative_now;
-            slot.sample_count = sample_count;
-            slot.data[..sample_count].copy_from_slice(&samples[..sample_count]);
+            slot.data.copy_from_slice(samples);
         }
 
         // Advance the write pointer only for packets that are actually newer;
@@ -788,6 +801,8 @@ impl Regulator {
         if should_update {
             self.last_seq_in.store(seq_num as i32, Ordering::Release);
         }
+
+        true
     }
 
     /// Push a received packet into the buffer.
@@ -797,11 +812,12 @@ impl Regulator {
     /// * `samples` - Interleaved audio samples
     ///
     /// # Returns
-    /// `true` if packet was accepted, `false` otherwise
+    /// `true` if the packet was accepted, `false` if it was rejected because
+    /// `samples.len()` is not the `fpp * channels` this regulator was
+    /// configured for.
     pub fn push(&mut self, sequence: u16, samples: &[f32]) -> bool {
         let now_ms = Self::now_ms();
-        self.push_internal(sequence, samples, now_ms);
-        true // Always return true for now
+        self.push_internal(sequence, samples, now_ms)
     }
 
     /// Pop samples for playback (internal with explicit timestamp).
@@ -839,12 +855,7 @@ impl Regulator {
                 if let Some(ref slot) = self.slots[slot_idx] {
                     for (ch, channel) in self.channels.iter_mut().enumerate() {
                         for s in 0..self.fpp {
-                            let idx = s * self.num_channels + ch;
-                            channel.tmp_buf[s] = if idx < slot.sample_count {
-                                slot.data[idx]
-                            } else {
-                                0.0
-                            };
+                            channel.tmp_buf[s] = slot.data[s * self.num_channels + ch];
                         }
                     }
                 }
@@ -1281,12 +1292,15 @@ impl Regulator {
         self.pull_stats.reset();
         self.push_stats.reset();
 
-        // Reset slots without deallocating
+        // Reset slots without deallocating. The audio is zeroed, not just the
+        // timestamp: after a reset the next stream can jump the write pointer
+        // over slots this one filled, and those slots are readable again as
+        // soon as they fall inside the new stream's span. Silence there is a
+        // dropout; the previous connection's audio is a burst of garbage.
         for slot in &mut self.slots {
             if let Some(ref mut s) = slot {
                 s.timestamp = 0.0;
-                s.sample_count = 0;
-                // No need to zero the data array - sample_count tracks what's valid
+                s.data.fill(0.0);
             }
         }
 
@@ -1362,6 +1376,18 @@ impl Default for Regulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plant a packet directly in the ring, bypassing `push`, so a test can
+    /// lay out an arrival timeline (timestamps, gaps, out-of-order arrivals)
+    /// without driving the wall clock. `samples` must be a full packet — the
+    /// same contract `push` enforces.
+    fn plant_packet(reg: &mut Regulator, seq: u16, timestamp: f64, samples: &[f32]) {
+        let slot = reg.slots[slot_index(seq)]
+            .as_mut()
+            .expect("slots are pre-allocated at configure time");
+        slot.timestamp = timestamp;
+        slot.data.copy_from_slice(samples);
+    }
 
     #[test]
     fn test_burg_training_and_prediction() {
@@ -1588,17 +1614,8 @@ mod tests {
         reg.last_seq_out = Some(last_seq);
         reg.last_seq_in.store(good_seq as i32, Ordering::Release);
 
-        if let Some(slot) = &mut reg.slots[slot_index(last_seq)] {
-            slot.timestamp = 40.0;
-            slot.sample_count = reg.fpp;
-            slot.data[..reg.fpp].copy_from_slice(&last_packet);
-        }
-
-        if let Some(slot) = &mut reg.slots[slot_index(good_seq)] {
-            slot.timestamp = 45.0;
-            slot.sample_count = reg.fpp;
-            slot.data[..reg.fpp].copy_from_slice(&packet);
-        }
+        plant_packet(&mut reg, last_seq, 40.0, &last_packet);
+        plant_packet(&mut reg, good_seq, 45.0, &packet);
 
         let mut concealment = vec![0.0f32; reg.fpp];
         let concealment_result = reg.pop_internal(&mut concealment, 50.0);
@@ -1643,24 +1660,14 @@ mod tests {
         reg.last_seq_in.store(fresh_seq as i32, Ordering::Release);
 
         // Previously-played packet, reference point for the out-of-order check.
-        if let Some(slot) = &mut reg.slots[slot_index(last_seq)] {
-            slot.timestamp = 40.0;
-            slot.sample_count = reg.fpp;
-        }
+        let silent_packet = vec![0.0f32; reg.fpp];
+        plant_packet(&mut reg, last_seq, 40.0, &silent_packet);
         // Stale but valid packet: misses tolerance at now=60 (41 + 10 < 60),
         // so the scan records it as `first_good_skipped` instead of playing it.
-        if let Some(slot) = &mut reg.slots[slot_index(stale_seq)] {
-            slot.timestamp = 41.0;
-            slot.sample_count = reg.fpp;
-            slot.data[..reg.fpp].copy_from_slice(&stale_packet);
-        }
+        plant_packet(&mut reg, stale_seq, 41.0, &stale_packet);
         // Fresh packet within tolerance (55 + 10 >= 60); playing it would skip
         // exactly one good packet, which triggers the deferral.
-        if let Some(slot) = &mut reg.slots[slot_index(fresh_seq)] {
-            slot.timestamp = 55.0;
-            slot.sample_count = reg.fpp;
-            slot.data[..reg.fpp].copy_from_slice(&fresh_packet);
-        }
+        plant_packet(&mut reg, fresh_seq, 55.0, &fresh_packet);
 
         let mut output = vec![0.0f32; reg.fpp];
         let first_result = reg.pop_internal(&mut output, 60.0);
@@ -1750,11 +1757,7 @@ mod tests {
         reg.last_seq_in.store(9, Ordering::Release);
         reg.last_seq_out = Some(7);
         reg.last_stashed = Some((9, slot_index(9)));
-        if let Some(slot) = &mut reg.slots[slot_index(9)] {
-            slot.timestamp = 100.0;
-            slot.sample_count = reg.fpp;
-            slot.data[..reg.fpp].copy_from_slice(&samples);
-        }
+        plant_packet(&mut reg, 9, 100.0, &samples);
 
         reg.reset();
 
@@ -2211,5 +2214,47 @@ mod tests {
         assert_eq!(auto.channels(), 1);
         assert_eq!(auto.fpp(), 64);
         assert_eq!(auto.tolerance_ms(), 64.0 * AUTO_INIT_VAL_FACTOR);
+    }
+
+    /// A connection fixes frames-per-packet and channel count when it is
+    /// established, so a packet carrying any other number of samples cannot
+    /// belong to this stream. `push` must reject it outright rather than fit
+    /// it to the slot: a short packet padded or left partially written plays
+    /// as a burst of garbage or silence inside otherwise good audio, and
+    /// either size would still drag the write pointer forward onto a slot the
+    /// read side then hands to the output.
+    #[test]
+    fn test_push_rejects_packets_that_are_not_exactly_one_packet_long() {
+        let mut reg = Regulator::with_params(2, 64, 48_000, 5.0);
+        let good = vec![0.5f32; reg.samples_per_packet];
+        assert!(reg.push_internal(10, &good, 0.0));
+        assert_eq!(reg.last_seq_in.load(Ordering::Acquire), 10);
+
+        let wrong_sizes = [
+            0,
+            1,
+            reg.samples_per_packet - reg.num_channels, // one frame short
+            reg.samples_per_packet - 1,                // one sample short
+            reg.samples_per_packet + 1,                // one sample long
+            reg.samples_per_packet * 2,                // double-length packet
+        ];
+        for len in wrong_sizes {
+            let packet = vec![0.25f32; len];
+            assert!(
+                !reg.push_internal(11, &packet, 1.0),
+                "accepted a {len}-sample packet on a {}-sample stream",
+                reg.samples_per_packet
+            );
+        }
+
+        // Neither the ring nor the write pointer moved: the slot the rejected
+        // packets targeted is still empty, and the newest sequence number is
+        // still the last good packet's.
+        assert_eq!(reg.last_seq_in.load(Ordering::Acquire), 10);
+        let slot = reg.slots[slot_index(11)]
+            .as_ref()
+            .expect("slots are pre-allocated at configure time");
+        assert_eq!(slot.timestamp, 0.0);
+        assert!(slot.data.iter().all(|&s| s == 0.0));
     }
 }
