@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use wasm_bindgen::prelude::*;
 
 use crate::audio::protocol::MAX_CHANNELS;
@@ -34,14 +34,12 @@ pub struct AudioParams {
     /// Monitor volume as linear multiplier * 1000 (range: 0 to 1000 for 0.0 to 1.0)
     /// Replaces the old loopback toggle - 0 means no monitoring
     pub(crate) monitor_volume: AtomicU32,
-    /// Audio processing settings
-    pub(crate) auto_gain_control: AtomicBool,
-    pub(crate) echo_cancellation: AtomicBool,
-    pub(crate) noise_suppression: AtomicBool,
     /// Total number of audio callbacks (process() calls)
     pub(crate) callback_count: AtomicU64,
-    /// Number of output channels (1=mono, 2=stereo)
-    pub(crate) output_channels: AtomicU32,
+    /// Number of capture (send) channels (1=mono, 2=stereo). Governs only the
+    /// send path — playback width is the peer's to declare (see
+    /// [`crate::audio::regulator::Regulator::push`]).
+    pub(crate) capture_channels: AtomicU32,
 }
 
 impl Default for AudioParams {
@@ -53,24 +51,21 @@ impl Default for AudioParams {
             input_gain_db: AtomicI32::new(0), // 0 dB (unity gain)
             output_volume: AtomicU32::new(1000), // 1.0 (full volume)
             monitor_volume: AtomicU32::new(0), // 0.0 (monitoring off by default)
-            auto_gain_control: AtomicBool::new(false),
-            echo_cancellation: AtomicBool::new(false),
-            noise_suppression: AtomicBool::new(false),
             callback_count: AtomicU64::new(0),
-            output_channels: AtomicU32::new(2), // Default to stereo
+            capture_channels: AtomicU32::new(2), // Default to stereo
         }
     }
 }
 
 impl AudioParams {
-    /// Set output channels (1=mono, 2=stereo)
-    pub fn set_output_channels(&self, channels: u32) {
-        self.output_channels.store(channels.clamp(1, MAX_CHANNELS as u32), Ordering::Relaxed);
+    /// Set capture (send) channels (1=mono, 2=stereo)
+    pub fn set_capture_channels(&self, channels: u32) {
+        self.capture_channels.store(channels.clamp(1, MAX_CHANNELS as u32), Ordering::Relaxed);
     }
 
-    /// Get output channels
-    pub fn get_output_channels(&self) -> u32 {
-        self.output_channels.load(Ordering::Relaxed)
+    /// Get capture (send) channels
+    pub fn get_capture_channels(&self) -> u32 {
+        self.capture_channels.load(Ordering::Relaxed)
     }
 }
 
@@ -111,42 +106,6 @@ impl AudioParams {
     #[wasm_bindgen(js_name = getMonitorVolume)]
     pub fn get_monitor_volume(&self) -> f32 {
         decode_volume(self.monitor_volume.load(Ordering::Relaxed))
-    }
-
-    /// Set auto gain control
-    #[wasm_bindgen(js_name = setAutoGainControl)]
-    pub fn set_auto_gain_control(&self, enabled: bool) {
-        self.auto_gain_control.store(enabled, Ordering::Relaxed);
-    }
-
-    /// Get auto gain control setting
-    #[wasm_bindgen(js_name = getAutoGainControl)]
-    pub fn get_auto_gain_control(&self) -> bool {
-        self.auto_gain_control.load(Ordering::Relaxed)
-    }
-
-    /// Set echo cancellation
-    #[wasm_bindgen(js_name = setEchoCancellation)]
-    pub fn set_echo_cancellation(&self, enabled: bool) {
-        self.echo_cancellation.store(enabled, Ordering::Relaxed);
-    }
-
-    /// Get echo cancellation setting
-    #[wasm_bindgen(js_name = getEchoCancellation)]
-    pub fn get_echo_cancellation(&self) -> bool {
-        self.echo_cancellation.load(Ordering::Relaxed)
-    }
-
-    /// Set noise suppression
-    #[wasm_bindgen(js_name = setNoiseSuppression)]
-    pub fn set_noise_suppression(&self, enabled: bool) {
-        self.noise_suppression.store(enabled, Ordering::Relaxed);
-    }
-
-    /// Get noise suppression setting
-    #[wasm_bindgen(js_name = getNoiseSuppression)]
-    pub fn get_noise_suppression(&self) -> bool {
-        self.noise_suppression.load(Ordering::Relaxed)
     }
 
     /// Get the total number of audio callbacks (process() calls)
@@ -342,42 +301,17 @@ mod tests {
     }
 
     #[test]
-    fn test_output_channels_roundtrip_and_clamp() {
+    fn test_capture_channels_roundtrip_and_clamp() {
         let p = AudioParams::default();
         for c in [1_u32, 2, 4, 8] {
-            p.set_output_channels(c);
-            assert_eq!(p.get_output_channels(), c);
+            p.set_capture_channels(c);
+            assert_eq!(p.get_capture_channels(), c);
         }
         // Clamp to [1, 8].
-        p.set_output_channels(0);
-        assert_eq!(p.get_output_channels(), 1);
-        p.set_output_channels(64);
-        assert_eq!(p.get_output_channels(), 8);
-    }
-
-    #[test]
-    fn test_bool_params_are_independent() {
-        // Each toggle is a distinct atomic; flipping one must not disturb the others.
-        let p = AudioParams::default();
-        p.set_auto_gain_control(true);
-        assert!(p.get_auto_gain_control());
-        assert!(!p.get_echo_cancellation());
-        assert!(!p.get_noise_suppression());
-
-        p.set_noise_suppression(true);
-        assert!(p.get_auto_gain_control());
-        assert!(!p.get_echo_cancellation());
-        assert!(p.get_noise_suppression());
-
-        p.set_auto_gain_control(false);
-        assert!(!p.get_auto_gain_control());
-        assert!(!p.get_echo_cancellation());
-        assert!(p.get_noise_suppression());
-
-        p.set_echo_cancellation(true);
-        assert!(!p.get_auto_gain_control());
-        assert!(p.get_echo_cancellation());
-        assert!(p.get_noise_suppression());
+        p.set_capture_channels(0);
+        assert_eq!(p.get_capture_channels(), 1);
+        p.set_capture_channels(64);
+        assert_eq!(p.get_capture_channels(), 8);
     }
 
     #[test]
@@ -432,7 +366,7 @@ mod tests {
             let p = Arc::clone(&params);
             thread::spawn(move || {
                 for c in 1..=target_channels {
-                    p.set_output_channels(c);
+                    p.set_capture_channels(c);
                     thread::yield_now();
                 }
             })
@@ -449,7 +383,7 @@ mod tests {
                 // hanging forever — if cross-thread visibility ever regresses.
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 while std::time::Instant::now() < deadline {
-                    if p.get_output_channels() == target_channels {
+                    if p.get_capture_channels() == target_channels {
                         return true;
                     }
                     thread::yield_now();
@@ -460,7 +394,7 @@ mod tests {
 
         writer.join().unwrap();
         let observed = reader.join().unwrap();
-        assert_eq!(params.get_output_channels(), target_channels);
+        assert_eq!(params.get_capture_channels(), target_channels);
         assert!(observed, "reader thread never observed the final value");
     }
 

@@ -288,7 +288,7 @@ impl WebTripSession {
         // Sync channels to AudioParams so processor knows to duplicate mono to stereo
         if !audio_params_ptr.is_null() {
             unsafe {
-                (*audio_params_ptr).set_output_channels(channels as u32);
+                (*audio_params_ptr).set_capture_channels(channels as u32);
             }
         }
 
@@ -402,7 +402,7 @@ impl WebTripSession {
             // Sync to AudioParams so processor knows to duplicate mono to stereo
             if !self.audio_params_ptr.is_null() {
                 unsafe {
-                    (*self.audio_params_ptr).set_output_channels(channels as u32);
+                    (*self.audio_params_ptr).set_capture_channels(channels as u32);
                 }
             }
         }
@@ -456,7 +456,7 @@ impl WebTripSession {
         self.output_device_id = device_id.clone();
         
         // If audio engine exists, apply immediately
-        if let Some(ref engine) = self.audio_engine {
+        if let Some(ref mut engine) = self.audio_engine {
             engine.set_output_device(device_id).await?;
         }
         Ok(())
@@ -500,7 +500,7 @@ impl WebTripSession {
 
         // Apply stored output device selection now that audio engine is ready
         if let Some(ref output_device) = self.output_device_id {
-            if let Some(ref engine) = self.audio_engine {
+            if let Some(ref mut engine) = self.audio_engine {
                 engine.set_output_device(Some(output_device.clone())).await?;
             }
         }

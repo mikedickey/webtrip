@@ -9,7 +9,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    AudioContext, AudioContextOptions, AudioWorkletNode, MediaStream,
+    AudioContext, AudioContextOptions, AudioWorkletNode, ChannelInterpretation, MediaStream,
     MediaStreamAudioSourceNode, MediaStreamConstraints,
 };
 
@@ -89,6 +89,11 @@ pub struct AudioEngine {
     params_ptr: *const AudioParams,
     local_to_network_buffer_ptr: *mut RingBuffer,
     network_to_local_buffer_ptr: *mut Regulator,
+    /// The output channel count the current `worklet_node` was built with
+    /// (`outputChannelCount` is construction-time only, so a change means
+    /// rebuilding the node — see `build_and_connect_worklet_node` and its
+    /// call from `set_output_device`).
+    worklet_output_channels: usize,
 }
 
 #[wasm_bindgen]
@@ -123,6 +128,7 @@ impl AudioEngine {
             params_ptr,
             local_to_network_buffer_ptr,
             network_to_local_buffer_ptr,
+            worklet_output_channels: 0,
         })
     }
 
@@ -177,7 +183,52 @@ impl AudioEngine {
 
         // Create source node from the stream
         let source_node = self.ctx.create_media_stream_source(&stream)?;
+        self.source_node = Some(source_node);
+        self.current_stream = Some(stream);
 
+        // Read the device's max channel count and configure the destination
+        // to it (explicit/discrete, so the browser never speaker-folds or
+        // up-mixes on our behalf — mapping is `map_to_output`'s job).
+        let output_channels = self.configure_destination()?;
+        self.build_and_connect_worklet_node(output_channels as usize)?;
+
+        // Resume the audio context.
+        // On iOS Safari, AudioContext.resume() returns a promise that *never* resolves when
+        // called outside an active user-gesture context (which expires ~5 s after a tap).
+        // Awaiting it would hang the entire connect flow. Instead we fire it as a background
+        // task; the context will resume either immediately (iOS 16+ where getUserMedia acts as
+        // an implicit unlock) or on the next user interaction (older iOS via resumeCtx()).
+        let resume_promise = self.ctx.resume()?;
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = JsFuture::from(resume_promise).await;
+        });
+
+        Ok(())
+    }
+
+    /// Read the destination's max channel count and configure it explicit /
+    /// discrete at that width, so the browser never speaker-folds or
+    /// up-mixes on our behalf. Returns the configured count.
+    fn configure_destination(&self) -> Result<u32, JsValue> {
+        let destination = self.ctx.destination();
+        let max_channels = destination.max_channel_count();
+        destination.set_channel_count(max_channels);
+        destination.set_channel_count_mode(web_sys::ChannelCountMode::Explicit);
+        destination.set_channel_interpretation(ChannelInterpretation::Discrete);
+        Ok(max_channels)
+    }
+
+    /// Build a fresh worklet node at `output_channels` wide and connect it:
+    /// source → worklet → destination, disconnecting any previous worklet
+    /// node. Capture stays mono in this phase (real multichannel capture is
+    /// a later phase), so `input_channels` is always 1.
+    ///
+    /// Used both by `start_capture` (first build) and `set_output_device`
+    /// (rebuild when `setSinkId` changes the destination's max channel
+    /// count) — `outputChannelCount` is construction-time only on
+    /// `AudioWorkletNode`, so a width change means a new node, not a
+    /// reconfigure.
+    fn build_and_connect_worklet_node(&mut self, output_channels: usize) -> Result<(), JsValue> {
         // Create processor with network support. `AudioEngine` stores raw
         // pointers (it is a `#[wasm_bindgen]` boundary type); wrap them in
         // `SharedPtr` here so the processor and the flag read below go through
@@ -192,8 +243,8 @@ impl AudioEngine {
             AudioProcessor::with_network(params, local_to_network, network_to_local)
         };
 
-        let process = Box::new(move |input: &[f32], output: &mut [f32]| {
-            processor.process(input, output)
+        let process = Box::new(move |input: &[f32], output: &mut [f32], out_channels: usize| {
+            processor.process(input, output, out_channels)
         });
 
         // Get ring buffer flag pointer for event-driven wake-up
@@ -202,26 +253,26 @@ impl AudioEngine {
             .map(|ring_buffer| ring_buffer.get_has_data_flag_ptr());
 
         // Create worklet node for processing (with flag pointer for Atomics.notify)
-        let worklet_node = create_worklet_node_with_flag(&self.ctx, process, ring_buffer_flag_ptr)?;
+        let worklet_node = create_worklet_node_with_flag(
+            &self.ctx,
+            process,
+            1,
+            output_channels,
+            ring_buffer_flag_ptr,
+        )?;
 
         // Connect: source -> worklet -> destination
-        source_node.connect_with_audio_node(&worklet_node)?;
+        if let Some(ref source) = self.source_node {
+            source.connect_with_audio_node(&worklet_node)?;
+        }
         worklet_node.connect_with_audio_node(&self.ctx.destination())?;
 
-        self.source_node = Some(source_node);
-        self.worklet_node = Some(worklet_node);
-        self.current_stream = Some(stream);
+        if let Some(ref old_node) = self.worklet_node {
+            let _ = old_node.disconnect();
+        }
 
-        // Resume the audio context.
-        // On iOS Safari, AudioContext.resume() returns a promise that *never* resolves when
-        // called outside an active user-gesture context (which expires ~5 s after a tap).
-        // Awaiting it would hang the entire connect flow. Instead we fire it as a background
-        // task; the context will resume either immediately (iOS 16+ where getUserMedia acts as
-        // an implicit unlock) or on the next user interaction (older iOS via resumeCtx()).
-        let resume_promise = self.ctx.resume()?;
-        wasm_bindgen_futures::spawn_local(async move {
-            let _ = JsFuture::from(resume_promise).await;
-        });
+        self.worklet_node = Some(worklet_node);
+        self.worklet_output_channels = output_channels;
 
         Ok(())
     }
@@ -294,15 +345,29 @@ impl AudioEngine {
     }
 
     /// Set the output audio device (sink) for playback
-    /// 
+    ///
     /// Uses the AudioContext.setSinkId() API to route audio to a specific device.
     /// Pass an empty string to use the default device.
-    /// 
+    ///
+    /// `setSinkId` can change `maxChannelCount` (a different physical output
+    /// device may support a different channel count). Once routed, this
+    /// re-reads it and rebuilds the worklet node at the new width if it
+    /// changed.
+    ///
     /// # Arguments
     /// * `device_id` - The device ID from the output device selector, or empty string for default
     #[wasm_bindgen(js_name = setOutputDevice)]
-    pub async fn set_output_device(&self, device_id: Option<String>) -> Result<(), JsValue> {
-        route_output_sink(self.ctx.as_ref(), device_id).await
+    pub async fn set_output_device(&mut self, device_id: Option<String>) -> Result<(), JsValue> {
+        route_output_sink(self.ctx.as_ref(), device_id).await?;
+
+        if self.worklet_node.is_some() {
+            let output_channels = self.configure_destination()?;
+            if output_channels as usize != self.worklet_output_channels {
+                self.build_and_connect_worklet_node(output_channels as usize)?;
+            }
+        }
+
+        Ok(())
     }
 }
 

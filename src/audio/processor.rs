@@ -78,6 +78,61 @@ pub(crate) fn downmix_to_mono(interleaved: &[f32], channels: usize, mono_out: &m
     }
 }
 
+/// Map `src_channels`-wide interleaved audio onto `out_channels` planar output
+/// channels (`out[ch * frames + frame]`, `frames == src.len() / src_channels`),
+/// per the target-behavior rules in the channel model plan:
+///
+/// - `out_channels == 1` → average all `src_channels` into it (delegates to
+///   [`downmix_to_mono`] — one implementation, not two).
+/// - `src_channels == 1`, `out_channels >= 2` → copy to channels 0 and 1; the
+///   rest silent.
+/// - `src_channels == 2`, `out_channels > 2` → channels 0 and 1; the rest
+///   silent.
+/// - otherwise → 1:1 for `min(src_channels, out_channels)`; extra source
+///   channels are dropped, extra output channels are silent.
+///
+/// Used for both the peer stream (regulator output) and the local monitor mix
+/// (capture), so both play back through the same mapping.
+pub(crate) fn map_to_output(src: &[f32], src_channels: usize, out: &mut [f32], out_channels: usize) {
+    let src_channels = src_channels.max(1);
+    let out_channels = out_channels.max(1);
+    let frames = out.len() / out_channels;
+
+    if out_channels == 1 {
+        downmix_to_mono(src, src_channels, &mut out[..frames]);
+        return;
+    }
+
+    out[..frames * out_channels].fill(0.0);
+
+    if src_channels == 1 {
+        // Copy the single source channel to output channels 0 and 1.
+        for dst_ch in 0..out_channels.min(2) {
+            out[dst_ch * frames..dst_ch * frames + frames.min(src.len())]
+                .copy_from_slice(&src[..frames.min(src.len())]);
+        }
+        return;
+    }
+
+    if src_channels == 2 && out_channels > 2 {
+        for dst_ch in 0..2 {
+            for frame in 0..frames {
+                out[dst_ch * frames + frame] = src.get(frame * src_channels + dst_ch).copied().unwrap_or(0.0);
+            }
+        }
+        return;
+    }
+
+    // 1:1 for min(src_channels, out_channels); extra source channels
+    // dropped, extra output channels left silent (already zeroed above).
+    let mapped_channels = src_channels.min(out_channels);
+    for ch in 0..mapped_channels {
+        for frame in 0..frames {
+            out[ch * frames + frame] = src.get(frame * src_channels + ch).copied().unwrap_or(0.0);
+        }
+    }
+}
+
 /// Compute the next peak-hold/decay state given the current audio level and
 /// the previously stored peak state.
 ///
@@ -113,16 +168,22 @@ pub struct AudioProcessor {
     /// Jitter buffer for receiving audio from network (network → main thread → jitter buffer → worklet → audio device).
     /// Null when no network is attached; still `&mut`-accessed via [`SharedPtr::as_mut`].
     network_to_local_buffer: SharedPtr<Regulator>,
-    /// Temporary buffer for gained audio (mono from mic)
+    /// Temporary buffer for gained audio (mono from mic; capture stays mono
+    /// until Phase 3 lands real multichannel capture)
     gained_buffer: Vec<f32>,
-    /// Temporary buffer for remote audio (mono, after downmix)
-    remote_buffer: Vec<f32>,
     /// Buffer for stereo send (mono duplicated to both channels)
     stereo_buffer: Vec<f32>,
-    /// Buffer for the regulator's interleaved output, before downmix to mono.
-    /// Preallocated at `128 * MAX_CHANNELS` so a widening `receive_from_network`
-    /// resize never allocates on the render thread.
+    /// Buffer for the regulator's interleaved output, before mapping to the
+    /// output device's channel count. Preallocated at `128 * MAX_CHANNELS` so
+    /// a widening `receive_from_network` resize never allocates on the render
+    /// thread.
     remote_interleaved: Vec<f32>,
+    /// The peer stream mapped onto the output device's channels (planar:
+    /// `[ch * frames + frame]`). Preallocated at `128 * MAX_CHANNELS`.
+    remote_mapped: Vec<f32>,
+    /// The local monitor mapped onto the output device's channels, same
+    /// planar layout as `remote_mapped`.
+    monitor_mapped: Vec<f32>,
 }
 
 impl AudioProcessor {
@@ -132,9 +193,10 @@ impl AudioProcessor {
             local_to_network_buffer: SharedPtr::null(),
             network_to_local_buffer: SharedPtr::null(),
             gained_buffer: vec![0.0; 128],
-            remote_buffer: vec![0.0; 128],
             stereo_buffer: vec![0.0; 256], // 128 samples * 2 channels
             remote_interleaved: vec![0.0; 128 * MAX_CHANNELS as usize],
+            remote_mapped: vec![0.0; 128 * MAX_CHANNELS as usize],
+            monitor_mapped: vec![0.0; 128 * MAX_CHANNELS as usize],
         }
     }
 
@@ -151,34 +213,50 @@ impl AudioProcessor {
             local_to_network_buffer,
             network_to_local_buffer,
             gained_buffer: vec![0.0; 128],
-            remote_buffer: vec![0.0; 128],
             stereo_buffer: vec![0.0; 256], // 128 samples * 2 channels
             remote_interleaved: vec![0.0; 128 * MAX_CHANNELS as usize],
+            remote_mapped: vec![0.0; 128 * MAX_CHANNELS as usize],
+            monitor_mapped: vec![0.0; 128 * MAX_CHANNELS as usize],
         }
     }
 
-    /// Process audio: calculate volume levels, handle network audio, and generate output
-    pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> bool {
+    /// Process audio: calculate volume levels, handle network audio, and generate output.
+    ///
+    /// `input` is mono capture (`frames` samples; real multichannel capture is
+    /// Phase 3). `output` is planar across `out_channels` output channels:
+    /// `output[ch * frames + frame]`, `frames == input.len()`.
+    pub fn process(&mut self, input: &[f32], output: &mut [f32], out_channels: usize) -> bool {
+        let out_channels = out_channels.max(1);
+        let frames = input.len();
+
         // Increment callback counter for stats tracking
         self.params.callback_count.fetch_add(1, Ordering::Relaxed);
-        
+
         // Get input gain (dB) and convert to linear
         let input_gain_db = self.params.input_gain_db.load(Ordering::Relaxed) as f32 / 100.0;
         let input_gain_linear = db_to_linear(input_gain_db);
-        
+
         // Ensure buffers are correct size
-        if self.gained_buffer.len() != input.len() {
-            self.gained_buffer.resize(input.len(), 0.0);
-            self.remote_buffer.resize(input.len(), 0.0);
+        if self.gained_buffer.len() != frames {
+            self.gained_buffer.resize(frames, 0.0);
+        }
+        let mapped_len = frames * out_channels;
+        if self.remote_mapped.len() < mapped_len {
+            self.remote_mapped.resize(mapped_len, 0.0);
+        }
+        if self.monitor_mapped.len() < mapped_len {
+            self.monitor_mapped.resize(mapped_len, 0.0);
         }
 
         // Apply input gain to local audio (clamped to [-1.0, 1.0])
         apply_gain(input, input_gain_linear, &mut self.gained_buffer);
 
-        // Calculate RMS for volume metering
+        // Calculate RMS for volume metering. Capture is mono in this phase
+        // (real multichannel capture, and a max-across-channels RMS, are
+        // Phase 3) so this is just the one capture channel's RMS.
         let rms = compute_rms(&self.gained_buffer);
         let current_db = amplitude_to_db(rms);
-        
+
         // Store dB level
         self.params.db_level.store(encode_db(current_db), Ordering::Relaxed);
 
@@ -188,23 +266,37 @@ impl AudioProcessor {
         // Send local audio to network (if enabled)
         self.send_local_to_network();
 
-        // Receive remote audio from network. Fills `remote_buffer` with the regulator's
-        // output (real, Burg-predicted concealment, or intentional silence) when a network
-        // buffer is connected, or with zeros otherwise — so we can mix it unconditionally.
-        self.receive_from_network();
+        // Receive remote audio from network into `remote_interleaved` and map
+        // it onto `out_channels` output channels. `receive_from_network`
+        // returns 0 when no network buffer is attached, in which case the
+        // peer stream is silence.
+        let remote_channels = self.receive_from_network(frames);
+        if remote_channels == 0 {
+            self.remote_mapped[..mapped_len].fill(0.0);
+        } else {
+            map_to_output(
+                &self.remote_interleaved[..frames * remote_channels],
+                remote_channels,
+                &mut self.remote_mapped[..mapped_len],
+                out_channels,
+            );
+        }
 
-        // Generate output: mix monitor + remote audio
+        // Map the local monitor (mono capture) onto the same output width.
+        map_to_output(&self.gained_buffer, 1, &mut self.monitor_mapped[..mapped_len], out_channels);
+
+        // Generate output: mix monitor + remote audio, per output channel.
         let monitor_volume = decode_volume(self.params.monitor_volume.load(Ordering::Relaxed));
         let output_volume  = decode_volume(self.params.output_volume.load(Ordering::Relaxed));
-        
-        let len = input.len().min(output.len());
-        for i in 0..len {
+
+        let out_len = output.len().min(mapped_len);
+        for i in 0..out_len {
             // Start with remote audio (zeros if no network connected)
-            let mut out_sample = self.remote_buffer[i];
+            let mut out_sample = self.remote_mapped[i];
 
             // Add local monitor audio (if enabled)
             if monitor_volume > 0.0 {
-                out_sample += self.gained_buffer[i] * monitor_volume;
+                out_sample += self.monitor_mapped[i] * monitor_volume;
             }
 
             // Apply output volume and clamp
@@ -243,9 +335,9 @@ impl AudioProcessor {
             return;
         }
 
-        let output_channels = self.params.get_output_channels();
-        
-        if output_channels >= 2 {
+        let capture_channels = self.params.get_capture_channels();
+
+        if capture_channels >= 2 {
             // Duplicate mono to stereo (interleaved: L R L R ...)
             let mono_len = self.gained_buffer.len();
             let stereo_len = mono_len * 2;
@@ -267,29 +359,29 @@ impl AudioProcessor {
         }
     }
 
-    /// Receive remote audio from network via jitter buffer.
+    /// Receive remote audio from network via jitter buffer into
+    /// `remote_interleaved`. Returns the regulator's channel count, or `0`
+    /// when no network buffer is attached (the caller treats that as
+    /// silence).
     ///
-    /// Always fills `remote_buffer` with the appropriate audio for this callback:
-    /// the regulator's output (real packet, Burg-predicted concealment, or intentional
-    /// silence) when a network buffer is connected, or zeros when none is attached.
-    /// `Regulator::pop()`'s return value is informational metadata (real vs. concealed)
-    /// and must NOT gate playback — concealed audio is the entire point of jitter
-    /// buffering and must be played to avoid clicks.
-    fn receive_from_network(&mut self) {
+    /// `Regulator::pop()`'s return value is informational metadata (real vs.
+    /// concealed) and must NOT gate playback — concealed audio is the entire
+    /// point of jitter buffering and must be played to avoid clicks.
+    fn receive_from_network(&mut self, frames: usize) -> usize {
         // SAFETY: `Regulator::pop` is still `&mut self`, so we take a `&mut`
         // through `SharedPtr::as_mut`. The push side runs on the network thread;
         // this remains the not-yet-sound path documented on `SharedPtr::as_mut`.
         let Some(regulator) = (unsafe { self.network_to_local_buffer.as_mut() }) else {
-            self.remote_buffer.fill(0.0);
-            return;
+            return 0;
         };
 
         // The pop width is the regulator's own — it is the peer's channel
         // count (adopted from their first packet) and fpp, not a local
-        // playback-device setting. `AudioParams::output_channels` governs
-        // only the send path (Phase 2 renames it to make that explicit).
+        // playback-device setting. `AudioParams::capture_channels` governs
+        // only the send path.
         let channels = regulator.channels();
         let fpp = regulator.fpp();
+        debug_assert_eq!(fpp, frames, "regulator fpp must match the worklet's frame count");
         let interleaved_len = fpp * channels;
 
         if self.remote_interleaved.len() < interleaved_len {
@@ -300,12 +392,7 @@ impl AudioProcessor {
         // bool distinguishes real vs concealed but is irrelevant for mixing).
         regulator.pop(&mut self.remote_interleaved[..interleaved_len]);
 
-        if channels == 1 {
-            let len = self.remote_buffer.len().min(fpp);
-            self.remote_buffer[..len].copy_from_slice(&self.remote_interleaved[..len]);
-        } else {
-            downmix_to_mono(&self.remote_interleaved[..interleaved_len], channels, &mut self.remote_buffer);
-        }
+        channels
     }
 }
 
@@ -429,6 +516,71 @@ mod tests {
         assert!((mono_out[1] - 0.0).abs() < EPS, "missing frame must read as silence");
     }
 
+    // --- map_to_output ------------------------------------------------------
+
+    /// Full `src_channels × out_channels` matrix over `1..=8`, with
+    /// per-channel-distinguishable input (channel `ch` always carries value
+    /// `ch + 1`). Asserts every rule branch: the `out_channels == 1` average
+    /// (delegated to `downmix_to_mono`), the `src_channels == 1` copy-to-0/1,
+    /// the `src_channels == 2, out_channels > 2` copy-to-0/1, the general
+    /// 1:1-with-drop case, and silence on every unmapped output channel.
+    #[test]
+    fn test_map_to_output_matrix_covers_every_branch() {
+        let frames = 3usize;
+        for src_channels in 1..=8usize {
+            let frame: Vec<f32> = (0..src_channels).map(|ch| (ch + 1) as f32).collect();
+            let mut src = Vec::with_capacity(frames * src_channels);
+            for _ in 0..frames {
+                src.extend_from_slice(&frame);
+            }
+
+            for out_channels in 1..=8usize {
+                let mut out = vec![-99.0f32; frames * out_channels];
+                map_to_output(&src, src_channels, &mut out, out_channels);
+
+                if out_channels == 1 {
+                    let expected: f32 = frame.iter().sum::<f32>() / src_channels as f32;
+                    for &s in &out {
+                        assert!(
+                            (s - expected).abs() < EPS,
+                            "src={src_channels} out={out_channels}: average branch expected {expected}, got {s}"
+                        );
+                    }
+                    continue;
+                }
+
+                let (mapped_channels, expect_at): (usize, Box<dyn Fn(usize) -> f32>) =
+                    if src_channels == 1 {
+                        (2.min(out_channels), Box::new(|_ch: usize| frame[0]))
+                    } else if src_channels == 2 && out_channels > 2 {
+                        (2, Box::new(|ch: usize| frame[ch]))
+                    } else {
+                        (src_channels.min(out_channels), Box::new(|ch: usize| frame[ch]))
+                    };
+
+                for ch in 0..out_channels {
+                    let plane = &out[ch * frames..ch * frames + frames];
+                    if ch < mapped_channels {
+                        let expected = expect_at(ch);
+                        for &s in plane {
+                            assert!(
+                                (s - expected).abs() < EPS,
+                                "src={src_channels} out={out_channels} ch={ch}: expected {expected}, got {s}"
+                            );
+                        }
+                    } else {
+                        for &s in plane {
+                            assert_eq!(
+                                s, 0.0,
+                                "src={src_channels} out={out_channels} ch={ch}: unmapped channel must be silent"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // --- compute_rms ------------------------------------------------------------
 
     #[test]
@@ -491,7 +643,7 @@ mod tests {
         // Drive a loud signal through process() to establish a peak.
         let loud: Vec<f32> = vec![1.0; 128];
         let mut out = vec![0.0f32; 128];
-        processor.process(&loud, &mut out);
+        processor.process(&loud, &mut out, 1);
 
         let stored_after_peak = params.peak_db_level.load(std::sync::atomic::Ordering::Relaxed);
         assert!(stored_after_peak > encode_db(-60.0), "a loud signal must raise the peak");
@@ -500,7 +652,7 @@ mod tests {
         // The stored fixed-point value must remain bit-for-bit identical throughout.
         let silence: Vec<f32> = vec![0.0; 128];
         for frame in 0..PEAK_HOLD_FRAMES {
-            processor.process(&silence, &mut out);
+            processor.process(&silence, &mut out, 1);
             let stored = params.peak_db_level.load(std::sync::atomic::Ordering::Relaxed);
             assert_eq!(
                 stored,
@@ -510,7 +662,7 @@ mod tests {
         }
 
         // After hold expires, decay must have begun (stored value decreases).
-        processor.process(&silence, &mut out);
+        processor.process(&silence, &mut out, 1);
         let stored_after_decay = params.peak_db_level.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             stored_after_decay < stored_after_peak,
