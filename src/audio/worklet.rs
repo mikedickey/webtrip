@@ -53,6 +53,13 @@ impl ProcessorHandle {
     /// matches the fixed `ch * RENDER_QUANTUM_FRAMES` offsets the JS side
     /// builds its views at when `frames == RENDER_QUANTUM_FRAMES` — true for
     /// every live AudioWorklet callback.
+    ///
+    /// `out_channels` is clamped to [`MAX_CHANNELS`], the scratch buffers'
+    /// per-channel capacity: `create_worklet_node_with_flag` already caps the
+    /// worklet's `outputChannelCount` there, but this is the actual ABI
+    /// boundary crossed from JS, so it holds the same guarantee regardless of
+    /// caller (see PR #84 review — an unclamped `out_channels` above
+    /// `MAX_CHANNELS` sliced `output_scratch` out of bounds and panicked).
     pub fn render(&mut self, in_channels: usize, out_channels: usize, frames: usize) -> bool {
         // `in_channels` is accepted for forward compatibility with real
         // multichannel capture; only the first input plane is read today.
@@ -61,7 +68,7 @@ impl ProcessorHandle {
             frames <= RENDER_QUANTUM_FRAMES,
             "frames ({frames}) exceeds scratch buffer capacity ({RENDER_QUANTUM_FRAMES})"
         );
-        let out_channels = out_channels.max(1);
+        let out_channels = out_channels.max(1).min(MAX_CHANNELS as usize);
         (self.callback)(
             &self.input_scratch[..frames],
             &mut self.output_scratch[..out_channels * frames],
@@ -215,5 +222,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Regression test for PR #84 review: a destination reporting more than
+    /// `MAX_CHANNELS` (a multichannel audio interface) must not make `render`
+    /// slice `output_scratch` — capacity `RENDER_QUANTUM_FRAMES * MAX_CHANNELS`
+    /// — out of bounds. At a full render quantum, `MAX_CHANNELS + 1` output
+    /// channels is exactly the shape that panicked before `render` clamped
+    /// `out_channels`.
+    #[wasm_bindgen_test]
+    fn render_clamps_out_channels_above_max_channels() {
+        let frames = RENDER_QUANTUM_FRAMES;
+        let requested_out_channels = MAX_CHANNELS as usize + 1;
+        let seen_out_channels = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let seen = seen_out_channels.clone();
+
+        let mut handle = ProcessorHandle::new(Box::new(move |_input, output, out_ch| {
+            seen.set(out_ch);
+            output.fill(1.0);
+            true
+        }));
+
+        let result = handle.render(1, requested_out_channels, frames);
+        assert!(
+            result,
+            "render must not panic when out_channels exceeds MAX_CHANNELS"
+        );
+        assert_eq!(
+            seen_out_channels.get(),
+            MAX_CHANNELS as usize,
+            "render must clamp out_channels to MAX_CHANNELS before invoking the callback"
+        );
     }
 }
