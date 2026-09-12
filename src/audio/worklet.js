@@ -1,3 +1,8 @@
+// Must match `RENDER_QUANTUM_FRAMES` in worklet.rs (fixed by the Web Audio spec)
+// and `protocol::MAX_CHANNELS` in protocol.rs (the wire's channel limit).
+const RENDER_QUANTUM_FRAMES = 128;
+const MAX_CHANNELS = 8;
+
 registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProcessor {
     constructor(options) {
         super();
@@ -7,10 +12,16 @@ registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProce
         this.stopped = false;
         this.memory = memory;
         this.hasFlagPtr = hasFlagPtr;
-        
+
         // Create Int32Array view for Atomics operations
         // We'll update this on each process() call in case the buffer grows
         this.int32View = null;
+
+        // Float32Array views over the WASM processor's planar scratch
+        // buffers, one per channel plane. Rebuilt whenever memory.buffer has
+        // detached (grown) since the last build — see ensureViews().
+        this.inputViews = null;
+        this.outputViews = null;
 
         // Listen for stop message from main thread
         this.port.onmessage = (event) => {
@@ -19,21 +30,57 @@ registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProce
             }
         };
     }
+
+    // (Re)build the per-channel views over the processor's input/output
+    // scratch buffers. A no-op unless memory.buffer has detached (grown)
+    // since the last call, since a detached buffer's views can no longer be
+    // read or written.
+    ensureViews() {
+        if (this.inputViews !== null && this.inputViews[0].buffer === this.memory.buffer) {
+            return;
+        }
+        const inputPtr = this.processor.input_ptr();
+        const outputPtr = this.processor.output_ptr();
+        this.inputViews = [];
+        this.outputViews = [];
+        for (let ch = 0; ch < MAX_CHANNELS; ch++) {
+            const byteOffset = ch * RENDER_QUANTUM_FRAMES * Float32Array.BYTES_PER_ELEMENT;
+            this.inputViews.push(
+                new Float32Array(this.memory.buffer, inputPtr + byteOffset, RENDER_QUANTUM_FRAMES)
+            );
+            this.outputViews.push(
+                new Float32Array(this.memory.buffer, outputPtr + byteOffset, RENDER_QUANTUM_FRAMES)
+            );
+        }
+    }
+
     process(inputs, outputs) {
         // Stop processing if signaled
         if (this.stopped) {
             return false;
         }
-        
-        // Get input buffer (from microphone/audio source)
-        const input = inputs[0]?.[0];
-        
-        // Get output buffer
-        const output = outputs[0]?.[0] || new Float32Array(128);
-        
+
+        this.ensureViews();
+
+        // Capture stays mono until real multichannel capture lands, so only
+        // channel 0 of the input plane is ever populated with real samples.
+        const inputChannel = inputs[0]?.[0];
+        if (inputChannel) {
+            this.inputViews[0].set(inputChannel);
+        } else {
+            this.inputViews[0].fill(0);
+        }
+
+        const inChannels = inputs[0]?.length || 1;
+        const outChannels = outputs[0]?.length || 1;
+
         // Process audio through the Wasm processor (even if no input for playback)
-        const result = this.processor.process(input || new Float32Array(128), output);
-        
+        const result = this.processor.render(inChannels, outChannels, RENDER_QUANTUM_FRAMES);
+
+        for (let ch = 0; ch < outChannels; ch++) {
+            outputs[0][ch]?.set(this.outputViews[ch]);
+        }
+
         // Signal main thread to process send/receive via Atomics.notify
         // This ensures bidirectional audio works even in listen-only mode
         if (this.hasFlagPtr !== undefined) {
@@ -45,7 +92,7 @@ registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProce
             // Now notify any waiters (main thread waiting via Atomics.waitAsync)
             Atomics.notify(this.int32View, flagIndex, 1);
         }
-        
+
         return result;
     }
 });
