@@ -1,6 +1,7 @@
 use crate::audio::devices::{get_media_devices, stop_media_stream};
 use crate::audio::params::AudioParams;
 use crate::audio::processor::AudioProcessor;
+use crate::audio::protocol::MAX_CHANNELS;
 use crate::audio::worklet::{create_worklet_node_with_flag, register_audio_worklet};
 use crate::audio::regulator::Regulator;
 use crate::audio::ring_buffer::RingBuffer;
@@ -209,9 +210,14 @@ impl AudioEngine {
     /// Read the destination's max channel count and configure it explicit /
     /// discrete at that width, so the browser never speaker-folds or
     /// up-mixes on our behalf. Returns the configured count.
+    ///
+    /// Clamped to [`MAX_CHANNELS`]: the worklet ABI's scratch buffers
+    /// (`ProcessorHandle`) and `worklet.js`'s channel views are both fixed at
+    /// that width, so a wider interface must be addressed at its first
+    /// `MAX_CHANNELS` outputs rather than its full `max_channel_count()`.
     fn configure_destination(&self) -> Result<u32, JsValue> {
         let destination = self.ctx.destination();
-        let max_channels = destination.max_channel_count();
+        let max_channels = destination.max_channel_count().min(MAX_CHANNELS as u32);
         destination.set_channel_count(max_channels);
         destination.set_channel_count_mode(web_sys::ChannelCountMode::Explicit);
         destination.set_channel_interpretation(ChannelInterpretation::Discrete);
