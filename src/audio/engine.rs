@@ -249,8 +249,8 @@ impl AudioEngine {
             AudioProcessor::with_network(params, local_to_network, network_to_local)
         };
 
-        let process = Box::new(move |input: &[f32], output: &mut [f32], out_channels: usize| {
-            processor.process(input, output, out_channels)
+        let process = Box::new(move |input: &[f32], in_channels: usize, output: &mut [f32], out_channels: usize| {
+            processor.process(input, in_channels, output, out_channels)
         });
 
         // Get ring buffer flag pointer for event-driven wake-up
