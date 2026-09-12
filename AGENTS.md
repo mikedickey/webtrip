@@ -142,6 +142,7 @@ When deleting or refactoring production code, delete its tests rather than porti
 - **`src/models/`** — Typed data models with auto-generated TypeScript types via `tsify-next`
 - **`src/lib.rs`** — WASM entry point, exports `init()` and public types to JavaScript
 - **`website/`** — React SPA for webtrip.dev (Vite, own package.json); the demo lives at the `/demo` route (`website/src/pages/demo/`) and loads the wasm-pack output at runtime from `/pkg/` (unbundled — the WebTransport worker re-imports `{origin}/pkg/webtrip.js`, see `wasm_module_url`). `website/server.js` serves the built site plus repo-root `pkg/` with the COOP/COEP headers SharedArrayBuffer needs
+- **`plans/`** — planning documents for work that is in progress, already completed, or superseded; see [plans/AGENTS.md](plans/AGENTS.md). Only read files in this directory when actively working on a specific plan, or when trying to understand the original implementation of a specific feature — do not read it otherwise
 
 ## Rust/WASM Specifics
 
