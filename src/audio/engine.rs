@@ -268,13 +268,37 @@ impl AudioEngine {
         worklet_node.connect_with_audio_node(&self.ctx.destination())?;
 
         if let Some(ref old_node) = self.worklet_node {
-            let _ = old_node.disconnect();
+            self.teardown_worklet_node(old_node);
         }
 
         self.worklet_node = Some(worklet_node);
         self.worklet_output_channels = output_channels;
 
         Ok(())
+    }
+
+    /// Fully detach `node` from the audio graph: post `"stop"` on its port
+    /// (see `worklet.js`) so its processor's `process()` returns `false` once
+    /// the message is delivered, and disconnect it in both directions.
+    ///
+    /// Both steps matter. Per the Web Audio spec, an `AudioWorkletNode` whose
+    /// `process()` last returned `true` keeps being invoked on the render
+    /// thread even with no output connections — `node.disconnect()` alone
+    /// only drops outgoing connections, so a node built by
+    /// `build_and_connect_worklet_node` and later replaced (e.g. by
+    /// `set_output_device`'s rebuild) would otherwise linger as an "active
+    /// processing" node: still popping the shared [`Regulator`] and writing
+    /// the send ring buffer every callback alongside its replacement.
+    ///
+    /// [`Regulator`]: crate::audio::regulator::Regulator
+    fn teardown_worklet_node(&self, node: &AudioWorkletNode) {
+        if let Ok(port) = node.port() {
+            let _ = port.post_message(&JsValue::from_str("stop"));
+        }
+        if let Some(ref source) = self.source_node {
+            let _ = source.disconnect_with_audio_node(node);
+        }
+        let _ = node.disconnect();
     }
 
     /// Check whether the AudioContext is still suspended (e.g. waiting for a user gesture on iOS).
@@ -303,24 +327,13 @@ impl AudioEngine {
     /// Stop audio capture
     #[wasm_bindgen(js_name = stopCapture)]
     pub fn stop_capture(&mut self) {
-        // Signal the worklet to stop processing
         if let Some(ref node) = self.worklet_node {
-            if let Ok(port) = node.port() {
-                let _ = port.post_message(&JsValue::from_str("stop"));
-            }
+            self.teardown_worklet_node(node);
         }
 
         // Stop all tracks in the stream
         if let Some(ref stream) = self.current_stream {
             stop_media_stream(stream);
-        }
-
-        // Disconnect nodes
-        if let Some(ref node) = self.source_node {
-            let _ = node.disconnect();
-        }
-        if let Some(ref node) = self.worklet_node {
-            let _ = node.disconnect();
         }
 
         self.source_node = None;
