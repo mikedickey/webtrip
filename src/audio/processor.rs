@@ -519,19 +519,25 @@ mod tests {
     // --- map_to_output ------------------------------------------------------
 
     /// Full `src_channels × out_channels` matrix over `1..=8`, with
-    /// per-channel-distinguishable input (channel `ch` always carries value
-    /// `ch + 1`). Asserts every rule branch: the `out_channels == 1` average
-    /// (delegated to `downmix_to_mono`), the `src_channels == 1` copy-to-0/1,
-    /// the `src_channels == 2, out_channels > 2` copy-to-0/1, the general
+    /// per-frame-*and*-per-channel-distinguishable input (frame `f` channel
+    /// `ch` carries value `f * 10 + ch + 1`, never repeated across frames) so
+    /// a mapping bug that reads the wrong frame — e.g. always frame 0 — fails
+    /// the assertions instead of accidentally matching. Asserts every rule
+    /// branch: the `out_channels == 1` average (delegated to
+    /// `downmix_to_mono`), the `src_channels == 1` copy-to-0/1, the
+    /// `src_channels == 2, out_channels > 2` copy-to-0/1, the general
     /// 1:1-with-drop case, and silence on every unmapped output channel.
     #[test]
     fn test_map_to_output_matrix_covers_every_branch() {
         let frames = 3usize;
+        let value = |frame: usize, ch: usize| (frame * 10 + ch + 1) as f32;
+
         for src_channels in 1..=8usize {
-            let frame: Vec<f32> = (0..src_channels).map(|ch| (ch + 1) as f32).collect();
             let mut src = Vec::with_capacity(frames * src_channels);
-            for _ in 0..frames {
-                src.extend_from_slice(&frame);
+            for frame in 0..frames {
+                for ch in 0..src_channels {
+                    src.push(value(frame, ch));
+                }
             }
 
             for out_channels in 1..=8usize {
@@ -539,33 +545,38 @@ mod tests {
                 map_to_output(&src, src_channels, &mut out, out_channels);
 
                 if out_channels == 1 {
-                    let expected: f32 = frame.iter().sum::<f32>() / src_channels as f32;
-                    for &s in &out {
+                    for frame in 0..frames {
+                        let expected: f32 =
+                            (0..src_channels).map(|ch| value(frame, ch)).sum::<f32>() / src_channels as f32;
+                        let s = out[frame];
                         assert!(
                             (s - expected).abs() < EPS,
-                            "src={src_channels} out={out_channels}: average branch expected {expected}, got {s}"
+                            "src={src_channels} out={out_channels} frame={frame}: average branch expected {expected}, got {s}"
                         );
                     }
                     continue;
                 }
 
-                let (mapped_channels, expect_at): (usize, Box<dyn Fn(usize) -> f32>) =
+                let (mapped_channels, expect_at): (usize, Box<dyn Fn(usize, usize) -> f32>) =
                     if src_channels == 1 {
-                        (2.min(out_channels), Box::new(|_ch: usize| frame[0]))
+                        (2.min(out_channels), Box::new(|_ch: usize, frame: usize| value(frame, 0)))
                     } else if src_channels == 2 && out_channels > 2 {
-                        (2, Box::new(|ch: usize| frame[ch]))
+                        (2, Box::new(|ch: usize, frame: usize| value(frame, ch)))
                     } else {
-                        (src_channels.min(out_channels), Box::new(|ch: usize| frame[ch]))
+                        (
+                            src_channels.min(out_channels),
+                            Box::new(|ch: usize, frame: usize| value(frame, ch)),
+                        )
                     };
 
                 for ch in 0..out_channels {
                     let plane = &out[ch * frames..ch * frames + frames];
                     if ch < mapped_channels {
-                        let expected = expect_at(ch);
-                        for &s in plane {
+                        for (frame, &s) in plane.iter().enumerate() {
+                            let expected = expect_at(ch, frame);
                             assert!(
                                 (s - expected).abs() < EPS,
-                                "src={src_channels} out={out_channels} ch={ch}: expected {expected}, got {s}"
+                                "src={src_channels} out={out_channels} ch={ch} frame={frame}: expected {expected}, got {s}"
                             );
                         }
                     } else {
