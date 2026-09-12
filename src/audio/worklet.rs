@@ -48,27 +48,23 @@ impl ProcessorHandle {
 
     /// Render one callback's worth of audio through the wrapped processor.
     ///
-    /// `frames` must not exceed `RENDER_QUANTUM_FRAMES`. The output planes
-    /// this writes are laid out contiguously at stride `frames`, which only
-    /// matches the fixed `ch * RENDER_QUANTUM_FRAMES` offsets the JS side
-    /// builds its views at when `frames == RENDER_QUANTUM_FRAMES` — true for
-    /// every live AudioWorklet callback.
-    ///
-    /// `out_channels` is clamped to [`MAX_CHANNELS`], the scratch buffers'
-    /// per-channel capacity: `create_worklet_node_with_flag` already caps the
-    /// worklet's `outputChannelCount` there, but this is the actual ABI
-    /// boundary crossed from JS, so it holds the same guarantee regardless of
-    /// caller (see PR #84 review — an unclamped `out_channels` above
-    /// `MAX_CHANNELS` sliced `output_scratch` out of bounds and panicked).
+    /// `frames` is clamped to [`RENDER_QUANTUM_FRAMES`] and `out_channels` to
+    /// [`MAX_CHANNELS`] — both scratch buffers' actual capacity — because this
+    /// is the ABI boundary crossed from JS: `debug_assert!` alone does not
+    /// run in an optimized (release) Wasm build, so an out-of-range value
+    /// from a caller would otherwise slice `input_scratch`/`output_scratch`
+    /// out of bounds and panic regardless of build profile (see PR #84
+    /// review). The output planes this writes are laid out contiguously at
+    /// stride `frames`, which only matches the fixed
+    /// `ch * RENDER_QUANTUM_FRAMES` offsets the JS side builds its views at
+    /// when `frames == RENDER_QUANTUM_FRAMES` — true for every live
+    /// AudioWorklet callback.
     pub fn render(&mut self, in_channels: usize, out_channels: usize, frames: usize) -> bool {
         // `in_channels` is accepted for forward compatibility with real
         // multichannel capture; only the first input plane is read today.
         let _ = in_channels;
-        debug_assert!(
-            frames <= RENDER_QUANTUM_FRAMES,
-            "frames ({frames}) exceeds scratch buffer capacity ({RENDER_QUANTUM_FRAMES})"
-        );
         let out_channels = out_channels.max(1).min(MAX_CHANNELS as usize);
+        let frames = frames.min(RENDER_QUANTUM_FRAMES);
         (self.callback)(
             &self.input_scratch[..frames],
             &mut self.output_scratch[..out_channels * frames],
@@ -252,6 +248,62 @@ mod tests {
             seen_out_channels.get(),
             MAX_CHANNELS as usize,
             "render must clamp out_channels to MAX_CHANNELS before invoking the callback"
+        );
+    }
+
+    /// Regression test for PR #84 review: the *lower* boundary of the
+    /// `out_channels` clamp. `render_clamps_out_channels_above_max_channels`
+    /// only covers the upper bound; a caller passing `0` (or a regression
+    /// that dropped the `.max(1)`) must still see the callback invoked with
+    /// exactly one output channel rather than an empty output slice.
+    #[wasm_bindgen_test]
+    fn render_clamps_out_channels_below_one() {
+        let frames = RENDER_QUANTUM_FRAMES;
+        let seen_out_channels = std::rc::Rc::new(std::cell::Cell::new(usize::MAX));
+        let seen = seen_out_channels.clone();
+
+        let mut handle = ProcessorHandle::new(Box::new(move |_input, output, out_ch| {
+            seen.set(out_ch);
+            output.fill(1.0);
+            true
+        }));
+
+        let result = handle.render(1, 0, frames);
+        assert!(result, "render must not panic when out_channels is 0");
+        assert_eq!(
+            seen_out_channels.get(),
+            1,
+            "render must clamp out_channels up to 1 before invoking the callback"
+        );
+    }
+
+    /// Regression test for PR #84 review: `render`'s `frames` argument used
+    /// to be checked only by a `debug_assert!`, which does not run in an
+    /// optimized (release) Wasm build — the build every `npm run build:wasm`
+    /// invocation produces. A `frames` above `RENDER_QUANTUM_FRAMES` must be
+    /// clamped rather than left to slice `input_scratch`/`output_scratch` out
+    /// of bounds and panic.
+    #[wasm_bindgen_test]
+    fn render_clamps_frames_above_render_quantum() {
+        let requested_frames = RENDER_QUANTUM_FRAMES + 1;
+        let seen_frames = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let seen = seen_frames.clone();
+
+        let mut handle = ProcessorHandle::new(Box::new(move |input, output, _out_ch| {
+            seen.set(input.len());
+            output.fill(1.0);
+            true
+        }));
+
+        let result = handle.render(1, 1, requested_frames);
+        assert!(
+            result,
+            "render must not panic when frames exceeds RENDER_QUANTUM_FRAMES"
+        );
+        assert_eq!(
+            seen_frames.get(),
+            RENDER_QUANTUM_FRAMES,
+            "render must clamp frames to RENDER_QUANTUM_FRAMES before invoking the callback"
         );
     }
 }
