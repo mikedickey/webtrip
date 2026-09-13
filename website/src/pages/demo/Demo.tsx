@@ -223,11 +223,11 @@ export default function Demo() {
     if (sessionState === "error" && session) beginDisconnect(session);
   }, [sessionState]);
 
-  // Capture only starts after a successful connectToStudio, so "connected" is
-  // the earliest point the browser has actually granted/discovered a channel
-  // count. Reset to "unknown" whenever the session leaves connected, so a
-  // later reconnect — possibly to a different input device — doesn't keep
-  // showing a stale gate.
+  // Reset to "unknown" whenever the session leaves connected, so a later
+  // reconnect — possibly to a different input device — doesn't keep showing a
+  // stale gate. The connected branch is a backstop only: the session reports
+  // "connected" before capture (and therefore channel discovery) starts, so
+  // handleConnect is what actually publishes the discovered count.
   useEffect(() => {
     if (!engine || sessionState !== "connected") {
       setMaxInputChannels(0);
@@ -295,6 +295,13 @@ export default function Demo() {
         }),
       ]);
       if (!mountedRef.current) return;
+
+      // connectToStudio only resolves after start_capture, so this is the
+      // first point the browser's granted channel count is actually known.
+      // The sessionState effect below can't serve here: the session reports
+      // "connected" before capture starts, so it would read the 0 sentinel
+      // and never re-run for this connection.
+      setMaxInputChannels(engine.session.getMaxInputChannels());
 
       try {
         await engine.session.setOutputDevice(outputDeviceId || undefined);
