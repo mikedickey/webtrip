@@ -55,6 +55,9 @@ web-sys = { version = "0.3.83", features = [
   "MediaStreamAudioSourceNode",
   "MediaStreamConstraints",
   "MediaStreamTrack",
+  "MediaTrackSettings",
+  "MediaTrackCapabilities",
+  "ULongRange",
   
   # For dependent_module (worklet.js loading)
   "Blob",

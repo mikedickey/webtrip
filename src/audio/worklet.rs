@@ -11,10 +11,10 @@ pub const RENDER_QUANTUM_FRAMES: usize = 128;
 
 /// Type alias for the audio processing callback.
 ///
-/// `input` is one render quantum of mono capture (real multichannel capture
-/// is a later phase). `output` is planar across `out_channels` output
-/// channels: `output[ch * frames + frame]`, `frames == input.len()`.
-pub type ProcessorCallback = Box<dyn FnMut(&[f32], &mut [f32], usize) -> bool>;
+/// `input` is planar across `in_channels` input channels: `input[ch * frames
+/// + frame]`. `output` is planar across `out_channels` output channels:
+/// `output[ch * frames + frame]`, `frames == input.len() / in_channels`.
+pub type ProcessorCallback = Box<dyn FnMut(&[f32], usize, &mut [f32], usize) -> bool>;
 
 /// Handle for a WASM audio processor that can be passed to the AudioWorklet.
 ///
@@ -27,8 +27,7 @@ pub type ProcessorCallback = Box<dyn FnMut(&[f32], &mut [f32], usize) -> bool>;
 pub struct ProcessorHandle {
     callback: ProcessorCallback,
     /// Planar input scratch: channel `ch`'s samples live at
-    /// `[ch * RENDER_QUANTUM_FRAMES .. + frames]`. Only channel 0 is read
-    /// today (capture stays mono until real multichannel capture lands).
+    /// `[ch * RENDER_QUANTUM_FRAMES .. + frames]`.
     input_scratch: Vec<f32>,
     /// Planar output scratch, same per-channel layout as `input_scratch`.
     output_scratch: Vec<f32>,
@@ -48,25 +47,24 @@ impl ProcessorHandle {
 
     /// Render one callback's worth of audio through the wrapped processor.
     ///
-    /// `frames` is clamped to [`RENDER_QUANTUM_FRAMES`] and `out_channels` to
-    /// [`MAX_CHANNELS`] — both scratch buffers' actual capacity — because this
-    /// is the ABI boundary crossed from JS: `debug_assert!` alone does not
-    /// run in an optimized (release) Wasm build, so an out-of-range value
-    /// from a caller would otherwise slice `input_scratch`/`output_scratch`
-    /// out of bounds and panic regardless of build profile (see PR #84
-    /// review). The output planes this writes are laid out contiguously at
-    /// stride `frames`, which only matches the fixed
-    /// `ch * RENDER_QUANTUM_FRAMES` offsets the JS side builds its views at
-    /// when `frames == RENDER_QUANTUM_FRAMES` — true for every live
-    /// AudioWorklet callback.
+    /// `frames` is clamped to [`RENDER_QUANTUM_FRAMES`] and `in_channels`/
+    /// `out_channels` to [`MAX_CHANNELS`] — both scratch buffers' actual
+    /// capacity — because this is the ABI boundary crossed from JS:
+    /// `debug_assert!` alone does not run in an optimized (release) Wasm
+    /// build, so an out-of-range value from a caller would otherwise slice
+    /// `input_scratch`/`output_scratch` out of bounds and panic regardless of
+    /// build profile (see PR #84 review). The input and output planes this
+    /// reads/writes are laid out contiguously at stride `frames`, which only
+    /// matches the fixed `ch * RENDER_QUANTUM_FRAMES` offsets the JS side
+    /// builds its views at when `frames == RENDER_QUANTUM_FRAMES` — true for
+    /// every live AudioWorklet callback.
     pub fn render(&mut self, in_channels: usize, out_channels: usize, frames: usize) -> bool {
-        // `in_channels` is accepted for forward compatibility with real
-        // multichannel capture; only the first input plane is read today.
-        let _ = in_channels;
+        let in_channels = in_channels.max(1).min(MAX_CHANNELS as usize);
         let out_channels = out_channels.max(1).min(MAX_CHANNELS as usize);
         let frames = frames.min(RENDER_QUANTUM_FRAMES);
         (self.callback)(
-            &self.input_scratch[..frames],
+            &self.input_scratch[..in_channels * frames],
+            in_channels,
             &mut self.output_scratch[..out_channels * frames],
             out_channels,
         )
@@ -178,7 +176,7 @@ mod tests {
         let frames = 4usize;
         let out_channels = 2usize;
 
-        let mut handle = ProcessorHandle::new(Box::new(move |input, output, out_ch| {
+        let mut handle = ProcessorHandle::new(Box::new(move |input, _in_ch, output, out_ch| {
             // Mirror `map_to_output`'s src_channels==1 rule: copy the mono
             // input to every output channel plane, scaled by channel index so
             // the two planes are distinguishable in the assertion below.
@@ -220,6 +218,71 @@ mod tests {
         }
     }
 
+    /// Drives `render` with a genuinely multi-channel *input* plane: writes
+    /// per-channel-distinguishable values into `input_scratch` via
+    /// `input_ptr()` (mirroring
+    /// `render_writes_planar_output_through_scratch_buffers`'s pattern for
+    /// writing raw scratch memory), calls `render(2, ..., frames)`, and
+    /// asserts the callback observes `in_channels == 2` and can read both
+    /// input planes correctly.
+    #[wasm_bindgen_test]
+    fn render_passes_planar_input_through_scratch_buffer() {
+        let frames = 4usize;
+        let in_channels = 2usize;
+
+        let seen_in_channels = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let seen = seen_in_channels.clone();
+        let seen_samples = std::rc::Rc::new(std::cell::RefCell::new(Vec::<f32>::new()));
+        let samples = seen_samples.clone();
+
+        let mut handle = ProcessorHandle::new(Box::new(move |input, in_ch, output, _out_ch| {
+            seen.set(in_ch);
+            samples.borrow_mut().extend_from_slice(input);
+            output.fill(1.0);
+            true
+        }));
+
+        let input_ptr = handle.input_ptr();
+        // SAFETY: `input_ptr` points at `handle`'s own live `input_scratch`
+        // `Vec<f32>`, which JS would instead reach through a `Float32Array`
+        // view over wasm memory at this same address. `render` hands the
+        // callback a *contiguous* `[..in_channels * frames]` prefix of this
+        // buffer (see its doc comment), so at `frames < RENDER_QUANTUM_FRAMES`
+        // (as here) the planes are packed at stride `frames`, not
+        // `RENDER_QUANTUM_FRAMES` — the fixed `RENDER_QUANTUM_FRAMES` stride
+        // only applies to the JS side's per-channel views, which line up with
+        // this contiguous slicing at a real `frames == RENDER_QUANTUM_FRAMES`
+        // callback, not at this test's deliberately small `frames`.
+        let input_scratch =
+            unsafe { std::slice::from_raw_parts_mut(input_ptr as *mut f32, in_channels * frames) };
+        for ch in 0..in_channels {
+            for f in 0..frames {
+                input_scratch[ch * frames + f] = (ch as f32 * 100.0) + f as f32 + 1.0;
+            }
+        }
+
+        let result = handle.render(in_channels, 1, frames);
+        assert!(result, "render must return the callback's result");
+        assert_eq!(
+            seen_in_channels.get(),
+            in_channels,
+            "callback must observe the clamped in_channels value"
+        );
+
+        let received = seen_samples.borrow();
+        assert_eq!(received.len(), in_channels * frames);
+        for ch in 0..in_channels {
+            for f in 0..frames {
+                let expected = (ch as f32 * 100.0) + f as f32 + 1.0;
+                let actual = received[ch * frames + f];
+                assert_eq!(
+                    actual, expected,
+                    "channel {ch} frame {f}: expected {expected}, got {actual}"
+                );
+            }
+        }
+    }
+
     /// Regression test for PR #84 review: a destination reporting more than
     /// `MAX_CHANNELS` (a multichannel audio interface) must not make `render`
     /// slice `output_scratch` — capacity `RENDER_QUANTUM_FRAMES * MAX_CHANNELS`
@@ -233,7 +296,7 @@ mod tests {
         let seen_out_channels = std::rc::Rc::new(std::cell::Cell::new(0usize));
         let seen = seen_out_channels.clone();
 
-        let mut handle = ProcessorHandle::new(Box::new(move |_input, output, out_ch| {
+        let mut handle = ProcessorHandle::new(Box::new(move |_input, _in_ch, output, out_ch| {
             seen.set(out_ch);
             output.fill(1.0);
             true
@@ -262,7 +325,7 @@ mod tests {
         let seen_out_channels = std::rc::Rc::new(std::cell::Cell::new(usize::MAX));
         let seen = seen_out_channels.clone();
 
-        let mut handle = ProcessorHandle::new(Box::new(move |_input, output, out_ch| {
+        let mut handle = ProcessorHandle::new(Box::new(move |_input, _in_ch, output, out_ch| {
             seen.set(out_ch);
             output.fill(1.0);
             true
@@ -274,6 +337,60 @@ mod tests {
             seen_out_channels.get(),
             1,
             "render must clamp out_channels up to 1 before invoking the callback"
+        );
+    }
+
+    /// `in_channels` analog of `render_clamps_out_channels_above_max_channels`:
+    /// a capture device reporting more than `MAX_CHANNELS` input planes must
+    /// not make `render` slice `input_scratch` — capacity
+    /// `RENDER_QUANTUM_FRAMES * MAX_CHANNELS` — out of bounds.
+    #[wasm_bindgen_test]
+    fn render_clamps_in_channels_above_max_channels() {
+        let frames = RENDER_QUANTUM_FRAMES;
+        let requested_in_channels = MAX_CHANNELS as usize + 1;
+        let seen_in_channels = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let seen = seen_in_channels.clone();
+
+        let mut handle = ProcessorHandle::new(Box::new(move |_input, in_ch, output, _out_ch| {
+            seen.set(in_ch);
+            output.fill(1.0);
+            true
+        }));
+
+        let result = handle.render(requested_in_channels, 1, frames);
+        assert!(
+            result,
+            "render must not panic when in_channels exceeds MAX_CHANNELS"
+        );
+        assert_eq!(
+            seen_in_channels.get(),
+            MAX_CHANNELS as usize,
+            "render must clamp in_channels to MAX_CHANNELS before invoking the callback"
+        );
+    }
+
+    /// `in_channels` analog of `render_clamps_out_channels_below_one`: a
+    /// caller passing `0` (or a regression that dropped the `.max(1)`) must
+    /// still see the callback invoked with exactly one input channel rather
+    /// than an empty input slice.
+    #[wasm_bindgen_test]
+    fn render_clamps_in_channels_below_one() {
+        let frames = RENDER_QUANTUM_FRAMES;
+        let seen_in_channels = std::rc::Rc::new(std::cell::Cell::new(usize::MAX));
+        let seen = seen_in_channels.clone();
+
+        let mut handle = ProcessorHandle::new(Box::new(move |_input, in_ch, output, _out_ch| {
+            seen.set(in_ch);
+            output.fill(1.0);
+            true
+        }));
+
+        let result = handle.render(0, 1, frames);
+        assert!(result, "render must not panic when in_channels is 0");
+        assert_eq!(
+            seen_in_channels.get(),
+            1,
+            "render must clamp in_channels up to 1 before invoking the callback"
         );
     }
 
@@ -289,7 +406,7 @@ mod tests {
         let seen_frames = std::rc::Rc::new(std::cell::Cell::new(0usize));
         let seen = seen_frames.clone();
 
-        let mut handle = ProcessorHandle::new(Box::new(move |input, output, _out_ch| {
+        let mut handle = ProcessorHandle::new(Box::new(move |input, _in_ch, output, _out_ch| {
             seen.set(input.len());
             output.fill(1.0);
             true

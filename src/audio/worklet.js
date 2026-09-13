@@ -62,16 +62,19 @@ registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProce
 
         this.ensureViews();
 
-        // Capture stays mono until real multichannel capture lands, so only
-        // channel 0 of the input plane is ever populated with real samples.
-        const inputChannel = inputs[0]?.[0];
-        if (inputChannel) {
-            this.inputViews[0].set(inputChannel);
-        } else {
-            this.inputViews[0].fill(0);
+        // Copy every input channel plane the browser actually delivered this
+        // callback into the corresponding WASM scratch view.
+        const inputChannels = inputs[0] || [];
+        const inChannels = inputChannels.length || 1;
+        for (let ch = 0; ch < inChannels; ch++) {
+            const chan = inputChannels[ch];
+            if (chan) {
+                this.inputViews[ch].set(chan);
+            } else {
+                this.inputViews[ch].fill(0);
+            }
         }
 
-        const inChannels = inputs[0]?.length || 1;
         const outChannels = outputs[0]?.length || 1;
 
         // Process audio through the Wasm processor (even if no input for playback)

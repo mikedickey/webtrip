@@ -254,21 +254,48 @@ through the scratch buffers and asserting the output planes.
 
 ## Phase 3 — Real multichannel capture
 
-- `AudioConstraints` (`engine.rs:23-31`) gains `channel_count`; `to_js` emits
-  `channelCount: { ideal: n }`. Chrome forces mono when `echoCancellation` is on, so stereo capture
-  requires the processing toggles off — the UI must say so rather than silently yielding mono.
-- After `getUserMedia`, read `track.getSettings().channelCount` for what was actually granted (the
-  true capture width) and `getCapabilities().channelCount.max` for the UI gate, falling back to
-  settings where capabilities are unavailable. `Cargo.toml`: add `MediaTrackSettings`,
-  `MediaTrackCapabilities`, `MediaTrackConstraints`.
-- Worklet input side becomes `channelCount = capture_channels`, explicit/discrete, so channel 2 is
-  no longer folded into channel 1.
-- `send_local_to_network` (`processor.rs:213-246`) interleaves the real N capture channels instead of
-  duplicating one — the `stereo_buffer` field and its "mono duplicated to both channels" comment go
-  away.
-- `WebTripSession` exposes the granted and maximum input channel counts to JS.
-- `Demo.tsx`: `ToggleButton` (`:68-85`) has no `disabled` prop today — add one, gate the Stereo
-  button on max input channels, and force Mono when it is 1.
+- `AudioConstraints` (`engine.rs`) gains `channel_count`; `to_js` emits `channelCount: { ideal: n }`
+  via the same manual `js_sys::Object`/`Reflect::set` pattern the `deviceId` constraint already uses
+  (not the typed `MediaTrackConstraints` builder). Chrome forces mono when `echoCancellation` is on,
+  so stereo capture requires the processing toggles off — the UI must say so rather than silently
+  yielding mono.
+- After `getUserMedia`, `start_capture` reads `track.getSettings().channelCount` for what was
+  actually granted (the true capture width) and `getCapabilities().channelCount.max` for the UI gate,
+  falling back to the granted value where capabilities are unavailable, both clamped to
+  `[1, MAX_CHANNELS]`. `Cargo.toml`: add `MediaTrackSettings`, `MediaTrackCapabilities`, and
+  `ULongRange` (the capability range type `getChannelCount()` returns) — not `MediaTrackConstraints`,
+  since the constraint side stays on the manual-object pattern above.
+- Worklet input side becomes `channelCount = granted_input_channels`, explicit/discrete, so channel 2
+  is no longer folded into channel 1. `build_and_connect_worklet_node` takes the real granted count at
+  both call sites (initial `start_capture` and the `set_output_device` rebuild-on-sink-change path).
+- The worklet ABI (`ProcessorCallback`, `ProcessorHandle::render`) carries a real `in_channels`-wide
+  planar input plane end to end, replacing the old always-channel-0-only read.
+  `AudioProcessor::process` applies gain and computes the level meter (max RMS across capture
+  channels, via `max_channel_rms`) over the true captured width, then converts planar → interleaved
+  once per callback (`interleave_planar`, into a shared `captured_interleaved` buffer) for both the
+  monitor mix and the network-send path — one conversion, not two.
+- **The network wire's channel count is a separate, fixed contract from the real captured width.**
+  `AudioBufferConfig.channels` (snapshotted from the Mono/Stereo toggle at connect time) still governs
+  how `webrtc.rs`/`webtransport_worker.rs` frame outbound packets — that did not change, and changing
+  it would mean discovering the real channel count before the transport is configured, a larger and
+  riskier restructuring than this phase needs. So `send_local_to_network` (`processor.rs`) conforms
+  the real captured width to that fixed wire width — via a new `conform_interleaved_channels`
+  function mirroring `map_to_output`'s mapping policy but for interleaved-to-interleaved data, into a
+  dedicated `wire_conformed` scratch buffer — whenever they differ (e.g. a mono-only input device with
+  the Stereo toggle still on). Skipping this conform step and just writing the real captured width to
+  the wire is a live regression: the transports would still frame packets at the old fixed width,
+  corrupting outbound audio for exactly the mismatched-device case this phase exists to support
+  correctly. The old `stereo_buffer` field and its "mono duplicated to both channels" duplication
+  logic are gone either way — replaced by this general N→M conform, not restored.
+- `WebTripSession` exposes the granted and maximum input channel counts to JS
+  (`getGrantedInputChannels`/`getMaxInputChannels`, both `0` before any capture has started — real
+  counts are always ≥1).
+- `Demo.tsx`: `ToggleButton` gains a `disabled` prop; the Stereo button is gated on max input channels
+  and forced to show Mono when it is 1 — display-only, since `setChannels` is Idle-only and the real
+  captured/sent width already tracks reality regardless of this toggle. The gate is read in
+  `handleConnect` right after `connectToStudio` resolves, not from a `sessionState === "connected"`
+  effect alone — the session's state callback fires `Connected` before capture (and channel discovery)
+  actually starts, so that effect alone would always see the "not yet known" sentinel.
 
 ---
 

@@ -29,6 +29,9 @@ struct AudioConstraints {
     auto_gain_control: bool,
     echo_cancellation: bool,
     noise_suppression: bool,
+    /// Desired capture channel count, sent as an `ideal` (not `exact`)
+    /// `channelCount` constraint. `None` means no preference is expressed.
+    channel_count: Option<u32>,
 }
 
 impl AudioConstraints {
@@ -38,12 +41,14 @@ impl AudioConstraints {
         auto_gain_control: bool,
         echo_cancellation: bool,
         noise_suppression: bool,
+        channel_count: Option<u32>,
     ) -> Self {
         Self {
             device_id: device_id.filter(|s| !s.is_empty()),
             auto_gain_control,
             echo_cancellation,
             noise_suppression,
+            channel_count,
         }
     }
 
@@ -76,6 +81,12 @@ impl AudioConstraints {
             &JsValue::from_bool(self.noise_suppression),
         )?;
 
+        if let Some(n) = self.channel_count {
+            let channel_constraint = js_sys::Object::new();
+            js_sys::Reflect::set(&channel_constraint, &"ideal".into(), &JsValue::from_f64(n as f64))?;
+            js_sys::Reflect::set(&constraints, &"channelCount".into(), &channel_constraint)?;
+        }
+
         Ok(constraints.into())
     }
 }
@@ -95,6 +106,18 @@ pub struct AudioEngine {
     /// rebuilding the node — see `build_and_connect_worklet_node` and its
     /// call from `set_output_device`).
     worklet_output_channels: usize,
+    /// The number of capture channels actually granted by the browser for
+    /// the current capture stream (from
+    /// `MediaStreamTrack.getSettings().channelCount`). `None` until
+    /// `start_capture`'s `getUserMedia` call resolves and discovery
+    /// actually completes — distinct from any real granted count, which is
+    /// always `Some(n)` with `n >= 1`.
+    granted_input_channels: Option<u32>,
+    /// The maximum channel count the current input device supports (from
+    /// `MediaStreamTrack.getCapabilities().channelCount.max`, falling back
+    /// to the granted count when capabilities are unavailable). `None`
+    /// until discovery completes, same as `granted_input_channels`.
+    max_input_channels: Option<u32>,
 }
 
 #[wasm_bindgen]
@@ -130,6 +153,8 @@ impl AudioEngine {
             local_to_network_buffer_ptr,
             network_to_local_buffer_ptr,
             worklet_output_channels: 0,
+            granted_input_channels: None,
+            max_input_channels: None,
         })
     }
 
@@ -167,12 +192,21 @@ impl AudioEngine {
         let media_devices = get_media_devices()?;
         let constraints = MediaStreamConstraints::new();
 
+        // Read the desired capture channel count (the Mono/Stereo toggle's
+        // target) so it can be sent as an `ideal` getUserMedia constraint.
+        let desired_channels = if self.params_ptr.is_null() {
+            1
+        } else {
+            unsafe { &*self.params_ptr }.get_capture_channels()
+        };
+
         // Build audio constraints
         let audio_constraints = AudioConstraints::resolve(
             device_id,
             auto_gain_control,
             echo_cancellation,
             noise_suppression,
+            Some(desired_channels),
         )
         .to_js()?;
 
@@ -181,6 +215,44 @@ impl AudioEngine {
 
         let stream_promise = media_devices.get_user_media_with_constraints(&constraints)?;
         let stream: MediaStream = JsFuture::from(stream_promise).await?.unchecked_into();
+
+        // Discover what the browser actually granted / what the device
+        // supports, falling back to the granted settings value when
+        // capabilities are unavailable (some browsers don't implement
+        // `getCapabilities()` on all track kinds).
+        let audio_tracks = stream.get_audio_tracks();
+        let (granted, max) = if let Some(track) = audio_tracks.get(0).dyn_into::<web_sys::MediaStreamTrack>().ok() {
+            let settings = track.get_settings();
+            let granted = settings
+                .get_channel_count()
+                .map(|c| c.max(1) as u32)
+                .unwrap_or(1)
+                .clamp(1, MAX_CHANNELS as u32);
+
+            // Some browsers (notably Safari) don't implement
+            // `getCapabilities()` on `MediaStreamTrack` at all — calling
+            // the unguarded web-sys binding would throw a JS TypeError and
+            // fail capture outright, so probe for the method first, the
+            // same way `route_output_sink` probes for `setSinkId`.
+            let has_get_capabilities =
+                js_sys::Reflect::has(&track, &JsValue::from_str("getCapabilities"))?;
+            let max = if has_get_capabilities {
+                track
+                    .get_capabilities()
+                    .get_channel_count()
+                    .and_then(|range| range.get_max())
+                    .unwrap_or(granted)
+                    .clamp(1, MAX_CHANNELS as u32)
+            } else {
+                granted
+            };
+
+            (granted, max)
+        } else {
+            (1, 1)
+        };
+        self.granted_input_channels = Some(granted);
+        self.max_input_channels = Some(max);
 
         // Create source node from the stream
         let source_node = self.ctx.create_media_stream_source(&stream)?;
@@ -191,7 +263,7 @@ impl AudioEngine {
         // to it (explicit/discrete, so the browser never speaker-folds or
         // up-mixes on our behalf — mapping is `map_to_output`'s job).
         let output_channels = self.configure_destination()?;
-        self.build_and_connect_worklet_node(output_channels as usize)?;
+        self.build_and_connect_worklet_node(granted as usize, output_channels as usize)?;
 
         // Resume the audio context.
         // On iOS Safari, AudioContext.resume() returns a promise that *never* resolves when
@@ -224,17 +296,20 @@ impl AudioEngine {
         Ok(max_channels)
     }
 
-    /// Build a fresh worklet node at `output_channels` wide and connect it:
-    /// source → worklet → destination, disconnecting any previous worklet
-    /// node. Capture stays mono in this phase (real multichannel capture is
-    /// a later phase), so `input_channels` is always 1.
+    /// Build a fresh worklet node at `input_channels` / `output_channels`
+    /// wide and connect it: source → worklet → destination, disconnecting
+    /// any previous worklet node. `input_channels` is the caller's
+    /// responsibility to determine — in practice the capture width actually
+    /// granted by the browser (`self.granted_input_channels`, discovered in
+    /// `start_capture`), preserved across rebuilds that aren't themselves
+    /// changing the capture device.
     ///
     /// Used both by `start_capture` (first build) and `set_output_device`
     /// (rebuild when `setSinkId` changes the destination's max channel
-    /// count) — `outputChannelCount` is construction-time only on
-    /// `AudioWorkletNode`, so a width change means a new node, not a
+    /// count) — `outputChannelCount`/`channelCount` are construction-time
+    /// only on `AudioWorkletNode`, so a width change means a new node, not a
     /// reconfigure.
-    fn build_and_connect_worklet_node(&mut self, output_channels: usize) -> Result<(), JsValue> {
+    fn build_and_connect_worklet_node(&mut self, input_channels: usize, output_channels: usize) -> Result<(), JsValue> {
         // Create processor with network support. `AudioEngine` stores raw
         // pointers (it is a `#[wasm_bindgen]` boundary type); wrap them in
         // `SharedPtr` here so the processor and the flag read below go through
@@ -249,8 +324,8 @@ impl AudioEngine {
             AudioProcessor::with_network(params, local_to_network, network_to_local)
         };
 
-        let process = Box::new(move |input: &[f32], output: &mut [f32], out_channels: usize| {
-            processor.process(input, output, out_channels)
+        let process = Box::new(move |input: &[f32], in_channels: usize, output: &mut [f32], out_channels: usize| {
+            processor.process(input, in_channels, output, out_channels)
         });
 
         // Get ring buffer flag pointer for event-driven wake-up
@@ -262,7 +337,7 @@ impl AudioEngine {
         let worklet_node = create_worklet_node_with_flag(
             &self.ctx,
             process,
-            1,
+            input_channels,
             output_channels,
             ring_buffer_flag_ptr,
         )?;
@@ -363,6 +438,40 @@ impl AudioEngine {
         self.worklet_node.as_ref().and_then(|node| node.port().ok())
     }
 
+    /// The number of capture channels actually granted by the browser for the
+    /// current capture stream (from `MediaStreamTrack.getSettings().channelCount`).
+    /// `None` until capture has started AND discovery has completed — not
+    /// merely "an `AudioEngine` exists" (`start_capture` is async and
+    /// discovery only resolves partway through it), so a caller can never
+    /// mistake "not yet known" for a real, always-`>=1` granted count.
+    #[wasm_bindgen(js_name = grantedInputChannels)]
+    pub fn granted_input_channels(&self) -> Option<u32> {
+        self.granted_input_channels
+    }
+
+    /// The maximum channel count the current input device supports (from
+    /// `MediaStreamTrack.getCapabilities().channelCount.max`, falling back to
+    /// the granted count when capabilities are unavailable). `None` until
+    /// discovery completes, same as `granted_input_channels`.
+    #[wasm_bindgen(js_name = maxInputChannels)]
+    pub fn max_input_channels(&self) -> Option<u32> {
+        self.max_input_channels
+    }
+
+    /// The number of channels the current playback output is configured
+    /// for (from `AudioContext.destination.maxChannelCount`, capped to
+    /// `MAX_CHANNELS` — see `configure_destination`). `None` until capture
+    /// has started AND the worklet node has actually been built.
+    ///
+    /// Unlike the input side there is no separate "requested vs. granted"
+    /// negotiation for output: `configure_destination` always configures
+    /// the destination to its full reported capability, so this is the one
+    /// value that matters — always `>= 1` once known.
+    #[wasm_bindgen(js_name = outputChannels)]
+    pub fn output_channels(&self) -> Option<u32> {
+        (self.worklet_output_channels > 0).then_some(self.worklet_output_channels as u32)
+    }
+
     /// Set the output audio device (sink) for playback
     ///
     /// Uses the AudioContext.setSinkId() API to route audio to a specific device.
@@ -382,7 +491,12 @@ impl AudioEngine {
         if self.worklet_node.is_some() {
             let output_channels = self.configure_destination()?;
             if output_channels as usize != self.worklet_output_channels {
-                self.build_and_connect_worklet_node(output_channels as usize)?;
+                // `worklet_node` only ever exists after `start_capture`'s
+                // discovery has already set `granted_input_channels`, so
+                // this is always `Some` in practice; `unwrap_or(1)` is a
+                // defensive floor, not a real fallback path.
+                let input_channels = self.granted_input_channels.unwrap_or(1) as usize;
+                self.build_and_connect_worklet_node(input_channels, output_channels as usize)?;
             }
         }
 
@@ -448,22 +562,32 @@ mod tests {
     ];
 
     #[test]
-    fn test_resolve_full_matrix_device_id_x_toggles() {
-        // device-id present/absent (incl. empty) × every toggle permutation.
+    fn test_resolve_full_matrix_device_id_x_toggles_x_channel_count() {
+        // device-id present/absent (incl. empty) × every toggle permutation ×
+        // channel-count present/absent.
         let device_id_cases: [(Option<String>, Option<&str>); 3] = [
             (Some("dev-1".to_string()), Some("dev-1")),
             (None, None),
             (Some(String::new()), None),
         ];
+        let channel_count_cases: [Option<u32>; 2] = [Some(2), None];
 
         for (raw_id, expected_id) in device_id_cases {
             for (agc, ec, ns) in BOOL_PERMUTATIONS {
-                let resolved =
-                    AudioConstraints::resolve(raw_id.clone(), agc, ec, ns);
-                assert_eq!(resolved.device_id.as_deref(), expected_id);
-                assert_eq!(resolved.auto_gain_control, agc);
-                assert_eq!(resolved.echo_cancellation, ec);
-                assert_eq!(resolved.noise_suppression, ns);
+                for channel_count in channel_count_cases {
+                    let resolved = AudioConstraints::resolve(
+                        raw_id.clone(),
+                        agc,
+                        ec,
+                        ns,
+                        channel_count,
+                    );
+                    assert_eq!(resolved.device_id.as_deref(), expected_id);
+                    assert_eq!(resolved.auto_gain_control, agc);
+                    assert_eq!(resolved.echo_cancellation, ec);
+                    assert_eq!(resolved.noise_suppression, ns);
+                    assert_eq!(resolved.channel_count, channel_count);
+                }
             }
         }
     }
@@ -764,15 +888,17 @@ mod tests {
     }
 
     /// `AudioConstraints::to_js` must emit an `exact` device-id constraint when a
-    /// specific device is requested, alongside the three processing toggles.
+    /// specific device is requested, alongside the three processing toggles, and
+    /// an `ideal` channelCount constraint when a channel count is requested.
     ///
     /// This is the optional-config branch of the constraints builder (the
     /// natively-tested `resolve` only produces the plain struct); the JS-object
-    /// conversion is browser glue, so the device-id path is exercised here.
+    /// conversion is browser glue, so the device-id / channel-count paths are
+    /// exercised here.
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     fn to_js_emits_exact_device_id() {
-        let js = AudioConstraints::resolve(Some("mic-7".to_string()), true, false, true)
+        let js = AudioConstraints::resolve(Some("mic-7".to_string()), true, false, true, Some(2))
             .to_js()
             .expect("to_js must build the getUserMedia constraints object");
 
@@ -787,16 +913,28 @@ mod tests {
             "deviceId.exact must equal the requested device id"
         );
 
+        let channel_count = js_sys::Reflect::get(&js, &"channelCount".into())
+            .expect("constraints must expose a channelCount field when a count is requested");
+        let ideal = js_sys::Reflect::get(&channel_count, &"ideal".into())
+            .expect("channelCount must carry an ideal constraint")
+            .as_f64();
+        assert_eq!(
+            ideal,
+            Some(2.0),
+            "channelCount.ideal must equal the requested channel count"
+        );
+
         assert_toggle_fields(&js, true, false, true);
     }
 
-    /// `AudioConstraints::to_js` must omit the device-id constraint entirely when
-    /// no device is requested (the default-device path), while still carrying the
-    /// processing toggles — the complementary branch to `to_js_emits_exact_device_id`.
+    /// `AudioConstraints::to_js` must omit the device-id and channelCount
+    /// constraints entirely when neither is requested (the default-device
+    /// path), while still carrying the processing toggles — the complementary
+    /// branch to `to_js_emits_exact_device_id`.
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     fn to_js_omits_device_id_for_default() {
-        let js = AudioConstraints::resolve(None, false, true, false)
+        let js = AudioConstraints::resolve(None, false, true, false, None)
             .to_js()
             .expect("to_js must build the getUserMedia constraints object");
 
@@ -804,6 +942,11 @@ mod tests {
             !js_sys::Reflect::has(&js, &"deviceId".into())
                 .expect("Reflect::has must succeed on the constraints object"),
             "the default-device path must not set a deviceId constraint"
+        );
+        assert!(
+            !js_sys::Reflect::has(&js, &"channelCount".into())
+                .expect("Reflect::has must succeed on the constraints object"),
+            "the no-channel-count path must not set a channelCount constraint"
         );
 
         assert_toggle_fields(&js, false, true, false);

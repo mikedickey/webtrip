@@ -119,6 +119,29 @@ pub(crate) fn is_valid_channel_count(channels: u8) -> bool {
     channels >= 1 && channels <= MAX_CHANNELS
 }
 
+/// Decide whether to narrow the session's configured channel count after a
+/// connection ends, given what the input device's capability turned out to
+/// be (`discovered_max`, from `AudioEngine::max_input_channels` — `None`
+/// when never discovered, e.g. no capture ever started).
+///
+/// Returns `Some(narrowed)` only when the device is known to support fewer
+/// channels than `current` — otherwise `None` (no change). Never widens:
+/// `discovered_max > current` returns `None`, since that would silently
+/// override a user's explicit narrower choice (e.g. Mono) rather than
+/// correct an impossible one.
+///
+/// Exists because `set_channels`/`AudioConstraints`'s `channelCount: ideal`
+/// request and the wire's declared channel count both come from this same
+/// session-level count, fixed at connect time — without narrowing it once a
+/// device turns out to support fewer channels, every subsequent connect
+/// attempt keeps requesting (and `AudioProcessor::send_local_to_network`
+/// keeps duplicating captured audio to fill) a wider count than the device
+/// can actually produce.
+pub(crate) fn narrowed_channel_count(current: u8, discovered_max: Option<u32>) -> Option<u8> {
+    let max = u8::try_from(discovered_max?).ok()?;
+    (max < current).then_some(max)
+}
+
 /// Returns `true` when the state transition `from → to` is permitted.
 ///
 /// Legal transitions:
@@ -285,7 +308,10 @@ impl WebTripSession {
         let sample_rate = 48000;
         let channels = 2; // Default to stereo
 
-        // Sync channels to AudioParams so processor knows to duplicate mono to stereo
+        // Sync channels to AudioParams: the requested capture width sent as
+        // getUserMedia's `channelCount` ideal constraint, and the wire's
+        // fixed channel count that `send_local_to_network` conforms real
+        // captured audio to (see `conform_interleaved_channels`).
         if !audio_params_ptr.is_null() {
             unsafe {
                 (*audio_params_ptr).set_capture_channels(channels as u32);
@@ -399,7 +425,8 @@ impl WebTripSession {
         if is_valid_channel_count(channels) {
             self.channels = channels;
 
-            // Sync to AudioParams so processor knows to duplicate mono to stereo
+            // Sync to AudioParams — see `new`'s equivalent sync for what
+            // this value drives.
             if !self.audio_params_ptr.is_null() {
                 unsafe {
                     (*self.audio_params_ptr).set_capture_channels(channels as u32);
@@ -735,6 +762,14 @@ impl WebTripSession {
             // no-op on already-closed state.
         }
 
+        // Capture the input device's discovered capability before
+        // `stop_capture` drops the `AudioEngine` that knows it — see
+        // `narrowed_channel_count` for why this needs to survive teardown.
+        let narrow_to = narrowed_channel_count(
+            self.channels,
+            self.audio_engine.as_ref().and_then(|e| e.max_input_channels()),
+        );
+
         // Stop audio capture when disconnecting (this will also stop the audio callback loop)
         self.stop_capture();
 
@@ -746,6 +781,15 @@ impl WebTripSession {
         self.network_to_local_buffer.reset();
 
         self.set_state(SessionState::Idle);
+
+        // Now Idle, so `set_channels` (Idle-only) will actually apply: if
+        // this connection discovered the input device supports fewer
+        // channels than currently configured, narrow so the next connect
+        // requests a consistent width instead of re-requesting (and
+        // duplicating capture to fill) the old, too-wide count.
+        if let Some(narrowed) = narrow_to {
+            self.set_channels(narrowed);
+        }
     }
     
     /// Start the audio callback loop
@@ -828,6 +872,41 @@ impl WebTripSession {
         Ok(())
     }
 
+    /// Number of capture channels actually granted by the browser for the
+    /// current session (see `AudioEngine::granted_input_channels`). `None`
+    /// when not yet known — no capture has started, or it has started but
+    /// device discovery hasn't completed yet — distinct from any real
+    /// channel count, which is always `Some(n)` with `n >= 1`.
+    #[wasm_bindgen(js_name = getGrantedInputChannels)]
+    pub fn get_granted_input_channels(&self) -> Option<u32> {
+        self.audio_engine
+            .as_ref()
+            .and_then(|e| e.granted_input_channels())
+    }
+
+    /// Maximum channel count the current input device supports (see
+    /// `AudioEngine::max_input_channels`). `None` when not yet known, same
+    /// as `get_granted_input_channels`.
+    #[wasm_bindgen(js_name = getMaxInputChannels)]
+    pub fn get_max_input_channels(&self) -> Option<u32> {
+        self.audio_engine
+            .as_ref()
+            .and_then(|e| e.max_input_channels())
+    }
+
+    /// Number of channels the current playback output is configured for
+    /// (see `AudioEngine::output_channels`). `None` when not yet known —
+    /// no capture has started, or it has started but the worklet node
+    /// hasn't been built yet. Unlike the input side there is no separate
+    /// granted/max distinction: output always uses the destination's full
+    /// reported capability, capped to `MAX_CHANNELS`.
+    #[wasm_bindgen(js_name = getOutputChannels)]
+    pub fn get_output_channels(&self) -> Option<u32> {
+        self.audio_engine
+            .as_ref()
+            .and_then(|e| e.output_channels())
+    }
+
     /// Check if connected to hub server
     #[wasm_bindgen(js_name = isConnected)]
     pub fn is_connected(&self) -> bool {
@@ -892,6 +971,44 @@ mod tests {
         assert!(is_valid_channel_count(1));
         assert!(is_valid_channel_count(8));
         assert!(!is_valid_channel_count(9));
+    }
+
+    // -----------------------------------------------------------------------
+    // Channel-count narrowing (disconnect-time correction)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn narrowed_channel_count_matrix() {
+        // (current, discovered_max) -> expected
+        let cases: &[(u8, Option<u32>, Option<u8>)] = &[
+            // Discovered fewer than configured: narrow.
+            (2, Some(1), Some(1)),
+            (8, Some(3), Some(3)),
+            // Discovered equal to configured: no change (avoid a no-op
+            // set_channels call, not that it would be wrong).
+            (2, Some(2), None),
+            (1, Some(1), None),
+            // Discovered MORE than configured: never widen — a user's
+            // explicit narrower choice (e.g. Mono) is never silently
+            // overridden back up.
+            (1, Some(2), None),
+            (1, Some(8), None),
+            // Never discovered (no capture ever started, or the engine
+            // never completed discovery before disconnect): no change.
+            (2, None, None),
+            // Boundary: discovered_max at MAX_CHANNELS, current above it is
+            // impossible by construction, so only the narrowing direction
+            // is meaningful here.
+            (8, Some(8), None),
+            (8, Some(u32::from(MAX_CHANNELS)), None),
+        ];
+        for &(current, discovered_max, expected) in cases {
+            assert_eq!(
+                narrowed_channel_count(current, discovered_max),
+                expected,
+                "current={current} discovered_max={discovered_max:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

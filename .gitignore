@@ -10,3 +10,4 @@ wasm-pack.log
 /certs/
 website/node_modules/
 website/dist/
+/.worktrees/

@@ -59,6 +59,16 @@ pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
     (sum_squares / samples.len() as f32).sqrt()
 }
 
+/// The level meter's RMS: the loudest of `channels` planar channels'
+/// individual RMS values, not their average — a single hot channel among
+/// quiet ones must still show on the meter. `planar` is `channels * frames`
+/// samples laid out `planar[ch * frames + frame]` (same layout `interleave_planar` reads).
+pub(crate) fn max_channel_rms(planar: &[f32], channels: usize, frames: usize) -> f32 {
+    (0..channels)
+        .map(|ch| compute_rms(&planar[ch * frames..(ch + 1) * frames]))
+        .fold(0.0f32, f32::max)
+}
+
 /// Downmix `channels`-wide interleaved audio to mono by averaging each
 /// frame's channels, writing one sample per frame into `mono_out`.
 ///
@@ -133,6 +143,83 @@ pub(crate) fn map_to_output(src: &[f32], src_channels: usize, out: &mut [f32], o
     }
 }
 
+/// Conform `src_channels`-wide interleaved audio to `out_channels`-wide
+/// interleaved audio, one frame at a time (`frames == out.len() /
+/// out_channels`).
+///
+/// Mirrors [`map_to_output`]'s documented channel-mapping policy — the same
+/// four rules: downmix-to-1, mono-duplicated-to-first-two,
+/// stereo-to-first-two-of-many, otherwise 1:1 with extra source channels
+/// dropped and extra destination channels silent — but for an INTERLEAVED
+/// source *and* destination.
+///
+/// Used to conform the browser's actually-granted capture width to the
+/// network wire's fixed per-session channel count (decided once at connect
+/// time from `AudioParams::capture_channels`), which `map_to_output`'s planar
+/// output layout cannot serve directly. The two functions deliberately keep
+/// separate implementations: they walk genuinely different memory layouts,
+/// and the parallel structure is cheaper than an abstraction over both.
+///
+/// Reads defensively past the end of `src` as silence, same as
+/// [`downmix_to_mono`] — this runs on the realtime audio thread.
+pub(crate) fn conform_interleaved_channels(src: &[f32], src_channels: usize, out: &mut [f32], out_channels: usize) {
+    let src_channels = src_channels.max(1);
+    let out_channels = out_channels.max(1);
+    let frames = out.len() / out_channels;
+
+    if out_channels == 1 {
+        downmix_to_mono(src, src_channels, &mut out[..frames]);
+        return;
+    }
+
+    out[..frames * out_channels].fill(0.0);
+
+    if src_channels == 1 {
+        // Duplicate the single source channel into output channels 0 and 1.
+        for frame in 0..frames {
+            let sample = src.get(frame).copied().unwrap_or(0.0);
+            for dst_ch in 0..out_channels.min(2) {
+                out[frame * out_channels + dst_ch] = sample;
+            }
+        }
+        return;
+    }
+
+    if src_channels == 2 && out_channels > 2 {
+        for frame in 0..frames {
+            for dst_ch in 0..2 {
+                out[frame * out_channels + dst_ch] = src.get(frame * src_channels + dst_ch).copied().unwrap_or(0.0);
+            }
+        }
+        return;
+    }
+
+    // 1:1 for min(src_channels, out_channels); extra source channels dropped,
+    // extra output channels left silent (already zeroed above).
+    let mapped_channels = src_channels.min(out_channels);
+    for frame in 0..frames {
+        for ch in 0..mapped_channels {
+            out[frame * out_channels + ch] = src.get(frame * src_channels + ch).copied().unwrap_or(0.0);
+        }
+    }
+}
+
+/// Convert `channels`-wide planar audio (`planar[ch * frames + frame]`) to
+/// interleaved (`out[frame * channels + ch]`). The inverse layout
+/// transform of what `map_to_output` consumes as its `src` — used to turn
+/// the worklet's planar capture into the interleaved shape both the
+/// network wire format and `map_to_output` expect.
+///
+/// Reads defensively past the end of `planar` as silence, same as
+/// `downmix_to_mono`.
+pub(crate) fn interleave_planar(planar: &[f32], channels: usize, frames: usize, out: &mut [f32]) {
+    for ch in 0..channels {
+        for frame in 0..frames {
+            out[frame * channels + ch] = planar.get(ch * frames + frame).copied().unwrap_or(0.0);
+        }
+    }
+}
+
 /// Compute the next peak-hold/decay state given the current audio level and
 /// the previously stored peak state.
 ///
@@ -168,11 +255,17 @@ pub struct AudioProcessor {
     /// Jitter buffer for receiving audio from network (network → main thread → jitter buffer → worklet → audio device).
     /// Null when no network is attached; still `&mut`-accessed via [`SharedPtr::as_mut`].
     network_to_local_buffer: SharedPtr<Regulator>,
-    /// Temporary buffer for gained audio (mono from mic; capture stays mono
-    /// until Phase 3 lands real multichannel capture)
+    /// Temporary buffer for gained audio. Planar multi-channel, same layout
+    /// as `process()`'s `input`: `in_channels * frames` samples, `gained[ch *
+    /// frames + frame]`. Preallocated at `128 * MAX_CHANNELS` so a widening
+    /// resize never allocates on the render thread.
     gained_buffer: Vec<f32>,
-    /// Buffer for stereo send (mono duplicated to both channels)
-    stereo_buffer: Vec<f32>,
+    /// The captured audio converted from the worklet's planar layout to
+    /// interleaved (`[frame * channels + ch]`), shared by the network-send path
+    /// and the local monitor mix so the planar→interleaved conversion happens
+    /// once per callback, not twice. Preallocated at `128 * MAX_CHANNELS` so a
+    /// widening resize never allocates on the render thread.
+    captured_interleaved: Vec<f32>,
     /// Buffer for the regulator's interleaved output, before mapping to the
     /// output device's channel count. Preallocated at `128 * MAX_CHANNELS` so
     /// a widening `receive_from_network` resize never allocates on the render
@@ -184,6 +277,12 @@ pub struct AudioProcessor {
     /// The local monitor mapped onto the output device's channels, same
     /// planar layout as `remote_mapped`.
     monitor_mapped: Vec<f32>,
+    /// Scratch buffer for `send_local_to_network`'s conform step (real
+    /// captured width → the session's fixed wire channel count). Kept
+    /// separate from `captured_interleaved` because the monitor mix still
+    /// needs the TRUE captured width, not the wire-conformed one.
+    /// Preallocated at `128 * MAX_CHANNELS`.
+    wire_conformed: Vec<f32>,
 }
 
 impl AudioProcessor {
@@ -192,11 +291,12 @@ impl AudioProcessor {
             params,
             local_to_network_buffer: SharedPtr::null(),
             network_to_local_buffer: SharedPtr::null(),
-            gained_buffer: vec![0.0; 128],
-            stereo_buffer: vec![0.0; 256], // 128 samples * 2 channels
+            gained_buffer: vec![0.0; 128 * MAX_CHANNELS as usize],
+            captured_interleaved: vec![0.0; 128 * MAX_CHANNELS as usize],
             remote_interleaved: vec![0.0; 128 * MAX_CHANNELS as usize],
             remote_mapped: vec![0.0; 128 * MAX_CHANNELS as usize],
             monitor_mapped: vec![0.0; 128 * MAX_CHANNELS as usize],
+            wire_conformed: vec![0.0; 128 * MAX_CHANNELS as usize],
         }
     }
 
@@ -212,22 +312,25 @@ impl AudioProcessor {
             params,
             local_to_network_buffer,
             network_to_local_buffer,
-            gained_buffer: vec![0.0; 128],
-            stereo_buffer: vec![0.0; 256], // 128 samples * 2 channels
+            gained_buffer: vec![0.0; 128 * MAX_CHANNELS as usize],
+            captured_interleaved: vec![0.0; 128 * MAX_CHANNELS as usize],
             remote_interleaved: vec![0.0; 128 * MAX_CHANNELS as usize],
             remote_mapped: vec![0.0; 128 * MAX_CHANNELS as usize],
             monitor_mapped: vec![0.0; 128 * MAX_CHANNELS as usize],
+            wire_conformed: vec![0.0; 128 * MAX_CHANNELS as usize],
         }
     }
 
     /// Process audio: calculate volume levels, handle network audio, and generate output.
     ///
-    /// `input` is mono capture (`frames` samples; real multichannel capture is
-    /// Phase 3). `output` is planar across `out_channels` output channels:
-    /// `output[ch * frames + frame]`, `frames == input.len()`.
-    pub fn process(&mut self, input: &[f32], output: &mut [f32], out_channels: usize) -> bool {
+    /// `input` is planar across `in_channels` input channels: `input[ch *
+    /// frames + frame]`, `frames == input.len() / in_channels`. `output` is
+    /// planar across `out_channels` output channels: `output[ch * frames +
+    /// frame]`.
+    pub fn process(&mut self, input: &[f32], in_channels: usize, output: &mut [f32], out_channels: usize) -> bool {
+        let in_channels = in_channels.max(1);
         let out_channels = out_channels.max(1);
-        let frames = input.len();
+        let frames = input.len() / in_channels;
 
         // Increment callback counter for stats tracking
         self.params.callback_count.fetch_add(1, Ordering::Relaxed);
@@ -237,8 +340,9 @@ impl AudioProcessor {
         let input_gain_linear = db_to_linear(input_gain_db);
 
         // Ensure buffers are correct size
-        if self.gained_buffer.len() != frames {
-            self.gained_buffer.resize(frames, 0.0);
+        let gained_len = in_channels * frames;
+        if self.gained_buffer.len() < gained_len {
+            self.gained_buffer.resize(gained_len, 0.0);
         }
         let mapped_len = frames * out_channels;
         if self.remote_mapped.len() < mapped_len {
@@ -251,10 +355,9 @@ impl AudioProcessor {
         // Apply input gain to local audio (clamped to [-1.0, 1.0])
         apply_gain(input, input_gain_linear, &mut self.gained_buffer);
 
-        // Calculate RMS for volume metering. Capture is mono in this phase
-        // (real multichannel capture, and a max-across-channels RMS, are
-        // Phase 3) so this is just the one capture channel's RMS.
-        let rms = compute_rms(&self.gained_buffer);
+        // Calculate RMS for volume metering: the loudest of the captured
+        // channels, not their average — a single hot channel must still show.
+        let rms = max_channel_rms(&self.gained_buffer, in_channels, frames);
         let current_db = amplitude_to_db(rms);
 
         // Store dB level
@@ -263,8 +366,16 @@ impl AudioProcessor {
         // Peak level tracking with hold and decay
         self.update_peak_level(current_db);
 
+        // Convert the planar capture to interleaved once, shared by the
+        // network-send path and the local monitor mix below.
+        let captured_len = frames * in_channels;
+        if self.captured_interleaved.len() < captured_len {
+            self.captured_interleaved.resize(captured_len, 0.0);
+        }
+        interleave_planar(&self.gained_buffer, in_channels, frames, &mut self.captured_interleaved[..captured_len]);
+
         // Send local audio to network (if enabled)
-        self.send_local_to_network();
+        self.send_local_to_network(in_channels, frames);
 
         // Receive remote audio from network into `remote_interleaved` and map
         // it onto `out_channels` output channels. `receive_from_network`
@@ -282,8 +393,13 @@ impl AudioProcessor {
             );
         }
 
-        // Map the local monitor (mono capture) onto the same output width.
-        map_to_output(&self.gained_buffer, 1, &mut self.monitor_mapped[..mapped_len], out_channels);
+        // Map the local monitor (captured, interleaved) onto the same output width.
+        map_to_output(
+            &self.captured_interleaved[..captured_len],
+            in_channels,
+            &mut self.monitor_mapped[..mapped_len],
+            out_channels,
+        );
 
         // Generate output: mix monitor + remote audio, per output channel.
         let monitor_volume = decode_volume(self.params.monitor_volume.load(Ordering::Relaxed));
@@ -323,8 +439,18 @@ impl AudioProcessor {
         }
     }
 
-    /// Send local audio to network via ring buffer
-    fn send_local_to_network(&mut self) {
+    /// Send local audio to network via ring buffer, as interleaved audio at
+    /// the session's *wire* channel count.
+    ///
+    /// `in_channels` is what the worklet actually captured this callback — the
+    /// browser's granted width, which can be narrower than what was requested
+    /// (a mono-only device, or echo cancellation forcing mono). The transports
+    /// downstream of this ring buffer frame every outbound packet at a fixed
+    /// width chosen once at connect time (`AudioParams::capture_channels`), so
+    /// a mismatch here would mis-frame the packets: two mono quantums packed
+    /// and labelled as one stereo quantum. Conform the captured width to the
+    /// wire width before writing.
+    fn send_local_to_network(&mut self, in_channels: usize, frames: usize) {
         // Sound shared borrow: `RingBuffer`'s write path is `&self` (interior
         // mutability), so producer and consumer may hold `&RingBuffer` at once.
         let Some(buffer) = self.local_to_network_buffer.as_ref() else {
@@ -335,28 +461,23 @@ impl AudioProcessor {
             return;
         }
 
-        let capture_channels = self.params.get_capture_channels();
-
-        if capture_channels >= 2 {
-            // Duplicate mono to stereo (interleaved: L R L R ...)
-            let mono_len = self.gained_buffer.len();
-            let stereo_len = mono_len * 2;
-            
-            // Resize stereo buffer if needed
-            if self.stereo_buffer.len() != stereo_len {
-                self.stereo_buffer.resize(stereo_len, 0.0);
-            }
-            
-            for (i, &sample) in self.gained_buffer.iter().enumerate() {
-                self.stereo_buffer[i * 2] = sample;     // Left channel
-                self.stereo_buffer[i * 2 + 1] = sample; // Right channel
-            }
-            
-            buffer.write(&self.stereo_buffer);
-        } else {
-            // Write mono directly
-            buffer.write(&self.gained_buffer);
+        let wire_channels = (self.params.get_capture_channels() as usize).max(1);
+        if in_channels == wire_channels {
+            buffer.write(&self.captured_interleaved[..frames * in_channels]);
+            return;
         }
+
+        let wire_len = frames * wire_channels;
+        if self.wire_conformed.len() < wire_len {
+            self.wire_conformed.resize(wire_len, 0.0);
+        }
+        conform_interleaved_channels(
+            &self.captured_interleaved[..frames * in_channels],
+            in_channels,
+            &mut self.wire_conformed[..wire_len],
+            wire_channels,
+        );
+        buffer.write(&self.wire_conformed[..wire_len]);
     }
 
     /// Receive remote audio from network via jitter buffer into
@@ -516,6 +637,52 @@ mod tests {
         assert!((mono_out[1] - 0.0).abs() < EPS, "missing frame must read as silence");
     }
 
+    // --- channel-mapping policy (map_to_output / conform_interleaved_channels) ---
+
+    /// The channel-mapping policy that `map_to_output` and
+    /// `conform_interleaved_channels` both implement, stated once for both
+    /// matrix tests (they differ only in destination memory layout).
+    ///
+    /// For `out_channels >= 2`, returns which SOURCE channel each mapped
+    /// destination channel must carry, in destination order; destination
+    /// channels at or beyond the returned length must be silent. The
+    /// `out_channels == 1` averaging branch is asserted separately, since it
+    /// is not a per-channel copy.
+    fn expected_channel_sources(src_channels: usize, out_channels: usize) -> Vec<usize> {
+        if src_channels == 1 {
+            // Mono duplicated into destination channels 0 and 1.
+            vec![0; out_channels.min(2)]
+        } else if src_channels == 2 && out_channels > 2 {
+            vec![0, 1]
+        } else {
+            (0..src_channels.min(out_channels)).collect()
+        }
+    }
+
+    /// Interleaved source for the mapping matrices: frame `f` channel `ch`
+    /// carries `f * 10 + ch + 1`, never repeated across frames or channels, so
+    /// a bug that reads the wrong frame (e.g. always frame 0) or the wrong
+    /// channel fails instead of coincidentally matching.
+    fn mapping_value(frame: usize, ch: usize) -> f32 {
+        (frame * 10 + ch + 1) as f32
+    }
+
+    fn mapping_source(frames: usize, src_channels: usize) -> Vec<f32> {
+        let mut src = Vec::with_capacity(frames * src_channels);
+        for frame in 0..frames {
+            for ch in 0..src_channels {
+                src.push(mapping_value(frame, ch));
+            }
+        }
+        src
+    }
+
+    /// The `out_channels == 1` branch's expected value: the average of every
+    /// source channel in that frame.
+    fn mapping_mono_average(frame: usize, src_channels: usize) -> f32 {
+        (0..src_channels).map(|ch| mapping_value(frame, ch)).sum::<f32>() / src_channels as f32
+    }
+
     // --- map_to_output ------------------------------------------------------
 
     /// Full `src_channels × out_channels` matrix over `1..=8`, with
@@ -530,15 +697,9 @@ mod tests {
     #[test]
     fn test_map_to_output_matrix_covers_every_branch() {
         let frames = 3usize;
-        let value = |frame: usize, ch: usize| (frame * 10 + ch + 1) as f32;
 
         for src_channels in 1..=8usize {
-            let mut src = Vec::with_capacity(frames * src_channels);
-            for frame in 0..frames {
-                for ch in 0..src_channels {
-                    src.push(value(frame, ch));
-                }
-            }
+            let src = mapping_source(frames, src_channels);
 
             for out_channels in 1..=8usize {
                 let mut out = vec![-99.0f32; frames * out_channels];
@@ -546,8 +707,7 @@ mod tests {
 
                 if out_channels == 1 {
                     for frame in 0..frames {
-                        let expected: f32 =
-                            (0..src_channels).map(|ch| value(frame, ch)).sum::<f32>() / src_channels as f32;
+                        let expected = mapping_mono_average(frame, src_channels);
                         let s = out[frame];
                         assert!(
                             (s - expected).abs() < EPS,
@@ -557,23 +717,13 @@ mod tests {
                     continue;
                 }
 
-                let (mapped_channels, expect_at): (usize, Box<dyn Fn(usize, usize) -> f32>) =
-                    if src_channels == 1 {
-                        (2.min(out_channels), Box::new(|_ch: usize, frame: usize| value(frame, 0)))
-                    } else if src_channels == 2 && out_channels > 2 {
-                        (2, Box::new(|ch: usize, frame: usize| value(frame, ch)))
-                    } else {
-                        (
-                            src_channels.min(out_channels),
-                            Box::new(|ch: usize, frame: usize| value(frame, ch)),
-                        )
-                    };
+                let sources = expected_channel_sources(src_channels, out_channels);
 
                 for ch in 0..out_channels {
                     let plane = &out[ch * frames..ch * frames + frames];
-                    if ch < mapped_channels {
+                    if let Some(&src_ch) = sources.get(ch) {
                         for (frame, &s) in plane.iter().enumerate() {
-                            let expected = expect_at(ch, frame);
+                            let expected = mapping_value(frame, src_ch);
                             assert!(
                                 (s - expected).abs() < EPS,
                                 "src={src_channels} out={out_channels} ch={ch} frame={frame}: expected {expected}, got {s}"
@@ -587,6 +737,102 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // --- conform_interleaved_channels ---------------------------------------
+
+    /// Same full `src_channels × out_channels` matrix over `1..=8` as
+    /// `test_map_to_output_matrix_covers_every_branch`, but for the
+    /// interleaved→interleaved conform used on the network send path (the
+    /// browser's granted capture width → the session's fixed wire width).
+    /// Asserts every rule branch — the `out_channels == 1` average, the
+    /// mono-to-0/1 duplication, the stereo-to-0/1 of a wider wire, the
+    /// general 1:1 case with extra source channels DROPPED — plus silence on
+    /// every unmapped destination channel. A destination-indexing bug (planar
+    /// instead of interleaved, or a frame/channel transposition) fails here
+    /// rather than shipping garbled audio to the peer.
+    #[test]
+    fn test_conform_interleaved_channels_matrix_covers_every_branch() {
+        let frames = 3usize;
+
+        for src_channels in 1..=8usize {
+            let src = mapping_source(frames, src_channels);
+
+            for out_channels in 1..=8usize {
+                let mut out = vec![-99.0f32; frames * out_channels];
+                conform_interleaved_channels(&src, src_channels, &mut out, out_channels);
+
+                if out_channels == 1 {
+                    for frame in 0..frames {
+                        let expected = mapping_mono_average(frame, src_channels);
+                        let s = out[frame];
+                        assert!(
+                            (s - expected).abs() < EPS,
+                            "src={src_channels} out={out_channels} frame={frame}: average branch expected {expected}, got {s}"
+                        );
+                    }
+                    continue;
+                }
+
+                let sources = expected_channel_sources(src_channels, out_channels);
+
+                for frame in 0..frames {
+                    for ch in 0..out_channels {
+                        let s = out[frame * out_channels + ch];
+                        match sources.get(ch) {
+                            Some(&src_ch) => {
+                                let expected = mapping_value(frame, src_ch);
+                                assert!(
+                                    (s - expected).abs() < EPS,
+                                    "src={src_channels} out={out_channels} frame={frame} ch={ch}: expected {expected}, got {s}"
+                                );
+                            }
+                            None => assert_eq!(
+                                s, 0.0,
+                                "src={src_channels} out={out_channels} frame={frame} ch={ch}: unmapped channel must be silent"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- interleave_planar --------------------------------------------------
+
+    /// Full `channels` matrix over `1..=8`, with per-frame-*and*-per-channel
+    /// distinguishable input (channel `ch` frame `f` carries value `ch * 100
+    /// + f + 1`, never repeated) so a swapped planar/interleaved index bug —
+    /// exactly the kind of transposition mistake that would silently produce
+    /// plausible-sounding but wrong audio — fails the assertions instead of
+    /// coincidentally passing.
+    #[test]
+    fn test_interleave_planar_matrix_distinguishes_frame_and_channel_order() {
+        let frames = 3usize;
+        let value = |ch: usize, frame: usize| (ch * 100 + frame + 1) as f32;
+
+        for channels in 1..=8usize {
+            let mut planar = vec![0.0f32; channels * frames];
+            for ch in 0..channels {
+                for frame in 0..frames {
+                    planar[ch * frames + frame] = value(ch, frame);
+                }
+            }
+
+            let mut out = vec![-99.0f32; frames * channels];
+            interleave_planar(&planar, channels, frames, &mut out);
+
+            for frame in 0..frames {
+                for ch in 0..channels {
+                    let expected = value(ch, frame);
+                    let actual = out[frame * channels + ch];
+                    assert!(
+                        (actual - expected).abs() < EPS,
+                        "channels={channels} frame={frame} ch={ch}: expected {expected}, got {actual}"
+                    );
                 }
             }
         }
@@ -625,6 +871,59 @@ mod tests {
         assert!((compute_rms(&dc_neg) - 0.5).abs() < EPS, "negative DC RMS must be 0.5");
     }
 
+    // --- max_channel_rms ----------------------------------------------------
+
+    /// For `channels` in `1..=8`, construct per-channel DC levels that are
+    /// NOT all equal (channel `ch` holds constant value `(ch + 1) * 0.1`) so
+    /// a regression that accidentally averages instead of maxing fails this
+    /// assertion instead of coincidentally passing on uniform input. The
+    /// loudest channel is always the last one (`channels`), so its RMS
+    /// (== its DC level) must be the result.
+    #[test]
+    fn test_max_channel_rms_returns_loudest_channel_not_average() {
+        let frames = 8usize;
+        for channels in 1..=8usize {
+            let mut planar = vec![0.0f32; channels * frames];
+            for ch in 0..channels {
+                let level = (ch + 1) as f32 * 0.1;
+                planar[ch * frames..(ch + 1) * frames].fill(level);
+            }
+
+            let result = max_channel_rms(&planar, channels, frames);
+            let expected_loudest = channels as f32 * 0.1;
+            assert!(
+                (result - expected_loudest).abs() < EPS,
+                "channels={channels}: expected max (loudest channel) {expected_loudest}, got {result}"
+            );
+
+            let average: f32 = (1..=channels).map(|ch| ch as f32 * 0.1).sum::<f32>() / channels as f32;
+            if channels > 1 {
+                assert!(
+                    (result - average).abs() > EPS,
+                    "channels={channels}: result must not equal the average across channels"
+                );
+            }
+        }
+    }
+
+    /// At `channels = 1`, `max_channel_rms` must be exactly `compute_rms` of
+    /// the single channel — pins the pass-through identity using the same
+    /// full-scale sine signal as `test_rms_full_scale_sine`.
+    #[test]
+    fn test_max_channel_rms_single_channel_is_compute_rms() {
+        let n = 1024usize;
+        let samples: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * i as f32 / n as f32).sin())
+            .collect();
+
+        let expected = compute_rms(&samples);
+        let actual = max_channel_rms(&samples, 1, n);
+        assert!(
+            (actual - expected).abs() < EPS,
+            "single-channel max_channel_rms must equal compute_rms: expected {expected}, got {actual}"
+        );
+    }
+
     // --- compute_peak_update ----------------------------------------------------
 
     #[test]
@@ -654,7 +953,7 @@ mod tests {
         // Drive a loud signal through process() to establish a peak.
         let loud: Vec<f32> = vec![1.0; 128];
         let mut out = vec![0.0f32; 128];
-        processor.process(&loud, &mut out, 1);
+        processor.process(&loud, 1, &mut out, 1);
 
         let stored_after_peak = params.peak_db_level.load(std::sync::atomic::Ordering::Relaxed);
         assert!(stored_after_peak > encode_db(-60.0), "a loud signal must raise the peak");
@@ -663,7 +962,7 @@ mod tests {
         // The stored fixed-point value must remain bit-for-bit identical throughout.
         let silence: Vec<f32> = vec![0.0; 128];
         for frame in 0..PEAK_HOLD_FRAMES {
-            processor.process(&silence, &mut out, 1);
+            processor.process(&silence, 1, &mut out, 1);
             let stored = params.peak_db_level.load(std::sync::atomic::Ordering::Relaxed);
             assert_eq!(
                 stored,
@@ -673,12 +972,137 @@ mod tests {
         }
 
         // After hold expires, decay must have begun (stored value decreases).
-        processor.process(&silence, &mut out, 1);
+        processor.process(&silence, 1, &mut out, 1);
         let stored_after_decay = params.peak_db_level.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             stored_after_decay < stored_after_peak,
             "peak must start decaying after the hold window expires"
         );
+    }
+
+    // --- process() wiring, end to end --------------------------------------
+
+    /// A processor wired to `ring` (streaming) with no regulator attached, so
+    /// the peer stream is silence and the output carries only the local
+    /// monitor. `ring` must already live where it will stay: the processor
+    /// keeps a raw pointer to it.
+    fn networked_processor(params: &'static AudioParams, ring: &mut RingBuffer) -> AudioProcessor {
+        ring.set_streaming(true);
+        AudioProcessor::with_network(params, SharedPtr::new(ring as *mut RingBuffer), SharedPtr::null())
+    }
+
+    /// `frames` of planar capture (`[ch * frames + frame]`) where channel `ch`
+    /// holds the constant `levels[ch]` — distinct per channel, so a dropped,
+    /// swapped or duplicated channel is detectable downstream.
+    fn planar_capture(levels: &[f32], frames: usize) -> Vec<f32> {
+        let mut input = vec![0.0f32; levels.len() * frames];
+        for (ch, &level) in levels.iter().enumerate() {
+            input[ch * frames..(ch + 1) * frames].fill(level);
+        }
+        input
+    }
+
+    /// End-to-end wiring of `process()` at a real multichannel capture width:
+    /// gain → RMS → interleave-once → (ring write AND monitor mix). The pure
+    /// helpers each have their own matrix test; what this pins is that
+    /// `process` hands each of them the right buffer in the right layout —
+    /// e.g. feeding the still-planar `gained_buffer` to `map_to_output`, or
+    /// writing the wrong buffer to the ring, would pass every other test.
+    #[test]
+    fn test_process_stereo_capture_feeds_ring_and_monitor() {
+        const FRAMES: usize = 128;
+        const LEFT: f32 = 0.25;
+        const RIGHT: f32 = -0.5;
+        const MONITOR: f32 = 0.5;
+
+        let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
+        params.set_capture_channels(2); // wire width matches the capture width here
+        params.set_monitor_volume(MONITOR);
+
+        let mut ring = RingBuffer::new();
+        let mut processor = networked_processor(params, &mut ring);
+
+        let input = planar_capture(&[LEFT, RIGHT], FRAMES);
+        let mut output = vec![-99.0f32; FRAMES * 2];
+        assert!(processor.process(&input, 2, &mut output, 2));
+
+        // The network path must see interleaved stereo: L,R per frame — not
+        // planar, not one channel, not an average.
+        assert_eq!(
+            ring.available(),
+            (FRAMES * 2) as u32,
+            "a stereo quantum must contribute frames * 2 samples to the wire"
+        );
+        let mut wire = vec![-99.0f32; FRAMES * 2];
+        assert!(ring.read(&mut wire));
+        for frame in 0..FRAMES {
+            assert!(
+                (wire[frame * 2] - LEFT).abs() < EPS,
+                "wire frame {frame} channel 0: expected {LEFT}, got {}",
+                wire[frame * 2]
+            );
+            assert!(
+                (wire[frame * 2 + 1] - RIGHT).abs() < EPS,
+                "wire frame {frame} channel 1: expected {RIGHT}, got {}",
+                wire[frame * 2 + 1]
+            );
+        }
+
+        // The monitor mix must reach the output planes 1:1 at monitor volume,
+        // with both source channels still distinguishable (no downmix, no
+        // channel-0-only copy). The peer stream is silence (no regulator).
+        for frame in 0..FRAMES {
+            let left = output[frame];
+            let right = output[FRAMES + frame];
+            assert!(
+                (left - LEFT * MONITOR).abs() < EPS,
+                "output plane 0 frame {frame}: expected {}, got {left}",
+                LEFT * MONITOR
+            );
+            assert!(
+                (right - RIGHT * MONITOR).abs() < EPS,
+                "output plane 1 frame {frame}: expected {}, got {right}",
+                RIGHT * MONITOR
+            );
+        }
+    }
+
+    /// Regression test: the transports frame every outbound packet at the
+    /// session's fixed wire width (`AudioParams::capture_channels`, chosen at
+    /// connect time), so when the browser grants a NARROWER capture than was
+    /// requested — a mono-only device against the default stereo session —
+    /// `process` must conform before writing. Writing `frames * in_channels`
+    /// instead would pack two mono quantums into one "stereo" packet, which
+    /// the peer decodes as double-speed garble.
+    #[test]
+    fn test_process_conforms_mono_capture_to_stereo_wire_width() {
+        const FRAMES: usize = 128;
+        const LEVEL: f32 = 0.4;
+
+        let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
+        params.set_capture_channels(2); // the wire is stereo …
+
+        let mut ring = RingBuffer::new();
+        let mut processor = networked_processor(params, &mut ring);
+
+        // … but the browser granted mono.
+        let input = planar_capture(&[LEVEL], FRAMES);
+        let mut output = vec![0.0f32; FRAMES * 2];
+        assert!(processor.process(&input, 1, &mut output, 2));
+
+        assert_eq!(
+            ring.available(),
+            (FRAMES * 2) as u32,
+            "a mono quantum must still contribute frames * wire_channels samples to the wire"
+        );
+        let mut wire = vec![-99.0f32; FRAMES * 2];
+        assert!(ring.read(&mut wire));
+        for (i, &sample) in wire.iter().enumerate() {
+            assert!(
+                (sample - LEVEL).abs() < EPS,
+                "wire sample {i}: mono capture must be duplicated into both wire channels, got {sample}"
+            );
+        }
     }
 
     #[test]
