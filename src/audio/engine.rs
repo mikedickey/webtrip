@@ -229,12 +229,23 @@ impl AudioEngine {
                 .unwrap_or(1)
                 .clamp(1, MAX_CHANNELS as u32);
 
-            let capabilities = track.get_capabilities();
-            let max = capabilities
-                .get_channel_count()
-                .and_then(|range| range.get_max())
-                .unwrap_or(granted)
-                .clamp(1, MAX_CHANNELS as u32);
+            // Some browsers (notably Safari) don't implement
+            // `getCapabilities()` on `MediaStreamTrack` at all — calling
+            // the unguarded web-sys binding would throw a JS TypeError and
+            // fail capture outright, so probe for the method first, the
+            // same way `route_output_sink` probes for `setSinkId`.
+            let has_get_capabilities =
+                js_sys::Reflect::has(&track, &JsValue::from_str("getCapabilities"))?;
+            let max = if has_get_capabilities {
+                track
+                    .get_capabilities()
+                    .get_channel_count()
+                    .and_then(|range| range.get_max())
+                    .unwrap_or(granted)
+                    .clamp(1, MAX_CHANNELS as u32)
+            } else {
+                granted
+            };
 
             (granted, max)
         } else {

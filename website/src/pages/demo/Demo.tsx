@@ -176,6 +176,13 @@ export default function Demo() {
       } else {
         setSessionState("idle");
       }
+      // The Stereo toggle defaults to true on every mount, but the session's
+      // actual channel count survives remounts (module-level singleton) and
+      // can have been narrowed by a prior disconnect (see
+      // WebTripSession::disconnect / narrowed_channel_count). Read it back so
+      // a remount can't show Stereo while the session — and therefore the
+      // next connect — is already fixed at Mono.
+      setStereo(eng.session.getChannels() === 2);
       try {
         const devs = (await eng.m.getAudioDevices()) as AudioDevices;
         if (cancelled) return;
@@ -225,16 +232,18 @@ export default function Demo() {
 
   // Reset to "unknown" whenever the session leaves connected, so a later
   // reconnect — possibly to a different input device — doesn't keep showing a
-  // stale gate. The connected branch is a backstop only: the session reports
-  // "connected" before capture (and therefore channel discovery) starts, so
-  // handleConnect is what actually publishes the discovered count.
+  // stale gate. Only reset here: the session reports "connected" before
+  // capture (and therefore channel discovery) starts, and connectToStudio's
+  // `&mut self` wasm-bindgen borrow is still held at that point — calling
+  // back into the session (e.g. getMaxInputChannels) before connectToStudio
+  // itself resolves trips wasm-bindgen's "recursive use of an object"
+  // aliasing check. handleConnect publishes the discovered count instead,
+  // after connectToStudio has actually returned.
   useEffect(() => {
-    if (!engine || sessionState !== "connected") {
+    if (sessionState !== "connected") {
       setMaxInputChannels(undefined);
-      return;
     }
-    setMaxInputChannels(engine.session.getMaxInputChannels());
-  }, [engine, sessionState]);
+  }, [sessionState]);
 
   // Display-only: setChannels is Idle-only and the capture/send path already
   // tracks the browser's real granted channel count regardless of this
