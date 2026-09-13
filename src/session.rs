@@ -828,6 +828,28 @@ impl WebTripSession {
         Ok(())
     }
 
+    /// Number of capture channels actually granted by the browser for the
+    /// current session (see `AudioEngine::granted_input_channels`). `0` when no
+    /// capture has started yet (distinguishing "not yet known" from any real
+    /// channel count, which is always ≥ 1).
+    #[wasm_bindgen(js_name = getGrantedInputChannels)]
+    pub fn get_granted_input_channels(&self) -> u32 {
+        self.audio_engine
+            .as_ref()
+            .map(|e| e.granted_input_channels())
+            .unwrap_or(0)
+    }
+
+    /// Maximum channel count the current input device supports (see
+    /// `AudioEngine::max_input_channels`). `0` when no capture has started yet.
+    #[wasm_bindgen(js_name = getMaxInputChannels)]
+    pub fn get_max_input_channels(&self) -> u32 {
+        self.audio_engine
+            .as_ref()
+            .map(|e| e.max_input_channels())
+            .unwrap_or(0)
+    }
+
     /// Check if connected to hub server
     #[wasm_bindgen(js_name = isConnected)]
     pub fn is_connected(&self) -> bool {
