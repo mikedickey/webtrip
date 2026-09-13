@@ -70,14 +70,20 @@ function ToggleButton({
   line1,
   line2,
   onClick,
+  disabled = false,
 }: {
   active: boolean;
   line1: string;
   line2: string;
   onClick: () => void;
+  disabled?: boolean;
 }) {
   return (
-    <button className={`toggle-btn-compact${active ? " active" : ""}`} onClick={onClick}>
+    <button
+      className={`toggle-btn-compact${active ? " active" : ""}`}
+      onClick={onClick}
+      disabled={disabled}
+    >
       <span className="toggle-line1">{line1}</span>
       <span className="toggle-line2">{line2}</span>
     </button>
@@ -103,6 +109,10 @@ export default function Demo() {
   const [echo, setEcho] = useState(false);
   const [noise, setNoise] = useState(false);
   const [stereo, setStereo] = useState(true);
+  // 0 means "not yet known" (mirrors the Rust side's 0 fallback before any
+  // capture has started) — distinct from any real channel count, which is
+  // always >= 1.
+  const [maxInputChannels, setMaxInputChannels] = useState(0);
 
   const [inputGain, setInputGain] = useState(0);
   const [outputVolume, setOutputVolume] = useState(100);
@@ -212,6 +222,30 @@ export default function Demo() {
     const session = engineRef.current?.session;
     if (sessionState === "error" && session) beginDisconnect(session);
   }, [sessionState]);
+
+  // Capture only starts after a successful connectToStudio, so "connected" is
+  // the earliest point the browser has actually granted/discovered a channel
+  // count. Reset to "unknown" whenever the session leaves connected, so a
+  // later reconnect — possibly to a different input device — doesn't keep
+  // showing a stale gate.
+  useEffect(() => {
+    if (!engine || sessionState !== "connected") {
+      setMaxInputChannels(0);
+      return;
+    }
+    setMaxInputChannels(engine.session.getMaxInputChannels());
+  }, [engine, sessionState]);
+
+  // Display-only: setChannels is Idle-only and the capture/send path already
+  // tracks the browser's real granted channel count regardless of this
+  // toggle's state (see AudioProcessor::process's in_channels parameter) —
+  // this just keeps the UI honest about what will be requested on the next
+  // connect.
+  useEffect(() => {
+    if (maxInputChannels === 1 && stereo) {
+      setStereo(false);
+    }
+  }, [maxInputChannels, stereo]);
 
   const handleConnect = async () => {
     if (!engine || dialing) return;
@@ -364,6 +398,7 @@ export default function Demo() {
     );
   }
 
+  const stereoDisabled = maxInputChannels === 1;
   const connected = sessionState === "connected";
   const inProgress = sessionState === "connecting" || sessionState === "negotiating";
   const statusLabel = connected
@@ -540,6 +575,7 @@ export default function Demo() {
             line1={stereo ? "Stereo" : "Mono"}
             line2={stereo ? "2 Channels" : "1 Channel"}
             onClick={handleStereoToggle}
+            disabled={stereoDisabled}
           />
         </div>
 
