@@ -109,10 +109,10 @@ export default function Demo() {
   const [echo, setEcho] = useState(false);
   const [noise, setNoise] = useState(false);
   const [stereo, setStereo] = useState(true);
-  // 0 means "not yet known" (mirrors the Rust side's 0 fallback before any
-  // capture has started) — distinct from any real channel count, which is
-  // always >= 1.
-  const [maxInputChannels, setMaxInputChannels] = useState(0);
+  // undefined means "not yet known" (mirrors getMaxInputChannels's Option —
+  // None until discovery completes, not merely "no capture started") —
+  // distinct from any real channel count, which is always >= 1.
+  const [maxInputChannels, setMaxInputChannels] = useState<number | undefined>(undefined);
 
   const [inputGain, setInputGain] = useState(0);
   const [outputVolume, setOutputVolume] = useState(100);
@@ -230,7 +230,7 @@ export default function Demo() {
   // handleConnect is what actually publishes the discovered count.
   useEffect(() => {
     if (!engine || sessionState !== "connected") {
-      setMaxInputChannels(0);
+      setMaxInputChannels(undefined);
       return;
     }
     setMaxInputChannels(engine.session.getMaxInputChannels());

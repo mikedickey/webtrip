@@ -108,14 +108,16 @@ pub struct AudioEngine {
     worklet_output_channels: usize,
     /// The number of capture channels actually granted by the browser for
     /// the current capture stream (from
-    /// `MediaStreamTrack.getSettings().channelCount`). `1` before any
-    /// capture has started.
-    granted_input_channels: u32,
+    /// `MediaStreamTrack.getSettings().channelCount`). `None` until
+    /// `start_capture`'s `getUserMedia` call resolves and discovery
+    /// actually completes — distinct from any real granted count, which is
+    /// always `Some(n)` with `n >= 1`.
+    granted_input_channels: Option<u32>,
     /// The maximum channel count the current input device supports (from
     /// `MediaStreamTrack.getCapabilities().channelCount.max`, falling back
-    /// to the granted count when capabilities are unavailable). `1` before
-    /// any capture has started.
-    max_input_channels: u32,
+    /// to the granted count when capabilities are unavailable). `None`
+    /// until discovery completes, same as `granted_input_channels`.
+    max_input_channels: Option<u32>,
 }
 
 #[wasm_bindgen]
@@ -151,8 +153,8 @@ impl AudioEngine {
             local_to_network_buffer_ptr,
             network_to_local_buffer_ptr,
             worklet_output_channels: 0,
-            granted_input_channels: 1,
-            max_input_channels: 1,
+            granted_input_channels: None,
+            max_input_channels: None,
         })
     }
 
@@ -238,8 +240,8 @@ impl AudioEngine {
         } else {
             (1, 1)
         };
-        self.granted_input_channels = granted;
-        self.max_input_channels = max;
+        self.granted_input_channels = Some(granted);
+        self.max_input_channels = Some(max);
 
         // Create source node from the stream
         let source_node = self.ctx.create_media_stream_source(&stream)?;
@@ -250,7 +252,7 @@ impl AudioEngine {
         // to it (explicit/discrete, so the browser never speaker-folds or
         // up-mixes on our behalf — mapping is `map_to_output`'s job).
         let output_channels = self.configure_destination()?;
-        self.build_and_connect_worklet_node(self.granted_input_channels as usize, output_channels as usize)?;
+        self.build_and_connect_worklet_node(granted as usize, output_channels as usize)?;
 
         // Resume the audio context.
         // On iOS Safari, AudioContext.resume() returns a promise that *never* resolves when
@@ -427,19 +429,36 @@ impl AudioEngine {
 
     /// The number of capture channels actually granted by the browser for the
     /// current capture stream (from `MediaStreamTrack.getSettings().channelCount`).
-    /// `1` before any capture has started.
+    /// `None` until capture has started AND discovery has completed — not
+    /// merely "an `AudioEngine` exists" (`start_capture` is async and
+    /// discovery only resolves partway through it), so a caller can never
+    /// mistake "not yet known" for a real, always-`>=1` granted count.
     #[wasm_bindgen(js_name = grantedInputChannels)]
-    pub fn granted_input_channels(&self) -> u32 {
+    pub fn granted_input_channels(&self) -> Option<u32> {
         self.granted_input_channels
     }
 
     /// The maximum channel count the current input device supports (from
     /// `MediaStreamTrack.getCapabilities().channelCount.max`, falling back to
-    /// the granted count when capabilities are unavailable). `1` before any
-    /// capture has started.
+    /// the granted count when capabilities are unavailable). `None` until
+    /// discovery completes, same as `granted_input_channels`.
     #[wasm_bindgen(js_name = maxInputChannels)]
-    pub fn max_input_channels(&self) -> u32 {
+    pub fn max_input_channels(&self) -> Option<u32> {
         self.max_input_channels
+    }
+
+    /// The number of channels the current playback output is configured
+    /// for (from `AudioContext.destination.maxChannelCount`, capped to
+    /// `MAX_CHANNELS` — see `configure_destination`). `None` until capture
+    /// has started AND the worklet node has actually been built.
+    ///
+    /// Unlike the input side there is no separate "requested vs. granted"
+    /// negotiation for output: `configure_destination` always configures
+    /// the destination to its full reported capability, so this is the one
+    /// value that matters — always `>= 1` once known.
+    #[wasm_bindgen(js_name = outputChannels)]
+    pub fn output_channels(&self) -> Option<u32> {
+        (self.worklet_output_channels > 0).then_some(self.worklet_output_channels as u32)
     }
 
     /// Set the output audio device (sink) for playback
@@ -461,7 +480,12 @@ impl AudioEngine {
         if self.worklet_node.is_some() {
             let output_channels = self.configure_destination()?;
             if output_channels as usize != self.worklet_output_channels {
-                self.build_and_connect_worklet_node(self.granted_input_channels as usize, output_channels as usize)?;
+                // `worklet_node` only ever exists after `start_capture`'s
+                // discovery has already set `granted_input_channels`, so
+                // this is always `Some` in practice; `unwrap_or(1)` is a
+                // defensive floor, not a real fallback path.
+                let input_channels = self.granted_input_channels.unwrap_or(1) as usize;
+                self.build_and_connect_worklet_node(input_channels, output_channels as usize)?;
             }
         }
 
