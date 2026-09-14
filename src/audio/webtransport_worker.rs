@@ -207,7 +207,10 @@ struct WorkerState {
     regulator_ptr: SharedPtr<Regulator>,
     /// Audio buffer configuration
     buffer_size: usize,
-    channels: u8,
+    /// Payload width of every outbound packet (and the ring buffer's width)
+    send_channels: u8,
+    /// Channel count asked back from the peer in every outbound header
+    receive_channels: u8,
     /// Sequence number for outgoing packets
     sequence_number: AtomicU16,
     /// Timestamp for outgoing packets
@@ -230,7 +233,8 @@ impl WorkerState {
             ring_buffer_ptr: SharedPtr::null(),
             regulator_ptr: SharedPtr::null(),
             buffer_size: 128,
-            channels: 2,
+            send_channels: 1,
+            receive_channels: 2,
             sequence_number: AtomicU16::new(0),
             timestamp: AtomicU64::new(0),
             running: AtomicBool::new(false),
@@ -241,14 +245,22 @@ impl WorkerState {
         }
     }
 
-    fn configure(&mut self, ring_ptr: usize, reg_ptr: usize, buffer_size: usize, channels: u8) {
+    fn configure(
+        &mut self,
+        ring_ptr: usize,
+        reg_ptr: usize,
+        buffer_size: usize,
+        send_channels: u8,
+        receive_channels: u8,
+    ) {
         self.ring_buffer_ptr = SharedPtr::from_addr(ring_ptr);
         self.regulator_ptr = SharedPtr::from_addr(reg_ptr);
         self.buffer_size = buffer_size;
-        self.channels = channels;
-        
+        self.send_channels = send_channels;
+        self.receive_channels = receive_channels;
+
         // Pre-allocate buffers
-        let samples_per_packet = buffer_size * channels as usize;
+        let samples_per_packet = samples_per_packet(buffer_size, send_channels) as usize;
         *self.audio_buffer.borrow_mut() = vec![0.0f32; samples_per_packet];
         
         // Max packet size: header + samples as 16-bit
@@ -320,10 +332,17 @@ pub fn worker_init(
     ring_buffer_ptr: usize,
     regulator_ptr: usize,
     buffer_size: usize,
-    channels: u8,
+    send_channels: u8,
+    receive_channels: u8,
 ) {
     WORKER_STATE.with(|state| {
-        state.borrow_mut().configure(ring_buffer_ptr, regulator_ptr, buffer_size, channels);
+        state.borrow_mut().configure(
+            ring_buffer_ptr,
+            regulator_ptr,
+            buffer_size,
+            send_channels,
+            receive_channels,
+        );
     });
 }
 
@@ -445,7 +464,7 @@ fn build_next_packet(state: &WorkerState) -> Option<(Uint8Array, usize)> {
     // Sound shared borrow: `RingBuffer`'s read path is `&self`.
     let ring_buffer = state.ring_buffer_ptr.as_ref()?;
 
-    let samples_needed = samples_per_packet(state.buffer_size, state.channels);
+    let samples_needed = samples_per_packet(state.buffer_size, state.send_channels);
     if send_decision(ring_buffer.available(), samples_needed) == SendDecision::Wait {
         return None;
     }
@@ -465,7 +484,8 @@ fn build_next_packet(state: &WorkerState) -> Option<(Uint8Array, usize)> {
         seq,
         ts,
         &audio_buffer,
-        state.channels,
+        state.send_channels,
+        state.receive_channels,
         &mut packet_buffer,
     ) {
         Ok(bytes_written) => {
@@ -752,7 +772,7 @@ pub fn worker_main() {
 /// Handle incoming message from main thread
 /// 
 /// Message types:
-/// - { type: "init", ringBufferPtr, regulatorPtr, bufferSize, channels }
+/// - { type: "init", ringBufferPtr, regulatorPtr, bufferSize, sendChannels, receiveChannels }
 /// - { type: "connect", serverUrl }
 /// - { type: "disconnect" }
 /// - { type: "getStats" }
@@ -777,12 +797,16 @@ pub fn handle_worker_message(msg: JsValue) -> js_sys::Promise {
                 .ok()
                 .and_then(|v| v.as_f64())
                 .unwrap_or(128.0) as usize;
-            let channels = Reflect::get(&msg, &"channels".into())
+            let send_channels = Reflect::get(&msg, &"sendChannels".into())
+                .ok()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0) as u8;
+            let receive_channels = Reflect::get(&msg, &"receiveChannels".into())
                 .ok()
                 .and_then(|v| v.as_f64())
                 .unwrap_or(2.0) as u8;
 
-            worker_init(ring_ptr, reg_ptr, buffer_size, channels);
+            worker_init(ring_ptr, reg_ptr, buffer_size, send_channels, receive_channels);
             
             // Post ready message to main thread
             post_message_to_main(&JsValue::from_str("ready"));
@@ -1014,7 +1038,8 @@ mod tests {
             ("ringBufferPtr", JsValue::from_f64(0.0)),
             ("regulatorPtr", JsValue::from_f64(0.0)),
             ("bufferSize", JsValue::from_f64(128.0)),
-            ("channels", JsValue::from_f64(2.0)),
+            ("sendChannels", JsValue::from_f64(1.0)),
+            ("receiveChannels", JsValue::from_f64(2.0)),
         ]);
 
         let result = JsFuture::from(handle_worker_message(msg))
@@ -1028,7 +1053,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn handle_worker_message_get_stats_resolves_stats_object() {
-        worker_init(0, 0, 128, 2);
+        worker_init(0, 0, 128, 1, 2);
 
         let msg = worker_message(&[("type", JsValue::from_str("getStats"))]);
         let result = JsFuture::from(handle_worker_message(msg))
@@ -1067,7 +1092,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn handle_worker_message_disconnect_resolves_ok() {
-        worker_init(0, 0, 128, 2);
+        worker_init(0, 0, 128, 1, 2);
 
         let msg = worker_message(&[("type", JsValue::from_str("disconnect"))]);
         let result = JsFuture::from(handle_worker_message(msg))
@@ -1103,10 +1128,10 @@ mod tests {
     // still need an HTTP/3 server and stay out of scope.
 
     /// `configure()` with a real (non-null) ring buffer must size the reusable
-    /// audio/packet buffers from `buffer_size * channels`, store both buffer
-    /// pointers, and register the `has_data` `Int32Array` view used by the send
-    /// loop's `Atomics.waitAsync`. Run on a *local* `WorkerState` so it can't
-    /// perturb the thread-local `WORKER_STATE` other tests share.
+    /// audio/packet buffers from `buffer_size * send_channels`, store both
+    /// buffer pointers, and register the `has_data` `Int32Array` view used by
+    /// the send loop's `Atomics.waitAsync`. Run on a *local* `WorkerState` so
+    /// it can't perturb the thread-local `WORKER_STATE` other tests share.
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     fn configure_sizes_buffers_and_stores_pointers() {
@@ -1115,21 +1140,24 @@ mod tests {
         let ring_ptr = &ring as *const RingBuffer as usize;
         let reg_ptr = &mut regulator as *mut Regulator as usize;
 
+        // Send and receive differ so sizing by the wrong one (receive) fails.
         let buffer_size: usize = 64;
-        let channels: u8 = 2;
-        let samples_per_packet = buffer_size * channels as usize;
+        let send_channels: u8 = 3;
+        let receive_channels: u8 = 2;
+        let samples_per_packet = buffer_size * send_channels as usize;
 
         let mut state = WorkerState::new();
-        state.configure(ring_ptr, reg_ptr, buffer_size, channels);
+        state.configure(ring_ptr, reg_ptr, buffer_size, send_channels, receive_channels);
 
         assert_eq!(state.ring_buffer_ptr.addr(), ring_ptr, "ring buffer pointer must be stored");
         assert_eq!(state.regulator_ptr.addr(), reg_ptr, "regulator pointer must be stored");
         assert_eq!(state.buffer_size, buffer_size);
-        assert_eq!(state.channels, channels);
+        assert_eq!(state.send_channels, send_channels);
+        assert_eq!(state.receive_channels, receive_channels);
         assert_eq!(
             state.audio_buffer.borrow().len(),
             samples_per_packet,
-            "audio buffer must be sized buffer_size * channels"
+            "audio buffer must be sized buffer_size * send_channels"
         );
         assert_eq!(
             state.packet_buffer.borrow().len(),
@@ -1162,15 +1190,17 @@ mod tests {
         let ring = RingBuffer::new();
         let mut regulator = Regulator::new();
         let buffer_size: usize = 64;
-        let channels: u8 = 2;
-        let frame = buffer_size * channels as usize;
+        let send_channels: u8 = 2;
+        let receive_channels: u8 = 4;
+        let frame = buffer_size * send_channels as usize;
 
         let mut state = WorkerState::new();
         state.configure(
             &ring as *const RingBuffer as usize,
             &mut regulator as *mut Regulator as usize,
             buffer_size,
-            channels,
+            send_channels,
+            receive_channels,
         );
 
         // Empty ring buffer → nothing to send, counters untouched.
@@ -1225,6 +1255,10 @@ mod tests {
         );
         assert_eq!(packet.header.sequence_number, 0);
         assert_eq!(packet.header.timestamp, 0);
+        assert_eq!(
+            packet.header.num_incoming_channels, receive_channels,
+            "the worker must advertise the configured receive count, not echo the send count"
+        );
 
         // Counters advanced once per packet, not once per sample or iteration.
         assert_eq!(state.sequence_number.load(Ordering::Relaxed), 2);
@@ -1248,7 +1282,7 @@ mod tests {
         let reg_ptr = &mut regulator as *mut Regulator as usize;
 
         WORKER_STATE.with(|state| {
-            state.borrow_mut().configure(ring_ptr, reg_ptr, 128, 2);
+            state.borrow_mut().configure(ring_ptr, reg_ptr, 128, 1, 2);
             state.borrow().start();
         });
         assert!(
@@ -1270,7 +1304,7 @@ mod tests {
         // buffers drop, so no later test can observe dangling pointers or
         // notify on a stale `Int32Array`. `configure()` with a null ring
         // buffer also clears the cached has_data view.
-        WORKER_STATE.with(|state| state.borrow_mut().configure(0, 0, 128, 2));
+        WORKER_STATE.with(|state| state.borrow_mut().configure(0, 0, 128, 1, 2));
         assert!(
             WORKER_STATE.with(|s| s.borrow().has_data_int32_array.borrow().is_none()),
             "re-configure with a null ring buffer must clear the cached has_data view"

@@ -33,16 +33,20 @@
 //! - 5 = 96000 Hz
 //! - 6 = 192000 Hz
 //!
-//! ## NumOutgoingChannelsToNet Special Encoding
+//! ## Channel Fields
 //!
-//! The `NumOutgoingChannelsToNet` field uses a space-optimized encoding:
-//! - **Value = 0**: Outgoing channels equals incoming channels (symmetric configuration)
-//!   - This is the most common case and avoids redundant data
-//!   - Example: If `NumIncomingChannelsFromNet = 2`, then outgoing is also 2
-//! - **Value = 1-254**: Explicit outgoing channel count (asymmetric configuration)
-//!   - Used when sender has different input/output channel counts
-//! - **Value = 255 (0xFF)**: Special case indicating zero input channels
-//!   - Sender is receive-only (no outgoing audio)
+//! Both fields are named from the perspective of the packet's sender, matching
+//! JackTrip's `DefaultHeader::fillHeaderCommonFromAudio`:
+//!
+//! - `NumIncomingChannelsFromNet` (byte 14) is how many channels the sender
+//!   receives from the network — the channel count it wants sent back.
+//! - `NumOutgoingChannelsToNet` (byte 15) is how many channels the sender
+//!   transmits — the channel count of this packet's payload. Receivers size
+//!   and stride the payload by it. It uses a space-optimized encoding:
+//!   - **Value = 0**: same as `NumIncomingChannelsFromNet` (symmetric
+//!     configuration)
+//!   - **Value = 1-254**: explicit channel count (asymmetric configuration)
+//!   - **Value = 255 (0xFF)**: the sender transmits no audio
 
 use wasm_bindgen::prelude::*;
 
@@ -144,9 +148,9 @@ impl SampleRateCode {
 ///
 /// This field is stored internally as the actual channel count, but uses special
 /// encoding when serialized to the wire format:
-/// - **0 on wire** = symmetric (outgoing equals incoming)
-/// - **1-254 on wire** = explicit channel count
-/// - **255 on wire** = receive-only (0 channels)
+/// - **0 on wire** = symmetric (the sender transmits as many channels as it receives)
+/// - **1-254 on wire** = explicit transmitted channel count
+/// - **255 on wire** = the sender transmits no audio (0 channels)
 ///
 /// The encoding/decoding is handled automatically by `serialize()` and `deserialize()`.
 #[derive(Debug, Clone, Copy)]
@@ -161,9 +165,9 @@ pub struct PacketHeader {
     pub sample_rate: SampleRateCode,
     /// Bit depth (1 byte): 8, 16, 24, or 32
     pub bit_depth: u8,
-    /// Number of incoming audio channels (from network to us)
+    /// Channels the sender receives from the network — the count it wants sent back
     pub num_incoming_channels: u8,
-    /// Number of outgoing audio channels (from us to network)
+    /// Channels the sender transmits — this packet's payload width
     /// Note: This is the decoded value; wire format uses special encoding
     pub num_outgoing_channels: u8,
 }
@@ -205,10 +209,10 @@ impl PacketHeader {
     /// This implements the space-optimized encoding where:
     /// - 0 means symmetric (outgoing = incoming)
     /// - 1-254 is explicit channel count
-    /// - 255 means zero input channels (receive-only)
+    /// - 255 means the sender transmits no audio
     fn encode_outgoing_channels(&self) -> u8 {
         if self.num_outgoing_channels == 0 {
-            // Zero input channels (receive-only)
+            // The sender transmits no audio
             255
         } else if self.num_outgoing_channels == self.num_incoming_channels {
             // Symmetric case - bandwidth optimization
@@ -226,12 +230,13 @@ impl PacketHeader {
     fn decode_outgoing_channels(encoded: u8, num_incoming: u8) -> u8 {
         match encoded {
             0 => num_incoming,  // Symmetric: outgoing = incoming
-            255 => 0,           // Receive-only: no outgoing channels
+            255 => 0,           // The sender transmits no audio
             n => n,             // Explicit count (1-254)
         }
     }
 
-    /// Total packet size for outgoing packets (header + audio data)
+    /// Total packet size for outgoing packets (header + audio data). The
+    /// payload is `num_outgoing_channels` wide — the channels the sender transmits.
     pub fn total_packet_size_out(&self) -> usize {
         HEADER_SIZE + audio_data_size(self.buffer_size, self.num_outgoing_channels, self.bit_depth)
     }
@@ -283,14 +288,13 @@ impl PacketHeader {
             num_incoming_channels
         );
 
-        // Validate - only num_incoming_channels matters for received packets
-        // (it tells us how many channels of audio data are in this packet)
+        // Validate the channel count the peer wants back (JackTrip rejects 0 too)
         if num_incoming_channels == 0 || num_incoming_channels > MAX_CHANNELS {
             return Err(ProtocolError::InvalidChannelCount);
         }
 
-        // Validate decoded outgoing channels
-        // After decoding, it can be 0 (receive-only) or 1-MAX_CHANNELS (normal range)
+        // Validate decoded outgoing channels — this packet's payload width.
+        // After decoding, it can be 0 (no audio) or 1-MAX_CHANNELS (normal range)
         if num_outgoing_channels > MAX_CHANNELS {
             #[cfg(target_arch = "wasm32")]
             web_sys::console::error_1(&format!(
@@ -381,28 +385,22 @@ impl AudioPacket {
     /// Serialize samples directly into a buffer without creating an AudioPacket (no allocation)
     ///
     /// This is optimized for the send path where we want to avoid cloning the samples vector.
+    /// `samples` is interleaved at `send_channels`, which becomes the header's
+    /// payload width (`num_outgoing_channels`, byte 15); `receive_channels` is
+    /// the count asked back from the peer (`num_incoming_channels`, byte 14).
     /// Returns the number of bytes written.
     pub fn serialize_samples_into(
         sequence_number: u16,
         timestamp: u64,
         samples: &[f32],
-        channels: u8,
+        send_channels: u8,
+        receive_channels: u8,
         buffer: &mut [u8],
     ) -> Result<usize, ProtocolError> {
-        // Create header inline
-        let mut header = if channels == 1 {
-            PacketHeader::new(sequence_number, timestamp)
-        } else {
-            PacketHeader::stereo(sequence_number, timestamp)
-        };
-        
-        header.buffer_size = if channels == 1 {
-            samples.len() as u16
-        } else {
-            (samples.len() / channels as usize) as u16
-        };
-        header.num_incoming_channels = channels;
-        header.num_outgoing_channels = channels;
+        let mut header = PacketHeader::new(sequence_number, timestamp);
+        header.buffer_size = (samples.len() / send_channels.max(1) as usize) as u16;
+        header.num_incoming_channels = receive_channels;
+        header.num_outgoing_channels = send_channels;
 
         let total_size = header.total_packet_size_out();
         if buffer.len() < total_size {
@@ -413,7 +411,7 @@ impl AudioPacket {
         header.serialize(&mut buffer[..HEADER_SIZE])?;
 
         let audio_start = HEADER_SIZE;
-        let num_channels = channels as usize;
+        let num_channels = send_channels as usize;
         let buf_size = header.buffer_size as usize;
 
         match header.bit_depth {
@@ -511,8 +509,8 @@ impl AudioPacket {
     pub fn deserialize_into(buffer: &[u8], samples: &mut Vec<f32>) -> Result<PacketHeader, ProtocolError> {
         let header = PacketHeader::deserialize(buffer)?;
 
-        // For incoming packets, use num_incoming_channels
-        let num_samples = header.buffer_size as usize * header.num_incoming_channels as usize;
+        // The payload is the sender's transmitted channels (byte 15)
+        let num_samples = header.buffer_size as usize * header.num_outgoing_channels as usize;
         let bytes_per_sample = (header.bit_depth as usize + 7) / 8;
         let audio_data_size = num_samples * bytes_per_sample;
 
@@ -530,7 +528,7 @@ impl AudioPacket {
         samples.reserve(num_samples);
         let audio_start = HEADER_SIZE;
 
-        let num_channels = header.num_incoming_channels as usize;
+        let num_channels = header.num_outgoing_channels as usize;
         let buf_size = header.buffer_size as usize;
 
         // Deserialize based on bit depth
@@ -955,6 +953,27 @@ mod tests {
         
         let decoded = PacketHeader::deserialize(&buffer).unwrap();
         assert_eq!(decoded.num_outgoing_channels, 4);
+
+        // The payload is framed at `num_outgoing_channels` (4, what the sender
+        // transmits), not the channel count asked back (2), as JackTrip reads
+        // it: serialize_into and deserialize_into must agree on that width or
+        // the planar samples land at the wrong offsets.
+        let buf_size = 16usize;
+        header.buffer_size = buf_size as u16;
+        let samples: Vec<f32> = (0..buf_size * 4)
+            .map(|i| (i as f32 / (buf_size * 4) as f32) - 0.5)
+            .collect();
+        let serialized = AudioPacket::new(header, samples.clone()).serialize().unwrap();
+        assert_eq!(serialized.len(), HEADER_SIZE + buf_size * 4 * 2);
+
+        let mut decoded_samples = Vec::new();
+        let decoded = AudioPacket::deserialize_into(&serialized, &mut decoded_samples).unwrap();
+        assert_eq!(decoded.num_incoming_channels, 2);
+        assert_eq!(decoded.num_outgoing_channels, 4);
+        assert_eq!(decoded_samples.len(), samples.len());
+        for (i, (a, b)) in samples.iter().zip(decoded_samples.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-4, "asymmetric sample {i} mismatch: {a} vs {b}");
+        }
     }
 
     #[test]
@@ -1214,13 +1233,24 @@ mod tests {
 
     // ----- AudioPacket::serialize_samples_into (allocation-free serialize path) -----
 
+    /// Regression test: send and receive widths are independent, and each goes
+    /// in the byte JackTrip reads it from. Sending 1 channel while asking for
+    /// 2 back must put the receive count (2) in byte 14 and the payload width
+    /// (1) in byte 15 (`DefaultHeader::fillHeaderCommonFromAudio`). This used
+    /// to write the send count into both bytes, so a mono sender always told
+    /// the hub "symmetric" and got mono back; with the two bytes swapped the
+    /// hub drops every packet as too small for its declared payload.
     #[test]
     fn test_serialize_samples_into_then_deserialize_mono_roundtrip() {
         let samples: Vec<f32> = (0..128).map(|i| i as f32 / 128.0).collect();
-        let mut buf = vec![0u8; HEADER_SIZE + 128 * 2];
+        // Oversized: the packet must be sized by the send width, not the
+        // receive width or the buffer length.
+        let mut buf = vec![0u8; HEADER_SIZE + 128 * 2 * 2];
 
-        let written = AudioPacket::serialize_samples_into(7, 1000, &samples, 1, &mut buf).unwrap();
-        assert_eq!(written, HEADER_SIZE + 128 * 2);
+        let written = AudioPacket::serialize_samples_into(7, 1000, &samples, 1, 2, &mut buf).unwrap();
+        assert_eq!(written, HEADER_SIZE + 128 * 1 * 2);
+        assert_eq!(buf[14], 2, "byte 14 must carry the receive channel count");
+        assert_eq!(buf[15], 1, "byte 15 must carry the send channel count (payload width)");
 
         let pkt = AudioPacket::deserialize(&buf[..written]).unwrap();
         assert_eq!(pkt.header.sequence_number, 7);
@@ -1235,7 +1265,7 @@ mod tests {
     fn test_serialize_samples_into_buffer_too_small_returns_error() {
         let samples = vec![0.0f32; 128];
         let mut tiny_buf = vec![0u8; 4]; // way too small
-        let result = AudioPacket::serialize_samples_into(0, 0, &samples, 1, &mut tiny_buf);
+        let result = AudioPacket::serialize_samples_into(0, 0, &samples, 1, 2, &mut tiny_buf);
         assert_eq!(result, Err(ProtocolError::BufferTooSmall));
     }
 }

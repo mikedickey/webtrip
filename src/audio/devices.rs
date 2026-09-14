@@ -1,7 +1,13 @@
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{MediaDeviceInfo, MediaDeviceKind, MediaDevices, MediaStream, MediaStreamConstraints};
+use web_sys::{
+    AudioContext, MediaDeviceInfo, MediaDeviceKind, MediaDevices, MediaStream,
+    MediaStreamConstraints, MediaStreamTrack,
+};
+
+use crate::audio::engine::{route_output_sink, AudioConstraints};
+use crate::audio::protocol::MAX_CHANNELS;
 
 /// Device information
 #[wasm_bindgen]
@@ -88,17 +94,116 @@ pub fn stop_media_stream(stream: &MediaStream) {
     }
 }
 
-/// Request audio permission by getting and immediately stopping a stream
-async fn request_audio_permission(media_devices: &MediaDevices) -> Result<(), JsValue> {
+/// Open an audio-only capture stream. `audio` is the `getUserMedia` audio
+/// constraint: `true` for the browser defaults, or a constraints object
+/// (see [`AudioConstraints::to_js`]).
+pub(crate) async fn get_user_media_audio(
+    media_devices: &MediaDevices,
+    audio: &JsValue,
+) -> Result<MediaStream, JsValue> {
     let constraints = MediaStreamConstraints::new();
-    constraints.set_audio(&JsValue::from(true));
+    constraints.set_audio(audio);
     constraints.set_video(&JsValue::from(false));
 
     let stream_promise = media_devices.get_user_media_with_constraints(&constraints)?;
-    let stream: MediaStream = JsFuture::from(stream_promise).await?.unchecked_into();
+    Ok(JsFuture::from(stream_promise).await?.unchecked_into())
+}
 
+/// Request audio permission by getting and immediately stopping a stream
+async fn request_audio_permission(media_devices: &MediaDevices) -> Result<(), JsValue> {
+    let stream = get_user_media_audio(media_devices, &JsValue::from(true)).await?;
     stop_media_stream(&stream);
     Ok(())
+}
+
+/// Clamp a device-reported channel count to the supported range
+/// `[1, MAX_CHANNELS]`.
+pub(crate) fn clamp_channel_count(channels: u32) -> u32 {
+    channels.clamp(1, MAX_CHANNELS as u32)
+}
+
+/// Resolve an input device's channel count from what its capture track
+/// reports: the capability maximum when known, otherwise the granted
+/// settings value, otherwise 1 — clamped to `[1, MAX_CHANNELS]`.
+pub(crate) fn resolve_input_channels(settings: Option<u32>, capability_max: Option<u32>) -> u32 {
+    clamp_channel_count(capability_max.or(settings).unwrap_or(1))
+}
+
+/// The first audio track of `stream`, if any.
+pub(crate) fn first_audio_track(stream: &MediaStream) -> Option<MediaStreamTrack> {
+    stream.get_audio_tracks().get(0).dyn_into::<MediaStreamTrack>().ok()
+}
+
+/// The channel count the browser granted `track`
+/// (`getSettings().channelCount`), if reported.
+pub(crate) fn settings_channels(track: &MediaStreamTrack) -> Option<u32> {
+    track.get_settings().get_channel_count().map(|c| c.max(0) as u32)
+}
+
+/// The maximum channel count `track`'s device supports
+/// (`getCapabilities().channelCount.max`), if reported.
+fn capability_max_channels(track: &MediaStreamTrack) -> Result<Option<u32>, JsValue> {
+    // Some browsers (notably Safari) don't implement `getCapabilities()` on
+    // `MediaStreamTrack` at all — calling the unguarded web-sys binding would
+    // throw a JS TypeError, so probe for the method first, the same way
+    // `route_output_sink` probes for `setSinkId`.
+    if !js_sys::Reflect::has(track, &JsValue::from_str("getCapabilities"))? {
+        return Ok(None);
+    }
+    Ok(track
+        .get_capabilities()
+        .get_channel_count()
+        .and_then(|range| range.get_max()))
+}
+
+/// Query how many channels an input device has, without connecting.
+///
+/// Opens the device (the default input when `deviceId` is absent or empty)
+/// with processing off and the native-width channel request, reads the
+/// capture track's channel capability, and stops the stream. Resolves to a
+/// count in `[1, MAX_CHANNELS]`.
+///
+/// A module-level function rather than a session method, so it can run while
+/// a `connectToStudio` call holds the session borrowed.
+#[wasm_bindgen(js_name = getInputDeviceChannels)]
+pub async fn get_input_device_channels(device_id: Option<String>) -> Result<u32, JsValue> {
+    let media_devices = get_media_devices()?;
+    let constraints = AudioConstraints::resolve(device_id, false, false, false).to_js()?;
+    let stream = get_user_media_audio(&media_devices, &constraints).await?;
+
+    let channels = match first_audio_track(&stream) {
+        Some(track) => capability_max_channels(&track)
+            .map(|max| resolve_input_channels(settings_channels(&track), max)),
+        None => Ok(1),
+    };
+
+    stop_media_stream(&stream);
+    channels
+}
+
+/// Query how many channels an output device has, without connecting.
+///
+/// Creates a throwaway `AudioContext`, routes it to `deviceId` when one is
+/// given (a no-op without `setSinkId`, so Safari and Firefox report the
+/// default output — the device they play to anyway), reads the
+/// destination's `maxChannelCount`, and closes the context. Resolves to a
+/// count in `[1, MAX_CHANNELS]`.
+///
+/// Module-level for the same reason as [`get_input_device_channels`].
+#[wasm_bindgen(js_name = getOutputDeviceChannels)]
+pub async fn get_output_device_channels(device_id: Option<String>) -> Result<u32, JsValue> {
+    let ctx = AudioContext::new()?;
+
+    let channels = match device_id.filter(|id| !id.is_empty()) {
+        Some(id) => route_output_sink(ctx.as_ref(), Some(id)).await,
+        None => Ok(()),
+    }
+    .map(|()| clamp_channel_count(ctx.destination().max_channel_count()));
+
+    if let Ok(close) = ctx.close() {
+        let _ = JsFuture::from(close).await;
+    }
+    channels
 }
 
 /// Enumerate all media devices
@@ -264,6 +369,33 @@ mod tests {
         assert_devices(&outputs, &[("out-2", "Out Second"), ("out-1", "Out First")]);
     }
 
+    #[test]
+    fn test_resolve_input_channels_boundaries() {
+        // (settings, capability_max) -> expected
+        let cases: &[(Option<u32>, Option<u32>, u32)] = &[
+            // Nothing reported: assume mono.
+            (None, None, 1),
+            // Capability only.
+            (None, Some(4), 4),
+            // Settings fallback when capabilities are unavailable.
+            (Some(2), None, 2),
+            // The capability wins over a narrower granted setting.
+            (Some(1), Some(2), 2),
+            // Clamped to [1, MAX_CHANNELS] on both sides.
+            (Some(0), None, 1),
+            (None, Some(0), 1),
+            (None, Some(9), 8),
+            (Some(9), None, 8),
+        ];
+        for &(settings, capability_max, expected) in cases {
+            assert_eq!(
+                resolve_input_channels(settings, capability_max),
+                expected,
+                "settings={settings:?} capability_max={capability_max:?}"
+            );
+        }
+    }
+
     // ── Browser tests (web_sys / MediaDevices) ───────────────────────────────
     //
     // Real-browser coverage of the device-enumeration / permission glue around
@@ -322,17 +454,9 @@ mod tests {
         let media_devices =
             get_media_devices().expect("navigator.mediaDevices must be available");
 
-        let constraints = MediaStreamConstraints::new();
-        constraints.set_audio(&JsValue::from(true));
-        constraints.set_video(&JsValue::from(false));
-        let stream: MediaStream = JsFuture::from(
-            media_devices
-                .get_user_media_with_constraints(&constraints)
-                .expect("getUserMedia call should be issued"),
-        )
-        .await
-        .expect("getUserMedia should resolve with fake-device flags")
-        .unchecked_into();
+        let stream = get_user_media_audio(&media_devices, &JsValue::from(true))
+            .await
+            .expect("getUserMedia should resolve with fake-device flags");
 
         let tracks = stream.get_tracks();
         assert!(tracks.length() > 0, "fake mic stream must expose at least one track");
@@ -404,6 +528,50 @@ mod tests {
                 "output device label must be populated after permission grant"
             );
         }
+    }
+
+    /// `get_input_device_channels` must open the device, resolve a count in
+    /// `[1, MAX_CHANNELS]`, and surface a `getUserMedia` failure (an unknown
+    /// exact device id) as a rejection rather than a made-up count.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn get_input_device_channels_resolves_count_or_rejects() {
+        let channels = get_input_device_channels(None)
+            .await
+            .expect("probing the default fake input should resolve");
+        assert!(
+            (1..=MAX_CHANNELS as u32).contains(&channels),
+            "input probe must resolve within [1, MAX_CHANNELS], got {channels}"
+        );
+
+        assert!(
+            get_input_device_channels(Some("no-such-input-device".to_string()))
+                .await
+                .is_err(),
+            "an unknown exact device id must reject"
+        );
+    }
+
+    /// `get_output_device_channels` must resolve the default output's count
+    /// in `[1, MAX_CHANNELS]`, and surface a failed `setSinkId` (an unknown
+    /// device id) as a rejection.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn get_output_device_channels_resolves_count_or_rejects() {
+        let channels = get_output_device_channels(None)
+            .await
+            .expect("probing the default output should resolve");
+        assert!(
+            (1..=MAX_CHANNELS as u32).contains(&channels),
+            "output probe must resolve within [1, MAX_CHANNELS], got {channels}"
+        );
+
+        assert!(
+            get_output_device_channels(Some("no-such-output-device".to_string()))
+                .await
+                .is_err(),
+            "an unknown sink id must reject"
+        );
     }
 }
 

@@ -153,10 +153,10 @@ pub(crate) fn map_to_output(src: &[f32], src_channels: usize, out: &mut [f32], o
 /// dropped and extra destination channels silent — but for an INTERLEAVED
 /// source *and* destination.
 ///
-/// Used to conform the browser's actually-granted capture width to the
-/// network wire's fixed per-session channel count (decided once at connect
-/// time from `AudioParams::capture_channels`), which `map_to_output`'s planar
-/// output layout cannot serve directly. The two functions deliberately keep
+/// Used to conform the capture width to the network wire's send channel
+/// count (fixed for the connection, `AudioParams::send_channels`) — e.g.
+/// averaging two captured channels into one sent — which `map_to_output`'s
+/// planar output layout cannot serve directly. The two functions deliberately keep
 /// separate implementations: they walk genuinely different memory layouts,
 /// and the parallel structure is cheaper than an abstraction over both.
 ///
@@ -440,16 +440,17 @@ impl AudioProcessor {
     }
 
     /// Send local audio to network via ring buffer, as interleaved audio at
-    /// the session's *wire* channel count.
+    /// the session's wire send channel count.
     ///
-    /// `in_channels` is what the worklet actually captured this callback — the
-    /// browser's granted width, which can be narrower than what was requested
-    /// (a mono-only device, or echo cancellation forcing mono). The transports
-    /// downstream of this ring buffer frame every outbound packet at a fixed
-    /// width chosen once at connect time (`AudioParams::capture_channels`), so
-    /// a mismatch here would mis-frame the packets: two mono quantums packed
-    /// and labelled as one stereo quantum. Conform the captured width to the
-    /// wire width before writing.
+    /// `in_channels` is what the worklet actually captured this callback —
+    /// the configured input channel count, or fewer when the browser granted
+    /// fewer (a mono-only device, or echo cancellation forcing mono). The
+    /// transports downstream of this ring buffer frame every outbound packet
+    /// at the send width fixed at connect time (`AudioParams::send_channels`),
+    /// which is independent of the capture width, so a mismatch here would
+    /// mis-frame the packets: two mono quantums packed and labelled as one
+    /// stereo quantum. Conform the captured width to the send width before
+    /// writing.
     fn send_local_to_network(&mut self, in_channels: usize, frames: usize) {
         // Sound shared borrow: `RingBuffer`'s write path is `&self` (interior
         // mutability), so producer and consumer may hold `&RingBuffer` at once.
@@ -461,7 +462,7 @@ impl AudioProcessor {
             return;
         }
 
-        let wire_channels = (self.params.get_capture_channels() as usize).max(1);
+        let wire_channels = (self.params.get_send_channels() as usize).max(1);
         if in_channels == wire_channels {
             buffer.write(&self.captured_interleaved[..frames * in_channels]);
             return;
@@ -498,7 +499,7 @@ impl AudioProcessor {
 
         // The pop width is the regulator's own — it is the peer's channel
         // count (adopted from their first packet) and fpp, not a local
-        // playback-device setting. `AudioParams::capture_channels` governs
+        // playback-device setting. `AudioParams::send_channels` governs
         // only the send path.
         let channels = regulator.channels();
         let fpp = regulator.fpp();
@@ -1016,7 +1017,7 @@ mod tests {
         const MONITOR: f32 = 0.5;
 
         let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
-        params.set_capture_channels(2); // wire width matches the capture width here
+        params.set_send_channels(2); // wire width matches the capture width here
         params.set_monitor_volume(MONITOR);
 
         let mut ring = RingBuffer::new();
@@ -1068,10 +1069,10 @@ mod tests {
     }
 
     /// Regression test: the transports frame every outbound packet at the
-    /// session's fixed wire width (`AudioParams::capture_channels`, chosen at
-    /// connect time), so when the browser grants a NARROWER capture than was
-    /// requested — a mono-only device against the default stereo session —
-    /// `process` must conform before writing. Writing `frames * in_channels`
+    /// session's fixed send width (`AudioParams::send_channels`, chosen at
+    /// connect time), so when the capture is NARROWER than the send width —
+    /// a mono-only device against a stereo send — `process` must conform
+    /// before writing. Writing `frames * in_channels`
     /// instead would pack two mono quantums into one "stereo" packet, which
     /// the peer decodes as double-speed garble.
     #[test]
@@ -1080,7 +1081,7 @@ mod tests {
         const LEVEL: f32 = 0.4;
 
         let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
-        params.set_capture_channels(2); // the wire is stereo …
+        params.set_send_channels(2); // the wire is stereo …
 
         let mut ring = RingBuffer::new();
         let mut processor = networked_processor(params, &mut ring);

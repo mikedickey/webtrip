@@ -186,7 +186,8 @@ fn build_worker_init_message(buffers: &AudioBufferConfig) -> serde_json::Value {
         "ringBufferPtr": buffers.local_to_network.addr() as f64,
         "regulatorPtr": buffers.network_to_local.addr() as f64,
         "bufferSize": buffers.buffer_size as f64,
-        "channels": buffers.channels as f64,
+        "sendChannels": buffers.send_channels as f64,
+        "receiveChannels": buffers.receive_channels as f64,
     })
 }
 
@@ -556,7 +557,7 @@ impl Transport for WebTransportImpl {
 
     fn set_audio_buffers(&mut self, config: AudioBufferConfig) {
         self.audio_buffers = Some(config);
-        super::transport::log_audio_buffers_set("WebTransport", config.channels, config.buffer_size);
+        super::transport::log_audio_buffers_set("WebTransport", &config);
     }
 
     fn set_on_state_change(&mut self, callback: js_sys::Function) {
@@ -814,7 +815,8 @@ mod tests {
             local_to_network: SharedPtr::null(),
             network_to_local: SharedPtr::null(),
             buffer_size: 128,
-            channels: 2,
+            send_channels: 1,
+            receive_channels: 2,
         });
 
         let msg = transport
@@ -1274,15 +1276,20 @@ mod tests {
             local_to_network: SharedPtr::from_addr(0x1000),
             network_to_local: SharedPtr::from_addr(0x2000),
             buffer_size: 128,
-            channels: 2,
+            send_channels: 1,
+            receive_channels: 2,
         };
 
         let msg = build_worker_init_message(&config);
 
+        // Pins the main-thread → worker init contract read by
+        // `webtransport_worker::handle_worker_message`.
         assert_eq!(msg["type"], "init");
         assert_eq!(msg["ringBufferPtr"], 0x1000 as f64);
         assert_eq!(msg["regulatorPtr"], 0x2000 as f64);
         assert_eq!(msg["bufferSize"], 128.0);
-        assert_eq!(msg["channels"], 2.0);
+        assert_eq!(msg["sendChannels"], 1.0);
+        assert_eq!(msg["receiveChannels"], 2.0);
+        assert!(msg.get("channels").is_none(), "the old symmetric `channels` field must be gone");
     }
 }

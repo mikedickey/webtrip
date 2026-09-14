@@ -380,7 +380,7 @@ impl WebRtcTransport {
             None => return,
         };
 
-        let samples_needed = (buffers.buffer_size * buffers.channels as usize) as u32;
+        let samples_needed = (buffers.buffer_size * buffers.send_channels as usize) as u32;
 
         // Sound shared borrow: `RingBuffer`'s read path is `&self`.
         let Some(ring_buffer) = buffers.local_to_network.as_ref() else {
@@ -433,7 +433,8 @@ impl WebRtcTransport {
                                         self.sequence_number,
                                         self.timestamp,
                                         &self.audio_to_send_buffer,
-                                        buffers.channels,
+                                        buffers.send_channels,
+                                        buffers.receive_channels,
                                         &mut self.packet_serialize_buffer,
                                     ) {
                                         Ok(bytes_written) => {
@@ -1121,11 +1122,11 @@ impl Transport for WebRtcTransport {
         self.audio_buffers = Some(config);
         
         // Resize internal buffers based on configuration
-        self.audio_to_send_buffer.resize(config.buffer_size * config.channels as usize, 0.0);
-        let max_packet_bytes = 16 + (config.buffer_size * config.channels as usize * 4);
+        self.audio_to_send_buffer.resize(config.buffer_size * config.send_channels as usize, 0.0);
+        let max_packet_bytes = 16 + (config.buffer_size * config.send_channels as usize * 4);
         self.packet_serialize_buffer.resize(max_packet_bytes, 0);
-        
-        super::transport::log_audio_buffers_set("WebRTC", config.channels, config.buffer_size);
+
+        super::transport::log_audio_buffers_set("WebRTC", &config);
     }
 
     fn set_on_state_change(&mut self, callback: js_sys::Function) {
@@ -1365,13 +1366,15 @@ mod tests {
         ring: &mut RingBuffer,
         reg: &mut Regulator,
         buffer_size: usize,
-        channels: u8,
+        send_channels: u8,
+        receive_channels: u8,
     ) -> AudioBufferConfig {
         AudioBufferConfig {
             local_to_network: SharedPtr::new(ring as *mut RingBuffer),
             network_to_local: SharedPtr::new(reg as *mut Regulator),
             buffer_size,
-            channels,
+            send_channels,
+            receive_channels,
         }
     }
 
@@ -1447,14 +1450,16 @@ mod tests {
     #[wasm_bindgen_test]
     fn webrtc_set_audio_buffers_resizes_internal_buffers() {
         // Pick non-default dimensions so the resize is observable (construction
-        // pre-sizes for 128 samples × 2 channels).
+        // pre-sizes for 128 samples × 2 channels). Send and receive differ so
+        // sizing by the wrong one (receive) fails.
         let buffer_size = 256usize;
-        let channels = 2u8;
-        let samples_per_packet = buffer_size * channels as usize;
+        let send_channels = 3u8;
+        let receive_channels = 2u8;
+        let samples_per_packet = buffer_size * send_channels as usize;
 
         let mut ring = RingBuffer::new();
         let mut reg = Regulator::new();
-        let config = buffer_config(&mut ring, &mut reg, buffer_size, channels);
+        let config = buffer_config(&mut ring, &mut reg, buffer_size, send_channels, receive_channels);
 
         let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
             .expect("transport construction should succeed");
@@ -1497,7 +1502,7 @@ mod tests {
         assert_eq!(ring.has_data_flag(), 1, "flag set while data is queued");
 
         let mut reg = Regulator::new();
-        let config = buffer_config(&mut ring, &mut reg, buffer_size, channels);
+        let config = buffer_config(&mut ring, &mut reg, buffer_size, channels, channels);
 
         let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
             .expect("transport construction should succeed");

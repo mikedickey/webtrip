@@ -36,10 +36,11 @@ pub struct AudioParams {
     pub(crate) monitor_volume: AtomicU32,
     /// Total number of audio callbacks (process() calls)
     pub(crate) callback_count: AtomicU64,
-    /// Number of capture (send) channels (1=mono, 2=stereo). Governs only the
-    /// send path — playback width is the peer's to declare (see
-    /// [`crate::audio::regulator::Regulator::push`]).
-    pub(crate) capture_channels: AtomicU32,
+    /// Number of channels sent over the wire, fixed for a connection. The
+    /// render thread conforms captured audio to this width before writing
+    /// the send ring buffer. Governs only the send path — playback width is
+    /// the peer's to declare (see [`crate::audio::regulator::Regulator::push`]).
+    pub(crate) send_channels: AtomicU32,
 }
 
 impl Default for AudioParams {
@@ -52,20 +53,20 @@ impl Default for AudioParams {
             output_volume: AtomicU32::new(1000), // 1.0 (full volume)
             monitor_volume: AtomicU32::new(0), // 0.0 (monitoring off by default)
             callback_count: AtomicU64::new(0),
-            capture_channels: AtomicU32::new(2), // Default to stereo
+            send_channels: AtomicU32::new(1), // Default to mono
         }
     }
 }
 
 impl AudioParams {
-    /// Set capture (send) channels (1=mono, 2=stereo)
-    pub fn set_capture_channels(&self, channels: u32) {
-        self.capture_channels.store(channels.clamp(1, MAX_CHANNELS as u32), Ordering::Relaxed);
+    /// Set the wire send channel count, clamped to `[1, MAX_CHANNELS]`
+    pub fn set_send_channels(&self, channels: u32) {
+        self.send_channels.store(channels.clamp(1, MAX_CHANNELS as u32), Ordering::Relaxed);
     }
 
-    /// Get capture (send) channels
-    pub fn get_capture_channels(&self) -> u32 {
-        self.capture_channels.load(Ordering::Relaxed)
+    /// Get the wire send channel count
+    pub fn get_send_channels(&self) -> u32 {
+        self.send_channels.load(Ordering::Relaxed)
     }
 }
 
@@ -301,17 +302,17 @@ mod tests {
     }
 
     #[test]
-    fn test_capture_channels_roundtrip_and_clamp() {
+    fn test_send_channels_roundtrip_and_clamp() {
         let p = AudioParams::default();
         for c in [1_u32, 2, 4, 8] {
-            p.set_capture_channels(c);
-            assert_eq!(p.get_capture_channels(), c);
+            p.set_send_channels(c);
+            assert_eq!(p.get_send_channels(), c);
         }
         // Clamp to [1, 8].
-        p.set_capture_channels(0);
-        assert_eq!(p.get_capture_channels(), 1);
-        p.set_capture_channels(64);
-        assert_eq!(p.get_capture_channels(), 8);
+        p.set_send_channels(0);
+        assert_eq!(p.get_send_channels(), 1);
+        p.set_send_channels(64);
+        assert_eq!(p.get_send_channels(), 8);
     }
 
     #[test]
@@ -366,7 +367,7 @@ mod tests {
             let p = Arc::clone(&params);
             thread::spawn(move || {
                 for c in 1..=target_channels {
-                    p.set_capture_channels(c);
+                    p.set_send_channels(c);
                     thread::yield_now();
                 }
             })
@@ -383,7 +384,7 @@ mod tests {
                 // hanging forever — if cross-thread visibility ever regresses.
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 while std::time::Instant::now() < deadline {
-                    if p.get_capture_channels() == target_channels {
+                    if p.get_send_channels() == target_channels {
                         return true;
                     }
                     thread::yield_now();
@@ -394,7 +395,7 @@ mod tests {
 
         writer.join().unwrap();
         let observed = reader.join().unwrap();
-        assert_eq!(params.get_capture_channels(), target_channels);
+        assert_eq!(params.get_send_channels(), target_channels);
         assert!(observed, "reader thread never observed the final value");
     }
 
