@@ -1,18 +1,19 @@
 # WebTrip Channel Model
 
-This document explains how WebTrip decides, discovers, and reconciles audio
-**channel counts** — how many channels the microphone actually captures, how
-many the network wire carries, how many the peer sends, and how many the
-speakers/headphones can play. It covers startup and channel discovery, and
+This document explains how WebTrip configures, discovers, and reconciles audio
+**channel counts**: how many channels a client sends and asks back over the
+network, how many input and output device channels it uses, and what happens
+when those disagree with each other or with what the hardware and the peer
+actually provide. It covers pre-connect configuration and device probing, and
 the complete flow of audio from the input device through the network to the
 output device.
 
 For the broader threading model (why there's an AudioWorklet thread, a main
 thread, and sometimes a WebTransport worker thread, and how they share
 memory) see [ARCHITECTURE.md](ARCHITECTURE.md) — this document assumes that
-context and focuses specifically on channels. For the original design
-rationale and phased implementation history, see
-[`plans/channel-model.md`](../plans/channel-model.md) — but treat that as
+context and focuses specifically on channels. For design rationale see
+[`plans/channel-config.md`](../plans/channel-config.md) (and the earlier
+[`plans/channel-model.md`](../plans/channel-model.md)) — but treat those as
 historical background, not current documentation; per
 [`plans/AGENTS.md`](../plans/AGENTS.md) the `plans/` directory isn't
 guaranteed to reflect the code as it stands today. This document is.
@@ -21,153 +22,174 @@ guaranteed to reflect the code as it stands today. This document is.
 
 ## Table of Contents
 
-1. [The Core Mental Model: Four Channel Counts](#the-core-mental-model-four-channel-counts)
-2. [Startup and Channel Discovery](#startup-and-channel-discovery)
-3. [Send Path: Microphone → Network](#send-path-microphone--network)
-4. [Receive Path: Network → Speakers](#receive-path-network--speakers)
-5. [The Channel-Mapping Policy](#the-channel-mapping-policy)
-6. [Key Invariants and Gotchas](#key-invariants-and-gotchas)
-7. [File Map](#file-map)
+1. [The Core Mental Model: Configured vs. Actual Channel Counts](#the-core-mental-model-configured-vs-actual-channel-counts)
+2. [The Wire: Bytes 14 and 15](#the-wire-bytes-14-and-15)
+3. [Before Connecting: Configuration and Probing](#before-connecting-configuration-and-probing)
+4. [Connecting: Capture and Playback Setup](#connecting-capture-and-playback-setup)
+5. [Send Path: Microphone → Network](#send-path-microphone--network)
+6. [Receive Path: Network → Speakers](#receive-path-network--speakers)
+7. [The Channel-Mapping Policy](#the-channel-mapping-policy)
+8. [The Demo's Capture Modes](#the-demos-capture-modes)
+9. [Key Invariants and Gotchas](#key-invariants-and-gotchas)
+10. [File Map](#file-map)
 
 ---
 
-## The Core Mental Model: Four Channel Counts
+## The Core Mental Model: Configured vs. Actual Channel Counts
 
-The single most important thing to understand about this codebase is that
-**"how many channels" means four different, independently-tracked things**,
-and confusing them is the source of most bugs in this area. None of them are
-required to be equal to each other, and the code is written to tolerate all
-of them disagreeing at once.
+**"How many channels" means several independent things**, and confusing them
+is the source of most bugs in this area. None of them is required to equal any
+other, and the code is written to tolerate all of them disagreeing at once.
 
-| # | What it means | Where it lives | When it's set |
+A session has four **configured** counts. All four are set only while `Idle`,
+are fixed for the life of a connection, and are retained across disconnects:
+
+| Count | Default | Meaning | Setter (JS) |
 |---|---|---|---|
-| 1 | **Requested / wire width** — what the app *asks* the browser for, and the fixed channel count the network wire is framed at for the whole connection | `WebTripSession.channels` (`session.rs`) / `AudioParams::capture_channels` (`params.rs`) | At session construction (`2`, "default to stereo"), or by `setChannels()` — **only while `Idle`** |
-| 2 | **Granted capture width** — what the browser actually delivers from the microphone this callback | `in_channels` parameter threaded through the worklet ABI and `AudioProcessor::process` | Every render callback (~2.7ms), from what the browser's `AudioWorkletNode` input actually contains |
-| 3 | **Peer's send width** — how many channels the *other end* of the connection is sending | `Regulator`'s adopted channel count (`regulator.channels()`) | From the peer's first received packet (see Phase 1 of the plan; `Regulator::push`) |
-| 4 | **Output width** — how many channels the local speakers/headphones support | `AudioEngine::output_channels()` / `WebTripSession::getOutputChannels()` | Synchronously, from `AudioContext.destination.maxChannelCount`, whenever the worklet node is (re)built |
+| **Send** | 1 | Channels this client sends over the wire — every outbound packet's payload width | `setSendChannels` |
+| **Receive** | 2 | Channels this client asks the peer to send back | `setReceiveChannels` |
+| **Input** | 2 | How many of the input device's channels to capture — its first N | `setInputChannels` |
+| **Output** | 2 | How many of the output device's channels to play to — its first N | `setOutputChannels` |
 
-Why aren't these unified into one number? Because they come from genuinely
-different sources with different timing:
+The wire counts (send, receive) have nothing to do with the devices. A client
+can connect without probing any device at all, using the system default
+devices. With the defaults, an unconfigured client captures the first two
+input channels and mixes them down to mono to send.
 
-- **#1 is a local UI choice**, fixed for the lifetime of a connection because
-  the network transports (WebRTC data channel, WebTransport datagrams) frame
-  every packet at a single, agreed-upon width — there's no per-packet
-  channel-count renegotiation.
-- **#2 is discovered asynchronously** via `getUserMedia`, and the browser is
-  free to grant fewer channels than requested (a mono-only mic, or Chrome
-  forcing mono when echo cancellation is on) — see
-  [Startup and Channel Discovery](#startup-and-channel-discovery).
-- **#3 is controlled by the *other* participant**, not this session at all —
-  see `plans/channel-model.md`'s Phase 1 for how the jitter buffer adopts it.
-- **#4 is a property of the local audio hardware**, read synchronously (no
-  negotiation, no permission prompt) the moment an `AudioContext` exists.
+At runtime three **actual** counts can differ from the configured ones:
 
-Two pure functions exist specifically to reconcile mismatches between these:
-[`map_to_output`](#the-channel-mapping-policy) (planar output, used for
-peer-stream and monitor mixing) and
-[`conform_interleaved_channels`](#the-channel-mapping-policy) (interleaved,
-used for the outbound wire). Both implement the *same* mapping policy; they
-differ only in memory layout.
+| Actual count | Where it comes from | Where it lives |
+|---|---|---|
+| **Capture width** | The input count, clamped to what `getUserMedia` actually granted | `in_channels`, threaded through the worklet ABI into `AudioProcessor::process` |
+| **Peer's send width** | Whatever the peer actually sends — the receive count is a request, not a guarantee | The `Regulator`'s adopted channel count (`regulator.channels()`), from the peer's first packet |
+| **Output width** | The output count, clamped to the destination's `maxChannelCount` | `out_channels` passed to every `process()` call |
+
+Two pure functions reconcile mismatches at each boundary:
+[`conform_interleaved_channels`](#the-channel-mapping-policy) (capture width →
+send count) and [`map_to_output`](#the-channel-mapping-policy) (peer's send
+width → output width, and capture width → output width for the monitor mix).
+Both implement the *same* mapping policy; they differ only in memory layout.
 
 ---
 
-## Startup and Channel Discovery
+## The Wire: Bytes 14 and 15
 
-### Before connecting
+Every JackTrip packet header (`protocol.rs`, `PacketHeader`, 16 bytes) carries
+two channel fields, both named from the perspective of the packet's *sender*
+(JackTrip's `DefaultHeader::fillHeaderCommonFromAudio`):
 
-- `WebTripSession::new()` defaults `channels = 2` and syncs it to
-  `AudioParams::capture_channels` (`session.rs`).
-- `setChannels(n)` lets the UI change the requested/wire width (#1 above) —
-  but only while `state == Idle`. Calling it while connected just logs a
-  warning and no-ops. This is deliberate: changing it mid-connection would
-  desync the `RingBuffer` producer (the worklet, writing at the old width)
-  from the consumer (the transport's send loop, framing packets at
-  whatever `AudioBufferConfig.channels` it was handed at connect time).
-- The demo's Stereo toggle (`Demo.tsx`) is the UI for this. Nothing about
-  microphone capability is known yet at this point — no `getUserMedia` call
-  has happened, so the toggle is enabled by default and simply reflects the
-  user's *preference*, not a confirmed capability.
+- **Byte 14, `NumIncomingChannelsFromNet`** — how many channels the sender
+  receives from the network: the count it *wants back*. Senders write the
+  receive count here.
+- **Byte 15, `NumOutgoingChannelsToNet`** — how many channels the sender
+  transmits: the channel count of *this packet's payload*. Senders write the
+  send count here; receivers size and stride the payload by it
+  (`deserialize_into`, and on the send side
+  `total_packet_size_out`/`serialize_into`). It uses a compact encoding: `0`
+  means "same as byte 14" (symmetric), `1`–`254` is an explicit count, and
+  `255` means "no audio".
+
+A JackTrip hub configures each client from its first packet: the client's
+byte 14 becomes what the hub sends it, and its byte 15 what the hub expects
+to receive.
+
+`AudioPacket::serialize_samples_into(seq, ts, samples, send_channels,
+receive_channels, buffer)` is the single place both transports build outbound
+packets. With the defaults (send 1, receive 2) byte 14 is `2` and byte 15 is
+`1`, which asks the hub for stereo while sending mono.
+
+Both fields are validated against `MAX_CHANNELS = 8` on receive.
+
+---
+
+## Before Connecting: Configuration and Probing
+
+### Probing devices
+
+Device channel counts can be queried before any connection, with two
+module-level async functions in `devices.rs`:
+
+- **`getInputDeviceChannels(deviceId?)`** opens the device with `getUserMedia`
+  (processing toggles off, `channelCount: {ideal: MAX_CHANNELS}`), reads the
+  first track's `getCapabilities().channelCount.max` — falling back to
+  `getSettings().channelCount` when capabilities are unavailable (Safari
+  doesn't implement `getCapabilities`) — then stops the stream. The pure
+  resolution, clamped to `[1, MAX_CHANNELS]`, is `resolve_input_channels`.
+- **`getOutputDeviceChannels(deviceId?)`** creates a throwaway `AudioContext`,
+  routes it to the device via `setSinkId` when an id is given, reads
+  `destination.maxChannelCount` clamped to `[1, MAX_CHANNELS]`, and closes the
+  context. Without `setSinkId` (Safari, Firefox) it reports the default
+  output, which is the device those browsers play to anyway.
+
+They are free functions rather than `WebTripSession` methods deliberately:
+`connectToStudio` holds a `&mut` wasm-bindgen borrow of the session while it
+awaits, and calling back into the session during that window trips
+wasm-bindgen's "recursive use of an object" check. A free function never
+touches the session.
+
+Probing is optional. The session's input/output counts are *upper bounds*
+applied against the real devices at capture time, so an unprobed client with
+the defaults still works on any hardware.
+
+### Configuring the session
+
+The four setters (`setSendChannels`, `setReceiveChannels`,
+`setInputChannels`, `setOutputChannels`) share one guard,
+`can_set_channel_count`: the count must be in `[1, MAX_CHANNELS]` and the
+session must be `Idle`. Otherwise the call logs a warning and does nothing.
+
+`Idle`-only is deliberate. The transports snapshot the wire counts into
+`AudioBufferConfig` at connect time, and the render thread reads the send
+count from `AudioParams::send_channels`. Changing either mid-connection would
+desync the `RingBuffer`'s producer (the worklet) from its consumer (the
+transport's send loop).
+
+`setSendChannels` also stores the count into `AudioParams::send_channels`, the
+atomic the render thread reads.
+
+---
+
+## Connecting: Capture and Playback Setup
 
 ### `connectToStudio()`
 
-`WebTripSession::connect_to_studio` snapshots the current requested width
-into `AudioBufferConfig.channels` (`session.rs`) before building the
-transport. **This snapshot is the wire's channel count for the entire
-connection** — nothing after this point changes it, even if capture later
-turns out narrower.
+`WebTripSession::connect_to_studio` builds `AudioBufferConfig { send_channels,
+receive_channels, .. }` and hands it to the transport:
 
-### `AudioEngine::start_capture` — the discovery sequence
+- **WebRTC** (`webrtc.rs`) sizes its send buffers from `send_channels` and
+  passes both counts to `serialize_samples_into` on every tick.
+- **WebTransport** (`webtransport.rs`) sends both to the worker in the init
+  message (`sendChannels`, `receiveChannels`); the worker
+  (`webtransport_worker.rs`) stores them in `WorkerState`, sizes its buffers
+  from `send_channels`, and passes both to `serialize_samples_into` in
+  `build_next_packet`.
 
-This is where channels #1 and #2 actually meet the browser (`engine.rs`):
+### `AudioEngine::start_capture`
 
-1. Read the requested width from `AudioParams::get_capture_channels()`.
-2. Call `getUserMedia` with an **`ideal`** (not `exact`) `channelCount`
-   constraint (`AudioConstraints::to_js`) — `ideal` means the browser does
-   its best but won't fail the whole request if it can't match exactly.
-3. Once the stream resolves, read the **granted** width from
-   `MediaStreamTrack.getSettings().channelCount`, and the device's **max**
-   capability from `.getCapabilities().channelCount.max` — falling back to
-   the granted value when capabilities aren't available. Both are clamped
-   to `[1, MAX_CHANNELS]` (`MAX_CHANNELS = 8`, `protocol.rs`).
-4. Store both as `Option<u32>` fields on `AudioEngine`
-   (`granted_input_channels`, `max_input_channels`) — **`None` until this
-   step actually runs**, not merely "an `AudioEngine` exists." This
-   distinction matters: `AudioEngine::create_with_network` (step before
-   this) returns before any of the above happens, so there's a real window,
-   mid-`start_capture`, where an engine exists but discovery hasn't
-   completed yet. `Option` (rather than a `0`-means-unknown sentinel) is
-   what makes that window safely distinguishable from a real answer — a
-   sentinel value silently collided with the engine's construction default
-   here in an earlier version of this code.
-5. Build the `AudioWorkletNode` at the **granted** input width (not the
-   requested width) — `build_and_connect_worklet_node(granted, output_channels)`
-   — and read the **output** width synchronously via
-   `configure_destination()` (`AudioContext.destination.maxChannelCount`,
-   capped to `MAX_CHANNELS`) in the same step.
+Once the transport is connected, the session starts capture with its input and
+output counts (`engine.rs`):
 
-`WebTripSession` exposes all three discovered values to JavaScript,
-symmetric to each other, all `Option<u32>` (`number | undefined` in
-TypeScript) with the same "`None`/`undefined` = not yet known" contract:
+1. Call `getUserMedia` with `channelCount: {ideal: MAX_CHANNELS}`
+   (`AudioConstraints::to_js`). Asking for the maximum makes the browser open
+   the device at its native width instead of downmixing, so "input channels =
+   N" reliably means the device's first N.
+2. Read the **granted** width from the track's `getSettings().channelCount`.
+3. Build the `AudioWorkletNode` with an input width of
+   `min(input_channels, granted)`. The node's `channelCount` is
+   `Explicit`/`Discrete`, so per the Web Audio spec the extra source channels
+   are simply dropped. That is how an input count of 1 captures only channel 0.
+   When the browser granted fewer than requested (e.g. Chrome forcing mono
+   under echo cancellation), the narrower width is used and the send path's
+   conform fills the send width.
+4. Configure the destination `Explicit`/`Discrete` at
+   `min(output_channels, destination.maxChannelCount, MAX_CHANNELS)`
+   (`configure_destination`). Setting a width above `maxChannelCount` throws.
 
-- `getGrantedInputChannels()`
-- `getMaxInputChannels()`
-- `getOutputChannels()` — note there's no "requested vs. granted" pair for
-  output; there's no negotiation on that side, so one value is all there is.
-
-### The Stereo toggle's gate
-
-The demo disables the Stereo toggle and forces its display to "Mono" once
-`getMaxInputChannels()` reports `1` — but this can only happen **after**
-`connectToStudio()` resolves (discovery is part of `start_capture`, which
-`connectToStudio` awaits internally). `Demo.tsx` reads the value right after
-that promise resolves, not from the `sessionState === "connected"` React
-effect alone — the session reports `Connected` *before* capture starts, so
-relying on that transition alone would always see the "not yet known" value.
-
-Critically, forcing the toggle to "Mono" is **display-only**. It does not
-call `setChannels(1)`, both because that call would be rejected (the session
-is no longer `Idle`) and because it doesn't need to: the send path already
-adapts to the real captured width every callback (see below). What it does
-*not* automatically fix is the requested/wire width (#1) for a *future*
-connection — see the next section.
-
-### `disconnect()` — narrowing for next time
-
-Without any correction, a disconnect leaves `AudioParams::capture_channels`
-exactly where it was. If a mono-only device was discovered during that
-connection, the *next* `connectToStudio()` would request `channelCount:
-{ideal: 2}` again and the wire would again be framed at 2 channels — wasting
-bandwidth via the duplication described in the next section, on every single
-future connection to that device.
-
-`WebTripSession::disconnect()` fixes this: it captures the just-discovered
-`max_input_channels` before tearing down the `AudioEngine`, and — once back
-in `Idle` — calls the ordinary `set_channels()` if the device's max is
-*narrower* than the currently-configured width. This is one-directional: it
-**never widens**. A user's explicit narrower choice (e.g. manually picking
-Mono) is never silently overridden back up just because a *different* device
-turns out to support more. The decision itself is a pure, unit-tested
-function — `narrowed_channel_count` in `session.rs`.
+The engine keeps the worklet's input width and the requested output count, so
+`set_output_device` can re-clamp the output against a new sink's
+`maxChannelCount` and rebuild the node when the width changes.
+`outputChannelCount`/`channelCount` are construction-time only on
+`AudioWorkletNode`.
 
 ---
 
@@ -176,7 +198,9 @@ function — `narrowed_channel_count` in `session.rs`.
 ```
  getUserMedia stream                AudioWorklet thread                  Main thread / Worker
         │                                    │                                    │
-        │ ① live MediaStreamTrack(s)         │                                    │
+        │ ① live MediaStreamTrack(s),        │                                    │
+        │   first in_channels kept by the    │                                    │
+        │   node's Explicit channelCount     │                                    │
         ├───────────────────────────────────>│                                    │
         │                            worklet.js process():                        │
         │                       copies EVERY input channel                        │
@@ -197,7 +221,7 @@ function — `narrowed_channel_count` in `session.rs`.
         │                                    │                                    │
         │                            ⑥ send_local_to_network:                     │
         │                               conform_interleaved_channels if           │
-        │                               in_channels != wire_channels, then        │
+        │                               in_channels != send_channels, then        │
         │                               RingBuffer::write()                       │
         │                                    │                                    │
         │                                    │      (shared WASM memory)          │
@@ -205,48 +229,33 @@ function — `narrowed_channel_count` in `session.rs`.
         │                                    │                                    │
         │                                    │                         ⑦ tick() (WebRTC) or
         │                                    │                            send_loop (WebTransport)
-        │                                    │                            reads RingBuffer,
-        │                                    │                            frames a PacketHeader
-        │                                    │                            with num_incoming_channels
-        │                                    │                            = wire_channels (fixed),
-        │                                    │                            sends over the network
+        │                                    │                            reads RingBuffer, frames a
+        │                                    │                            PacketHeader with byte 14 =
+        │                                    │                            receive_channels and byte 15 =
+        │                                    │                            send_channels, sends it
 ```
 
 Key points:
 
-- **Step ①-⑤ happen on the AudioWorklet thread**, once per ~2.7ms render
+- **Steps ①-⑥ happen on the AudioWorklet thread**, once per ~2.7ms render
   quantum (`RENDER_QUANTUM_FRAMES = 128` samples, `worklet.rs`).
-- **`in_channels` is the real, browser-granted width this callback** — not
-  the requested width, not a fixed session-level constant. It flows all the
-  way from `worklet.js`'s `inputs[0].length` through `ProcessorHandle::render`
-  into `AudioProcessor::process(input, in_channels, output, out_channels)`
+- **`in_channels` is the real capture width this callback.** It flows from
+  `worklet.js`'s `inputs[0].length` through `ProcessorHandle::render` into
+  `AudioProcessor::process(input, in_channels, output, out_channels)`
   (`processor.rs`).
 - **Step ⑤ is the one and only planar→interleaved conversion per callback.**
-  `captured_interleaved` is a shared buffer consumed by both the send path
-  (below) and the local monitor mix (receive-path section) — this is
-  intentional, not an oversight: writing it twice would duplicate work and
-  risk the two consumers drifting out of sync.
-- **Step ⑥ is where the wire's fixed width (#1) and the real captured width
-  (#2) get reconciled**, if they differ. `send_local_to_network` reads
-  `wire_channels = AudioParams::get_capture_channels()` — the value
-  snapshotted at connect time, unrelated to what the mic is actually
-  producing right now — and only pays the conform cost when
-  `in_channels != wire_channels`. The conform itself follows the [same
-  mapping policy](#the-channel-mapping-policy) as playback. This is how a
-  mono-only mic with the Stereo toggle still requested ends up sending
-  *duplicated* mono over the wire rather than corrupting the packet framing:
-  correctness is guaranteed; the bandwidth cost of the mismatch is not
-  eliminated by this step alone (see
-  [`disconnect()`'s narrowing](#disconnect--narrowing-for-next-time) for how
-  it's avoided on *future* connections).
+  `captured_interleaved` is shared by the send path and the local monitor mix
+  on purpose. Converting twice would duplicate work and risk the two consumers
+  drifting apart.
+- **Step ⑥ is where the capture width and the send count meet.**
+  `send_local_to_network` reads `AudioParams::get_send_channels()` and pays for
+  the conform only when `in_channels != send_channels`. This is how two
+  captured channels are averaged into one sent channel, and how a mono capture
+  against a stereo send is duplicated rather than mis-framed.
 - **Step ⑦ happens on the main thread (WebRTC) or a dedicated worker
-  (WebTransport)** — see [ARCHITECTURE.md](ARCHITECTURE.md) for why network
-  I/O can't happen directly on the AudioWorklet thread. The packet's
-  `num_incoming_channels` header field (`protocol.rs`, `PacketHeader`,
-  16-byte `HEADER_SIZE`) is always `wire_channels` — the fixed width from
-  `AudioBufferConfig`, read directly off the config struct
-  (`webrtc.rs::tick`, `AudioPacket::serialize_samples_into(..., buffers.channels, ...)`),
-  never off what the worklet actually captured.
+  (WebTransport).** See [ARCHITECTURE.md](ARCHITECTURE.md) for why network I/O
+  can't run on the AudioWorklet thread. Both header channel fields come from
+  `AudioBufferConfig`, never from what the worklet actually captured.
 
 ---
 
@@ -259,10 +268,10 @@ Key points:
       │      deliver_received_packet   │                                  │                        │
       │      (transport.rs)            │                                  │                        │
       │                                │                                  │                        │
-      │            ⑨ Regulator::push(seq, header.num_incoming_channels,   │                        │
+      │            ⑨ Regulator::push(seq, header.num_outgoing_channels,   │                        │
       │               samples) — ADOPTS the peer's channel count from     │                        │
-      │               their first packet (Phase 1); rejects a mid-stream  │                        │
-      │               change instead of silently reinterpreting it        │                        │
+      │               their first packet; rejects a mid-stream change     │                        │
+      │               instead of silently reinterpreting it               │                        │
       │                                │                                  │                        │
       │                                │       (shared WASM memory)       │                        │
       │                                │ <────────────────────────────────│                        │
@@ -294,26 +303,26 @@ Key points:
 
 Key points:
 
-- **`out_channels` is the destination's width (#4 above)**, configured once
-  by `configure_destination()`/`build_and_connect_worklet_node` and passed
-  into every `process()` call — it does not vary per-callback the way
-  `in_channels` does, since the output device's capability doesn't change
-  mid-callback the way a peer's stream identity can.
-- **Step ⑨ is Phase 1's regulator adoption**, not a Phase 3 concept — but it
-  determines `remote_channels` for step ⑪, so it belongs in this diagram.
-  See `plans/channel-model.md`'s Phase 1 section and `Regulator::push`'s doc
-  comment for the full soundness argument (it involves rebuilding
-  channel-derived jitter-buffer state on the network thread while the audio
-  thread may concurrently be mid-`pop`).
-- **Steps ⑪ and ⑫ use the exact same function** — `map_to_output` — applied
-  to two different sources (the peer's decoded stream, and the local
-  capture, for self-monitoring). This is why the mapping policy is
-  documented once, centrally, rather than per call site — see next section.
+- **The receive count is a request.** It goes out in byte 14 of every packet,
+  and a well-behaved hub sends that many channels back. But the regulator
+  adopts whatever count the peer's first packet actually carries (step ⑨), and
+  `map_to_output` handles any mismatch with the output width. The session's
+  constructor also configures the regulator with the receive count, as its
+  pre-adoption shape.
+- **`out_channels` is the output width**, configured by
+  `configure_destination`/`build_and_connect_worklet_node` and passed into
+  every `process()` call.
+- **Step ⑨'s soundness argument** (rebuilding channel-derived jitter-buffer
+  state on the network thread while the audio thread may be mid-`pop`) is in
+  `Regulator::push`'s doc comment.
+- **Steps ⑪ and ⑫ use the exact same function**, `map_to_output`, applied to
+  two different sources. That's why the mapping policy is documented once,
+  below.
 - **The destination is configured `Explicit`/`Discrete`**
   (`ChannelCountMode`/`ChannelInterpretation`, set in both
-  `configure_destination` and `create_worklet_node_with_flag`) specifically
-  so the browser never does its own channel folding/upmixing — all channel
-  mapping is `map_to_output`'s job, not the Web Audio graph's.
+  `configure_destination` and `create_worklet_node_with_flag`) so the browser
+  never folds or upmixes channels itself. All channel mapping is
+  `map_to_output`'s job.
 
 ---
 
@@ -321,62 +330,80 @@ Key points:
 
 Two pure functions in `processor.rs` implement **the same four-branch
 policy** for reconciling a source channel count against a destination
-channel count — they differ only in memory layout (one planar, one
-interleaved), because the two consumers need different layouts:
+channel count. They differ only in memory layout (one planar, one
+interleaved), because their consumers need different layouts:
 
 | Function | Source layout | Destination layout | Used for |
 |---|---|---|---|
 | `map_to_output(src, src_channels, out, out_channels)` | interleaved | **planar** (`out[ch*frames+frame]`) | Peer stream → output; local capture → monitor mix |
-| `conform_interleaved_channels(src, src_channels, out, out_channels)` | interleaved | **interleaved** (`out[frame*out_channels+ch]`) | Real captured width → the wire's fixed width |
+| `conform_interleaved_channels(src, src_channels, out, out_channels)` | interleaved | **interleaved** (`out[frame*out_channels+ch]`) | Capture width → send count |
 
-The policy itself (both functions implement it identically, just writing to
-a different destination shape):
+The policy itself:
 
 1. **`out_channels == 1`** → average every source channel down to one
-   (delegates to `downmix_to_mono` in the planar case).
+   (delegates to `downmix_to_mono`).
 2. **`src_channels == 1 && out_channels >= 2`** → copy the single source
    channel to destination channels 0 and 1; everything past channel 1 is
-   silent. (This is the "duplicate mono to stereo" behavior — now a special
-   case of a general rule, not its own code path.)
+   silent.
 3. **`src_channels == 2 && out_channels > 2`** → copy source channels 0/1 to
    destination channels 0/1; the rest silent.
 4. **Otherwise** → 1:1 for `min(src_channels, out_channels)`; extra source
    channels are dropped, extra destination channels are silent.
 
-There's also `interleave_planar` (planar → interleaved, the inverse layout
-transform used once per callback to build `captured_interleaved`) and
-`max_channel_rms` (the level meter: the *loudest* of the capture channels,
-not their average — a single hot channel among quiet ones must still show on
-the meter).
+There's also `interleave_planar` (planar → interleaved, used once per callback
+to build `captured_interleaved`) and `max_channel_rms` (the level meter: the
+*loudest* capture channel, not their average — a single hot channel among
+quiet ones must still show on the meter).
+
+---
+
+## The Demo's Capture Modes
+
+The demo (`website/src/pages/demo/Demo.tsx`) is one client of the model above.
+It probes the selected devices on first render, whenever the selection
+changes, and on `navigator.mediaDevices`'s `devicechange` event (which also
+re-lists devices). It always asks for 2 receive channels, and uses 2 output
+channels when the output device supports at least 2, otherwise 1.
+
+A 1-channel input device shows a locked "Mono". Otherwise a cycling button
+picks between three modes, each just an (input, send) pair — the mixing falls
+out of `conform_interleaved_channels`:
+
+| Mode | Input channels | Send channels | Mapping |
+|---|---|---|---|
+| Mix to Mono (default) | 2 | 1 | 2 → 1 averages (rule 1) |
+| Stereo | 2 | 2 | 1:1 (rule 4) |
+| Mono | 1 | 1 | identity; the worklet node keeps only channel 0 |
+
+The demo applies all four counts in `handleConnect`, right before
+`connectToStudio` while the session is still `Idle`. So a remount never needs
+to re-sync the module-singleton session. Connection and device settings are
+locked from connect start until the session is back to idle; gain, volume, and
+monitor stay live.
 
 ---
 
 ## Key Invariants and Gotchas
 
-- **The wire's channel count never tracks the real captured width
-  mid-connection.** It's fixed at `connectToStudio()` time
-  (`AudioBufferConfig.channels`) and only ever changes via `disconnect()`'s
-  narrowing, applied to the *next* connection. This was a deliberate,
-  smaller-blast-radius choice over restructuring the connect sequence to
-  discover capture width before configuring the transport — see
-  `plans/channel-model.md`'s Phase 3 section for the reasoning.
-- **`AudioParams::capture_channels` does double duty**: it's both the
-  `channelCount: {ideal: n}` constraint sent to `getUserMedia` *and* the
-  wire's fixed framing width. They happen to be the same field today; if a
-  future change ever needs to request one width but frame packets at
-  another, this field would need to split.
-- **`None`/`undefined` genuinely means "not yet known," never "zero
-  channels."** The discovery code in `engine.rs` clamps both granted and max
-  to `[1, MAX_CHANNELS]` — a literal `0` reported by a browser would be
-  floored to `1`, not surfaced as an error. A live `MediaStreamTrack`
-  reporting zero channels isn't something current browsers produce in
-  practice (an input with no channel capability fails `getUserMedia` outright
-  rather than resolving with a degenerate track), so this hasn't needed
-  further handling — but it means a real "device reports 0" scenario, if one
-  ever surfaced, is currently silently coerced to `1` rather than reported.
+- **Wire and device counts are independent.** Nothing derives the send count
+  from the input device or the receive count from the output device. The only
+  links are the mapping functions at each boundary.
+- **All four configured counts are fixed for a connection and retained after
+  it.** Nothing narrows or rewrites them on disconnect. A device that turned
+  out narrower than configured is handled by clamping at capture time, every
+  time.
+- **Payload width is byte 15.** Both serialize (`total_packet_size_out`,
+  `serialize_into`) and deserialize stride the payload by
+  `num_outgoing_channels`, as JackTrip's receivers do
+  (`JackTrip::getPeerNumOutgoingChannels`). Byte 14 never affects the size of
+  the packet it's in.
 - **Chrome forces mono capture when echo cancellation is on.** This is a
-  browser policy, not a WebTrip bug — if stereo capture looks unavailable
-  during testing, check the AGC/Echo/Noise toggles first.
+  browser policy, not a WebTrip bug. The capture width drops to 1 and the
+  conform fills the send width. If stereo capture looks unavailable during
+  testing, check the AGC/Echo/Noise toggles first.
+- **A browser reporting 0 channels is floored to 1** (`clamp_channel_count`),
+  not surfaced as an error. Current browsers fail `getUserMedia` outright for
+  an input with no channels rather than resolve with a degenerate track.
 - **`RENDER_QUANTUM_FRAMES` (128) and `MAX_CHANNELS` (8) bound the worklet's
   planar scratch buffers** (`ProcessorHandle::input_scratch`/`output_scratch`
   in `worklet.rs`, sized `RENDER_QUANTUM_FRAMES * MAX_CHANNELS`). Every
@@ -384,10 +411,9 @@ the meter).
   `captured_interleaved`, `wire_conformed`, `remote_interleaved`,
   `remote_mapped`, `monitor_mapped`) is preallocated at `128 * MAX_CHANNELS`
   so a widening resize never allocates on the real-time render thread.
-- **A device with more than `MAX_CHANNELS` inputs is addressed at its first
-  8 channels only** — both the input and output discovery paths clamp to
-  `MAX_CHANNELS`, matching the wire protocol's own limit
-  (`protocol.rs::MAX_CHANNELS`).
+- **A device with more than `MAX_CHANNELS` channels is addressed at its first
+  8 only.** The probes, capture, and destination all clamp to `MAX_CHANNELS`,
+  matching the wire protocol's own limit (`protocol.rs::MAX_CHANNELS`).
 
 ---
 
@@ -395,13 +421,15 @@ the meter).
 
 | Concern | File |
 |---|---|
-| Session-level channel state, `setChannels`, discovery-exposing getters, disconnect narrowing | `src/session.rs` |
-| Atomic shared `capture_channels` field | `src/audio/params.rs` |
-| `getUserMedia` constraints, granted/max discovery, destination configuration, worklet node (re)building | `src/audio/engine.rs` |
+| Session channel configuration (send/receive/input/output setters, Idle-only guard), `AudioBufferConfig` construction | `src/session.rs` |
+| `AudioBufferConfig` (send/receive counts handed to transports) | `src/audio/transport.rs` |
+| Atomic shared `send_channels` field | `src/audio/params.rs` |
+| Pre-connect device probes (`getInputDeviceChannels`, `getOutputDeviceChannels`), `resolve_input_channels` | `src/audio/devices.rs` |
+| `getUserMedia` constraints, capture-width clamping, destination configuration, worklet node (re)building | `src/audio/engine.rs` |
 | Worklet ABI (planar scratch buffers, `ProcessorCallback`/`ProcessorHandle::render`) | `src/audio/worklet.rs` |
 | Worklet JS bridge (copies each channel plane in/out of WASM memory) | `src/audio/worklet.js` |
 | Gain, metering, planar↔interleaved conversion, channel-mapping policy, send/receive wiring | `src/audio/processor.rs` |
-| Wire protocol header (`num_incoming_channels`, `MAX_CHANNELS`) | `src/audio/protocol.rs` |
+| Wire protocol header (bytes 14/15, payload sizing, `MAX_CHANNELS`) | `src/audio/protocol.rs` |
 | Peer channel-count adoption (jitter buffer) | `src/audio/regulator.rs` |
-| Per-transport packet framing at the fixed wire width | `src/audio/webrtc.rs`, `src/audio/webtransport_worker.rs` |
-| Demo UI: Stereo toggle, gating, display sync | `website/src/pages/demo/Demo.tsx` |
+| Per-transport packet framing at the send/receive counts | `src/audio/webrtc.rs`, `src/audio/webtransport.rs`, `src/audio/webtransport_worker.rs` |
+| Demo UI: probing, `devicechange`, capture modes, config locking | `website/src/pages/demo/Demo.tsx` |

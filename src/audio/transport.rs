@@ -38,7 +38,7 @@ pub(crate) fn deliver_received_packet(
     samples: &mut Vec<f32>,
 ) -> Result<PushOutcome, ProtocolError> {
     let header: PacketHeader = AudioPacket::deserialize_into(data, samples)?;
-    let outcome = regulator.push(header.sequence_number, header.num_incoming_channels as usize, samples);
+    let outcome = regulator.push(header.sequence_number, header.num_outgoing_channels as usize, samples);
 
     #[cfg(target_arch = "wasm32")]
     if outcome != PushOutcome::Stored {
@@ -116,16 +116,20 @@ pub struct AudioBufferConfig {
     pub network_to_local: SharedPtr<crate::audio::regulator::Regulator>,
     /// Buffer size in samples per channel
     pub buffer_size: usize,
-    /// Number of audio channels
-    pub channels: u8,
+    /// Channels this client sends: the ring buffer's interleaved width and
+    /// every outbound packet's payload width (`num_outgoing_channels`, byte 15)
+    pub send_channels: u8,
+    /// Channels this client asks the peer to send back
+    /// (`num_incoming_channels`, byte 14, on every outbound packet)
+    pub receive_channels: u8,
 }
 
 /// Log that audio buffers have been configured on a transport
-pub(crate) fn log_audio_buffers_set(transport_name: &str, channels: u8, buffer_size: usize) {
+pub(crate) fn log_audio_buffers_set(transport_name: &str, config: &AudioBufferConfig) {
     web_sys::console::debug_1(
         &format!(
-            "✅ {}: Audio buffers configured ({}ch, {} samples)",
-            transport_name, channels, buffer_size
+            "✅ {}: Audio buffers configured (send {}ch, receive {}ch, {} samples)",
+            transport_name, config.send_channels, config.receive_channels, config.buffer_size
         )
         .into(),
     );

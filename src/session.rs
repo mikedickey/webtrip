@@ -119,29 +119,6 @@ pub(crate) fn is_valid_channel_count(channels: u8) -> bool {
     channels >= 1 && channels <= MAX_CHANNELS
 }
 
-/// Decide whether to narrow the session's configured channel count after a
-/// connection ends, given what the input device's capability turned out to
-/// be (`discovered_max`, from `AudioEngine::max_input_channels` — `None`
-/// when never discovered, e.g. no capture ever started).
-///
-/// Returns `Some(narrowed)` only when the device is known to support fewer
-/// channels than `current` — otherwise `None` (no change). Never widens:
-/// `discovered_max > current` returns `None`, since that would silently
-/// override a user's explicit narrower choice (e.g. Mono) rather than
-/// correct an impossible one.
-///
-/// Exists because `set_channels`/`AudioConstraints`'s `channelCount: ideal`
-/// request and the wire's declared channel count both come from this same
-/// session-level count, fixed at connect time — without narrowing it once a
-/// device turns out to support fewer channels, every subsequent connect
-/// attempt keeps requesting (and `AudioProcessor::send_local_to_network`
-/// keeps duplicating captured audio to fill) a wider count than the device
-/// can actually produce.
-pub(crate) fn narrowed_channel_count(current: u8, discovered_max: Option<u32>) -> Option<u8> {
-    let max = u8::try_from(discovered_max?).ok()?;
-    (max < current).then_some(max)
-}
-
 /// Returns `true` when the state transition `from → to` is permitted.
 ///
 /// Legal transitions:
@@ -273,9 +250,17 @@ pub struct WebTripSession {
     // State
     state: SessionState,
 
-    // Configuration
+    // Configuration. The four channel counts are independent, set only
+    // while Idle, and fixed for the life of a connection.
     buffer_size: usize,
-    channels: u8,
+    /// Channels sent over the wire (payload width of every outbound packet)
+    send_channels: u8,
+    /// Channels asked back from the peer (advertised in every outbound header)
+    receive_channels: u8,
+    /// Input device channels to capture (the first N, clamped to the device)
+    input_channels: u8,
+    /// Output device channels to play to (the first N, clamped to the device)
+    output_channels: u8,
 
     // Callbacks
     on_state_change: Option<js_sys::Function>,
@@ -306,15 +291,14 @@ impl WebTripSession {
     pub fn new(audio_params_ptr: *const AudioParams) -> Result<WebTripSession, JsValue> {
         let buffer_size = 128;
         let sample_rate = 48000;
-        let channels = 2; // Default to stereo
+        let send_channels = 1;
+        let receive_channels = 2;
 
-        // Sync channels to AudioParams: the requested capture width sent as
-        // getUserMedia's `channelCount` ideal constraint, and the wire's
-        // fixed channel count that `send_local_to_network` conforms real
-        // captured audio to (see `conform_interleaved_channels`).
+        // Sync the send width to AudioParams: the render thread conforms
+        // captured audio to it (see `conform_interleaved_channels`).
         if !audio_params_ptr.is_null() {
             unsafe {
-                (*audio_params_ptr).set_capture_channels(channels as u32);
+                (*audio_params_ptr).set_send_channels(send_channels as u32);
             }
         }
 
@@ -322,8 +306,9 @@ impl WebTripSession {
         let local_to_network_buffer = Box::new(RingBuffer::new());
         let mut network_to_local_buffer = Box::new(Regulator::new());
 
-        // Configure regulator with auto-adaptive tolerance and headroom (-500.0)
-        network_to_local_buffer.configure(channels as usize, buffer_size, sample_rate, -500.0);
+        // Configure regulator with auto-adaptive tolerance and headroom (-500.0).
+        // The peer's actual count is still adopted from its first packet.
+        network_to_local_buffer.configure(receive_channels as usize, buffer_size, sample_rate, -500.0);
 
         Ok(WebTripSession {
             audio_params_ptr,
@@ -334,7 +319,10 @@ impl WebTripSession {
             transport_type: TransportType::WebRTC, // Default to WebRTC
             state: SessionState::Idle,
             buffer_size,
-            channels,
+            send_channels,
+            receive_channels,
+            input_channels: 2,
+            output_channels: 2,
             on_state_change: None,
             pending_capture_params: None,
             output_device_id: None,
@@ -406,39 +394,88 @@ impl WebTripSession {
         self.local_to_network_buffer.get_has_data_flag_ptr()
     }
 
-    /// Set the number of audio channels (1 for mono, 2 for stereo)
+    /// Set how many channels this client sends over the wire (default 1).
     ///
-    /// Must be called before connecting: it is rejected outside `Idle`. This
-    /// only sets the local send width; the receive width is the peer's to
-    /// declare and is adopted from its first packet
-    /// ([`Regulator::push`](crate::audio::regulator::Regulator::push)).
-    /// Reconfiguring the regulator here used to reset its jitter policy and
-    /// leave the transport's snapshotted channel count stale mid-session — a
-    /// click on the demo's Stereo button while connected would silently
+    /// Every channel-count setter is rejected outside `Idle` (and for counts
+    /// outside [1, `MAX_CHANNELS`]): the transports and the render thread
+    /// snapshot these at connect time, so a mid-connection change would
     /// desync producer and consumer on the channel-agnostic `RingBuffer`.
-    #[wasm_bindgen(js_name = setChannels)]
-    pub fn set_channels(&mut self, channels: u8) {
-        if self.state != SessionState::Idle {
-            web_sys::console::warn_1(&"⚠️ Cannot change channels while connected".into());
+    ///
+    /// This is each outbound packet's payload width, independent of the
+    /// input device: captured audio is conformed to it on the render thread
+    /// (`conform_interleaved_channels`), e.g. 2 input channels averaged into
+    /// 1 sent.
+    #[wasm_bindgen(js_name = setSendChannels)]
+    pub fn set_send_channels(&mut self, channels: u8) {
+        if !self.can_set_channel_count("send", channels) {
             return;
         }
-        if is_valid_channel_count(channels) {
-            self.channels = channels;
-
-            // Sync to AudioParams — see `new`'s equivalent sync for what
-            // this value drives.
-            if !self.audio_params_ptr.is_null() {
-                unsafe {
-                    (*self.audio_params_ptr).set_capture_channels(channels as u32);
-                }
+        self.send_channels = channels;
+        if !self.audio_params_ptr.is_null() {
+            unsafe {
+                (*self.audio_params_ptr).set_send_channels(channels as u32);
             }
         }
     }
 
-    /// Get the current channel count
-    #[wasm_bindgen(js_name = getChannels)]
-    pub fn get_channels(&self) -> u8 {
-        self.channels
+    /// Get the configured send channel count
+    #[wasm_bindgen(js_name = getSendChannels)]
+    pub fn get_send_channels(&self) -> u8 {
+        self.send_channels
+    }
+
+    /// Set how many channels this client asks the peer to send back
+    /// (default 2), advertised in every outbound packet's header. Idle-only
+    /// (see [`set_send_channels`](Self::set_send_channels)).
+    ///
+    /// The peer decides what it actually sends: the regulator adopts the
+    /// count from its first packet
+    /// ([`Regulator::push`](crate::audio::regulator::Regulator::push)) and
+    /// `map_to_output` maps it onto the output device.
+    #[wasm_bindgen(js_name = setReceiveChannels)]
+    pub fn set_receive_channels(&mut self, channels: u8) {
+        if self.can_set_channel_count("receive", channels) {
+            self.receive_channels = channels;
+        }
+    }
+
+    /// Get the configured receive channel count
+    #[wasm_bindgen(js_name = getReceiveChannels)]
+    pub fn get_receive_channels(&self) -> u8 {
+        self.receive_channels
+    }
+
+    /// Set how many input device channels to capture (default 2): the
+    /// device's first N, clamped at capture time to what the browser grants.
+    /// Idle-only (see [`set_send_channels`](Self::set_send_channels)).
+    #[wasm_bindgen(js_name = setInputChannels)]
+    pub fn set_input_channels(&mut self, channels: u8) {
+        if self.can_set_channel_count("input", channels) {
+            self.input_channels = channels;
+        }
+    }
+
+    /// Get the configured input device channel count
+    #[wasm_bindgen(js_name = getInputChannels)]
+    pub fn get_input_channels(&self) -> u8 {
+        self.input_channels
+    }
+
+    /// Set how many output device channels to play to (default 2): the
+    /// device's first N, clamped at capture time to the destination's
+    /// `maxChannelCount`. Idle-only (see
+    /// [`set_send_channels`](Self::set_send_channels)).
+    #[wasm_bindgen(js_name = setOutputChannels)]
+    pub fn set_output_channels(&mut self, channels: u8) {
+        if self.can_set_channel_count("output", channels) {
+            self.output_channels = channels;
+        }
+    }
+
+    /// Get the configured output device channel count
+    #[wasm_bindgen(js_name = getOutputChannels)]
+    pub fn get_output_channels(&self) -> u8 {
+        self.output_channels
     }
 
     /// Set the transport type to use for connections
@@ -521,6 +558,8 @@ impl WebTripSession {
                     auto_gain_control,
                     echo_cancellation,
                     noise_suppression,
+                    self.input_channels as u32,
+                    self.output_channels as u32,
                 )
                 .await?;
         }
@@ -615,7 +654,8 @@ impl WebTripSession {
             local_to_network: SharedPtr::new(&mut *self.local_to_network_buffer),
             network_to_local: SharedPtr::new(&mut *self.network_to_local_buffer),
             buffer_size: self.buffer_size,
-            channels: self.channels,
+            send_channels: self.send_channels,
+            receive_channels: self.receive_channels,
         };
 
         // Create the appropriate transport based on type
@@ -762,14 +802,6 @@ impl WebTripSession {
             // no-op on already-closed state.
         }
 
-        // Capture the input device's discovered capability before
-        // `stop_capture` drops the `AudioEngine` that knows it — see
-        // `narrowed_channel_count` for why this needs to survive teardown.
-        let narrow_to = narrowed_channel_count(
-            self.channels,
-            self.audio_engine.as_ref().and_then(|e| e.max_input_channels()),
-        );
-
         // Stop audio capture when disconnecting (this will also stop the audio callback loop)
         self.stop_capture();
 
@@ -781,15 +813,6 @@ impl WebTripSession {
         self.network_to_local_buffer.reset();
 
         self.set_state(SessionState::Idle);
-
-        // Now Idle, so `set_channels` (Idle-only) will actually apply: if
-        // this connection discovered the input device supports fewer
-        // channels than currently configured, narrow so the next connect
-        // requests a consistent width instead of re-requesting (and
-        // duplicating capture to fill) the old, too-wide count.
-        if let Some(narrowed) = narrow_to {
-            self.set_channels(narrowed);
-        }
     }
     
     /// Start the audio callback loop
@@ -872,41 +895,6 @@ impl WebTripSession {
         Ok(())
     }
 
-    /// Number of capture channels actually granted by the browser for the
-    /// current session (see `AudioEngine::granted_input_channels`). `None`
-    /// when not yet known — no capture has started, or it has started but
-    /// device discovery hasn't completed yet — distinct from any real
-    /// channel count, which is always `Some(n)` with `n >= 1`.
-    #[wasm_bindgen(js_name = getGrantedInputChannels)]
-    pub fn get_granted_input_channels(&self) -> Option<u32> {
-        self.audio_engine
-            .as_ref()
-            .and_then(|e| e.granted_input_channels())
-    }
-
-    /// Maximum channel count the current input device supports (see
-    /// `AudioEngine::max_input_channels`). `None` when not yet known, same
-    /// as `get_granted_input_channels`.
-    #[wasm_bindgen(js_name = getMaxInputChannels)]
-    pub fn get_max_input_channels(&self) -> Option<u32> {
-        self.audio_engine
-            .as_ref()
-            .and_then(|e| e.max_input_channels())
-    }
-
-    /// Number of channels the current playback output is configured for
-    /// (see `AudioEngine::output_channels`). `None` when not yet known —
-    /// no capture has started, or it has started but the worklet node
-    /// hasn't been built yet. Unlike the input side there is no separate
-    /// granted/max distinction: output always uses the destination's full
-    /// reported capability, capped to `MAX_CHANNELS`.
-    #[wasm_bindgen(js_name = getOutputChannels)]
-    pub fn get_output_channels(&self) -> Option<u32> {
-        self.audio_engine
-            .as_ref()
-            .and_then(|e| e.output_channels())
-    }
-
     /// Check if connected to hub server
     #[wasm_bindgen(js_name = isConnected)]
     pub fn is_connected(&self) -> bool {
@@ -918,6 +906,24 @@ impl WebTripSession {
 
     // ========== Private Methods ==========
 
+    /// Shared guard for the channel-count setters: a count may change only
+    /// while `Idle` and only within [1, `MAX_CHANNELS`]. Logs the reason
+    /// (`which` names the setting) when it may not.
+    fn can_set_channel_count(&self, which: &str, channels: u8) -> bool {
+        if self.state != SessionState::Idle {
+            web_sys::console::warn_1(
+                &format!("⚠️ Cannot change {which} channels while connected").into(),
+            );
+            return false;
+        }
+        if !is_valid_channel_count(channels) {
+            web_sys::console::warn_1(
+                &format!("⚠️ Invalid {which} channel count: {channels}").into(),
+            );
+            return false;
+        }
+        true
+    }
 
     fn set_state(&mut self, state: SessionState) {
         if self.state == state {
@@ -971,44 +977,6 @@ mod tests {
         assert!(is_valid_channel_count(1));
         assert!(is_valid_channel_count(8));
         assert!(!is_valid_channel_count(9));
-    }
-
-    // -----------------------------------------------------------------------
-    // Channel-count narrowing (disconnect-time correction)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn narrowed_channel_count_matrix() {
-        // (current, discovered_max) -> expected
-        let cases: &[(u8, Option<u32>, Option<u8>)] = &[
-            // Discovered fewer than configured: narrow.
-            (2, Some(1), Some(1)),
-            (8, Some(3), Some(3)),
-            // Discovered equal to configured: no change (avoid a no-op
-            // set_channels call, not that it would be wrong).
-            (2, Some(2), None),
-            (1, Some(1), None),
-            // Discovered MORE than configured: never widen — a user's
-            // explicit narrower choice (e.g. Mono) is never silently
-            // overridden back up.
-            (1, Some(2), None),
-            (1, Some(8), None),
-            // Never discovered (no capture ever started, or the engine
-            // never completed discovery before disconnect): no change.
-            (2, None, None),
-            // Boundary: discovered_max at MAX_CHANNELS, current above it is
-            // impossible by construction, so only the narrowing direction
-            // is meaningful here.
-            (8, Some(8), None),
-            (8, Some(u32::from(MAX_CHANNELS)), None),
-        ];
-        for &(current, discovered_max, expected) in cases {
-            assert_eq!(
-                narrowed_channel_count(current, discovered_max),
-                expected,
-                "current={current} discovered_max={discovered_max:?}"
-            );
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -1198,6 +1166,17 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;
 
+    /// The session's (send, receive, input, output) channel counts.
+    #[cfg(target_arch = "wasm32")]
+    fn channel_config(session: &WebTripSession) -> (u8, u8, u8, u8) {
+        (
+            session.get_send_channels(),
+            session.get_receive_channels(),
+            session.get_input_channels(),
+            session.get_output_channels(),
+        )
+    }
+
     /// Register a [`recording_state_callback`] on `session`, returning the
     /// shared log and the `Closure` (kept alive by the caller).
     #[cfg(target_arch = "wasm32")]
@@ -1216,7 +1195,9 @@ mod tests {
     /// `state()` and the order of the `on_state_change` callbacks), exercises
     /// the `AudioContext`-backed `is_audio_suspended`/`resume_audio` on the
     /// now-live engine, then tears down via `disconnect()` and asserts the
-    /// session returns to `Idle`. This runs the real async/await connect path,
+    /// session returns to `Idle`. Along the way it pins the channel-count
+    /// setters' contract: applied while `Idle`, ignored while connected, and
+    /// retained across disconnect (nothing narrows them). This runs the real async/await connect path,
     /// `AudioEngine::create`, worklet bootstrap, and the `Atomics.waitAsync`
     /// audio-callback loop in the browser — only the network transport is mocked.
     #[cfg(target_arch = "wasm32")]
@@ -1232,6 +1213,20 @@ mod tests {
 
         assert_eq!(session.state(), SessionState::Idle);
         assert!(!session.is_connected());
+
+        // Every count away from its default, so a setter that ignored its
+        // argument (or wrote the wrong field) fails.
+        let configured = (2, 1, 1, 1);
+        session.set_send_channels(configured.0);
+        session.set_receive_channels(configured.1);
+        session.set_input_channels(configured.2);
+        session.set_output_channels(configured.3);
+        assert_eq!(channel_config(&session), configured, "setters must apply while Idle");
+        assert_eq!(
+            params.get_send_channels(),
+            u32::from(configured.0),
+            "setSendChannels must reach the render thread's AudioParams"
+        );
 
         session
             .connect_with_test_transport(Box::new(MockTransport::new()))
@@ -1271,6 +1266,18 @@ mod tests {
             .await
             .expect("resume_audio with a live engine should resolve");
 
+        // Channel counts are fixed for the connection.
+        session.set_send_channels(1);
+        session.set_receive_channels(2);
+        session.set_input_channels(2);
+        session.set_output_channels(2);
+        assert_eq!(
+            channel_config(&session),
+            configured,
+            "channel-count setters must be ignored while connected"
+        );
+        assert_eq!(params.get_send_channels(), u32::from(configured.0));
+
         session.disconnect().await;
         // Wait on the actual teardown transition rather than a fixed delay:
         // poll until the session reports `Idle` (or bail after a generous
@@ -1292,6 +1299,11 @@ mod tests {
             Some("idle"),
             "the final emitted state after disconnect must be 'idle', got {:?}",
             log.borrow()
+        );
+        assert_eq!(
+            channel_config(&session),
+            configured,
+            "disconnect must retain the configured channel counts"
         );
     }
 

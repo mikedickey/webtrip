@@ -4,6 +4,7 @@ import {
   isIOS,
   type AudioDevices,
   type DemoEngine,
+  type DeviceInfo,
   type SessionState,
   type WebTripSession,
 } from "../../lib/webtrip";
@@ -14,6 +15,7 @@ import "./demo.css";
 
 type Phase = "loading" | "ready" | "mic-error" | "engine-error";
 type TransportChoice = "auto" | "webrtc" | "webtransport";
+type CaptureMode = "mixToMono" | "stereo" | "mono";
 
 const SESSION_STATE_LABELS: Record<SessionState, string> = {
   idle: "Not Connected",
@@ -22,6 +24,23 @@ const SESSION_STATE_LABELS: Record<SessionState, string> = {
   connected: "Connected",
   error: "Connection Error",
 };
+
+// The capture button cycles through these in order. Each mode fixes how many
+// input device channels are captured and how many are sent; the library's
+// send-side channel mapping does the rest (2 captured → 1 sent averages them,
+// and 1 captured keeps only the device's first channel).
+const CAPTURE_MODES: Record<
+  CaptureMode,
+  { next: CaptureMode; line1: string; line2: string; inputChannels: number; sendChannels: number }
+> = {
+  mixToMono: { next: "stereo", line1: "Mix to Mono", line2: "2 → 1 ch", inputChannels: 2, sendChannels: 1 },
+  stereo: { next: "mono", line1: "Stereo", line2: "2 ch", inputChannels: 2, sendChannels: 2 },
+  mono: { next: "mixToMono", line1: "Mono", line2: "1st ch", inputChannels: 1, sendChannels: 1 },
+};
+
+// The demo always asks the peer for stereo; the library maps whatever the
+// peer actually sends onto the output device.
+const RECEIVE_CHANNELS = 2;
 
 // Wrap connectToStudio in a 45-second timeout so the UI never hangs forever.
 // The most common cause on iOS is AudioContext.resume() waiting for a user
@@ -65,6 +84,14 @@ function beginDisconnect(session: WebTripSession) {
   pendingDisconnect.catch(() => {});
 }
 
+// Keep the current selection if the device is still present, otherwise fall
+// back to the first listed device.
+function pickDevice(devices: DeviceInfo[], currentId: string): string {
+  return devices.some((d) => d.deviceId === currentId)
+    ? currentId
+    : (devices[0]?.deviceId ?? "");
+}
+
 function ToggleButton({
   active,
   line1,
@@ -105,14 +132,21 @@ export default function Demo() {
   const [inputDeviceId, setInputDeviceId] = useState("");
   const [outputDeviceId, setOutputDeviceId] = useState("");
 
+  // Channel counts of the selected devices, probed before connecting.
+  // undefined means "not yet known" (a probe is in flight).
+  const [inputDeviceChannels, setInputDeviceChannels] = useState<number | undefined>(undefined);
+  const [outputDeviceChannels, setOutputDeviceChannels] = useState<number | undefined>(undefined);
+  // Bumped on `devicechange` so the probes re-run even when the selected ids
+  // are unchanged: "default" may now point at different hardware.
+  const [probeNonce, setProbeNonce] = useState(0);
+
   const [agc, setAgc] = useState(false);
   const [echo, setEcho] = useState(false);
   const [noise, setNoise] = useState(false);
-  const [stereo, setStereo] = useState(true);
-  // undefined means "not yet known" (mirrors getMaxInputChannels's Option —
-  // None until discovery completes, not merely "no capture started") —
-  // distinct from any real channel count, which is always >= 1.
-  const [maxInputChannels, setMaxInputChannels] = useState<number | undefined>(undefined);
+  // The user's choice for multi-channel inputs. A 1-channel input always
+  // captures Mono without overwriting this, so switching back to a
+  // multi-channel device restores the choice.
+  const [captureMode, setCaptureMode] = useState<CaptureMode>("mixToMono");
 
   const [inputGain, setInputGain] = useState(0);
   const [outputVolume, setOutputVolume] = useState(100);
@@ -176,20 +210,13 @@ export default function Demo() {
       } else {
         setSessionState("idle");
       }
-      // The Stereo toggle defaults to true on every mount, but the session's
-      // actual channel count survives remounts (module-level singleton) and
-      // can have been narrowed by a prior disconnect (see
-      // WebTripSession::disconnect / narrowed_channel_count). Read it back so
-      // a remount can't show Stereo while the session — and therefore the
-      // next connect — is already fixed at Mono.
-      setStereo(eng.session.getChannels() === 2);
       try {
         const devs = (await eng.m.getAudioDevices()) as AudioDevices;
         if (cancelled) return;
         setEngine(eng);
         setDevices(devs);
-        setInputDeviceId(devs.inputDevices[0]?.deviceId ?? "");
-        setOutputDeviceId(devs.outputDevices[0]?.deviceId ?? "");
+        setInputDeviceId(pickDevice(devs.inputDevices, ""));
+        setOutputDeviceId(pickDevice(devs.outputDevices, ""));
         setPhase("ready");
       } catch (error) {
         console.error(error);
@@ -202,6 +229,72 @@ export default function Demo() {
       if (session) beginDisconnect(session);
     };
   }, [loadAttempt]);
+
+  // Re-list devices when hardware is plugged in or removed, falling back to
+  // the first device if a selected one disappeared, and re-probe channels.
+  useEffect(() => {
+    if (!engine) return;
+    const mediaDevices = navigator.mediaDevices;
+    let cancelled = false;
+    const handleDeviceChange = async () => {
+      try {
+        const devs = (await engine.m.getAudioDevices()) as AudioDevices;
+        if (cancelled) return;
+        setDevices(devs);
+        setInputDeviceId((current) => pickDevice(devs.inputDevices, current));
+        setOutputDeviceId((current) => pickDevice(devs.outputDevices, current));
+        setProbeNonce((nonce) => nonce + 1);
+      } catch (error) {
+        console.error("Failed to refresh audio devices:", error);
+      }
+    };
+    mediaDevices?.addEventListener("devicechange", handleDeviceChange);
+    return () => {
+      cancelled = true;
+      mediaDevices?.removeEventListener("devicechange", handleDeviceChange);
+    };
+  }, [engine]);
+
+  // Probe the selected input device's channel count. If the probe itself
+  // fails, assume 2: capture clamps to what the device really grants, so this
+  // never over-requests.
+  useEffect(() => {
+    if (!engine) return;
+    let cancelled = false;
+    setInputDeviceChannels(undefined);
+    engine.m
+      .getInputDeviceChannels(inputDeviceId || undefined)
+      .catch((error: unknown) => {
+        console.warn("Failed to probe input device channels:", error);
+        return 2;
+      })
+      .then((channels) => {
+        if (!cancelled) setInputDeviceChannels(channels);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [engine, inputDeviceId, probeNonce]);
+
+  // Probe the selected output device's channel count. A failed probe assumes
+  // 2 for the same reason as the input probe: playback clamps to the device.
+  useEffect(() => {
+    if (!engine) return;
+    let cancelled = false;
+    setOutputDeviceChannels(undefined);
+    engine.m
+      .getOutputDeviceChannels(outputDeviceId || undefined)
+      .catch((error: unknown) => {
+        console.warn("Failed to probe output device channels:", error);
+        return 2;
+      })
+      .then((channels) => {
+        if (!cancelled) setOutputDeviceChannels(channels);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [engine, outputDeviceId, probeNonce]);
 
   const webTransportAvailable = engine?.m.WebTripSession.isWebTransportAvailable() ?? false;
 
@@ -230,40 +323,18 @@ export default function Demo() {
     if (sessionState === "error" && session) beginDisconnect(session);
   }, [sessionState]);
 
-  // Reset to "unknown" whenever the session leaves connected, so a later
-  // reconnect — possibly to a different input device — doesn't keep showing a
-  // stale gate. Only reset here: the session reports "connected" before
-  // capture (and therefore channel discovery) starts, and connectToStudio's
-  // `&mut self` wasm-bindgen borrow is still held at that point — calling
-  // back into the session (e.g. getMaxInputChannels) before connectToStudio
-  // itself resolves trips wasm-bindgen's "recursive use of an object"
-  // aliasing check. handleConnect publishes the discovered count instead,
-  // after connectToStudio has actually returned.
-  useEffect(() => {
-    if (sessionState !== "connected") {
-      setMaxInputChannels(undefined);
-    }
-  }, [sessionState]);
-
-  // Display-only: setChannels is Idle-only and the capture/send path already
-  // tracks the browser's real granted channel count regardless of this
-  // toggle's state (see AudioProcessor::process's in_channels parameter) —
-  // this just keeps the UI honest about what will be requested on the next
-  // connect.
-  useEffect(() => {
-    if (maxInputChannels === 1 && stereo) {
-      setStereo(false);
-    }
-  }, [maxInputChannels, stereo]);
-
   const handleConnect = async () => {
-    if (!engine || dialing) return;
+    if (!engine || dialing || inputDeviceChannels === undefined || outputDeviceChannels === undefined) {
+      return;
+    }
     const host = serverHost.trim();
     if (!host) {
       alert("Please enter a server host.");
       return;
     }
     const port = parseInt(serverPort, 10) || 4464;
+    const outputChannels = outputDeviceChannels >= 2 ? 2 : 1;
+    const mode = CAPTURE_MODES[inputDeviceChannels === 1 ? "mono" : captureMode];
 
     dialing = true;
     setBusy(true);
@@ -280,6 +351,13 @@ export default function Demo() {
           await prior.catch(() => {});
           if (pendingDisconnect === prior) pendingDisconnect = null;
         }
+        // Apply the channel configuration now, while the session is Idle (the
+        // setters are ignored in any other state). Applying it at connect time
+        // also means a remount never has to re-sync the singleton session.
+        engine.session.setReceiveChannels(RECEIVE_CHANNELS);
+        engine.session.setOutputChannels(outputChannels);
+        engine.session.setInputChannels(mode.inputChannels);
+        engine.session.setSendChannels(mode.sendChannels);
         await engine.session.connectToStudio(
           host,
           port,
@@ -304,13 +382,6 @@ export default function Demo() {
         }),
       ]);
       if (!mountedRef.current) return;
-
-      // connectToStudio only resolves after start_capture, so this is the
-      // first point the browser's granted channel count is actually known.
-      // The sessionState effect below can't serve here: the session reports
-      // "connected" before capture starts, so it would read the 0 sentinel
-      // and never re-run for this connection.
-      setMaxInputChannels(engine.session.getMaxInputChannels());
 
       try {
         await engine.session.setOutputDevice(outputDeviceId || undefined);
@@ -341,25 +412,6 @@ export default function Demo() {
 
   const handleDisconnect = () => {
     if (engine) beginDisconnect(engine.session);
-  };
-
-  const handleOutputDeviceChange = async (deviceId: string) => {
-    const previousDeviceId = outputDeviceId;
-    setOutputDeviceId(deviceId);
-    if (!engine) return;
-    try {
-      await engine.session.setOutputDevice(deviceId || undefined);
-    } catch (error) {
-      console.error("Failed to set output device:", error);
-      if (mountedRef.current) alert(`Failed to change output device: ${error}`);
-      setOutputDeviceId(previousDeviceId);
-    }
-  };
-
-  const handleStereoToggle = () => {
-    const next = !stereo;
-    setStereo(next);
-    engine?.session.setChannels(next ? 2 : 1);
   };
 
   const handleIosResume = async () => {
@@ -414,9 +466,16 @@ export default function Demo() {
     );
   }
 
-  const stereoDisabled = maxInputChannels === 1;
   const connected = sessionState === "connected";
   const inProgress = sessionState === "connecting" || sessionState === "negotiating";
+  // Connection and device settings are applied at connect time, so they are
+  // locked from the moment a connect starts until the session is back to
+  // idle. The transient "error" state is included: its teardown is scheduled
+  // by an effect, and a connect that sneaks in first would attach a transport
+  // while the Rust state machine drops the Error → Connecting transition,
+  // desyncing UI and session.
+  const configLocked = busy || inProgress || connected || sessionState === "error";
+  const deviceChannelsKnown = inputDeviceChannels !== undefined && outputDeviceChannels !== undefined;
   const statusLabel = connected
     ? `Connected (${activeTransport === "webtransport" ? "WebTransport" : "WebRTC"})`
     : SESSION_STATE_LABELS[sessionState] ?? sessionState;
@@ -458,6 +517,7 @@ export default function Demo() {
               className="text-input"
               placeholder="studio.jacktrip.org"
               value={serverHost}
+              disabled={configLocked}
               onChange={(e) => setServerHost(e.target.value)}
             />
           </div>
@@ -469,6 +529,7 @@ export default function Demo() {
               className="text-input"
               placeholder="4464"
               value={serverPort}
+              disabled={configLocked}
               onChange={(e) => setServerPort(e.target.value)}
             />
           </div>
@@ -482,6 +543,7 @@ export default function Demo() {
             className="text-input"
             placeholder="Leave empty for anonymous"
             value={clientName}
+            disabled={configLocked}
             onChange={(e) => setClientName(e.target.value)}
           />
         </div>
@@ -492,6 +554,7 @@ export default function Demo() {
             id="transport"
             className="select"
             value={transportChoice}
+            disabled={configLocked}
             onChange={(e) => setTransportChoice(e.target.value as TransportChoice)}
           >
             <option value="auto">Auto</option>
@@ -505,11 +568,7 @@ export default function Demo() {
         <div className="connection-buttons">
           <button
             className="action-btn primary"
-            // Also disabled during the transient "error" state: its teardown
-            // is scheduled by an effect, and a connect that sneaks in first
-            // would attach a transport while the Rust state machine drops the
-            // Error → Connecting transition, desyncing UI and session.
-            disabled={busy || inProgress || connected || sessionState === "error"}
+            disabled={configLocked || !deviceChannelsKnown}
             onClick={handleConnect}
           >
             {connected ? "Connected" : busy || inProgress ? "Connecting..." : "Connect to Studio"}
@@ -530,6 +589,7 @@ export default function Demo() {
             id="input-device"
             className="select"
             value={inputDeviceId}
+            disabled={configLocked}
             onChange={(e) => setInputDeviceId(e.target.value)}
           >
             {devices.inputDevices.map((d) => (
@@ -546,7 +606,8 @@ export default function Demo() {
               id="output-device"
               className="select"
               value={outputDeviceId}
-              onChange={(e) => handleOutputDeviceChange(e.target.value)}
+              disabled={configLocked}
+              onChange={(e) => setOutputDeviceId(e.target.value)}
             >
               {devices.outputDevices.map((d) => (
                 <option key={d.deviceId} value={d.deviceId}>
@@ -573,26 +634,40 @@ export default function Demo() {
 
         <div className="section-header">Audio Processing</div>
         <div className="toggles-grid">
-          <ToggleButton active={agc} line1="AGC" line2="Auto Gain" onClick={() => setAgc(!agc)} />
+          <ToggleButton
+            active={agc}
+            line1="AGC"
+            line2="Auto Gain"
+            onClick={() => setAgc(!agc)}
+            disabled={configLocked}
+          />
           <ToggleButton
             active={echo}
             line1="Echo"
             line2="Cancellation"
             onClick={() => setEcho(!echo)}
+            disabled={configLocked}
           />
           <ToggleButton
             active={noise}
             line1="Noise"
             line2="Suppression"
             onClick={() => setNoise(!noise)}
+            disabled={configLocked}
           />
-          <ToggleButton
-            active={stereo}
-            line1={stereo ? "Stereo" : "Mono"}
-            line2={stereo ? "2 Channels" : "1 Channel"}
-            onClick={handleStereoToggle}
-            disabled={stereoDisabled}
-          />
+          {inputDeviceChannels === 1 ? (
+            <ToggleButton active={false} line1="Mono" line2="1 ch" onClick={() => {}} disabled />
+          ) : (
+            inputDeviceChannels !== undefined && (
+              <ToggleButton
+                active={captureMode === "stereo"}
+                line1={CAPTURE_MODES[captureMode].line1}
+                line2={CAPTURE_MODES[captureMode].line2}
+                onClick={() => setCaptureMode(CAPTURE_MODES[captureMode].next)}
+                disabled={configLocked}
+              />
+            )
+          )}
         </div>
 
         <div className="section-header">Gain Controls</div>
