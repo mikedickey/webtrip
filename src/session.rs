@@ -555,6 +555,7 @@ impl WebTripSession {
             engine
                 .start_capture(
                     device_id,
+                    self.output_device_id.clone(),
                     auto_gain_control,
                     echo_cancellation,
                     noise_suppression,
@@ -562,13 +563,6 @@ impl WebTripSession {
                     self.output_channels as u32,
                 )
                 .await?;
-        }
-
-        // Apply stored output device selection now that audio engine is ready
-        if let Some(ref output_device) = self.output_device_id {
-            if let Some(ref mut engine) = self.audio_engine {
-                engine.set_output_device(Some(output_device.clone())).await?;
-            }
         }
 
         // Start audio callback loop ONLY for transports that need main-thread tick()

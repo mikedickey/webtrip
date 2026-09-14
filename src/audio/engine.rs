@@ -182,10 +182,13 @@ impl AudioEngine {
     /// Captures the device's first `input_channels` channels (fewer when the
     /// browser grants fewer) and plays to the output device's first
     /// `output_channels` channels (fewer when the destination supports fewer).
+    /// A given `output_device_id` is routed before the worklet is connected,
+    /// so playback never starts on the default output.
     #[wasm_bindgen(js_name = startCapture)]
     pub async fn start_capture(
         &mut self,
         device_id: Option<String>,
+        output_device_id: Option<String>,
         auto_gain_control: bool,
         echo_cancellation: bool,
         noise_suppression: bool,
@@ -220,6 +223,14 @@ impl AudioEngine {
         let source_node = self.ctx.create_media_stream_source(&stream)?;
         self.source_node = Some(source_node);
         self.current_stream = Some(stream);
+
+        // Route to the selected sink before anything is connected to the
+        // destination: remote audio may already be queued, and
+        // `maxChannelCount` below must be the selected device's, not the
+        // default output's.
+        if output_device_id.is_some() {
+            route_output_sink(self.ctx.as_ref(), output_device_id).await?;
+        }
 
         // Configure the destination (explicit/discrete, so the browser never
         // speaker-folds or up-mixes on our behalf — mapping is
@@ -710,7 +721,7 @@ mod tests {
         );
 
         engine
-            .start_capture(None, false, false, false, 2, 2)
+            .start_capture(None, None, false, false, false, 2, 2)
             .await
             .expect("start_capture should resolve with the fake-device flags");
 
@@ -775,7 +786,7 @@ mod tests {
         ring.set_streaming(true);
 
         engine
-            .start_capture(None, false, false, false, 2, 2)
+            .start_capture(None, None, false, false, false, 2, 2)
             .await
             .expect("start_capture over the networked branch should resolve");
 

@@ -129,6 +129,7 @@ Two exported async free functions. They are module-level, not session methods, s
   - A `navigator.mediaDevices` `devicechange` listener, registered in an effect and removed on cleanup.
   - It re-runs `getAudioDevices()`. If a selected id disappeared it falls back to the first device (`pickDevice`, shared with the mount path).
   - It always re-probes the selected devices, even if the id is unchanged, because "default" may now point at different hardware. A probe nonce in the effect dependencies forces this.
+  - Probes are skipped while the config is locked (connecting through teardown): counts only apply at the next connect, and a `getUserMedia` probe beside a live capture may disturb its track. A probe skipped or cancelled while locked runs on unlock; a completed one for the same id and nonce is not repeated. Both probes share one `useDeviceChannels` hook.
 - **Capture button.**
   - Hidden until `inputDeviceChannels` is known.
   - Shows a locked "Mono" / "1 ch" when the count is 1.

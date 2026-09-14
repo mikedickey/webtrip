@@ -92,6 +92,47 @@ function pickDevice(devices: DeviceInfo[], currentId: string): string {
     : (devices[0]?.deviceId ?? "");
 }
 
+// The channel count of a selected device, probed before connecting and again
+// whenever the id or probe nonce changes. undefined means "not yet known" (a
+// probe is in flight). A failed probe assumes 2: capture and playback clamp to
+// what the device really grants, so this never over-requests.
+//
+// Probing is skipped while `locked`: counts are only applied at the next
+// connect, and the input probe's getUserMedia on a device that is already
+// capturing may disturb the live track. A probe skipped or cancelled while
+// locked runs on unlock; one already completed for this id and nonce does not
+// repeat.
+function useDeviceChannels(
+  probe: ((deviceId?: string) => Promise<number>) | undefined,
+  deviceId: string,
+  probeNonce: number,
+  locked: boolean,
+  kind: "input" | "output",
+): number | undefined {
+  const [channels, setChannels] = useState<number | undefined>(undefined);
+  const probedKey = useRef<string | null>(null);
+  useEffect(() => {
+    const key = `${deviceId}\n${probeNonce}`;
+    if (!probe || locked || probedKey.current === key) return;
+    let cancelled = false;
+    setChannels(undefined);
+    probe(deviceId || undefined)
+      .catch((error: unknown) => {
+        console.warn(`Failed to probe ${kind} device channels:`, error);
+        return 2;
+      })
+      .then((count) => {
+        if (cancelled) return;
+        probedKey.current = key;
+        setChannels(count);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [probe, deviceId, probeNonce, locked, kind]);
+  return channels;
+}
+
 function ToggleButton({
   active,
   line1,
@@ -132,10 +173,6 @@ export default function Demo() {
   const [inputDeviceId, setInputDeviceId] = useState("");
   const [outputDeviceId, setOutputDeviceId] = useState("");
 
-  // Channel counts of the selected devices, probed before connecting.
-  // undefined means "not yet known" (a probe is in flight).
-  const [inputDeviceChannels, setInputDeviceChannels] = useState<number | undefined>(undefined);
-  const [outputDeviceChannels, setOutputDeviceChannels] = useState<number | undefined>(undefined);
   // Bumped on `devicechange` so the probes re-run even when the selected ids
   // are unchanged: "default" may now point at different hardware.
   const [probeNonce, setProbeNonce] = useState(0);
@@ -255,46 +292,30 @@ export default function Demo() {
     };
   }, [engine]);
 
-  // Probe the selected input device's channel count. If the probe itself
-  // fails, assume 2: capture clamps to what the device really grants, so this
-  // never over-requests.
-  useEffect(() => {
-    if (!engine) return;
-    let cancelled = false;
-    setInputDeviceChannels(undefined);
-    engine.m
-      .getInputDeviceChannels(inputDeviceId || undefined)
-      .catch((error: unknown) => {
-        console.warn("Failed to probe input device channels:", error);
-        return 2;
-      })
-      .then((channels) => {
-        if (!cancelled) setInputDeviceChannels(channels);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [engine, inputDeviceId, probeNonce]);
+  const connected = sessionState === "connected";
+  const inProgress = sessionState === "connecting" || sessionState === "negotiating";
+  // Connection and device settings are applied at connect time, so they are
+  // locked from the moment a connect starts until the session is back to
+  // idle. The transient "error" state is included: its teardown is scheduled
+  // by an effect, and a connect that sneaks in first would attach a transport
+  // while the Rust state machine drops the Error → Connecting transition,
+  // desyncing UI and session.
+  const configLocked = busy || inProgress || connected || sessionState === "error";
 
-  // Probe the selected output device's channel count. A failed probe assumes
-  // 2 for the same reason as the input probe: playback clamps to the device.
-  useEffect(() => {
-    if (!engine) return;
-    let cancelled = false;
-    setOutputDeviceChannels(undefined);
-    engine.m
-      .getOutputDeviceChannels(outputDeviceId || undefined)
-      .catch((error: unknown) => {
-        console.warn("Failed to probe output device channels:", error);
-        return 2;
-      })
-      .then((channels) => {
-        if (!cancelled) setOutputDeviceChannels(channels);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [engine, outputDeviceId, probeNonce]);
+  const inputDeviceChannels = useDeviceChannels(
+    engine?.m.getInputDeviceChannels,
+    inputDeviceId,
+    probeNonce,
+    configLocked,
+    "input",
+  );
+  const outputDeviceChannels = useDeviceChannels(
+    engine?.m.getOutputDeviceChannels,
+    outputDeviceId,
+    probeNonce,
+    configLocked,
+    "output",
+  );
 
   const webTransportAvailable = engine?.m.WebTripSession.isWebTransportAvailable() ?? false;
 
@@ -358,6 +379,9 @@ export default function Demo() {
         engine.session.setOutputChannels(outputChannels);
         engine.session.setInputChannels(mode.inputChannels);
         engine.session.setSendChannels(mode.sendChannels);
+        // Store the sink before connecting so start_capture routes playback to
+        // it during engine bring-up, instead of starting on the default output.
+        await engine.session.setOutputDevice(outputDeviceId || undefined);
         await engine.session.connectToStudio(
           host,
           port,
@@ -382,13 +406,6 @@ export default function Demo() {
         }),
       ]);
       if (!mountedRef.current) return;
-
-      try {
-        await engine.session.setOutputDevice(outputDeviceId || undefined);
-      } catch (error) {
-        // Don't fail the connection if output device setting fails.
-        console.warn("Failed to set output device:", error);
-      }
 
       // On iOS Safari, AudioContext.resume() requires a user gesture and may
       // not have resolved yet. If the context is still suspended, show a
@@ -466,15 +483,6 @@ export default function Demo() {
     );
   }
 
-  const connected = sessionState === "connected";
-  const inProgress = sessionState === "connecting" || sessionState === "negotiating";
-  // Connection and device settings are applied at connect time, so they are
-  // locked from the moment a connect starts until the session is back to
-  // idle. The transient "error" state is included: its teardown is scheduled
-  // by an effect, and a connect that sneaks in first would attach a transport
-  // while the Rust state machine drops the Error → Connecting transition,
-  // desyncing UI and session.
-  const configLocked = busy || inProgress || connected || sessionState === "error";
   const deviceChannelsKnown = inputDeviceChannels !== undefined && outputDeviceChannels !== undefined;
   const statusLabel = connected
     ? `Connected (${activeTransport === "webtransport" ? "WebTransport" : "WebRTC"})`

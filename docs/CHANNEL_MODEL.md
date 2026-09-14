@@ -83,7 +83,7 @@ two channel fields, both named from the perspective of the packet's *sender*
   receive count here.
 - **Byte 15, `NumOutgoingChannelsToNet`** — how many channels the sender
   transmits: the channel count of *this packet's payload*. Senders write the
-  send count here; receivers size and stride the payload by it
+  send count here; receivers size and stride the payload by its decoded value
   (`deserialize_into`, and on the send side
   `total_packet_size_out`/`serialize_into`). It uses a compact encoding: `0`
   means "same as byte 14" (symmetric), `1`–`254` is an explicit count, and
@@ -98,7 +98,10 @@ receive_channels, buffer)` is the single place both transports build outbound
 packets. With the defaults (send 1, receive 2) byte 14 is `2` and byte 15 is
 `1`, which asks the hub for stereo while sending mono.
 
-Both fields are validated against `MAX_CHANNELS = 8` on receive.
+On receive, byte 14 must be `1`–`MAX_CHANNELS` (`0` is rejected, as JackTrip
+does), and byte 15 must decode to `0`–`MAX_CHANNELS`. A "no audio" packet
+(byte 15 = `255`, decoded `0`) passes header validation, but the regulator
+then rejects it as `UnsupportedChannelCount`.
 
 ---
 
@@ -173,7 +176,9 @@ output counts (`engine.rs`):
    (`AudioConstraints::to_js`). Asking for the maximum makes the browser open
    the device at its native width instead of downmixing, so "input channels =
    N" reliably means the device's first N.
-2. Read the **granted** width from the track's `getSettings().channelCount`.
+2. Read the **granted** width from the track's `getSettings().channelCount`
+   (`resolve_input_channels(settings, None)`). A browser that doesn't report
+   it is treated as granting 1 channel.
 3. Build the `AudioWorkletNode` with an input width of
    `min(input_channels, granted)`. The node's `channelCount` is
    `Explicit`/`Discrete`, so per the Web Audio spec the extra source channels
@@ -181,9 +186,14 @@ output counts (`engine.rs`):
    When the browser granted fewer than requested (e.g. Chrome forcing mono
    under echo cancellation), the narrower width is used and the send path's
    conform fills the send width.
-4. Configure the destination `Explicit`/`Discrete` at
+4. Route the context to the session's stored output device, if any
+   (`route_output_sink`), before anything is connected to the destination, so
+   playback never starts on the default output.
+5. Configure the destination `Explicit`/`Discrete` at
    `min(output_channels, destination.maxChannelCount, MAX_CHANNELS)`
    (`configure_destination`). Setting a width above `maxChannelCount` throws.
+   Because step 4 already ran, this is the selected device's
+   `maxChannelCount`.
 
 The engine keeps the worklet's input width and the requested output count, so
 `set_output_device` can re-clamp the output against a new sink's
@@ -306,9 +316,9 @@ Key points:
 - **The receive count is a request.** It goes out in byte 14 of every packet,
   and a well-behaved hub sends that many channels back. But the regulator
   adopts whatever count the peer's first packet actually carries (step ⑨), and
-  `map_to_output` handles any mismatch with the output width. The session's
-  constructor also configures the regulator with the receive count, as its
-  pre-adoption shape.
+  `map_to_output` handles any mismatch with the output width. Before that first
+  packet, the regulator has the shape the session's constructor gave it: the
+  default receive count (2). `setReceiveChannels` doesn't reconfigure it.
 - **`out_channels` is the output width**, configured by
   `configure_destination`/`build_and_connect_worklet_node` and passed into
   every `process()` call.
@@ -362,12 +372,21 @@ quiet ones must still show on the meter).
 The demo (`website/src/pages/demo/Demo.tsx`) is one client of the model above.
 It probes the selected devices on first render, whenever the selection
 changes, and on `navigator.mediaDevices`'s `devicechange` event (which also
-re-lists devices). It always asks for 2 receive channels, and uses 2 output
-channels when the output device supports at least 2, otherwise 1.
+re-lists devices). Probes are skipped while the settings are locked (from the
+start of a connect until the session is back to idle): counts only apply at
+the next connect, and opening the input with `getUserMedia` beside a live
+capture may disturb its track. A probe skipped while locked runs once the
+session is idle again. It always asks for 2 receive channels, and uses 2 output
+channels when the output device supports at least 2, otherwise 1. Connect
+stays disabled until both probes have resolved. A probe that fails logs a
+warning and assumes 2, since capture and playback still clamp to the real
+device.
 
 A 1-channel input device shows a locked "Mono". Otherwise a cycling button
 picks between three modes, each just an (input, send) pair — the mixing falls
-out of `conform_interleaved_channels`:
+out of `conform_interleaved_channels`. Selecting a 1-channel device doesn't
+overwrite the chosen mode, so switching back to a multi-channel device
+restores it (Mix to Mono by default).
 
 | Mode | Input channels | Send channels | Mapping |
 |---|---|---|---|
@@ -392,11 +411,13 @@ monitor stay live.
   it.** Nothing narrows or rewrites them on disconnect. A device that turned
   out narrower than configured is handled by clamping at capture time, every
   time.
-- **Payload width is byte 15.** Both serialize (`total_packet_size_out`,
-  `serialize_into`) and deserialize stride the payload by
-  `num_outgoing_channels`, as JackTrip's receivers do
-  (`JackTrip::getPeerNumOutgoingChannels`). Byte 14 never affects the size of
-  the packet it's in.
+- **Payload width is the *decoded* byte 15.** Both serialize
+  (`total_packet_size_out`, `serialize_into`) and deserialize stride the
+  payload by `num_outgoing_channels`, as JackTrip's receivers do
+  (`JackTrip::getPeerNumOutgoingChannels`). For a symmetric packet (byte 15 =
+  `0`) that value comes from byte 14, so a receiver that sizes the payload from
+  the raw byte 15 misreads it. WebTrip itself sends symmetric packets whenever
+  the send and receive counts are equal (e.g. the demo's Stereo mode).
 - **Chrome forces mono capture when echo cancellation is on.** This is a
   browser policy, not a WebTrip bug. The capture width drops to 1 and the
   conform fills the send width. If stereo capture looks unavailable during
@@ -404,6 +425,10 @@ monitor stay live.
 - **A browser reporting 0 channels is floored to 1** (`clamp_channel_count`),
   not surfaced as an error. Current browsers fail `getUserMedia` outright for
   an input with no channels rather than resolve with a degenerate track.
+- **An unreported channel count also means 1.** If a track's
+  `getSettings()` has no `channelCount`, capture narrows to 1 channel even on
+  a stereo device. If `getCapabilities()` is missing too, the input probe
+  resolves to 1, and the demo locks Mono.
 - **`RENDER_QUANTUM_FRAMES` (128) and `MAX_CHANNELS` (8) bound the worklet's
   planar scratch buffers** (`ProcessorHandle::input_scratch`/`output_scratch`
   in `worklet.rs`, sized `RENDER_QUANTUM_FRAMES * MAX_CHANNELS`). Every
