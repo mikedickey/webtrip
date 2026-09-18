@@ -380,7 +380,7 @@ impl WebRtcTransport {
             None => return,
         };
 
-        let samples_needed = (buffers.buffer_size * buffers.send_channels as usize) as u32;
+        let samples_needed = buffers.samples_per_packet() as u32;
 
         // Sound shared borrow: `RingBuffer`'s read path is `&self`.
         let Some(ring_buffer) = buffers.local_to_network.as_ref() else {
@@ -1122,8 +1122,8 @@ impl Transport for WebRtcTransport {
         self.audio_buffers = Some(config);
         
         // Resize internal buffers based on configuration
-        self.audio_to_send_buffer.resize(config.buffer_size * config.send_channels as usize, 0.0);
-        let max_packet_bytes = 16 + (config.buffer_size * config.send_channels as usize * 4);
+        self.audio_to_send_buffer.resize(config.samples_per_packet(), 0.0);
+        let max_packet_bytes = 16 + (config.samples_per_packet() * 4);
         self.packet_serialize_buffer.resize(max_packet_bytes, 0);
 
         super::transport::log_audio_buffers_set("WebRTC", &config);

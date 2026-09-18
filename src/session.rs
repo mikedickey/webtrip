@@ -331,14 +331,27 @@ impl WebTripSession {
         })
     }
 
+    /// The session's audio buffers and channel counts, as handed to a
+    /// transport before it connects.
+    fn audio_buffer_config(&mut self) -> AudioBufferConfig {
+        AudioBufferConfig {
+            local_to_network: SharedPtr::new(&mut *self.local_to_network_buffer),
+            network_to_local: SharedPtr::new(&mut *self.network_to_local_buffer),
+            buffer_size: self.buffer_size,
+            send_channels: self.send_channels,
+            receive_channels: self.receive_channels,
+        }
+    }
+
     /// Connect the session over a caller-supplied, already-constructed transport,
     /// bypassing the real per-type transport construction in `connect_to_studio`.
     ///
     /// Unit-test only. Mirrors `connect_to_studio`'s pre-transport steps (mark
-    /// `Connecting`, register default capture params) and then reuses the shared
-    /// [`finalize_connection`] tail, so a test can drive the full connect →
-    /// `AudioEngine`/worklet/callback-loop → `Connected` sequence against a mock
-    /// transport with no live hub. Pair with [`disconnect`] for the teardown half.
+    /// `Connecting`, register default capture params, hand the transport the
+    /// audio buffers) and then reuses the shared [`finalize_connection`] tail,
+    /// so a test can drive the full connect → `AudioEngine`/worklet/callback-loop
+    /// → `Connected` sequence against a mock transport with no live hub. Pair
+    /// with [`disconnect`] for the teardown half.
     ///
     /// [`finalize_connection`]: Self::finalize_connection
     /// [`disconnect`]: Self::disconnect
@@ -354,6 +367,8 @@ impl WebTripSession {
             noise_suppression: false,
         });
         self.set_state(SessionState::Connecting);
+
+        transport.set_audio_buffers(self.audio_buffer_config());
 
         Transport::connect(transport.as_mut(), "test-host", DEFAULT_SIGNALING_PORT, "").await?;
 
@@ -644,13 +659,7 @@ impl WebTripSession {
         self.set_state(SessionState::Connecting);
 
         // Create buffer configuration for transports that need it
-        let buffer_config = AudioBufferConfig {
-            local_to_network: SharedPtr::new(&mut *self.local_to_network_buffer),
-            network_to_local: SharedPtr::new(&mut *self.network_to_local_buffer),
-            buffer_size: self.buffer_size,
-            send_channels: self.send_channels,
-            receive_channels: self.receive_channels,
-        };
+        let buffer_config = self.audio_buffer_config();
 
         // Create the appropriate transport based on type
         let client_name_str = client_name.as_deref().unwrap_or("");
