@@ -124,6 +124,14 @@ pub struct AudioBufferConfig {
     pub receive_channels: u8,
 }
 
+impl AudioBufferConfig {
+    /// Interleaved samples in one outbound packet: `buffer_size` frames at
+    /// `send_channels` wide.
+    pub fn samples_per_packet(&self) -> usize {
+        self.buffer_size * self.send_channels as usize
+    }
+}
+
 /// Log that audio buffers have been configured on a transport
 pub(crate) fn log_audio_buffers_set(transport_name: &str, config: &AudioBufferConfig) {
     web_sys::console::debug_1(

@@ -1519,6 +1519,20 @@ mod tests {
         slot.seq = Some(seq);
     }
 
+    /// Push a packet a test expects the regulator to store, asserting the
+    /// outcome. Tests that drive `push_internal` for setup would otherwise
+    /// discard the `#[must_use]` result, so a push that starts getting
+    /// rejected (wrong size, unadopted channel count) would leave the
+    /// regulator empty and surface as a confusing failure further down —
+    /// or as no failure at all.
+    fn push_stored(reg: &mut Regulator, seq: u16, channels: usize, samples: &[f32], now_ms: f64) {
+        assert_eq!(
+            reg.push_internal(seq, channels, samples, now_ms),
+            PushOutcome::Stored,
+            "setup push of seq {seq} ({channels}ch) must be stored"
+        );
+    }
+
     #[test]
     fn test_burg_training_and_prediction() {
         let mut burg = BurgAlgorithm::new(64);
@@ -1577,11 +1591,11 @@ mod tests {
         let near_max: u16 = u16::MAX - 2;
         
         // Push packets near wraparound boundary with proper timing
-        reg.push_internal(near_max, 1, &samples, 0.0);
-        reg.push_internal(near_max.wrapping_add(1), 1, &samples, 3.0);
-        reg.push_internal(near_max.wrapping_add(2), 1, &samples, 6.0); // This wraps to 0
-        reg.push_internal(0, 1, &samples, 9.0); // Already wrapped
-        reg.push_internal(1, 1, &samples, 12.0);
+        push_stored(&mut reg, near_max, 1, &samples, 0.0);
+        push_stored(&mut reg, near_max.wrapping_add(1), 1, &samples, 3.0);
+        push_stored(&mut reg, near_max.wrapping_add(2), 1, &samples, 6.0); // This wraps to 0
+        push_stored(&mut reg, 0, 1, &samples, 9.0); // Already wrapped
+        push_stored(&mut reg, 1, 1, &samples, 12.0);
         
         let mut output = vec![0.0f32; 128];
         
@@ -1623,7 +1637,7 @@ mod tests {
         // A stream that is playing out normally.
         let mut t = 0.0;
         for i in 0..10u16 {
-            reg.push_internal(100 + i, 1, &samples, t);
+            push_stored(&mut reg, 100 + i, 1, &samples, t);
             t += dt;
         }
         let mut pop_t = 10.0;
@@ -1644,7 +1658,7 @@ mod tests {
         let mut tail_real = 0;
         for k in 0..600u16 {
             let now = resume_t + k as f64 * dt;
-            reg.push_internal(first_resumed + k, 1, &samples, now);
+            push_stored(&mut reg, first_resumed + k, 1, &samples, now);
             let real = reg.pop_internal(&mut out, now + 1.0);
             if real && first_real_pkt.is_none() {
                 first_real_pkt = Some(k);
@@ -1874,8 +1888,8 @@ mod tests {
         let samples = vec![0.25f32; reg.samples_per_packet];
 
         // Drive a small stream through the regulator.
-        reg.push_internal(0, 2, &samples, 0.0);
-        reg.push_internal(1, 2, &samples, 2.0);
+        push_stored(&mut reg, 0, 2, &samples, 0.0);
+        push_stored(&mut reg, 1, 2, &samples, 2.0);
         let mut out = vec![0.0f32; reg.samples_per_packet];
         let _ = reg.pop_internal(&mut out, 10.0);
         let _ = reg.pop_internal(&mut out, 12.0);
@@ -1953,7 +1967,7 @@ mod tests {
 
         // After reset, the first pop on a fresh stream should return silence
         // (startup), not the stale stashed buffer.
-        reg.push_internal(0, 1, &samples, 0.0);
+        push_stored(&mut reg, 0, 1, &samples, 0.0);
         let mut out = vec![0.0f32; reg.fpp];
         let result = reg.pop_internal(&mut out, 1.0); // still inside tolerance window
         assert!(!result, "should not replay the pre-reset stash");
@@ -1968,7 +1982,7 @@ mod tests {
         let mut reg = Regulator::with_params(1, 32, 48_000, 5.0);
         let samples = vec![0.5f32; reg.fpp];
 
-        reg.push_internal(0, 1, &samples, 0.0);
+        push_stored(&mut reg, 0, 1, &samples, 0.0);
         let mut out = vec![0.0f32; reg.fpp];
         let r1 = reg.pop_internal(&mut out, 10.0);
         assert!(r1);
@@ -1977,7 +1991,7 @@ mod tests {
         // Skip seq 1, 2 — push seq 3 directly. With `skipped = 2`, the
         // regulator should treat this as a glitch, conceal, stash, and bump
         // overruns.
-        reg.push_internal(3, 1, &samples, 20.0);
+        push_stored(&mut reg, 3, 1, &samples, 20.0);
         let r2 = reg.pop_internal(&mut out, 40.0);
         assert!(!r2, "skipped-gap path returns concealment (false)");
         assert_eq!(reg.pull_stats.overruns, 2, "overrun counter tracks skip distance");
@@ -2000,7 +2014,7 @@ mod tests {
         let mut reg = Regulator::with_params(1, 32, 48_000, 5.0);
         let samples = vec![0.5f32; reg.fpp];
 
-        reg.push_internal(0, 1, &samples, 0.0);
+        push_stored(&mut reg, 0, 1, &samples, 0.0);
         let mut out = vec![0.0f32; reg.fpp];
         let r0 = reg.pop_internal(&mut out, 10.0);
         assert!(r0);
@@ -2025,7 +2039,7 @@ mod tests {
         );
 
         // Real packet arrives — next pop should be real audio again.
-        reg.push_internal(1, 1, &samples, 25.0);
+        push_stored(&mut reg, 1, 1, &samples, 25.0);
         let r_resume = reg.pop_internal(&mut out, 30.0);
         assert!(r_resume, "PLC must disengage once a real packet is available");
         assert_eq!(reg.last_seq_out, Some(1));
@@ -2033,7 +2047,7 @@ mod tests {
         let underruns_after = reg.pull_stats.underruns;
 
         // No further underruns when consumption keeps pace.
-        reg.push_internal(2, 1, &samples, 32.0);
+        push_stored(&mut reg, 2, 1, &samples, 32.0);
         let r_next = reg.pop_internal(&mut out, 38.0);
         assert!(r_next);
         assert_eq!(reg.pull_stats.underruns, underruns_after);
@@ -2052,8 +2066,8 @@ mod tests {
         let samples = vec![0.1f32; reg.samples_per_packet];
 
         // Before any pop, last_seq_out is None so depth treats read == write.
-        reg.push_internal(0, 2, &samples, 0.0);
-        reg.push_internal(1, 2, &samples, 2.0);
+        push_stored(&mut reg, 0, 2, &samples, 0.0);
+        push_stored(&mut reg, 1, 2, &samples, 2.0);
         assert_eq!(reg.depth(), 0, "with no pop, read==write so depth is zero");
 
         // First pop sets last_seq_out; the in-flight buffer is consumed.
@@ -2065,7 +2079,7 @@ mod tests {
         // Push more packets without popping — depth grows by one per push.
         for (i, t) in (1u16..=3).zip([12.0_f64, 14.0, 16.0]) {
             let seq = seq_after_first_pop.wrapping_add(i);
-            reg.push_internal(seq, 2, &samples, t);
+            push_stored(&mut reg, seq, 2, &samples, t);
             assert_eq!(
                 reg.depth() as u16,
                 i,
@@ -2111,8 +2125,8 @@ mod tests {
     fn test_stats_reflect_internal_counters_and_state() {
         let mut reg = Regulator::with_params(1, 32, 48_000, 7.5);
         let samples = vec![0.0f32; reg.fpp];
-        reg.push_internal(42, 1, &samples, 0.0);
-        reg.push_internal(43, 1, &samples, 2.0);
+        push_stored(&mut reg, 42, 1, &samples, 0.0);
+        push_stored(&mut reg, 43, 1, &samples, 2.0);
 
         let mut out = vec![0.0f32; reg.fpp];
         let _ = reg.pop_internal(&mut out, 15.0);

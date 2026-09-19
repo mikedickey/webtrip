@@ -130,20 +130,27 @@ pub(crate) fn assert_valid_sdp(sdp: &str) {
 /// lifecycle in unit tests without a live hub.
 ///
 /// It performs no network I/O and touches no browser APIs: `connect` transitions
-/// synchronously to `Connected`, `close` to `Closed`, and `tick` is the trait's
-/// no-op default. Pass it to [`WebTripSession::connect_with_test_transport`] so a
-/// test can exercise the real connect → `AudioEngine` → `disconnect` path against
-/// a transport that always succeeds instantly.
+/// synchronously to `Connected`, `close` to `Closed`, and `tick` discards
+/// whatever the worklet has queued for sending. Pass it to
+/// [`WebTripSession::connect_with_test_transport`] so a test can exercise the
+/// real connect → `AudioEngine` → `disconnect` path against a transport that
+/// always succeeds instantly.
 ///
 /// [`WebTripSession::connect_with_test_transport`]: crate::session::WebTripSession::connect_with_test_transport
 pub(crate) struct MockTransport {
     state: crate::audio::transport::TransportState,
+    /// The session's buffers, from `set_audio_buffers`.
+    audio_buffers: Option<crate::audio::transport::AudioBufferConfig>,
+    /// One packet of scratch for draining the send ring buffer.
+    drain_scratch: Vec<f32>,
 }
 
 impl MockTransport {
     pub(crate) fn new() -> Self {
         Self {
             state: crate::audio::transport::TransportState::Disconnected,
+            audio_buffers: None,
+            drain_scratch: Vec::new(),
         }
     }
 }
@@ -153,6 +160,24 @@ impl crate::audio::transport::Transport for MockTransport {
         // The concrete type is irrelevant to the lifecycle under test; report
         // the default so no production `TransportType::Mock` variant is needed.
         crate::audio::transport::TransportType::WebRTC
+    }
+
+    fn set_audio_buffers(&mut self, config: crate::audio::transport::AudioBufferConfig) {
+        self.drain_scratch.resize(config.samples_per_packet(), 0.0);
+        self.audio_buffers = Some(config);
+    }
+
+    /// Drain the send ring buffer, as `WebRtcTransport` does before its data
+    /// channel opens, so the has-data flag clears and the callback loop's
+    /// `Atomics.waitAsync` can sleep. A no-op tick left the flag at 1 once the
+    /// worklet wrote: `waitAsync` then returned synchronously forever, the loop
+    /// never yielded, and the renderer hung (the intermittent CI
+    /// `coverage:wasm` "Timed out receiving message from renderer").
+    fn tick(&mut self) {
+        let ring = self.audio_buffers.and_then(|buffers| buffers.local_to_network.as_ref());
+        if let Some(ring) = ring {
+            while ring.read(&mut self.drain_scratch) {}
+        }
     }
 
     fn state(&self) -> crate::audio::transport::TransportState {
