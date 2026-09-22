@@ -1135,7 +1135,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn configure_sizes_buffers_and_stores_pointers() {
         let ring = RingBuffer::new();
-        let regulator = Regulator::new();
+        let mut regulator = Regulator::new();
         let ring_ptr = &ring as *const RingBuffer as usize;
         let reg_ptr = &mut regulator as *mut Regulator as usize;
 
@@ -1187,7 +1187,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn build_next_packet_serializes_full_frames_and_advances_counters() {
         let ring = RingBuffer::new();
-        let regulator = Regulator::new();
+        let mut regulator = Regulator::new();
         let buffer_size: usize = 64;
         let send_channels: u8 = 2;
         let receive_channels: u8 = 4;
@@ -1276,7 +1276,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn worker_disconnect_stops_and_notifies_idempotently() {
         let ring = RingBuffer::new();
-        let regulator = Regulator::new();
+        let mut regulator = Regulator::new();
         let ring_ptr = &ring as *const RingBuffer as usize;
         let reg_ptr = &mut regulator as *mut Regulator as usize;
 
