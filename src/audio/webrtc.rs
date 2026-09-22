@@ -410,10 +410,9 @@ impl WebRtcTransport {
             }
             TickDecision::Idle => {}
             TickDecision::Process { .. } => {
-                // SAFETY: `Regulator::push` is still `&mut self`; see
-                // `SharedPtr::as_mut`. Distinct object from `ring_buffer` above,
-                // so no aliasing between the two borrows.
-                let Some(jitter_buffer) = (unsafe { buffers.network_to_local.as_mut() }) else {
+                // Distinct object from `ring_buffer` above, so no aliasing
+                // between the two borrows. Regulator is `&self` (SPSC).
+                let Some(jitter_buffer) = buffers.network_to_local.as_ref() else {
                     return;
                 };
 

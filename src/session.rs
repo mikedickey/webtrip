@@ -304,7 +304,7 @@ impl WebTripSession {
 
         // Create owned buffers
         let local_to_network_buffer = Box::new(RingBuffer::new());
-        let mut network_to_local_buffer = Box::new(Regulator::new());
+        let network_to_local_buffer = Box::new(Regulator::new());
 
         // Configure regulator with auto-adaptive tolerance and headroom (-500.0).
         // The peer's actual count is still adopted from its first packet.
@@ -597,15 +597,20 @@ impl WebTripSession {
         Ok(())
     }
 
-    /// Stop audio capture (internal use only)
-    fn stop_capture(&mut self) {
+    /// Stop audio capture (internal use only).
+    ///
+    /// Awaits worklet quiescence (via [`AudioEngine::stop_capture`]'s
+    /// `AudioContext.suspend`) before returning, so the caller may safely
+    /// [`Regulator::reset`](crate::audio::regulator::Regulator::reset)
+    /// afterwards (WEB-53 Bug 7).
+    async fn stop_capture(&mut self) {
         // Stop audio callback loop first (no more ticks)
         self.stop_audio_callback_loop();
         
         // IMPORTANT: Stop audio engine before dropping
         // This ensures AudioWorklet stops using buffer pointers
         if let Some(ref mut engine) = self.audio_engine {
-            engine.stop_capture();
+            engine.stop_capture().await;
         }
         self.audio_engine = None;
 
@@ -805,8 +810,9 @@ impl WebTripSession {
             // no-op on already-closed state.
         }
 
-        // Stop audio capture when disconnecting (this will also stop the audio callback loop)
-        self.stop_capture();
+        // Stop audio capture when disconnecting (this will also stop the audio callback loop
+        // and quiesce the worklet via AudioContext.suspend — required before reset).
+        self.stop_capture().await;
 
         // Clear any pending capture parameters
         self.pending_capture_params = None;
@@ -958,10 +964,15 @@ impl Drop for WebTripSession {
         // `disconnect()` is now async and can't be awaited from Drop. Instead,
         // best-effort teardown: drop the transport (its own Drop impl fires
         // off the shutdown message and schedules the fallback terminate) and
-        // stop audio capture. The Regulator doesn't need to be reset in Drop
-        // because the whole session is being deallocated.
+        // stop audio capture without awaiting worklet quiescence. The Regulator
+        // doesn't need to be reset in Drop because the whole session is being
+        // deallocated.
         self.transport = None;
-        self.stop_capture();
+        self.stop_audio_callback_loop();
+        if let Some(ref mut engine) = self.audio_engine {
+            engine.stop_capture_now();
+        }
+        self.audio_engine = None;
     }
 }
 

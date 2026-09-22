@@ -44,10 +44,22 @@
 //! unambiguous ordering, and handle the one case folding would have prevented
 //! explicitly instead.
 
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 /// Sentinel value for "no sequence number" (None)
 const SEQ_NONE: i32 = -1;
+
+/// Bits of an `f64` stored in an [`AtomicU64`] for cross-thread stats publication.
+#[inline]
+fn f64_to_bits(v: f64) -> u64 {
+    v.to_bits()
+}
+
+#[inline]
+fn f64_from_bits(v: u64) -> f64 {
+    f64::from_bits(v)
+}
 
 // ============================================================================
 // Constants
@@ -507,17 +519,27 @@ impl TimingStats {
 /// configure time, and is always full: a packet of any other size is rejected
 /// before it reaches a slot ([`Regulator::push`]). That leaves no
 /// partially-filled state to track and no allocation on the audio path.
+///
+/// # Publication
+///
+/// `seq` is the per-slot publication stamp. The producer writes `timestamp`,
+/// then `data`, then stores `seq` with [`Ordering::Release`]. The consumer
+/// loads `seq` with [`Ordering::Acquire`] and only then trusts the payload.
+/// This is independent of the stream-wide [`RegulatorInner::last_seq_in`]
+/// pointer: a reordered straggler must still publish its slot without
+/// advancing that pointer.
 struct PacketSlot {
     /// Arrival timestamp in milliseconds
     timestamp: f64,
     /// One packet of audio (interleaved channels), `samples_per_packet` long
     data: Vec<f32>,
-    /// The sequence number whose data currently occupies this slot, or
-    /// `None` if never written or just reset. Because every `NUM_SLOTS`th
-    /// sequence number aliases onto the same slot (see the module header),
-    /// `data` alone doesn't say *which* packet it belongs to — this is the
-    /// identity check the read side verifies before trusting it.
-    seq: Option<u16>,
+    /// Sequence number occupying this slot, or [`SEQ_NONE`] if empty.
+    /// Because every `NUM_SLOTS`th sequence number aliases onto the same slot
+    /// (see the module header), `data` alone doesn't say *which* packet it
+    /// belongs to — this is the identity check the read side verifies before
+    /// trusting it. Atomic so a straggler's store synchronizes-with the
+    /// consumer without needing to advance `last_seq_in`.
+    seq: AtomicI32,
 }
 
 impl PacketSlot {
@@ -525,8 +547,27 @@ impl PacketSlot {
         Self {
             timestamp: 0.0,
             data: vec![0.0; samples_per_packet],
-            seq: None,
+            seq: AtomicI32::new(SEQ_NONE),
         }
+    }
+
+    /// Publish `seq` as the identity of the data currently in this slot.
+    /// Must be called **after** `timestamp` and `data` are written.
+    #[inline]
+    fn publish_seq(&self, seq: u16) {
+        self.seq.store(seq as i32, Ordering::Release);
+    }
+
+    /// Clear the identity stamp (reset / invalidate).
+    #[inline]
+    fn clear_seq(&self) {
+        self.seq.store(SEQ_NONE, Ordering::Release);
+    }
+
+    /// Whether this slot currently holds `seq` (Acquire).
+    #[inline]
+    fn holds(&self, seq: u16) -> bool {
+        self.seq.load(Ordering::Acquire) == seq as i32
     }
 }
 
@@ -566,7 +607,35 @@ pub struct RegulatorStats {
 /// - **Adaptive buffering**: Automatically adjusts tolerance based on network jitter
 /// - **Burg algorithm PLC**: Uses autoregressive prediction to conceal packet loss
 /// - **Smooth crossfading**: Blends between predicted and real audio to hide glitches
+///
+/// # Concurrency (SPSC)
+///
+/// One network-side producer calls [`push`](Self::push); one audio-side consumer
+/// calls [`pop`](Self::pop). Main-thread [`stats`](Self::stats) /
+/// [`depth`](Self::depth) / [`latency_ms`](Self::latency_ms) read only atomics.
+/// Methods take `&self` and reach interior state through [`UnsafeCell`]; that is
+/// sound because:
+///
+/// 1. Every producer payload write completes before a `Release` store (`PacketSlot::seq`
+///    and/or `last_seq_in`).
+/// 2. Every consumer payload read happens after an `Acquire` load of those stamps.
+/// 3. The consumer never trusts a slot whose stamp does not match the expected seq.
+///
+/// See WEB-53. Do not weaken this to `&mut self` + concurrent `SharedPtr::as_mut`.
 pub struct Regulator {
+    inner: UnsafeCell<RegulatorInner>,
+}
+
+// SAFETY: `Regulator` is shared across the network producer, audio consumer, and
+// main-thread stats readers. Exclusive `&mut` aliases are never handed out;
+// cross-thread access goes through `&self` + the SPSC publication discipline on
+// `Regulator` (see struct docs). `UnsafeCell` makes the interior mutations
+// through shared references well-formed; the atomics supply the happens-before.
+unsafe impl Sync for Regulator {}
+
+/// Interior state of [`Regulator`]. Not `Sync` on its own — reached only via
+/// [`Regulator`]'s audited `&self` accessors under the SPSC protocol.
+struct RegulatorInner {
     // Configuration
     num_channels: usize,
     sample_rate: u32,
@@ -586,10 +655,12 @@ pub struct Regulator {
     slots: Vec<Option<PacketSlot>>,
 
     // Sequence tracking
-    /// Last sequence number received (SEQ_NONE = not initialized)
-    /// Uses AtomicI32 for thread-safe access between push (writer) and pop (reader) threads
+    /// Last sequence number received (SEQ_NONE = not initialized).
+    /// Stream-wide publication pointer between push (writer) and pop (reader).
     last_seq_in: AtomicI32,
-    last_seq_out: Option<u16>,
+    /// Last sequence number played. Atomic so main-thread `depth()` can read it
+    /// without racing the audio thread's stores.
+    last_seq_out: AtomicI32,
     last_stashed: Option<(u16, usize)>,
 
     // Timing (internal clock using performance.now() equivalent)
@@ -606,7 +677,7 @@ pub struct Regulator {
     skip_auto_headroom: bool,
     auto_headroom_start_time: f64,
 
-    // Statistics
+    // Statistics (audio/network thread working copies)
     packet_count: u64,
     plc_packet_count: u64,
     packets_rejected: u64,
@@ -623,6 +694,18 @@ pub struct Regulator {
 
     // State
     last_was_glitch: bool,
+
+    // ---- Published snapshot for main-thread stats()/depth()/latency_ms() ----
+    // Written by the producer/consumer that owns the corresponding working
+    // field; read with Acquire from any thread. Memory-safe even when values
+    // are momentarily stale.
+    pub_tolerance_bits: AtomicU64,
+    pub_headroom_bits: AtomicU64,
+    pub_max_latency_bits: AtomicU64,
+    pub_glitches: AtomicU64,
+    pub_skipped: AtomicU64,
+    pub_packets: AtomicU64,
+    pub_rejected: AtomicU64,
 }
 
 enum PacketDecision {
@@ -654,12 +737,12 @@ pub enum PushOutcome {
     WrongPacketSize { expected: usize, got: usize },
 }
 
+
 impl Regulator {
     /// Get current time in milliseconds.
     fn now_ms() -> f64 {
         #[cfg(target_arch = "wasm32")]
         {
-            // Use js_sys::Date::now() which returns milliseconds since epoch
             js_sys::Date::now()
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -673,24 +756,29 @@ impl Regulator {
         }
     }
 
+    /// SAFETY: caller upholds the SPSC discipline documented on [`Regulator`].
+    #[inline]
+    fn inner_mut(&self) -> &mut RegulatorInner {
+        unsafe { &mut *self.inner.get() }
+    }
+
+    /// Shared borrow of interior state. Only for reading fields that are
+    /// immutable for the life of a stream (e.g. `fpp`) or already synchronized.
+    #[inline]
+    fn inner(&self) -> &RegulatorInner {
+        unsafe { &*self.inner.get() }
+    }
+
     /// Create a new Regulator with default parameters.
     /// Use `configure()` to set the proper parameters.
     pub fn new() -> Self {
-        // Start with defaults that will be overridden by configure()
         Self::with_params(1, 128, 48000, -1.0)
     }
 
     /// Create a new Regulator with specific parameters.
-    ///
-    /// # Arguments
-    /// * `channels` - Number of audio channels
-    /// * `fpp` - Frames (samples) per packet per channel
-    /// * `sample_rate` - Sample rate in Hz
-    /// * `tolerance_ms` - Initial tolerance in ms, or negative for auto mode
     pub fn with_params(channels: usize, fpp: usize, sample_rate: u32, tolerance_ms: f64) -> Self {
         let samples_per_packet = fpp * channels;
 
-        // Calculate history based on FPP
         let packets_in_past = if fpp < HIST_FPP {
             HIST * (HIST_FPP / fpp)
         } else if fpp > HIST_FPP * 2 {
@@ -702,10 +790,9 @@ impl Regulator {
         let up_to_now = packets_in_past * fpp;
         let beyond_now = (packets_in_past + 1) * fpp;
 
-        // Determine auto mode and initial tolerance
         let (auto_mode, auto_headroom, initial_tolerance) = if tolerance_ms <= 0.0 {
             let headroom = if tolerance_ms == -500.0 {
-                -1.0 // Variable headroom
+                -1.0
             } else {
                 tolerance_ms.abs()
             };
@@ -714,53 +801,43 @@ impl Regulator {
             (false, tolerance_ms, tolerance_ms)
         };
 
-        // Create crossfade ramps
-        let fade_up: Vec<f32> = (0..fpp)
-            .map(|i| i as f32 / fpp as f32)
-            .collect();
+        let fade_up: Vec<f32> = (0..fpp).map(|i| i as f32 / fpp as f32).collect();
         let fade_down: Vec<f32> = fade_up.iter().map(|&x| 1.0 - x).collect();
 
-        // Create channel states
         let channel_states: Vec<ChannelState> = (0..channels)
             .map(|_| ChannelState::new(fpp, up_to_now, packets_in_past))
             .collect();
 
-        // Create packet slots (pre-allocated to avoid allocations in audio path)
         let mut slots = Vec::with_capacity(NUM_SLOTS);
         for _ in 0..NUM_SLOTS {
             slots.push(Some(PacketSlot::new(samples_per_packet)));
         }
 
-        Self {
+        let current_headroom = if auto_headroom < 0.0 { 0.0 } else { auto_headroom };
+        let inner = RegulatorInner {
             num_channels: channels,
             sample_rate,
             fpp,
             samples_per_packet,
-
             burg: BurgAlgorithm::new(up_to_now),
             packets_in_past,
             up_to_now,
             beyond_now,
-
             channels: channel_states,
             slots,
-
             last_seq_in: AtomicI32::new(SEQ_NONE),
-            last_seq_out: None,
+            last_seq_out: AtomicI32::new(SEQ_NONE),
             last_stashed: None,
-
             start_time_ms: 0.0,
             last_pop_time_ms: 0.0,
             push_stats: TimingStats::new(sample_rate, fpp),
             pull_stats: TimingStats::new(sample_rate, fpp),
-
             auto_mode,
             tolerance_ms: initial_tolerance,
             auto_headroom,
-            current_headroom: if auto_headroom < 0.0 { 0.0 } else { auto_headroom },
+            current_headroom,
             skip_auto_headroom: true,
             auto_headroom_start_time: 6000.0,
-
             packet_count: 0,
             plc_packet_count: 0,
             packets_rejected: 0,
@@ -770,44 +847,101 @@ impl Regulator {
             stats_glitches: 0,
             last_max_latency: 0.0,
             stats_max_latency: 0.0,
-
             fade_up,
             fade_down,
             last_was_glitch: false,
+            pub_tolerance_bits: AtomicU64::new(f64_to_bits(initial_tolerance)),
+            pub_headroom_bits: AtomicU64::new(f64_to_bits(current_headroom)),
+            pub_max_latency_bits: AtomicU64::new(0),
+            pub_glitches: AtomicU64::new(0),
+            pub_skipped: AtomicU64::new(0),
+            pub_packets: AtomicU64::new(0),
+            pub_rejected: AtomicU64::new(0),
+        };
+        Self {
+            inner: UnsafeCell::new(inner),
         }
     }
 
     /// Configure the regulator parameters.
-    ///
-    /// # Arguments
-    /// * `channels` - Number of audio channels
-    /// * `fpp` - Frames (samples) per packet per channel
-    /// * `sample_rate` - Sample rate in Hz
-    /// * `tolerance_ms` - Initial tolerance in ms, or negative for auto mode
-    pub fn configure(&mut self, channels: usize, fpp: usize, sample_rate: u32, tolerance_ms: f64) {
-        *self = Self::with_params(channels, fpp, sample_rate, tolerance_ms);
+    pub fn configure(&self, channels: usize, fpp: usize, sample_rate: u32, tolerance_ms: f64) {
+        // Rebuild in place — safe because configure runs before the regulator
+        // is shared across threads (or after a quiesced reset).
+        *self.inner_mut() = Self::with_params(channels, fpp, sample_rate, tolerance_ms)
+            .inner
+            .into_inner();
     }
 
-    /// Push a received packet into the buffer (with explicit timestamp).
-    /// This method performs NO heap allocations on the `Stored` path — all
-    /// buffers involved are pre-allocated. Adoption
-    /// ([`adopt_channel_count`](Self::adopt_channel_count)) is the one
-    /// exception, and it only ever runs once per stream, on the first packet.
+    /// Push a received packet into the buffer.
+    pub fn push(&self, sequence: u16, channels: usize, samples: &[f32]) -> PushOutcome {
+        self.inner_mut().push(sequence, channels, samples)
+    }
+
+    /// Pop samples for playback.
     ///
-    /// # Arguments
-    /// * `seq_num` - Packet sequence number (u16 wraps at 65535)
-    /// * `channels` - The channel count this packet claims to carry, from the
-    ///   wire header. Taken explicitly rather than inferred from
-    ///   `samples.len() / fpp`: e.g. 4ch×64 and 2ch×128 are both 256 samples,
-    ///   and inference would silently adopt the wrong stride.
-    /// * `samples` - Interleaved audio samples
-    /// * `now_ms` - Current timestamp in milliseconds
+    /// Returns `true` if real packet data was output, `false` if concealment
+    /// was used. After returning, [`channels`](Self::channels) reflects the
+    /// peer width synchronized by this pop's Acquire (WEB-53 Bug 3).
+    pub fn pop(&self, output: &mut [f32]) -> bool {
+        self.inner_mut().pop(output)
+    }
+
+    /// Get current statistics (lock-free; safe from any thread).
+    pub fn stats(&self) -> RegulatorStats {
+        self.inner().stats()
+    }
+
+    /// Reset the regulator state.
+    pub fn reset(&self) {
+        self.inner_mut().reset()
+    }
+
+    /// Get the current tolerance in milliseconds.
+    pub fn tolerance_ms(&self) -> f64 {
+        f64_from_bits(self.inner().pub_tolerance_bits.load(Ordering::Acquire))
+    }
+
+    /// Get the frames per packet.
+    pub fn fpp(&self) -> usize {
+        self.inner().fpp
+    }
+
+    /// Get the number of channels (peer-adopted).
     ///
-    /// # Returns
-    /// See [`PushOutcome`].
+    /// After a [`pop`](Self::pop) on the same thread, this matches the width
+    /// that pop used — the Acquire inside pop orders the `num_channels` write.
+    pub fn channels(&self) -> usize {
+        self.inner().num_channels
+    }
+
+    /// Check if the regulator has been initialized (received first packet).
+    pub fn is_initialized(&self) -> bool {
+        self.inner().last_seq_in.load(Ordering::Acquire) != SEQ_NONE
+    }
+
+    /// Get current buffer depth (number of packets buffered).
+    pub fn depth(&self) -> u32 {
+        self.inner().depth()
+    }
+
+    /// Get approximate latency in milliseconds.
+    pub fn latency_ms(&self) -> f32 {
+        self.inner().latency_ms()
+    }
+}
+
+impl Default for Regulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+
+impl RegulatorInner {
     fn push_internal(&mut self, seq_num: u16, channels: usize, samples: &[f32], now_ms: f64) -> PushOutcome {
         if channels == 0 || channels > MAX_CHANNELS {
             self.packets_rejected += 1;
+            self.publish_stats();
             return PushOutcome::UnsupportedChannelCount { got: channels };
         }
 
@@ -825,6 +959,7 @@ impl Regulator {
         let expected = channels * self.fpp;
         if samples.len() != expected {
             self.packets_rejected += 1;
+            self.publish_stats();
             return PushOutcome::WrongPacketSize { expected, got: samples.len() };
         }
 
@@ -843,6 +978,7 @@ impl Regulator {
             // peer bug or an unsignaled renegotiation, not something to
             // re-adopt into — see `PushOutcome::ChannelCountChanged`.
             self.packets_rejected += 1;
+            self.publish_stats();
             return PushOutcome::ChannelCountChanged { adopted: self.num_channels, got: channels };
         }
 
@@ -854,7 +990,10 @@ impl Regulator {
         if let Some(ref mut slot) = self.slots[slot_index(seq_num)] {
             slot.timestamp = relative_now;
             slot.data.copy_from_slice(samples);
-            slot.seq = Some(seq_num);
+            // Publish last: Release-store of seq synchronizes-with the consumer's
+            // Acquire identity check. Independent of the conditional last_seq_in
+            // advance below — stragglers must still publish their slots.
+            slot.publish_seq(seq_num);
         }
 
         // Advance the write pointer only for packets that are actually newer;
@@ -870,6 +1009,7 @@ impl Regulator {
             self.last_seq_in.store(seq_num as i32, Ordering::Release);
         }
 
+        self.publish_stats();
         PushOutcome::Stored
     }
 
@@ -907,11 +1047,9 @@ impl Regulator {
     /// real (non-`SEQ_NONE`) path when `reset()` re-arms `SEQ_NONE` and a new
     /// peer then adopts a different channel count here — that `pop` could read
     /// a slot or channel buffer already resized out from under it.
-    /// `WebTripSession::disconnect` orders `close().await` → `stop_capture()`
-    /// → `reset()`, but the worklet's final render call is not synchronously
-    /// joinable with that ordering, so this window is believed narrow but not
-    /// proven closed. This is the same open concurrency question documented on
-    /// `SharedPtr::as_mut`; it is tracked there, not claimed solved here.
+    /// `WebTripSession::disconnect` closes that window by awaiting
+    /// `AudioContext.suspend()` inside `stop_capture` before `reset()` (WEB-53
+    /// Bug 7), so no worklet callback can still be inside `pop` when this runs.
     fn adopt_channel_count(&mut self, channels: usize) {
         self.num_channels = channels;
         self.samples_per_packet = self.fpp * channels;
@@ -938,8 +1076,8 @@ impl Regulator {
     ///
     /// # Returns
     /// See [`PushOutcome`].
-    pub fn push(&mut self, sequence: u16, channels: usize, samples: &[f32]) -> PushOutcome {
-        let now_ms = Self::now_ms();
+    fn push(&mut self, sequence: u16, channels: usize, samples: &[f32]) -> PushOutcome {
+        let now_ms = Regulator::now_ms();
         self.push_internal(sequence, channels, samples, now_ms)
     }
 
@@ -952,21 +1090,30 @@ impl Regulator {
     /// # Returns
     /// `true` if real packet data was output, `false` if concealment was used
     fn pop_internal(&mut self, output: &mut [f32], now_ms: f64) -> bool {
-        let relative_now = now_ms - self.start_time_ms;
+        // Acquire FIRST so start_time_ms / num_channels / slots written before
+        // the matching Release are visible (WEB-53 Bug 2).
         let last_seq_in_raw = self.last_seq_in.load(Ordering::Acquire);
         let last_seq_in = last_seq_in_raw as u16;
+        let relative_now = now_ms - self.start_time_ms;
+
+        // Track inter-pop timing after the acquire so relative_now is coherent.
+        if self.last_pop_time_ms > 0.0 {
+            let elapsed = now_ms - self.last_pop_time_ms;
+            self.pull_stats.tick(elapsed, relative_now);
+        }
+        self.last_pop_time_ms = now_ms;
 
         // Return silence during startup
         if last_seq_in_raw == SEQ_NONE || relative_now < self.tolerance_ms {
             output.fill(0.0);
+            self.publish_stats();
             return false;
         }
 
         // Check for underrun (no new packets)
-        if let Some(last_out) = self.last_seq_out {
-            if last_seq_in == last_out {
-                return self.handle_underrun(output, relative_now);
-            }
+        let last_out_raw = self.last_seq_out.load(Ordering::Acquire);
+        if last_out_raw != SEQ_NONE && last_seq_in == last_out_raw as u16 {
+            return self.handle_underrun(output, relative_now);
         }
 
         // Find best packet to output (NO allocations)
@@ -975,25 +1122,42 @@ impl Regulator {
         match result {
             Some(PacketDecision::Packet { seq, slot_idx }) => {
                 // Deinterleave from slot directly into channel tmp buffers (NO allocation)
+                let mut valid = false;
                 if let Some(ref slot) = self.slots[slot_idx] {
-                    for (ch, channel) in self.channels.iter_mut().enumerate() {
-                        for s in 0..self.fpp {
-                            channel.tmp_buf[s] = slot.data[s * self.num_channels + ch];
+                    // Identity must still hold before we trust the payload.
+                    if slot.holds(seq) {
+                        for (ch, channel) in self.channels.iter_mut().enumerate() {
+                            for s in 0..self.fpp {
+                                channel.tmp_buf[s] = slot.data[s * self.num_channels + ch];
+                            }
                         }
+                        // Revalidate after the copy — a full-ring wrap can
+                        // overwrite the slot while we were reading (WEB-53).
+                        valid = slot.holds(seq);
                     }
+                }
+
+                if !valid {
+                    // Stamp mismatch: conceal rather than play torn audio.
+                    self.pull_stats.underruns += 1;
+                    self.output_concealment(output);
+                    self.publish_stats();
+                    return false;
                 }
 
                 // Process with Burg algorithm
                 self.process_burg(false);
                 self.interleave_output(output);
 
-                self.last_seq_out = Some(seq);
+                self.last_seq_out.store(seq as i32, Ordering::Release);
                 self.packet_count += 1;
+                self.publish_stats();
                 true
             }
             Some(PacketDecision::ConcealSkippedPacket { skipped }) => {
                 self.pull_stats.overruns += skipped;
                 self.output_concealment(output);
+                self.publish_stats();
                 false
             }
             None => {
@@ -1009,28 +1173,25 @@ impl Regulator {
     ///
     /// # Returns
     /// `true` if real packet data was output, `false` if concealment was used
-    pub fn pop(&mut self, output: &mut [f32]) -> bool {
-        let now_ms = Self::now_ms();
-        
-        // Track time between pops for statistics
-        if self.last_pop_time_ms > 0.0 {
-            let elapsed = now_ms - self.last_pop_time_ms;
-            self.pull_stats.tick(elapsed, now_ms - self.start_time_ms);
-        }
-        self.last_pop_time_ms = now_ms;
-        
+    fn pop(&mut self, output: &mut [f32]) -> bool {
+        let now_ms = Regulator::now_ms();
         self.pop_internal(output, now_ms)
     }
 
     /// Handle an underrun (missing packet).
     fn handle_underrun(&mut self, output: &mut [f32], now: f64) -> bool {
         self.pull_stats.underruns += 1;
+        self.publish_stats();
 
-        // Check for stuck client (no packets for a long time)
-        if let Some(last_out) = self.last_seq_out {
+        // Check for stuck client (no packets for a long time). Validate the
+        // slot stamp before trusting the timestamp — the producer may have
+        // recycled this slot (WEB-53 Bug 1).
+        let last_out_raw = self.last_seq_out.load(Ordering::Acquire);
+        if last_out_raw != SEQ_NONE {
+            let last_out = last_out_raw as u16;
             let slot_idx = slot_index(last_out);
             if let Some(ref slot) = self.slots[slot_idx] {
-                if now - slot.timestamp > 10000.0 {
+                if slot.holds(last_out) && now - slot.timestamp > 10000.0 {
                     // Stuck - output silence
                     output.fill(0.0);
                     return false;
@@ -1069,8 +1230,9 @@ impl Regulator {
             return Some(PacketDecision::Packet { seq, slot_idx });
         }
 
-        let start_seq = if let Some(last_out) = self.last_seq_out {
-            last_out.wrapping_add(1)
+        let last_out_for_start = self.last_seq_out.load(Ordering::Acquire);
+        let start_seq = if last_out_for_start != SEQ_NONE {
+            (last_out_for_start as u16).wrapping_add(1)
         } else {
             last_seq_in
         };
@@ -1094,7 +1256,7 @@ impl Regulator {
             // The reset lives on this side of the buffer so that `last_seq_out`
             // keeps its single-writer (audio thread) property — `last_seq_in` is
             // atomic precisely because it is the one pointer both agents touch.
-            self.last_seq_out = None;
+            self.last_seq_out.store(SEQ_NONE, Ordering::Release);
             return None;
         }
 
@@ -1109,24 +1271,25 @@ impl Regulator {
             let slot_idx = slot_index(seq);
 
             let timestamp = match &self.slots[slot_idx] {
-                Some(slot) if slot.seq == Some(seq) => slot.timestamp,
+                Some(slot) if slot.holds(seq) => slot.timestamp,
                 _ => continue,
             };
 
-            // Skip packets that arrived too early (out of order)
-            if let Some(last_out) = self.last_seq_out {
+            // Skip packets that arrived too early (out of order).
+            // Validate last_out's stamp before trusting its timestamp (WEB-53 Bug 4).
+            let last_out_raw = self.last_seq_out.load(Ordering::Acquire);
+            if last_out_raw != SEQ_NONE {
+                let last_out = last_out_raw as u16;
                 let last_out_idx = slot_index(last_out);
                 if let Some(ref last_slot) = &self.slots[last_out_idx] {
-                    if timestamp < last_slot.timestamp
+                    if last_slot.holds(last_out)
+                        && timestamp < last_slot.timestamp
                         && last_slot.timestamp - timestamp > self.tolerance_ms
                     {
                         continue;
                     }
                 }
-            }
-
-            // Calculate skipped packet count (recalculate for each candidate, don't accumulate)
-            if let Some(last_out) = self.last_seq_out {
+                // Calculate skipped packet count (recalculate for each candidate)
                 skipped = seq.wrapping_sub(last_out.wrapping_add(1)) as u64;
             }
 
@@ -1174,9 +1337,11 @@ impl Regulator {
 
     /// Update push statistics when pulling a packet.
     fn update_push_stats(&mut self, seq: u16, timestamp: f64, now: f64) {
-        let Some(last_out) = self.last_seq_out else {
+        let last_out_raw = self.last_seq_out.load(Ordering::Acquire);
+        if last_out_raw == SEQ_NONE {
             return;
-        };
+        }
+        let last_out = last_out_raw as u16;
 
         let fpp_duration_ms = 1000.0 * self.fpp as f64 / self.sample_rate as f64;
 
@@ -1185,6 +1350,10 @@ impl Regulator {
         let last_out_idx = slot_index(last_out);
 
         if let Some(ref last_slot) = &self.slots[last_out_idx] {
+            // Stamp check before trusting timestamp (WEB-53 Bug 4).
+            if !last_slot.holds(last_out) {
+                return;
+            }
             let prev_time = last_slot.timestamp + (pkts as f64 + 1.0) * fpp_duration_ms;
             if prev_time < timestamp {
                 let elapsed = timestamp - prev_time;
@@ -1261,6 +1430,7 @@ impl Regulator {
 
         new_tolerance = new_tolerance.clamp(fpp_duration_ms, AUTO_MAX_MS);
         self.tolerance_ms = new_tolerance;
+        self.publish_stats();
     }
 
     /// Process audio with Burg algorithm for PLC.
@@ -1360,27 +1530,32 @@ impl Regulator {
     }
 
     /// Get current statistics.
-    pub fn stats(&self) -> RegulatorStats {
-        let total_glitches = self.pull_stats.underruns + self.pull_stats.overruns;
-        let last_seq_raw = self.last_seq_in.load(Ordering::Relaxed);
+    fn stats(&self) -> RegulatorStats {
+        // Only atomics — safe to call from the main thread while push/pop run
+        // (WEB-53 Bug 6).
+        let last_seq_raw = self.last_seq_in.load(Ordering::Acquire);
         let last_seq = if last_seq_raw == SEQ_NONE { 0 } else { last_seq_raw as u16 };
+        let packets = self.pub_packets.load(Ordering::Acquire);
         RegulatorStats {
-            tolerance_ms: self.tolerance_ms,
-            headroom_ms: self.current_headroom,
-            max_latency_ms: self.last_max_latency,
-            glitches: total_glitches.saturating_sub(self.stats_glitches),
-            skipped: self.skipped.saturating_sub(self.last_skipped),
-            packets_received: self.packet_count, // Use packet_count for total packets received
-            packets_played: self.packet_count,
+            tolerance_ms: f64_from_bits(self.pub_tolerance_bits.load(Ordering::Acquire)),
+            headroom_ms: f64_from_bits(self.pub_headroom_bits.load(Ordering::Acquire)),
+            max_latency_ms: f64_from_bits(self.pub_max_latency_bits.load(Ordering::Acquire)),
+            glitches: self.pub_glitches.load(Ordering::Acquire),
+            skipped: self.pub_skipped.load(Ordering::Acquire),
+            packets_received: packets,
+            packets_played: packets,
             last_seq_received: last_seq,
-            packets_rejected: self.packets_rejected,
+            packets_rejected: self.pub_rejected.load(Ordering::Acquire),
         }
     }
 
     /// Reset the regulator state.
-    pub fn reset(&mut self) {
+    fn reset(&mut self) {
+        // Publish SEQ_NONE first so a concurrent pop's next Acquire exits early.
+        // Destructive slot/channel clears follow; callers must quiesce the
+        // consumer before reset (WEB-53 Bug 7 — session suspends the worklet).
         self.last_seq_in.store(SEQ_NONE, Ordering::Release);
-        self.last_seq_out = None;
+        self.last_seq_out.store(SEQ_NONE, Ordering::Release);
         // A stash left over from the previous connection would otherwise be
         // returned on the first pop after reconnect, pinning `last_seq_out` to
         // a stale sequence number and triggering thousands of spurious PLCs
@@ -1426,7 +1601,7 @@ impl Regulator {
             if let Some(ref mut s) = slot {
                 s.timestamp = 0.0;
                 s.data.fill(0.0);
-                s.seq = None;
+                s.clear_seq();
             }
         }
 
@@ -1447,54 +1622,51 @@ impl Regulator {
             channel.train_data.fill(0.0);
             channel.ring_wptr = channel.ring_size / 2;
         }
+        self.publish_stats();
     }
 
-    /// Get the current tolerance in milliseconds.
-    pub fn tolerance_ms(&self) -> f64 {
-        self.tolerance_ms
-    }
-
-    /// Get the frames per packet.
-    pub fn fpp(&self) -> usize {
-        self.fpp
-    }
-
-    /// Get the number of channels.
-    pub fn channels(&self) -> usize {
-        self.num_channels
-    }
-
-    /// Check if the regulator has been initialized (received first packet).
-    pub fn is_initialized(&self) -> bool {
-        self.last_seq_in.load(Ordering::Acquire) != SEQ_NONE
+    /// Publish a stats snapshot for main-thread readers (WEB-53 Bug 6).
+    fn publish_stats(&self) {
+        let total_glitches = self.pull_stats.underruns + self.pull_stats.overruns;
+        self.pub_tolerance_bits
+            .store(f64_to_bits(self.tolerance_ms), Ordering::Release);
+        self.pub_headroom_bits
+            .store(f64_to_bits(self.current_headroom), Ordering::Release);
+        self.pub_max_latency_bits
+            .store(f64_to_bits(self.last_max_latency), Ordering::Release);
+        self.pub_glitches.store(
+            total_glitches.saturating_sub(self.stats_glitches),
+            Ordering::Release,
+        );
+        self.pub_skipped.store(
+            self.skipped.saturating_sub(self.last_skipped),
+            Ordering::Release,
+        );
+        self.pub_packets.store(self.packet_count, Ordering::Release);
+        self.pub_rejected.store(self.packets_rejected, Ordering::Release);
     }
 
     /// Get current buffer depth (number of packets buffered).
-    pub fn depth(&self) -> u32 {
+    fn depth(&self) -> u32 {
         let write_raw = self.last_seq_in.load(Ordering::Acquire);
         if write_raw == SEQ_NONE {
             return 0;
         }
         let write = write_raw as u16;
-        let read = self.last_seq_out.unwrap_or(write);
+        let read_raw = self.last_seq_out.load(Ordering::Acquire);
+        let read = if read_raw == SEQ_NONE { write } else { read_raw as u16 };
         // Use wrapping arithmetic to handle sequence number wraparound (u16)
         write.wrapping_sub(read) as u32
     }
 
     /// Get approximate latency in milliseconds.
-    pub fn latency_ms(&self) -> f32 {
+    fn latency_ms(&self) -> f32 {
         let depth = self.depth();
         // `depth` counts packets (sequence numbers), each `fpp` frames long —
         // not `samples_per_packet`, which also carries the channel count and
         // would double-count latency for anything wider than mono.
         let total_frames = depth * self.fpp as u32;
         (total_frames as f32 / self.sample_rate as f32) * 1000.0
-    }
-}
-
-impl Default for Regulator {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1510,13 +1682,13 @@ mod tests {
     /// lay out an arrival timeline (timestamps, gaps, out-of-order arrivals)
     /// without driving the wall clock. `samples` must be a full packet — the
     /// same contract `push` enforces.
-    fn plant_packet(reg: &mut Regulator, seq: u16, timestamp: f64, samples: &[f32]) {
-        let slot = reg.slots[slot_index(seq)]
+    fn plant_packet(reg: &Regulator, seq: u16, timestamp: f64, samples: &[f32]) {
+        let slot = reg.inner_mut().slots[slot_index(seq)]
             .as_mut()
             .expect("slots are pre-allocated at configure time");
         slot.timestamp = timestamp;
         slot.data.copy_from_slice(samples);
-        slot.seq = Some(seq);
+        slot.publish_seq(seq);
     }
 
     /// Push a packet a test expects the regulator to store, asserting the
@@ -1525,12 +1697,33 @@ mod tests {
     /// rejected (wrong size, unadopted channel count) would leave the
     /// regulator empty and surface as a confusing failure further down —
     /// or as no failure at all.
-    fn push_stored(reg: &mut Regulator, seq: u16, channels: usize, samples: &[f32], now_ms: f64) {
+    fn push_stored(reg: &Regulator, seq: u16, channels: usize, samples: &[f32], now_ms: f64) {
         assert_eq!(
-            reg.push_internal(seq, channels, samples, now_ms),
+            reg.inner_mut().push_internal(seq, channels, samples, now_ms),
             PushOutcome::Stored,
             "setup push of seq {seq} ({channels}ch) must be stored"
         );
+    }
+
+    fn last_seq_out_opt(reg: &Regulator) -> Option<u16> {
+        let v = reg.inner().last_seq_out.load(Ordering::Acquire);
+        if v == SEQ_NONE {
+            None
+        } else {
+            Some(v as u16)
+        }
+    }
+
+    fn set_last_seq_out(reg: &Regulator, v: Option<u16>) {
+        let raw = match v {
+            Some(s) => s as i32,
+            None => SEQ_NONE,
+        };
+        reg.inner_mut().last_seq_out.store(raw, Ordering::Release);
+    }
+
+    fn inner(reg: &Regulator) -> &mut RegulatorInner {
+        reg.inner_mut()
     }
 
     #[test]
@@ -1582,7 +1775,7 @@ mod tests {
 
     #[test]
     fn test_sequence_number_wraparound() {
-        let mut reg = Regulator::with_params(1, 128, 48000, 50.0);
+        let reg = Regulator::with_params(1, 128, 48000, 50.0);
 
         // Create test samples
         let samples: Vec<f32> = (0..128).map(|i| (i as f32 * 0.01).sin()).collect();
@@ -1591,26 +1784,26 @@ mod tests {
         let near_max: u16 = u16::MAX - 2;
         
         // Push packets near wraparound boundary with proper timing
-        push_stored(&mut reg, near_max, 1, &samples, 0.0);
-        push_stored(&mut reg, near_max.wrapping_add(1), 1, &samples, 3.0);
-        push_stored(&mut reg, near_max.wrapping_add(2), 1, &samples, 6.0); // This wraps to 0
-        push_stored(&mut reg, 0, 1, &samples, 9.0); // Already wrapped
-        push_stored(&mut reg, 1, 1, &samples, 12.0);
+        push_stored(&reg, near_max, 1, &samples, 0.0);
+        push_stored(&reg, near_max.wrapping_add(1), 1, &samples, 3.0);
+        push_stored(&reg, near_max.wrapping_add(2), 1, &samples, 6.0); // This wraps to 0
+        push_stored(&reg, 0, 1, &samples, 9.0); // Already wrapped
+        push_stored(&reg, 1, 1, &samples, 12.0);
         
         let mut output = vec![0.0f32; 128];
         
         // Pop packets - should work smoothly across wraparound
         // Pop after tolerance is met
-        let _result1 = reg.pop_internal(&mut output, 60.0);
-        let _result2 = reg.pop_internal(&mut output, 63.0);
-        let _result3 = reg.pop_internal(&mut output, 66.0);
+        let _result1 = reg.inner_mut().pop_internal(&mut output, 60.0);
+        let _result2 = reg.inner_mut().pop_internal(&mut output, 63.0);
+        let _result3 = reg.inner_mut().pop_internal(&mut output, 66.0);
         
         // Verify depth calculation works across wraparound
         let depth = reg.depth();
         assert!(depth < 100); // Should be a reasonable small number, not huge
         
         // Verify last_seq_out was set properly (should be Some value, not causing issues)
-        assert!(reg.last_seq_out.is_some());
+        assert!(last_seq_out_opt(&reg).is_some());
     }
 
     /// An inbound outage longer than the ring's horizon strands the read
@@ -1629,23 +1822,23 @@ mod tests {
     /// and resynchronize onto the live stream within a couple of callbacks.
     #[test]
     fn test_loss_burst_wider_than_ring_resyncs_read_pointer() {
-        let mut reg = Regulator::with_params(1, 128, 48_000, 5.0);
-        let samples = vec![0.5f32; reg.fpp];
-        let dt = 1000.0 * reg.fpp as f64 / reg.sample_rate as f64;
-        let mut out = vec![0.0f32; reg.fpp];
+        let reg = Regulator::with_params(1, 128, 48_000, 5.0);
+        let samples = vec![0.5f32; inner(&reg).fpp];
+        let dt = 1000.0 * inner(&reg).fpp as f64 / inner(&reg).sample_rate as f64;
+        let mut out = vec![0.0f32; inner(&reg).fpp];
 
         // A stream that is playing out normally.
         let mut t = 0.0;
         for i in 0..10u16 {
-            push_stored(&mut reg, 100 + i, 1, &samples, t);
+            push_stored(&reg, 100 + i, 1, &samples, t);
             t += dt;
         }
         let mut pop_t = 10.0;
         for _ in 0..10 {
-            reg.pop_internal(&mut out, pop_t);
+            reg.inner_mut().pop_internal(&mut out, pop_t);
             pop_t += dt;
         }
-        assert_eq!(reg.last_seq_out, Some(109), "stream should be playing out");
+        assert_eq!(last_seq_out_opt(&reg), Some(109), "stream should be playing out");
 
         // Nothing arrives for 5000 packets — 13.3 s at fpp=128, past the ring's
         // 4096-packet (10.9 s) horizon. An ordinary wifi roam, not an exotic
@@ -1658,8 +1851,8 @@ mod tests {
         let mut tail_real = 0;
         for k in 0..600u16 {
             let now = resume_t + k as f64 * dt;
-            push_stored(&mut reg, first_resumed + k, 1, &samples, now);
-            let real = reg.pop_internal(&mut out, now + 1.0);
+            push_stored(&reg, first_resumed + k, 1, &samples, now);
+            let real = reg.inner_mut().pop_internal(&mut out, now + 1.0);
             if real && first_real_pkt.is_none() {
                 first_real_pkt = Some(k);
             }
@@ -1679,8 +1872,7 @@ mod tests {
             tail_real >= 45,
             "playback must be sustained once resynced, not intermittent ({tail_real}/50)"
         );
-        assert_eq!(
-            reg.last_seq_out,
+        assert_eq!(last_seq_out_opt(&reg),
             Some(first_resumed + 599),
             "the read pointer must be on the live stream, not replaying slot aliases \
              from before the outage"
@@ -1701,30 +1893,29 @@ mod tests {
     /// catch it — only a direct seq check can.
     #[test]
     fn test_stale_aliased_slot_is_not_played_as_missing_packet() {
-        let mut reg = Regulator::with_params(1, 32, 48_000, 10.0);
+        let reg = Regulator::with_params(1, 32, 48_000, 10.0);
         let last_seq = 5u16;
         let candidate_seq = last_seq.wrapping_add(1); // 6 — genuinely lost, never planted
         let stale_seq = candidate_seq.wrapping_sub(NUM_SLOTS as u16); // aliases to same slot
-        let last_packet = vec![0.1f32; reg.fpp];
-        let stale_packet = vec![0.9f32; reg.fpp];
+        let last_packet = vec![0.1f32; inner(&reg).fpp];
+        let stale_packet = vec![0.9f32; inner(&reg).fpp];
 
-        reg.start_time_ms = 0.0;
-        reg.last_seq_out = Some(last_seq);
-        reg.last_seq_in.store(candidate_seq as i32, Ordering::Release);
+        inner(&reg).start_time_ms = 0.0;
+        set_last_seq_out(&reg, Some(last_seq));
+        inner(&reg).last_seq_in.store(candidate_seq as i32, Ordering::Release);
 
-        plant_packet(&mut reg, last_seq, 40.0, &last_packet);
-        plant_packet(&mut reg, stale_seq, 41.0, &stale_packet); // candidate_seq never planted
+        plant_packet(&reg, last_seq, 40.0, &last_packet);
+        plant_packet(&reg, stale_seq, 41.0, &stale_packet); // candidate_seq never planted
 
-        let mut output = vec![0.0f32; reg.fpp];
-        let result = reg.pop_internal(&mut output, 50.0);
+        let mut output = vec![0.0f32; inner(&reg).fpp];
+        let result = reg.inner_mut().pop_internal(&mut output, 50.0);
 
         assert!(
             !result,
             "a slot whose stored seq doesn't match the candidate must not be \
              played back as real audio"
         );
-        assert_eq!(
-            reg.last_seq_out,
+        assert_eq!(last_seq_out_opt(&reg),
             Some(last_seq),
             "read pointer must not advance onto a candidate whose slot \
              actually holds a stale, aliased packet"
@@ -1738,90 +1929,90 @@ mod tests {
 
     #[test]
     fn test_burg_priming_uses_plc_iterations() {
-        let mut reg = Regulator::with_params(1, 32, 48_000, 10.0);
-        let history_packets = reg.packets_in_past;
-        let history: Vec<f32> = (0..reg.up_to_now)
+        let reg = Regulator::with_params(1, 32, 48_000, 10.0);
+        let history_packets = inner(&reg).packets_in_past;
+        let history: Vec<f32> = (0..inner(&reg).up_to_now)
             .map(|i| (i as f32 * 0.1).sin())
             .collect();
 
         {
-            let channel = &mut reg.channels[0];
+            let channel = &mut inner(&reg).channels[0];
             for (i, packet) in channel.predicted_past.iter_mut().enumerate() {
-                let start = i * reg.fpp;
-                let end = start + reg.fpp;
+                let start = i * inner(&reg).fpp;
+                let end = start + inner(&reg).fpp;
                 packet.copy_from_slice(&history[start..end]);
             }
         }
 
-        reg.process_burg(true);
+        reg.inner_mut().process_burg(true);
         assert!(
-            reg.channels[0]
+            inner(&reg).channels[0]
                 .output_now_packet
                 .iter()
                 .all(|sample| sample.abs() < 1e-6),
             "PLC should stay muted before the predictor is primed"
         );
 
-        reg.plc_packet_count = history_packets as u64 + 1;
-        reg.process_burg(true);
+        inner(&reg).plc_packet_count = history_packets as u64 + 1;
+        reg.inner_mut().process_burg(true);
         assert!(
-            reg.channels[0]
+            inner(&reg).channels[0]
                 .output_now_packet
                 .iter()
                 .any(|sample| sample.abs() > 1e-6),
             "PLC should emit predicted audio once the PLC iteration counter is primed"
         );
-        assert_eq!(reg.packet_count, 0);
-        assert_eq!(reg.plc_packet_count, history_packets as u64 + 2);
+        assert_eq!(inner(&reg).packet_count, 0);
+        assert_eq!(inner(&reg).plc_packet_count, history_packets as u64 + 2);
     }
 
     #[test]
     fn test_skipped_packet_outputs_concealment_before_stashed_real_packet() {
-        let mut reg = Regulator::with_params(1, 32, 48_000, 10.0);
-        let history_packets = reg.packets_in_past;
-        let fpp_duration_ms = 1000.0 * reg.fpp as f64 / reg.sample_rate as f64;
-        let history: Vec<f32> = (0..reg.up_to_now)
+        let reg = Regulator::with_params(1, 32, 48_000, 10.0);
+        let history_packets = inner(&reg).packets_in_past;
+        let fpp_duration_ms = 1000.0 * inner(&reg).fpp as f64 / inner(&reg).sample_rate as f64;
+        let history: Vec<f32> = (0..inner(&reg).up_to_now)
             .map(|i| (i as f32 * 0.1).sin())
             .collect();
-        let packet = vec![0.25f32; reg.fpp];
-        let last_packet = vec![0.1f32; reg.fpp];
+        let packet = vec![0.25f32; inner(&reg).fpp];
+        let last_packet = vec![0.1f32; inner(&reg).fpp];
         let last_seq = 10u16;
         let good_seq = last_seq.wrapping_add(2);
 
         {
-            let channel = &mut reg.channels[0];
+            let channel = &mut inner(&reg).channels[0];
             for (i, predicted) in channel.predicted_past.iter_mut().enumerate() {
-                let start = i * reg.fpp;
-                let end = start + reg.fpp;
+                let start = i * inner(&reg).fpp;
+                let end = start + inner(&reg).fpp;
                 predicted.copy_from_slice(&history[start..end]);
             }
         }
-        reg.plc_packet_count = history_packets as u64 + 1;
+        inner(&reg).plc_packet_count = history_packets as u64 + 1;
 
-        reg.start_time_ms = 0.0;
-        reg.last_seq_out = Some(last_seq);
-        reg.last_seq_in.store(good_seq as i32, Ordering::Release);
+        inner(&reg).start_time_ms = 0.0;
+        set_last_seq_out(&reg, Some(last_seq));
+        inner(&reg).last_seq_in.store(good_seq as i32, Ordering::Release);
 
-        plant_packet(&mut reg, last_seq, 40.0, &last_packet);
-        plant_packet(&mut reg, good_seq, 45.0, &packet);
+        plant_packet(&reg, last_seq, 40.0, &last_packet);
+        plant_packet(&reg, good_seq, 45.0, &packet);
 
-        let mut concealment = vec![0.0f32; reg.fpp];
-        let concealment_result = reg.pop_internal(&mut concealment, 50.0);
+        let mut concealment = vec![0.0f32; inner(&reg).fpp];
+        let concealment_result = reg.inner_mut().pop_internal(&mut concealment, 50.0);
         assert!(!concealment_result);
-        assert_eq!(reg.pull_stats.overruns, 1);
-        assert_eq!(reg.last_stashed.map(|(seq, _)| seq), Some(good_seq));
-        assert_eq!(reg.last_seq_out, Some(last_seq));
+        assert_eq!(inner(&reg).pull_stats.overruns, 1);
+        assert_eq!(inner(&reg).last_stashed.map(|(seq, _)| seq), Some(good_seq));
+        assert_eq!(last_seq_out_opt(&reg), Some(last_seq));
         assert!(
             concealment.iter().any(|sample| sample.abs() > 1e-6),
             "skipped packets should trigger PLC output before the real packet is replayed"
         );
 
-        let mut real_output = vec![0.0f32; reg.fpp];
-        let real_result = reg.pop_internal(&mut real_output, 50.0 + fpp_duration_ms);
+        let mut real_output = vec![0.0f32; inner(&reg).fpp];
+        let real_result = reg.inner_mut().pop_internal(&mut real_output, 50.0 + fpp_duration_ms);
         assert!(real_result);
-        assert_eq!(reg.last_stashed, None);
-        assert_eq!(reg.last_seq_out, Some(good_seq));
-        assert_eq!(reg.packet_count, 1);
+        assert_eq!(inner(&reg).last_stashed, None);
+        assert_eq!(last_seq_out_opt(&reg), Some(good_seq));
+        assert_eq!(inner(&reg).packet_count, 1);
         assert!(
             real_output.iter().any(|sample| sample.abs() > 1e-6),
             "the stashed real packet should be rendered on the following callback"
@@ -1835,47 +2026,47 @@ mod tests {
     /// adjustments only happen once they are at least 2 packets wide.
     #[test]
     fn test_single_skipped_packet_defers_latency_adjustment() {
-        let mut reg = Regulator::with_params(1, 32, 48_000, 10.0);
-        let fpp_duration_ms = 1000.0 * reg.fpp as f64 / reg.sample_rate as f64;
-        let stale_packet = vec![0.25f32; reg.fpp];
-        let fresh_packet = vec![0.5f32; reg.fpp];
+        let reg = Regulator::with_params(1, 32, 48_000, 10.0);
+        let fpp_duration_ms = 1000.0 * inner(&reg).fpp as f64 / inner(&reg).sample_rate as f64;
+        let stale_packet = vec![0.25f32; inner(&reg).fpp];
+        let fresh_packet = vec![0.5f32; inner(&reg).fpp];
         let last_seq = 10u16;
         let stale_seq = last_seq.wrapping_add(1);
         let fresh_seq = last_seq.wrapping_add(2);
 
-        reg.start_time_ms = 0.0;
-        reg.last_seq_out = Some(last_seq);
-        reg.last_seq_in.store(fresh_seq as i32, Ordering::Release);
+        inner(&reg).start_time_ms = 0.0;
+        set_last_seq_out(&reg, Some(last_seq));
+        inner(&reg).last_seq_in.store(fresh_seq as i32, Ordering::Release);
 
         // Previously-played packet, reference point for the out-of-order check.
-        let silent_packet = vec![0.0f32; reg.fpp];
-        plant_packet(&mut reg, last_seq, 40.0, &silent_packet);
+        let silent_packet = vec![0.0f32; inner(&reg).fpp];
+        plant_packet(&reg, last_seq, 40.0, &silent_packet);
         // Stale but valid packet: misses tolerance at now=60 (41 + 10 < 60),
         // so the scan records it as `first_good_skipped` instead of playing it.
-        plant_packet(&mut reg, stale_seq, 41.0, &stale_packet);
+        plant_packet(&reg, stale_seq, 41.0, &stale_packet);
         // Fresh packet within tolerance (55 + 10 >= 60); playing it would skip
         // exactly one good packet, which triggers the deferral.
-        plant_packet(&mut reg, fresh_seq, 55.0, &fresh_packet);
+        plant_packet(&reg, fresh_seq, 55.0, &fresh_packet);
 
-        let mut output = vec![0.0f32; reg.fpp];
-        let first_result = reg.pop_internal(&mut output, 60.0);
+        let mut output = vec![0.0f32; inner(&reg).fpp];
+        let first_result = reg.inner_mut().pop_internal(&mut output, 60.0);
         assert!(
             first_result,
             "deferral should play the stale packet as real audio, not concealment"
         );
-        assert_eq!(reg.last_seq_out, Some(stale_seq));
-        assert_eq!(reg.last_stashed.map(|(seq, _)| seq), Some(fresh_seq));
-        assert_eq!(reg.skipped, 0, "no packet may be counted as skipped");
-        assert_eq!(reg.pull_stats.overruns, 0, "no glitch may be recorded");
-        assert_eq!(reg.packet_count, 1);
+        assert_eq!(last_seq_out_opt(&reg), Some(stale_seq));
+        assert_eq!(inner(&reg).last_stashed.map(|(seq, _)| seq), Some(fresh_seq));
+        assert_eq!(inner(&reg).skipped, 0, "no packet may be counted as skipped");
+        assert_eq!(inner(&reg).pull_stats.overruns, 0, "no glitch may be recorded");
+        assert_eq!(inner(&reg).packet_count, 1);
 
-        let second_result = reg.pop_internal(&mut output, 60.0 + fpp_duration_ms);
+        let second_result = reg.inner_mut().pop_internal(&mut output, 60.0 + fpp_duration_ms);
         assert!(second_result);
-        assert_eq!(reg.last_stashed, None);
-        assert_eq!(reg.last_seq_out, Some(fresh_seq));
-        assert_eq!(reg.packet_count, 2);
-        assert_eq!(reg.skipped, 0);
-        assert_eq!(reg.pull_stats.overruns, 0);
+        assert_eq!(inner(&reg).last_stashed, None);
+        assert_eq!(last_seq_out_opt(&reg), Some(fresh_seq));
+        assert_eq!(inner(&reg).packet_count, 2);
+        assert_eq!(inner(&reg).skipped, 0);
+        assert_eq!(inner(&reg).pull_stats.overruns, 0);
     }
 
     /// After a full push/pop cycle that accumulates state (stats, sequence
@@ -1884,45 +2075,45 @@ mod tests {
     /// required for safe stream reconnection.
     #[test]
     fn test_reset_clears_state_after_active_stream() {
-        let mut reg = Regulator::with_params(2, 32, 48_000, 5.0);
-        let samples = vec![0.25f32; reg.samples_per_packet];
+        let reg = Regulator::with_params(2, 32, 48_000, 5.0);
+        let samples = vec![0.25f32; inner(&reg).samples_per_packet];
 
         // Drive a small stream through the regulator.
-        push_stored(&mut reg, 0, 2, &samples, 0.0);
-        push_stored(&mut reg, 1, 2, &samples, 2.0);
-        let mut out = vec![0.0f32; reg.samples_per_packet];
-        let _ = reg.pop_internal(&mut out, 10.0);
-        let _ = reg.pop_internal(&mut out, 12.0);
-        let _ = reg.pop_internal(&mut out, 14.0); // forces underrun -> PLC
+        push_stored(&reg, 0, 2, &samples, 0.0);
+        push_stored(&reg, 1, 2, &samples, 2.0);
+        let mut out = vec![0.0f32; inner(&reg).samples_per_packet];
+        let _ = reg.inner_mut().pop_internal(&mut out, 10.0);
+        let _ = reg.inner_mut().pop_internal(&mut out, 12.0);
+        let _ = reg.inner_mut().pop_internal(&mut out, 14.0); // forces underrun -> PLC
 
         assert!(reg.is_initialized());
-        assert!(reg.last_seq_out.is_some());
-        assert!(reg.packet_count > 0);
-        assert!(reg.pull_stats.underruns > 0);
+        assert!(last_seq_out_opt(&reg).is_some());
+        assert!(inner(&reg).packet_count > 0);
+        assert!(inner(&reg).pull_stats.underruns > 0);
 
         reg.reset();
 
         assert!(!reg.is_initialized(), "last_seq_in should be cleared");
-        assert_eq!(reg.last_seq_out, None);
-        assert_eq!(reg.last_stashed, None);
-        assert_eq!(reg.packet_count, 0);
-        assert_eq!(reg.plc_packet_count, 0);
-        assert_eq!(reg.skipped, 0);
-        assert_eq!(reg.last_skipped, 0);
-        assert_eq!(reg.last_glitches, 0);
-        assert_eq!(reg.stats_glitches, 0);
-        assert_eq!(reg.last_max_latency, 0.0);
-        assert_eq!(reg.stats_max_latency, 0.0);
-        assert!(!reg.last_was_glitch);
-        assert_eq!(reg.start_time_ms, 0.0);
-        assert_eq!(reg.last_pop_time_ms, 0.0);
-        assert_eq!(reg.pull_stats.underruns, 0);
-        assert_eq!(reg.pull_stats.overruns, 0);
-        assert_eq!(reg.push_stats.long_term_count, 0);
+        assert_eq!(last_seq_out_opt(&reg), None);
+        assert_eq!(inner(&reg).last_stashed, None);
+        assert_eq!(inner(&reg).packet_count, 0);
+        assert_eq!(inner(&reg).plc_packet_count, 0);
+        assert_eq!(inner(&reg).skipped, 0);
+        assert_eq!(inner(&reg).last_skipped, 0);
+        assert_eq!(inner(&reg).last_glitches, 0);
+        assert_eq!(inner(&reg).stats_glitches, 0);
+        assert_eq!(inner(&reg).last_max_latency, 0.0);
+        assert_eq!(inner(&reg).stats_max_latency, 0.0);
+        assert!(!inner(&reg).last_was_glitch);
+        assert_eq!(inner(&reg).start_time_ms, 0.0);
+        assert_eq!(inner(&reg).last_pop_time_ms, 0.0);
+        assert_eq!(inner(&reg).pull_stats.underruns, 0);
+        assert_eq!(inner(&reg).pull_stats.overruns, 0);
+        assert_eq!(inner(&reg).push_stats.long_term_count, 0);
         assert_eq!(reg.depth(), 0);
 
         // Channels should be zeroed and ring write pointer should be re-centered.
-        for channel in &reg.channels {
+        for channel in &inner(&reg).channels {
             assert!(channel.tmp_buf.iter().all(|s| *s == 0.0));
             assert!(channel.real_now_packet.iter().all(|s| *s == 0.0));
             assert!(channel.output_now_packet.iter().all(|s| *s == 0.0));
@@ -1932,11 +2123,11 @@ mod tests {
         // A reconnect on a new stream with a different channel count must be
         // able to adopt again — reset() re-arms SEQ_NONE, which is the only
         // gate on adoption.
-        let mono = vec![0.5f32; reg.fpp];
-        let outcome = reg.push_internal(0, 1, &mono, 0.0);
+        let mono = vec![0.5f32; inner(&reg).fpp];
+        let outcome = reg.inner_mut().push_internal(0, 1, &mono, 0.0);
         assert_eq!(outcome, PushOutcome::Stored);
         assert_eq!(reg.channels(), 1, "reconnect must re-adopt the new peer's channel count");
-        assert_eq!(reg.samples_per_packet, reg.fpp);
+        assert_eq!(inner(&reg).samples_per_packet, inner(&reg).fpp);
     }
 
     /// The 7def5fc race fix: a `last_stashed` slot left from a prior connection
@@ -1946,30 +2137,30 @@ mod tests {
     /// catches up.
     #[test]
     fn test_reset_clears_stashed_packet_to_avoid_stale_pop() {
-        let mut reg = Regulator::with_params(1, 32, 48_000, 5.0);
-        let samples = vec![0.5f32; reg.fpp];
+        let reg = Regulator::with_params(1, 32, 48_000, 5.0);
+        let samples = vec![0.5f32; inner(&reg).fpp];
 
         // Simulate a prior connection that landed with a stashed packet:
         // primer connection seq 7, stash for "next-good" seq 9.
-        reg.last_seq_in.store(9, Ordering::Release);
-        reg.last_seq_out = Some(7);
-        reg.last_stashed = Some((9, slot_index(9)));
-        plant_packet(&mut reg, 9, 100.0, &samples);
+        inner(&reg).last_seq_in.store(9, Ordering::Release);
+        set_last_seq_out(&reg, Some(7));
+        inner(&reg).last_stashed = Some((9, slot_index(9)));
+        plant_packet(&reg, 9, 100.0, &samples);
 
         reg.reset();
 
         assert_eq!(
-            reg.last_stashed, None,
+            inner(&reg).last_stashed, None,
             "stashed packet from prior connection must be cleared"
         );
         assert!(!reg.is_initialized());
-        assert_eq!(reg.last_seq_out, None);
+        assert_eq!(last_seq_out_opt(&reg), None);
 
         // After reset, the first pop on a fresh stream should return silence
         // (startup), not the stale stashed buffer.
-        push_stored(&mut reg, 0, 1, &samples, 0.0);
-        let mut out = vec![0.0f32; reg.fpp];
-        let result = reg.pop_internal(&mut out, 1.0); // still inside tolerance window
+        push_stored(&reg, 0, 1, &samples, 0.0);
+        let mut out = vec![0.0f32; inner(&reg).fpp];
+        let result = reg.inner_mut().pop_internal(&mut out, 1.0); // still inside tolerance window
         assert!(!result, "should not replay the pre-reset stash");
         assert!(out.iter().all(|s| *s == 0.0));
     }
@@ -1979,78 +2170,78 @@ mod tests {
     /// counter by the number of skipped packets.
     #[test]
     fn test_overrun_counter_increments_when_packets_skipped() {
-        let mut reg = Regulator::with_params(1, 32, 48_000, 5.0);
-        let samples = vec![0.5f32; reg.fpp];
+        let reg = Regulator::with_params(1, 32, 48_000, 5.0);
+        let samples = vec![0.5f32; inner(&reg).fpp];
 
-        push_stored(&mut reg, 0, 1, &samples, 0.0);
-        let mut out = vec![0.0f32; reg.fpp];
-        let r1 = reg.pop_internal(&mut out, 10.0);
+        push_stored(&reg, 0, 1, &samples, 0.0);
+        let mut out = vec![0.0f32; inner(&reg).fpp];
+        let r1 = reg.inner_mut().pop_internal(&mut out, 10.0);
         assert!(r1);
-        assert_eq!(reg.last_seq_out, Some(0));
+        assert_eq!(last_seq_out_opt(&reg), Some(0));
 
         // Skip seq 1, 2 — push seq 3 directly. With `skipped = 2`, the
         // regulator should treat this as a glitch, conceal, stash, and bump
         // overruns.
-        push_stored(&mut reg, 3, 1, &samples, 20.0);
-        let r2 = reg.pop_internal(&mut out, 40.0);
+        push_stored(&reg, 3, 1, &samples, 20.0);
+        let r2 = reg.inner_mut().pop_internal(&mut out, 40.0);
         assert!(!r2, "skipped-gap path returns concealment (false)");
-        assert_eq!(reg.pull_stats.overruns, 2, "overrun counter tracks skip distance");
-        assert_eq!(reg.skipped, 2, "skipped counter tracks skip distance");
+        assert_eq!(inner(&reg).pull_stats.overruns, 2, "overrun counter tracks skip distance");
+        assert_eq!(inner(&reg).skipped, 2, "skipped counter tracks skip distance");
         // The good packet must have been stashed for replay on the next pop.
-        assert_eq!(reg.last_stashed.map(|(s, _)| s), Some(3));
+        assert_eq!(inner(&reg).last_stashed.map(|(s, _)| s), Some(3));
 
         // Next pop should consume the stashed real packet, no new overruns.
-        let overruns_before = reg.pull_stats.overruns;
-        let r3 = reg.pop_internal(&mut out, 42.0);
+        let overruns_before = inner(&reg).pull_stats.overruns;
+        let r3 = reg.inner_mut().pop_internal(&mut out, 42.0);
         assert!(r3, "stashed packet replay should be a real-packet pop");
-        assert_eq!(reg.last_seq_out, Some(3));
-        assert_eq!(reg.pull_stats.overruns, overruns_before);
+        assert_eq!(last_seq_out_opt(&reg), Some(3));
+        assert_eq!(inner(&reg).pull_stats.overruns, overruns_before);
     }
 
     /// PLC must kick in after consecutive misses and disengage as soon as a
     /// real packet arrives. The result boolean should reflect this transition.
     #[test]
     fn test_plc_engages_on_underrun_and_stops_with_real_packets() {
-        let mut reg = Regulator::with_params(1, 32, 48_000, 5.0);
-        let samples = vec![0.5f32; reg.fpp];
+        let reg = Regulator::with_params(1, 32, 48_000, 5.0);
+        let samples = vec![0.5f32; inner(&reg).fpp];
 
-        push_stored(&mut reg, 0, 1, &samples, 0.0);
-        let mut out = vec![0.0f32; reg.fpp];
-        let r0 = reg.pop_internal(&mut out, 10.0);
+        push_stored(&reg, 0, 1, &samples, 0.0);
+        let mut out = vec![0.0f32; inner(&reg).fpp];
+        let r0 = reg.inner_mut().pop_internal(&mut out, 10.0);
         assert!(r0);
-        let plc_after_first = reg.plc_packet_count;
-        let packets_after_first = reg.packet_count;
+        let plc_after_first = inner(&reg).plc_packet_count;
+        let packets_after_first = inner(&reg).packet_count;
 
         // Three consecutive underrun pops should each invoke PLC.
         for i in 0..3 {
             let t = 12.0 + i as f64 * 2.0;
-            let result = reg.pop_internal(&mut out, t);
+            let result = reg.inner_mut().pop_internal(&mut out, t);
             assert!(!result, "missing packet at t={t} should produce PLC output");
         }
-        assert_eq!(reg.pull_stats.underruns, 3);
+        assert_eq!(inner(&reg).pull_stats.underruns, 3);
         assert_eq!(
-            reg.plc_packet_count,
+            inner(&reg).plc_packet_count,
             plc_after_first + 3,
             "process_burg should run for each concealed packet"
         );
         assert_eq!(
-            reg.packet_count, packets_after_first,
+            inner(&reg).packet_count, packets_after_first,
             "packet_count must not grow while concealing"
         );
 
         // Real packet arrives — next pop should be real audio again.
-        push_stored(&mut reg, 1, 1, &samples, 25.0);
-        let r_resume = reg.pop_internal(&mut out, 30.0);
+        push_stored(&reg, 1, 1, &samples, 25.0);
+        let r_resume = reg.inner_mut().pop_internal(&mut out, 30.0);
         assert!(r_resume, "PLC must disengage once a real packet is available");
-        assert_eq!(reg.last_seq_out, Some(1));
-        assert_eq!(reg.packet_count, packets_after_first + 1);
-        let underruns_after = reg.pull_stats.underruns;
+        assert_eq!(last_seq_out_opt(&reg), Some(1));
+        assert_eq!(inner(&reg).packet_count, packets_after_first + 1);
+        let underruns_after = inner(&reg).pull_stats.underruns;
 
         // No further underruns when consumption keeps pace.
-        push_stored(&mut reg, 2, 1, &samples, 32.0);
-        let r_next = reg.pop_internal(&mut out, 38.0);
+        push_stored(&reg, 2, 1, &samples, 32.0);
+        let r_next = reg.inner_mut().pop_internal(&mut out, 38.0);
         assert!(r_next);
-        assert_eq!(reg.pull_stats.underruns, underruns_after);
+        assert_eq!(inner(&reg).pull_stats.underruns, underruns_after);
     }
 
     /// `depth()` and `latency_ms()` should report the gap between the newest
@@ -2059,27 +2250,27 @@ mod tests {
     /// Pops drain depth monotonically until it returns to zero.
     #[test]
     fn test_depth_and_latency_reflect_buffered_packets() {
-        let mut reg = Regulator::with_params(2, 64, 48_000, 5.0);
+        let reg = Regulator::with_params(2, 64, 48_000, 5.0);
         assert_eq!(reg.depth(), 0, "depth starts at zero before first packet");
         assert_eq!(reg.latency_ms(), 0.0);
 
-        let samples = vec![0.1f32; reg.samples_per_packet];
+        let samples = vec![0.1f32; inner(&reg).samples_per_packet];
 
         // Before any pop, last_seq_out is None so depth treats read == write.
-        push_stored(&mut reg, 0, 2, &samples, 0.0);
-        push_stored(&mut reg, 1, 2, &samples, 2.0);
+        push_stored(&reg, 0, 2, &samples, 0.0);
+        push_stored(&reg, 1, 2, &samples, 2.0);
         assert_eq!(reg.depth(), 0, "with no pop, read==write so depth is zero");
 
         // First pop sets last_seq_out; the in-flight buffer is consumed.
-        let mut out = vec![0.0f32; reg.samples_per_packet];
-        let r = reg.pop_internal(&mut out, 10.0);
+        let mut out = vec![0.0f32; inner(&reg).samples_per_packet];
+        let r = reg.inner_mut().pop_internal(&mut out, 10.0);
         assert!(r);
-        let seq_after_first_pop = reg.last_seq_out.expect("pop must set last_seq_out");
+        let seq_after_first_pop = last_seq_out_opt(&reg).expect("pop must set last_seq_out");
 
         // Push more packets without popping — depth grows by one per push.
         for (i, t) in (1u16..=3).zip([12.0_f64, 14.0, 16.0]) {
             let seq = seq_after_first_pop.wrapping_add(i);
-            push_stored(&mut reg, seq, 2, &samples, t);
+            push_stored(&reg, seq, 2, &samples, t);
             assert_eq!(
                 reg.depth() as u16,
                 i,
@@ -2092,7 +2283,7 @@ mod tests {
         // double-count latency at 2ch.
         let depth = reg.depth();
         let expected_ms =
-            (depth as f32 * reg.fpp as f32 / reg.sample_rate as f32) * 1000.0;
+            (depth as f32 * inner(&reg).fpp as f32 / inner(&reg).sample_rate as f32) * 1000.0;
         assert!(
             (reg.latency_ms() - expected_ms).abs() < 1e-3,
             "latency_ms ({}) should match depth*fpp/sr ({expected_ms})",
@@ -2106,7 +2297,7 @@ mod tests {
             if reg.depth() == 0 {
                 break;
             }
-            let _ = reg.pop_internal(&mut out, t);
+            let _ = reg.inner_mut().pop_internal(&mut out, t);
             let new_depth = reg.depth();
             assert!(
                 new_depth <= prev_depth,
@@ -2123,28 +2314,28 @@ mod tests {
     /// number consistently with internal state.
     #[test]
     fn test_stats_reflect_internal_counters_and_state() {
-        let mut reg = Regulator::with_params(1, 32, 48_000, 7.5);
-        let samples = vec![0.0f32; reg.fpp];
-        push_stored(&mut reg, 42, 1, &samples, 0.0);
-        push_stored(&mut reg, 43, 1, &samples, 2.0);
+        let reg = Regulator::with_params(1, 32, 48_000, 7.5);
+        let samples = vec![0.0f32; inner(&reg).fpp];
+        push_stored(&reg, 42, 1, &samples, 0.0);
+        push_stored(&reg, 43, 1, &samples, 2.0);
 
-        let mut out = vec![0.0f32; reg.fpp];
-        let _ = reg.pop_internal(&mut out, 15.0);
-        let _ = reg.pop_internal(&mut out, 17.0);
-        let _ = reg.pop_internal(&mut out, 19.0); // underrun
+        let mut out = vec![0.0f32; inner(&reg).fpp];
+        let _ = reg.inner_mut().pop_internal(&mut out, 15.0);
+        let _ = reg.inner_mut().pop_internal(&mut out, 17.0);
+        let _ = reg.inner_mut().pop_internal(&mut out, 19.0); // underrun
 
         let s = reg.stats();
-        assert_eq!(s.tolerance_ms, reg.tolerance_ms);
-        assert_eq!(s.headroom_ms, reg.current_headroom);
-        assert_eq!(s.max_latency_ms, reg.last_max_latency);
-        assert_eq!(s.packets_received, reg.packet_count);
-        assert_eq!(s.packets_played, reg.packet_count);
+        assert_eq!(s.tolerance_ms, inner(&reg).tolerance_ms);
+        assert_eq!(s.headroom_ms, inner(&reg).current_headroom);
+        assert_eq!(s.max_latency_ms, inner(&reg).last_max_latency);
+        assert_eq!(s.packets_received, inner(&reg).packet_count);
+        assert_eq!(s.packets_played, inner(&reg).packet_count);
         assert_eq!(
             s.last_seq_received, 43,
             "last_seq_received should match the highest seq pushed"
         );
         let expected_glitches =
-            (reg.pull_stats.underruns + reg.pull_stats.overruns) - reg.stats_glitches;
+            (inner(&reg).pull_stats.underruns + inner(&reg).pull_stats.overruns) - inner(&reg).stats_glitches;
         assert_eq!(s.glitches, expected_glitches);
 
         // Stats on a fresh regulator: zeroed counters, default tolerance,
@@ -2157,8 +2348,8 @@ mod tests {
         assert_eq!(fs.skipped, 0);
         assert_eq!(fs.last_seq_received, 0);
         assert_eq!(fs.packets_rejected, 0);
-        assert_eq!(fs.tolerance_ms, fresh.tolerance_ms);
-        assert_eq!(fs.headroom_ms, fresh.current_headroom);
+        assert_eq!(fs.tolerance_ms, fresh.tolerance_ms());
+        assert_eq!(fs.headroom_ms, inner(&fresh).current_headroom);
     }
 
     /// Auto mode must not adjust tolerance until `AUTO_INIT_DURATION_MS` of
@@ -2166,28 +2357,28 @@ mod tests {
     /// jittery enough to demand an adjustment.
     #[test]
     fn test_auto_tolerance_unchanged_during_init_duration() {
-        let mut reg = Regulator::with_params(1, 32, 48_000, -1.0);
-        let initial = reg.tolerance_ms;
-        assert!(reg.auto_mode);
+        let reg = Regulator::with_params(1, 32, 48_000, -1.0);
+        let initial = inner(&reg).tolerance_ms;
+        assert!(inner(&reg).auto_mode);
 
         // Inject long-term stats that would normally drive a tolerance bump.
-        reg.push_stats.long_term_max = 100.0;
-        reg.push_stats.long_term_std_dev = 25.0;
-        reg.pull_stats.long_term_max = 50.0;
-        reg.pull_stats.long_term_std_dev = 10.0;
+        inner(&reg).push_stats.long_term_max = 100.0;
+        inner(&reg).push_stats.long_term_std_dev = 25.0;
+        inner(&reg).pull_stats.long_term_max = 50.0;
+        inner(&reg).pull_stats.long_term_std_dev = 10.0;
 
-        reg.update_tolerance(0.0);
-        reg.update_tolerance(1500.0);
-        reg.update_tolerance(AUTO_INIT_DURATION_MS - 0.1);
+        reg.inner_mut().update_tolerance(0.0);
+        reg.inner_mut().update_tolerance(1500.0);
+        reg.inner_mut().update_tolerance(AUTO_INIT_DURATION_MS - 0.1);
         assert_eq!(
-            reg.tolerance_ms, initial,
+            inner(&reg).tolerance_ms, initial,
             "tolerance must be unchanged before AUTO_INIT_DURATION_MS"
         );
 
         // Once we cross the threshold the same inputs cause an update.
-        reg.update_tolerance(AUTO_INIT_DURATION_MS + 1.0);
+        reg.inner_mut().update_tolerance(AUTO_INIT_DURATION_MS + 1.0);
         assert_ne!(
-            reg.tolerance_ms, initial,
+            inner(&reg).tolerance_ms, initial,
             "tolerance should react to long-term stats after init duration"
         );
     }
@@ -2197,17 +2388,17 @@ mod tests {
     /// `[fpp_duration_ms, AUTO_MAX_MS]`.
     #[test]
     fn test_auto_tolerance_recomputes_from_long_term_stats() {
-        let mut reg = Regulator::with_params(1, 32, 48_000, -1.0);
-        let initial = reg.tolerance_ms;
-        let fpp_duration_ms = 1000.0 * reg.fpp as f64 / reg.sample_rate as f64;
+        let reg = Regulator::with_params(1, 32, 48_000, -1.0);
+        let initial = inner(&reg).tolerance_ms;
+        let fpp_duration_ms = 1000.0 * inner(&reg).fpp as f64 / inner(&reg).sample_rate as f64;
 
         // Phase 1: jittery push, calm pull — tolerance should rise sharply.
-        reg.push_stats.long_term_max = 80.0;
-        reg.push_stats.long_term_std_dev = 20.0;
-        reg.pull_stats.long_term_max = 10.0;
-        reg.pull_stats.long_term_std_dev = 2.0;
-        reg.update_tolerance(7000.0); // past AUTO_INIT_DURATION_MS & headroom warmup
-        let after_jitter = reg.tolerance_ms;
+        inner(&reg).push_stats.long_term_max = 80.0;
+        inner(&reg).push_stats.long_term_std_dev = 20.0;
+        inner(&reg).pull_stats.long_term_max = 10.0;
+        inner(&reg).pull_stats.long_term_std_dev = 2.0;
+        reg.inner_mut().update_tolerance(7000.0); // past AUTO_INIT_DURATION_MS & headroom warmup
+        let after_jitter = inner(&reg).tolerance_ms;
         assert!(
             after_jitter > initial,
             "tolerance must grow with long-term jitter (init={initial}, after={after_jitter})"
@@ -2216,12 +2407,12 @@ mod tests {
         assert!(after_jitter >= fpp_duration_ms);
 
         // Phase 2: calm network — tolerance should fall back down.
-        reg.push_stats.long_term_max = 3.0;
-        reg.push_stats.long_term_std_dev = 1.0;
-        reg.pull_stats.long_term_max = 2.0;
-        reg.pull_stats.long_term_std_dev = 0.5;
-        reg.update_tolerance(7100.0);
-        let after_calm = reg.tolerance_ms;
+        inner(&reg).push_stats.long_term_max = 3.0;
+        inner(&reg).push_stats.long_term_std_dev = 1.0;
+        inner(&reg).pull_stats.long_term_max = 2.0;
+        inner(&reg).pull_stats.long_term_std_dev = 0.5;
+        reg.inner_mut().update_tolerance(7100.0);
+        let after_calm = inner(&reg).tolerance_ms;
         assert!(
             after_calm < after_jitter,
             "tolerance must drop when jitter subsides (jitter={after_jitter}, calm={after_calm})"
@@ -2229,25 +2420,25 @@ mod tests {
         assert!(after_calm >= fpp_duration_ms);
 
         // current_headroom should track the configured (positive) auto_headroom.
-        assert!((reg.current_headroom - reg.auto_headroom).abs() < 1e-9);
+        assert!((inner(&reg).current_headroom - inner(&reg).auto_headroom).abs() < 1e-9);
     }
 
     /// Fixed (non-auto) tolerance mode must ignore the auto-tolerance machinery
     /// entirely, even when push/pull stats look noisy.
     #[test]
     fn test_fixed_tolerance_mode_does_not_auto_update() {
-        let mut reg = Regulator::with_params(1, 32, 48_000, 25.0);
-        assert!(!reg.auto_mode);
-        assert_eq!(reg.tolerance_ms, 25.0);
+        let reg = Regulator::with_params(1, 32, 48_000, 25.0);
+        assert!(!inner(&reg).auto_mode);
+        assert_eq!(inner(&reg).tolerance_ms, 25.0);
 
-        reg.push_stats.long_term_max = 200.0;
-        reg.push_stats.long_term_std_dev = 50.0;
-        reg.pull_stats.long_term_max = 100.0;
-        reg.pull_stats.long_term_std_dev = 20.0;
+        inner(&reg).push_stats.long_term_max = 200.0;
+        inner(&reg).push_stats.long_term_std_dev = 50.0;
+        inner(&reg).pull_stats.long_term_max = 100.0;
+        inner(&reg).pull_stats.long_term_std_dev = 20.0;
 
-        reg.update_tolerance(10_000.0);
+        reg.inner_mut().update_tolerance(10_000.0);
         assert_eq!(
-            reg.tolerance_ms, 25.0,
+            inner(&reg).tolerance_ms, 25.0,
             "fixed-mode tolerance must remain at the configured value"
         );
     }
@@ -2378,13 +2569,13 @@ mod tests {
     /// from that depth for a known packet format.
     #[test]
     fn test_depth_and_latency_handle_u16_wraparound() {
-        let mut reg = Regulator::with_params(1, 128, 48_000, 5.0);
+        let reg = Regulator::with_params(1, 128, 48_000, 5.0);
 
         // Write pointer wrapped around (now 2); read pointer near the top.
         let read: u16 = u16::MAX - 1; // 65534
         let write: u16 = 2;
-        reg.last_seq_in.store(write as i32, Ordering::Release);
-        reg.last_seq_out = Some(read);
+        inner(&reg).last_seq_in.store(write as i32, Ordering::Release);
+        set_last_seq_out(&reg, Some(read));
 
         // 65534 -> 65535 -> 0 -> 1 -> 2 is a forward distance of 4 packets.
         assert_eq!(reg.depth(), write.wrapping_sub(read) as u32);
@@ -2424,17 +2615,17 @@ mod tests {
     /// scramble channels.
     #[test]
     fn test_first_packet_adopts_peer_channel_count_and_plays_back_at_that_stride() {
-        let mut reg = Regulator::with_params(2, 32, 48_000, 5.0);
+        let reg = Regulator::with_params(2, 32, 48_000, 5.0);
         let original_fpp = reg.fpp();
         let original_tolerance = reg.tolerance_ms();
 
         // Peer sends 1 channel; this regulator was constructed for 2.
-        let ramp: Vec<f32> = (0..reg.fpp).map(|i| i as f32).collect();
-        assert_eq!(reg.push_internal(0, 1, &ramp, 0.0), PushOutcome::Stored);
+        let ramp: Vec<f32> = (0..inner(&reg).fpp).map(|i| i as f32).collect();
+        assert_eq!(reg.inner_mut().push_internal(0, 1, &ramp, 0.0), PushOutcome::Stored);
         assert_eq!(reg.channels(), 1, "first packet must adopt the peer's channel count");
 
-        let mut out = vec![0.0f32; reg.fpp];
-        let real = reg.pop_internal(&mut out, 10.0); // past the 5ms tolerance
+        let mut out = vec![0.0f32; inner(&reg).fpp];
+        let real = reg.inner_mut().pop_internal(&mut out, 10.0); // past the 5ms tolerance
         assert!(real, "the adopted-stride packet must play back as real audio");
         assert_eq!(
             out, ramp,
@@ -2458,63 +2649,63 @@ mod tests {
     /// read side then hands to the output.
     #[test]
     fn test_push_rejects_packets_that_are_not_exactly_one_packet_long() {
-        let mut reg = Regulator::with_params(2, 64, 48_000, 5.0);
-        let good = vec![0.5f32; reg.samples_per_packet];
-        assert_eq!(reg.push_internal(10, 2, &good, 0.0), PushOutcome::Stored);
-        assert_eq!(reg.last_seq_in.load(Ordering::Acquire), 10);
+        let reg = Regulator::with_params(2, 64, 48_000, 5.0);
+        let good = vec![0.5f32; inner(&reg).samples_per_packet];
+        assert_eq!(reg.inner_mut().push_internal(10, 2, &good, 0.0), PushOutcome::Stored);
+        assert_eq!(inner(&reg).last_seq_in.load(Ordering::Acquire), 10);
 
         let wrong_sizes = [
             0,
             1,
-            reg.samples_per_packet - reg.num_channels, // one frame short
-            reg.samples_per_packet - 1,                // one sample short
-            reg.samples_per_packet + 1,                // one sample long
-            reg.samples_per_packet * 2,                // double-length packet
+            inner(&reg).samples_per_packet - inner(&reg).num_channels, // one frame short
+            inner(&reg).samples_per_packet - 1,                // one sample short
+            inner(&reg).samples_per_packet + 1,                // one sample long
+            inner(&reg).samples_per_packet * 2,                // double-length packet
         ];
         for len in wrong_sizes {
             let packet = vec![0.25f32; len];
             assert_eq!(
-                reg.push_internal(11, 2, &packet, 1.0),
-                PushOutcome::WrongPacketSize { expected: reg.samples_per_packet, got: len },
+                reg.inner_mut().push_internal(11, 2, &packet, 1.0),
+                PushOutcome::WrongPacketSize { expected: inner(&reg).samples_per_packet, got: len },
                 "accepted a {len}-sample packet on a {}-sample stream",
-                reg.samples_per_packet
+                inner(&reg).samples_per_packet
             );
         }
 
         // Neither the ring nor the write pointer moved: the slot the rejected
         // packets targeted is still empty, and the newest sequence number is
         // still the last good packet's.
-        assert_eq!(reg.last_seq_in.load(Ordering::Acquire), 10);
-        let slot = reg.slots[slot_index(11)]
+        assert_eq!(inner(&reg).last_seq_in.load(Ordering::Acquire), 10);
+        let slot = inner(&reg).slots[slot_index(11)]
             .as_ref()
             .expect("slots are pre-allocated at configure time");
         assert_eq!(slot.timestamp, 0.0);
         assert!(slot.data.iter().all(|&s| s == 0.0));
-        assert_eq!(reg.packets_rejected, wrong_sizes.len() as u64);
+        assert_eq!(inner(&reg).packets_rejected, wrong_sizes.len() as u64);
 
         // Channel count 0, or beyond MAX_CHANNELS, is rejected before the size
         // check even runs.
-        let rejected_before = reg.packets_rejected;
+        let rejected_before = inner(&reg).packets_rejected;
         assert_eq!(
-            reg.push_internal(12, 0, &[], 2.0),
+            reg.inner_mut().push_internal(12, 0, &[], 2.0),
             PushOutcome::UnsupportedChannelCount { got: 0 }
         );
         assert_eq!(
-            reg.push_internal(12, MAX_CHANNELS + 1, &[0.0], 2.0),
+            reg.inner_mut().push_internal(12, MAX_CHANNELS + 1, &[0.0], 2.0),
             PushOutcome::UnsupportedChannelCount { got: MAX_CHANNELS + 1 }
         );
-        assert_eq!(reg.packets_rejected, rejected_before + 2);
+        assert_eq!(inner(&reg).packets_rejected, rejected_before + 2);
 
         // A packet claiming a channel count that differs from the count
         // already adopted for this stream is rejected outright, not
         // re-adopted — see `PushOutcome::ChannelCountChanged`.
-        let mismatched = vec![0.5f32; reg.fpp]; // 1ch-sized; this stream adopted 2ch
+        let mismatched = vec![0.5f32; inner(&reg).fpp]; // 1ch-sized; this stream adopted 2ch
         assert_eq!(
-            reg.push_internal(13, 1, &mismatched, 3.0),
+            reg.inner_mut().push_internal(13, 1, &mismatched, 3.0),
             PushOutcome::ChannelCountChanged { adopted: 2, got: 1 }
         );
         assert_eq!(
-            reg.last_seq_in.load(Ordering::Acquire), 10,
+            inner(&reg).last_seq_in.load(Ordering::Acquire), 10,
             "a rejected packet must not move the write pointer"
         );
     }
@@ -2528,17 +2719,74 @@ mod tests {
     /// just because the sample count happens to match.
     #[test]
     fn test_push_channel_count_is_explicit_not_inferred_from_sample_count() {
-        let mut reg = Regulator::with_params(2, 128, 48_000, 5.0);
+        let reg = Regulator::with_params(2, 128, 48_000, 5.0);
         let first = vec![0.1f32; 256]; // 2ch * 128fpp
-        assert_eq!(reg.push_internal(0, 2, &first, 0.0), PushOutcome::Stored);
+        assert_eq!(reg.inner_mut().push_internal(0, 2, &first, 0.0), PushOutcome::Stored);
 
         // Same total sample count as a valid 2ch*128fpp packet, but claiming
         // 4 channels — must be rejected for its size (4*128=512 != 256), not
         // accepted as if it were secretly the 2ch stride.
         let same_len_but_4ch = vec![0.2f32; 256];
         assert_eq!(
-            reg.push_internal(1, 4, &same_len_but_4ch, 1.0),
+            reg.inner_mut().push_internal(1, 4, &same_len_but_4ch, 1.0),
             PushOutcome::WrongPacketSize { expected: 4 * 128, got: 256 }
         );
+    }
+
+    /// WEB-53 Bug 1: a reordered straggler must still publish its slot via the
+    /// per-slot Release stamp, even though it must not advance `last_seq_in`.
+    /// Without the stamp, the consumer would never observe the straggler's
+    /// payload under the SPSC protocol.
+    #[test]
+    fn test_straggler_publishes_slot_without_advancing_write_pointer() {
+        let reg = Regulator::with_params(1, 32, 48_000, 5.0);
+        let samples_a = vec![0.25f32; 32];
+        let samples_b = vec![0.75f32; 32];
+        push_stored(&reg, 10, 1, &samples_a, 100.0);
+        push_stored(&reg, 12, 1, &samples_a, 102.0);
+        assert_eq!(inner(&reg).last_seq_in.load(Ordering::Acquire), 12);
+
+        // Straggler seq 11 — between last_seq_out (none) and last_seq_in.
+        push_stored(&reg, 11, 1, &samples_b, 103.0);
+        assert_eq!(
+            inner(&reg).last_seq_in.load(Ordering::Acquire),
+            12,
+            "straggler must not advance last_seq_in"
+        );
+        let slot = inner(&reg).slots[slot_index(11)].as_ref().unwrap();
+        assert!(
+            slot.holds(11),
+            "straggler must Release-publish its slot stamp"
+        );
+        assert!(
+            (slot.data[0] - 0.75).abs() < 1e-6,
+            "straggler payload must be stored"
+        );
+    }
+
+    /// WEB-53 Bug 6: `stats()` must read the published atomic snapshot, not
+    /// plain fields — so a main-thread reader observes values that were
+    /// Release-stored by push/pop rather than racing those writers.
+    #[test]
+    fn test_stats_reads_published_atomics_after_push() {
+        let reg = Regulator::with_params(1, 32, 48_000, 5.0);
+        let samples = vec![0.1f32; 32];
+        push_stored(&reg, 0, 1, &samples, 0.0);
+        // Deliberately corrupt the working copy without republishing — if
+        // stats() read plain fields it would see this; the atomic snapshot
+        // must still report the published rejection count of 0.
+        inner(&reg).packets_rejected = 99;
+        assert_eq!(
+            reg.stats().packets_rejected,
+            0,
+            "stats must not read the unpublished working copy"
+        );
+        assert_eq!(reg.stats().last_seq_received, 0);
+
+        // Restore the working copy, then a real rejection must update the
+        // published snapshot (working copy was 0, +=1 → publish 1).
+        inner(&reg).packets_rejected = 0;
+        let _ = reg.inner_mut().push_internal(1, 1, &[], 1.0); // wrong size
+        assert_eq!(reg.stats().packets_rejected, 1);
     }
 }
