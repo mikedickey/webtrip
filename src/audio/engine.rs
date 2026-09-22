@@ -381,8 +381,6 @@ impl AudioEngine {
         Ok(())
     }
 
-    /// Stop audio capture
-    #[wasm_bindgen(js_name = stopCapture)]
     /// Fully stop capture: suspend the AudioContext (so the worklet render
     /// thread cannot run another `process()`), tear down the worklet node,
     /// and stop media tracks.
