@@ -196,7 +196,7 @@ impl AudioEngine {
         output_channels: u32,
     ) -> Result<(), JsValue> {
         // Stop any existing capture
-        self.stop_capture();
+        self.stop_capture().await;
 
         // Get user media with specified device and constraints
         let media_devices = get_media_devices()?;
@@ -383,7 +383,27 @@ impl AudioEngine {
 
     /// Stop audio capture
     #[wasm_bindgen(js_name = stopCapture)]
-    pub fn stop_capture(&mut self) {
+    /// Fully stop capture: suspend the AudioContext (so the worklet render
+    /// thread cannot run another `process()`), tear down the worklet node,
+    /// and stop media tracks.
+    ///
+    /// Suspending before teardown is load-bearing for [`Regulator::reset`]:
+    /// posting `"stop"` alone is asynchronous, and a concurrent `pop` racing
+    /// `reset` is a data race (WEB-53 Bug 7). `AudioContext.suspend()` waits
+    /// until the render quantum has stopped.
+    #[wasm_bindgen(js_name = stopCapture)]
+    pub async fn stop_capture(&mut self) {
+        // Quiesce the render thread before dropping worklet / shared buffers.
+        if let Ok(suspend) = self.ctx.suspend() {
+            let _ = JsFuture::from(suspend).await;
+        }
+        self.stop_capture_now();
+    }
+
+    /// Tear down the worklet and media tracks without waiting for the render
+    /// thread. Used from [`Drop`] paths that cannot await; prefer
+    /// [`stop_capture`](Self::stop_capture) whenever async is available.
+    pub(crate) fn stop_capture_now(&mut self) {
         if let Some(ref node) = self.worklet_node {
             self.teardown_worklet_node(node);
         }
@@ -734,7 +754,7 @@ mod tests {
             "get_worklet_port must return Some(MessagePort) while capturing"
         );
 
-        engine.stop_capture();
+        engine.stop_capture().await;
 
         assert!(
             !engine.is_capturing(),
@@ -819,7 +839,7 @@ mod tests {
              wired via set_local_to_network_buffer (samples_written stayed 0)"
         );
 
-        engine.stop_capture();
+        engine.stop_capture().await;
         close_engine(engine).await;
     }
 
