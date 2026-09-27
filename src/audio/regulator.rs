@@ -697,8 +697,11 @@ struct RegulatorInner {
 
     // ---- Published snapshot for main-thread stats()/depth()/latency_ms() ----
     // Written by the producer/consumer that owns the corresponding working
-    // field; read with Acquire from any thread. Memory-safe even when values
-    // are momentarily stale.
+    // field; read from any thread. Atomic so concurrent reads are not a data
+    // race (no torn f64/u64), but Relaxed: these are display-only values that
+    // guard no other memory, so a momentarily stale or mutually inconsistent
+    // snapshot is fine. Do not read payload/config based on one of these —
+    // `last_seq_in` / `PacketSlot::seq` carry the Acquire/Release handshake.
     pub_tolerance_bits: AtomicU64,
     pub_headroom_bits: AtomicU64,
     pub_max_latency_bits: AtomicU64,
@@ -898,7 +901,7 @@ impl Regulator {
 
     /// Get the current tolerance in milliseconds.
     pub fn tolerance_ms(&self) -> f64 {
-        f64_from_bits(self.inner().pub_tolerance_bits.load(Ordering::Acquire))
+        f64_from_bits(self.inner().pub_tolerance_bits.load(Ordering::Relaxed))
     }
 
     /// Get the frames per packet.
@@ -1124,16 +1127,18 @@ impl RegulatorInner {
                 // Deinterleave from slot directly into channel tmp buffers (NO allocation)
                 let mut valid = false;
                 if let Some(ref slot) = self.slots[slot_idx] {
-                    // Identity must still hold before we trust the payload.
+                    // Identity must still hold before we trust the payload: a
+                    // `last_stashed` decision from an earlier pop bypasses
+                    // find_best_packet's own check, and if this thread stalled
+                    // since then the producer may have lapped the ring onto
+                    // this slot (WEB-53).
                     if slot.holds(seq) {
                         for (ch, channel) in self.channels.iter_mut().enumerate() {
                             for s in 0..self.fpp {
                                 channel.tmp_buf[s] = slot.data[s * self.num_channels + ch];
                             }
                         }
-                        // Revalidate after the copy — a full-ring wrap can
-                        // overwrite the slot while we were reading (WEB-53).
-                        valid = slot.holds(seq);
+                        valid = true;
                     }
                 }
 
@@ -1230,11 +1235,11 @@ impl RegulatorInner {
             return Some(PacketDecision::Packet { seq, slot_idx });
         }
 
-        let last_out_for_start = self.last_seq_out.load(Ordering::Acquire);
-        let start_seq = if last_out_for_start != SEQ_NONE {
-            (last_out_for_start as u16).wrapping_add(1)
-        } else {
-            last_seq_in
+        let last_out_raw = self.last_seq_out.load(Ordering::Acquire);
+        let last_out = (last_out_raw != SEQ_NONE).then_some(last_out_raw as u16);
+        let start_seq = match last_out {
+            Some(last_out) => last_out.wrapping_add(1),
+            None => last_seq_in,
         };
 
         let new_pkts = seq_span(start_seq, last_seq_in);
@@ -1275,21 +1280,8 @@ impl RegulatorInner {
                 _ => continue,
             };
 
-            // Skip packets that arrived too early (out of order).
-            // Validate last_out's stamp before trusting its timestamp (WEB-53 Bug 4).
-            let last_out_raw = self.last_seq_out.load(Ordering::Acquire);
-            if last_out_raw != SEQ_NONE {
-                let last_out = last_out_raw as u16;
-                let last_out_idx = slot_index(last_out);
-                if let Some(ref last_slot) = &self.slots[last_out_idx] {
-                    if last_slot.holds(last_out)
-                        && timestamp < last_slot.timestamp
-                        && last_slot.timestamp - timestamp > self.tolerance_ms
-                    {
-                        continue;
-                    }
-                }
-                // Calculate skipped packet count (recalculate for each candidate)
+            // Calculate skipped packet count (recalculate for each candidate)
+            if let Some(last_out) = last_out {
                 skipped = seq.wrapping_sub(last_out.wrapping_add(1)) as u64;
             }
 
@@ -1535,17 +1527,17 @@ impl RegulatorInner {
         // (WEB-53 Bug 6).
         let last_seq_raw = self.last_seq_in.load(Ordering::Acquire);
         let last_seq = if last_seq_raw == SEQ_NONE { 0 } else { last_seq_raw as u16 };
-        let packets = self.pub_packets.load(Ordering::Acquire);
+        let packets = self.pub_packets.load(Ordering::Relaxed);
         RegulatorStats {
-            tolerance_ms: f64_from_bits(self.pub_tolerance_bits.load(Ordering::Acquire)),
-            headroom_ms: f64_from_bits(self.pub_headroom_bits.load(Ordering::Acquire)),
-            max_latency_ms: f64_from_bits(self.pub_max_latency_bits.load(Ordering::Acquire)),
-            glitches: self.pub_glitches.load(Ordering::Acquire),
-            skipped: self.pub_skipped.load(Ordering::Acquire),
+            tolerance_ms: f64_from_bits(self.pub_tolerance_bits.load(Ordering::Relaxed)),
+            headroom_ms: f64_from_bits(self.pub_headroom_bits.load(Ordering::Relaxed)),
+            max_latency_ms: f64_from_bits(self.pub_max_latency_bits.load(Ordering::Relaxed)),
+            glitches: self.pub_glitches.load(Ordering::Relaxed),
+            skipped: self.pub_skipped.load(Ordering::Relaxed),
             packets_received: packets,
             packets_played: packets,
             last_seq_received: last_seq,
-            packets_rejected: self.pub_rejected.load(Ordering::Acquire),
+            packets_rejected: self.pub_rejected.load(Ordering::Relaxed),
         }
     }
 
@@ -1629,21 +1621,21 @@ impl RegulatorInner {
     fn publish_stats(&self) {
         let total_glitches = self.pull_stats.underruns + self.pull_stats.overruns;
         self.pub_tolerance_bits
-            .store(f64_to_bits(self.tolerance_ms), Ordering::Release);
+            .store(f64_to_bits(self.tolerance_ms), Ordering::Relaxed);
         self.pub_headroom_bits
-            .store(f64_to_bits(self.current_headroom), Ordering::Release);
+            .store(f64_to_bits(self.current_headroom), Ordering::Relaxed);
         self.pub_max_latency_bits
-            .store(f64_to_bits(self.last_max_latency), Ordering::Release);
+            .store(f64_to_bits(self.last_max_latency), Ordering::Relaxed);
         self.pub_glitches.store(
             total_glitches.saturating_sub(self.stats_glitches),
-            Ordering::Release,
+            Ordering::Relaxed,
         );
         self.pub_skipped.store(
             self.skipped.saturating_sub(self.last_skipped),
-            Ordering::Release,
+            Ordering::Relaxed,
         );
-        self.pub_packets.store(self.packet_count, Ordering::Release);
-        self.pub_rejected.store(self.packets_rejected, Ordering::Release);
+        self.pub_packets.store(self.packet_count, Ordering::Relaxed);
+        self.pub_rejected.store(self.packets_rejected, Ordering::Relaxed);
     }
 
     /// Get current buffer depth (number of packets buffered).
@@ -2038,7 +2030,7 @@ mod tests {
         set_last_seq_out(&reg, Some(last_seq));
         inner(&reg).last_seq_in.store(fresh_seq as i32, Ordering::Release);
 
-        // Previously-played packet, reference point for the out-of-order check.
+        // Previously-played packet, reference point for push-stats timing.
         let silent_packet = vec![0.0f32; inner(&reg).fpp];
         plant_packet(&reg, last_seq, 40.0, &silent_packet);
         // Stale but valid packet: misses tolerance at now=60 (41 + 10 < 60),
