@@ -586,8 +586,6 @@ pub struct RegulatorStats {
     pub max_latency_ms: f64,
     /// Number of glitches (underruns + overruns)
     pub glitches: u64,
-    /// Number of skipped packets
-    pub skipped: u64,
     /// Packets received
     pub packets_received: u64,
     /// Packets played
@@ -681,8 +679,6 @@ struct RegulatorInner {
     packet_count: u64,
     plc_packet_count: u64,
     packets_rejected: u64,
-    skipped: u64,
-    last_skipped: u64,
     last_glitches: u64,
     stats_glitches: u64,
     last_max_latency: f64,
@@ -706,7 +702,6 @@ struct RegulatorInner {
     pub_headroom_bits: AtomicU64,
     pub_max_latency_bits: AtomicU64,
     pub_glitches: AtomicU64,
-    pub_skipped: AtomicU64,
     pub_packets: AtomicU64,
     pub_rejected: AtomicU64,
 }
@@ -844,8 +839,6 @@ impl Regulator {
             packet_count: 0,
             plc_packet_count: 0,
             packets_rejected: 0,
-            skipped: 0,
-            last_skipped: 0,
             last_glitches: 0,
             stats_glitches: 0,
             last_max_latency: 0.0,
@@ -857,7 +850,6 @@ impl Regulator {
             pub_headroom_bits: AtomicU64::new(f64_to_bits(current_headroom)),
             pub_max_latency_bits: AtomicU64::new(0),
             pub_glitches: AtomicU64::new(0),
-            pub_skipped: AtomicU64::new(0),
             pub_packets: AtomicU64::new(0),
             pub_rejected: AtomicU64::new(0),
         };
@@ -944,7 +936,7 @@ impl RegulatorInner {
     fn push_internal(&mut self, seq_num: u16, channels: usize, samples: &[f32], now_ms: f64) -> PushOutcome {
         if channels == 0 || channels > MAX_CHANNELS {
             self.packets_rejected += 1;
-            self.publish_stats();
+            self.publish_producer_stats();
             return PushOutcome::UnsupportedChannelCount { got: channels };
         }
 
@@ -962,7 +954,7 @@ impl RegulatorInner {
         let expected = channels * self.fpp;
         if samples.len() != expected {
             self.packets_rejected += 1;
-            self.publish_stats();
+            self.publish_producer_stats();
             return PushOutcome::WrongPacketSize { expected, got: samples.len() };
         }
 
@@ -981,7 +973,7 @@ impl RegulatorInner {
             // peer bug or an unsignaled renegotiation, not something to
             // re-adopt into — see `PushOutcome::ChannelCountChanged`.
             self.packets_rejected += 1;
-            self.publish_stats();
+            self.publish_producer_stats();
             return PushOutcome::ChannelCountChanged { adopted: self.num_channels, got: channels };
         }
 
@@ -1012,7 +1004,6 @@ impl RegulatorInner {
             self.last_seq_in.store(seq_num as i32, Ordering::Release);
         }
 
-        self.publish_stats();
         PushOutcome::Stored
     }
 
@@ -1109,7 +1100,7 @@ impl RegulatorInner {
         // Return silence during startup
         if last_seq_in_raw == SEQ_NONE || relative_now < self.tolerance_ms {
             output.fill(0.0);
-            self.publish_stats();
+            self.publish_consumer_stats();
             return false;
         }
 
@@ -1146,7 +1137,7 @@ impl RegulatorInner {
                     // Stamp mismatch: conceal rather than play torn audio.
                     self.pull_stats.underruns += 1;
                     self.output_concealment(output);
-                    self.publish_stats();
+                    self.publish_consumer_stats();
                     return false;
                 }
 
@@ -1156,13 +1147,13 @@ impl RegulatorInner {
 
                 self.last_seq_out.store(seq as i32, Ordering::Release);
                 self.packet_count += 1;
-                self.publish_stats();
+                self.publish_consumer_stats();
                 true
             }
             Some(PacketDecision::ConcealSkippedPacket { skipped }) => {
                 self.pull_stats.overruns += skipped;
                 self.output_concealment(output);
-                self.publish_stats();
+                self.publish_consumer_stats();
                 false
             }
             None => {
@@ -1186,7 +1177,7 @@ impl RegulatorInner {
     /// Handle an underrun (missing packet).
     fn handle_underrun(&mut self, output: &mut [f32], now: f64) -> bool {
         self.pull_stats.underruns += 1;
-        self.publish_stats();
+        self.publish_consumer_stats();
 
         // Check for stuck client (no packets for a long time). Validate the
         // slot stamp before trusting the timestamp — the producer may have
@@ -1302,7 +1293,6 @@ impl RegulatorInner {
                 } else if skipped > 0 {
                     // process a glitch to account for the skipped packets,
                     // but stash and use this good packet on next callback.
-                    self.skipped += skipped;
                     self.last_stashed = Some((seq, slot_idx));
                     self.update_push_stats(seq, timestamp, now);
                     return Some(PacketDecision::ConcealSkippedPacket { skipped });
@@ -1365,26 +1355,23 @@ impl RegulatorInner {
         }
 
         let total_glitches = self.pull_stats.underruns + self.pull_stats.overruns;
-        let total_skipped = self.skipped;
         let new_glitches = total_glitches.saturating_sub(self.last_glitches);
-        let new_skipped = total_skipped.saturating_sub(self.last_skipped);
         self.last_glitches = total_glitches;
-        self.last_skipped = total_skipped;
 
         // Skip warmup period
         if now <= self.auto_headroom_start_time {
             self.last_max_latency  = 0.0;  // ignore during warmup
             self.stats_max_latency = 0.0;
-            self.update_headroom(0, 0);
+            self.update_headroom(0);
         } else {
             self.last_max_latency = self.stats_max_latency;
             self.stats_max_latency = 0.0;
-            self.update_headroom(new_glitches, new_skipped);
+            self.update_headroom(new_glitches);
         }
     }
 
     /// Update headroom based on glitch counts.
-    fn update_headroom(&mut self, glitches: u64, _skipped: u64) {
+    fn update_headroom(&mut self, glitches: u64) {
         let fpp_duration_ms = 1000.0 * self.fpp as f64 / self.sample_rate as f64;
 
         if self.auto_headroom < 0.0 {
@@ -1422,7 +1409,7 @@ impl RegulatorInner {
 
         new_tolerance = new_tolerance.clamp(fpp_duration_ms, AUTO_MAX_MS);
         self.tolerance_ms = new_tolerance;
-        self.publish_stats();
+        self.publish_consumer_stats();
     }
 
     /// Process audio with Burg algorithm for PLC.
@@ -1533,7 +1520,6 @@ impl RegulatorInner {
             headroom_ms: f64_from_bits(self.pub_headroom_bits.load(Ordering::Relaxed)),
             max_latency_ms: f64_from_bits(self.pub_max_latency_bits.load(Ordering::Relaxed)),
             glitches: self.pub_glitches.load(Ordering::Relaxed),
-            skipped: self.pub_skipped.load(Ordering::Relaxed),
             packets_received: packets,
             packets_played: packets,
             last_seq_received: last_seq,
@@ -1556,8 +1542,6 @@ impl RegulatorInner {
         self.packet_count = 0;
         self.plc_packet_count = 0;
         self.packets_rejected = 0;
-        self.skipped = 0;
-        self.last_skipped = 0;
         self.last_glitches = 0;
         self.stats_glitches = 0;
         self.last_max_latency = 0.0;
@@ -1614,11 +1598,26 @@ impl RegulatorInner {
             channel.train_data.fill(0.0);
             channel.ring_wptr = channel.ring_size / 2;
         }
-        self.publish_stats();
+        self.publish_producer_stats();
+        self.publish_consumer_stats();
     }
 
-    /// Publish a stats snapshot for main-thread readers (WEB-53 Bug 6).
-    fn publish_stats(&self) {
+    /// Publish the producer-owned part of the stats snapshot. Called only
+    /// from the push side (and a quiesced `reset`).
+    ///
+    /// The snapshot is split by owner, not published whole from both sides:
+    /// each thread may read only the working fields it writes. A combined
+    /// publish from push would read consumer-owned counters without
+    /// synchronization and could store a stale value over the consumer's
+    /// newer one, making `stats()` counts step backwards.
+    fn publish_producer_stats(&self) {
+        self.pub_rejected.store(self.packets_rejected, Ordering::Relaxed);
+    }
+
+    /// Publish the consumer-owned part of the stats snapshot (WEB-53 Bug 6).
+    /// Called only from the pop side (and a quiesced `reset`); see
+    /// [`publish_producer_stats`](Self::publish_producer_stats).
+    fn publish_consumer_stats(&self) {
         let total_glitches = self.pull_stats.underruns + self.pull_stats.overruns;
         self.pub_tolerance_bits
             .store(f64_to_bits(self.tolerance_ms), Ordering::Relaxed);
@@ -1630,12 +1629,7 @@ impl RegulatorInner {
             total_glitches.saturating_sub(self.stats_glitches),
             Ordering::Relaxed,
         );
-        self.pub_skipped.store(
-            self.skipped.saturating_sub(self.last_skipped),
-            Ordering::Relaxed,
-        );
         self.pub_packets.store(self.packet_count, Ordering::Relaxed);
-        self.pub_rejected.store(self.packets_rejected, Ordering::Relaxed);
     }
 
     /// Get current buffer depth (number of packets buffered).
@@ -2048,7 +2042,6 @@ mod tests {
         );
         assert_eq!(last_seq_out_opt(&reg), Some(stale_seq));
         assert_eq!(inner(&reg).last_stashed.map(|(seq, _)| seq), Some(fresh_seq));
-        assert_eq!(inner(&reg).skipped, 0, "no packet may be counted as skipped");
         assert_eq!(inner(&reg).pull_stats.overruns, 0, "no glitch may be recorded");
         assert_eq!(inner(&reg).packet_count, 1);
 
@@ -2057,7 +2050,6 @@ mod tests {
         assert_eq!(inner(&reg).last_stashed, None);
         assert_eq!(last_seq_out_opt(&reg), Some(fresh_seq));
         assert_eq!(inner(&reg).packet_count, 2);
-        assert_eq!(inner(&reg).skipped, 0);
         assert_eq!(inner(&reg).pull_stats.overruns, 0);
     }
 
@@ -2090,8 +2082,6 @@ mod tests {
         assert_eq!(inner(&reg).last_stashed, None);
         assert_eq!(inner(&reg).packet_count, 0);
         assert_eq!(inner(&reg).plc_packet_count, 0);
-        assert_eq!(inner(&reg).skipped, 0);
-        assert_eq!(inner(&reg).last_skipped, 0);
         assert_eq!(inner(&reg).last_glitches, 0);
         assert_eq!(inner(&reg).stats_glitches, 0);
         assert_eq!(inner(&reg).last_max_latency, 0.0);
@@ -2178,7 +2168,6 @@ mod tests {
         let r2 = reg.inner_mut().pop_internal(&mut out, 40.0);
         assert!(!r2, "skipped-gap path returns concealment (false)");
         assert_eq!(inner(&reg).pull_stats.overruns, 2, "overrun counter tracks skip distance");
-        assert_eq!(inner(&reg).skipped, 2, "skipped counter tracks skip distance");
         // The good packet must have been stashed for replay on the next pop.
         assert_eq!(inner(&reg).last_stashed.map(|(s, _)| s), Some(3));
 
@@ -2337,7 +2326,6 @@ mod tests {
         assert_eq!(fs.packets_received, 0);
         assert_eq!(fs.packets_played, 0);
         assert_eq!(fs.glitches, 0);
-        assert_eq!(fs.skipped, 0);
         assert_eq!(fs.last_seq_received, 0);
         assert_eq!(fs.packets_rejected, 0);
         assert_eq!(fs.tolerance_ms, fresh.tolerance_ms());
@@ -2780,5 +2768,29 @@ mod tests {
         inner(&reg).packets_rejected = 0;
         let _ = reg.inner_mut().push_internal(1, 1, &[], 1.0); // wrong size
         assert_eq!(reg.stats().packets_rejected, 1);
+    }
+
+    /// PR #89 review: push must not republish consumer-owned counters. It used
+    /// to store the whole snapshot from its own (unsynchronized, possibly
+    /// stale) view of `packet_count`, overwriting the consumer's newer publish
+    /// and making `packets_received` step backwards.
+    #[test]
+    fn test_push_does_not_republish_consumer_stats() {
+        let reg = Regulator::with_params(1, 32, 48_000, 5.0);
+        let samples = vec![0.1f32; 32];
+        let mut out = vec![0.0f32; 32];
+        push_stored(&reg, 0, 1, &samples, 0.0);
+        assert!(reg.inner_mut().pop_internal(&mut out, 10.0));
+        assert_eq!(reg.stats().packets_received, 1);
+
+        // Stand in for the producer's stale view of the consumer's counter.
+        inner(&reg).packet_count = 0;
+        push_stored(&reg, 1, 1, &samples, 11.0);
+        let _ = reg.inner_mut().push_internal(2, 1, &[], 12.0); // rejected path
+        assert_eq!(
+            reg.stats().packets_received,
+            1,
+            "push overwrote the consumer's published packet count"
+        );
     }
 }

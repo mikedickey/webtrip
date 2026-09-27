@@ -92,8 +92,6 @@ pub struct SessionStats {
     pub regulator_packets_played: u64,
     /// Number of PLC activations (packet loss concealment)
     pub regulator_plc_count: u64,
-    /// Number of packets skipped (late/reordered)
-    pub regulator_skipped: u64,
     /// Last packet sequence number received (u16, wraps at 65535)
     pub regulator_last_seq: u16,
     /// Packets rejected by the regulator (bad channel count, a channel count
@@ -226,7 +224,6 @@ pub(crate) fn build_session_stats(
         regulator_initialized,
         regulator_packets_played: reg_stats.packets_played,
         regulator_plc_count: reg_stats.glitches,
-        regulator_skipped: reg_stats.skipped,
         regulator_last_seq: reg_stats.last_seq_received,
         regulator_packets_rejected: reg_stats.packets_rejected,
     }
@@ -1105,7 +1102,6 @@ mod tests {
             headroom_ms: 5.0,
             max_latency_ms: 30.0,
             glitches: 3,
-            skipped: 1,
             packets_received: 1000,
             packets_played: 997,
             last_seq_received: 42,
@@ -1131,7 +1127,6 @@ mod tests {
         assert!((s.regulator_headroom_ms - 5.0).abs() < 1e-9);
         assert!((s.regulator_max_latency_ms - 30.0).abs() < 1e-9);
         assert_eq!(s.regulator_plc_count, 3);
-        assert_eq!(s.regulator_skipped, 1);
         assert_eq!(s.regulator_packets_played, 997);
         assert_eq!(s.regulator_last_seq, 42);
         assert_eq!(s.regulator_packets_rejected, 7);

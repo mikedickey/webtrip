@@ -11,8 +11,6 @@ interface DemoStats {
   played: number;
   plc: number;
   plcRate: number;
-  skipped: number;
-  lossRate: number;
 }
 
 /** Connection statistics, polled from the session twice a second while mounted. */
@@ -24,8 +22,6 @@ export default function StatsPanel({ engine }: { engine: DemoEngine }) {
       const s = engine.session.get_stats();
       const played = Number(s.regulator_packets_played);
       const plc = Number(s.regulator_plc_count);
-      const skipped = Number(s.regulator_skipped);
-      const received = Number(s.packets_received);
       setStats({
         toleranceMs: s.regulator_tolerance_ms,
         initialized: s.regulator_initialized,
@@ -36,8 +32,6 @@ export default function StatsPanel({ engine }: { engine: DemoEngine }) {
         played,
         plc,
         plcRate: played > 0 ? (plc / played) * 100 : 0,
-        skipped,
-        lossRate: received > 0 ? (skipped / received) * 100 : 0,
       });
     }, 500);
     return () => clearInterval(id);
@@ -72,7 +66,6 @@ export default function StatsPanel({ engine }: { engine: DemoEngine }) {
         {rows([
           ["Packets played:", String(stats.played)],
           ["PLC activations:", `${stats.plc} (${stats.plcRate.toFixed(2)}%)`],
-          ["Packets skipped:", `${stats.skipped} (${stats.lossRate.toFixed(2)}%)`],
         ])}
       </div>
     </div>
