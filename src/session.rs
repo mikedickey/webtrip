@@ -301,11 +301,14 @@ impl WebTripSession {
 
         // Create owned buffers
         let local_to_network_buffer = Box::new(RingBuffer::new());
-        let network_to_local_buffer = Box::new(Regulator::new());
-
-        // Configure regulator with auto-adaptive tolerance and headroom (-500.0).
+        // Regulator with auto-adaptive tolerance and headroom (-500.0).
         // The peer's actual count is still adopted from its first packet.
-        network_to_local_buffer.configure(receive_channels as usize, buffer_size, sample_rate, -500.0);
+        let network_to_local_buffer = Box::new(Regulator::with_params(
+            receive_channels as usize,
+            buffer_size,
+            sample_rate,
+            -500.0,
+        ));
 
         Ok(WebTripSession {
             audio_params_ptr,
