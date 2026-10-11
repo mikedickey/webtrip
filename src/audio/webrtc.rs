@@ -294,6 +294,10 @@ pub struct WebRtcTransport {
     receive_queue: Rc<RefCell<VecDeque<Vec<u8>>>>,
     /// Hub signaling client (used when connecting to JackTrip hub)
     signaling: Option<HubSignaling>,
+    /// Where `signaling` lives while `connect_to_hub` is in flight (shared
+    /// with its ICE callback), so `close_sync` can still hang it up when the
+    /// session abandons the dial mid-handshake.
+    signaling_in_setup: Option<Rc<RefCell<Option<HubSignaling>>>>,
     /// Callbacks stored as closures
     #[allow(clippy::type_complexity)]
     on_message_closure: Option<Closure<dyn FnMut(MessageEvent)>>,
@@ -342,6 +346,7 @@ impl WebRtcTransport {
             state: TransportState::Disconnected,
             receive_queue: Rc::new(RefCell::new(VecDeque::with_capacity(64))),
             signaling: None,
+            signaling_in_setup: None,
             on_message_closure: None,
             on_channel_open_closure: None,
             on_channel_close_closure: None,
@@ -562,6 +567,7 @@ impl WebRtcTransport {
 
         // Wrap signaling in Rc<RefCell<>> for safe sharing with closures
         let signaling_rc = Rc::new(RefCell::new(self.signaling.take()));
+        self.signaling_in_setup = Some(signaling_rc.clone());
         let signaling_for_ice = signaling_rc.clone();
         
         let ice_js_callback = Closure::wrap(Box::new(move |candidate: JsValue, sdp_mid: JsValue, sdp_m_line_index: JsValue| {
@@ -753,6 +759,7 @@ impl WebRtcTransport {
         
         // NOW restore signaling back to self (after connection is complete)
         self.signaling = signaling_rc.borrow_mut().take();
+        self.signaling_in_setup = None;
         
         // Update our state now that we're connected
         self.state = TransportState::Connected;
@@ -914,6 +921,14 @@ impl WebRtcTransport {
 
         // Disconnect signaling
         if let Some(mut sig) = self.signaling.take() {
+            sig.disconnect();
+        }
+        // ...including a handshake still in progress (the session abandoned
+        // the dial). Detach its state callback first: `connect_to_hub` would
+        // take our own hang-up for the hub closing the WebSocket and reject a
+        // connect promise nobody awaits any more.
+        if let Some(mut sig) = self.signaling_in_setup.take().and_then(|rc| rc.borrow_mut().take()) {
+            sig.clear_on_state_change();
             sig.disconnect();
         }
 

@@ -163,8 +163,8 @@ fn capability_max_channels(track: &MediaStreamTrack) -> Result<Option<u32>, JsVa
 /// capture track's channel capability, and stops the stream. Resolves to a
 /// count in `[1, MAX_CHANNELS]`.
 ///
-/// A module-level function rather than a session method, so it can run while
-/// a `connectToStudio` call holds the session borrowed.
+/// A module-level function rather than a session method: it probes hardware
+/// and needs nothing from a session.
 #[wasm_bindgen(js_name = getInputDeviceChannels)]
 pub async fn get_input_device_channels(device_id: Option<String>) -> Result<u32, JsValue> {
     let media_devices = get_media_devices()?;

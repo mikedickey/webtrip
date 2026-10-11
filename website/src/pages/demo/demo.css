@@ -84,7 +84,7 @@
 }
 
 .connection-status.connecting .status-dot,
-.connection-status.negotiating .status-dot {
+.connection-status.disconnecting .status-dot {
   background: #f0a000;
   box-shadow: 0 0 10px rgba(240, 160, 0, 0.5);
   animation: pulse 1s ease-in-out infinite;
@@ -128,6 +128,13 @@
   display: flex;
   gap: 8px;
   margin-bottom: 16px;
+}
+
+.connect-error {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: #ff4757;
+  margin: -8px 0 16px;
 }
 
 .action-btn {

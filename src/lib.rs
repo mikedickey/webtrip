@@ -11,6 +11,7 @@ pub mod models;
 
 // Other core modules
 mod dependent_module;
+mod lifecycle;
 pub mod session;
 
 // Shared scaffolding for browser (`wasm-bindgen-test`) tests. Holds the single

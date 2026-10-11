@@ -124,11 +124,9 @@ module-level async functions in `devices.rs`:
   context. Without `setSinkId` (Safari, Firefox) it reports the default
   output, which is the device those browsers play to anyway.
 
-They are free functions rather than `WebTripSession` methods deliberately:
-`connectToStudio` holds a `&mut` wasm-bindgen borrow of the session while it
-awaits, and calling back into the session during that window trips
-wasm-bindgen's "recursive use of an object" check. A free function never
-touches the session.
+They are free functions rather than `WebTripSession` methods because they
+need nothing from a session: they probe hardware, independent of any
+connection.
 
 Probing is optional. The session's input/output counts are *upper bounds*
 applied against the real devices at capture time, so an unprobed client with
@@ -395,10 +393,11 @@ restores it (Mix to Mono by default).
 | Mono | 1 | 1 | identity; the worklet node keeps only channel 0 |
 
 The demo applies all four counts in `handleConnect`, right before
-`connectToStudio` while the session is still `Idle`. So a remount never needs
-to re-sync the module-singleton session. Connection and device settings are
-locked from connect start until the session is back to idle; gain, volume, and
-monitor stay live.
+`connectToStudio`; Connect is only enabled while the session is `Idle`, so the
+setters always take effect. So a remount never needs to re-sync the
+module-singleton session. Connection and device settings are locked from
+connect start until the session is back to idle; gain, volume, and monitor
+stay live.
 
 ---
 
