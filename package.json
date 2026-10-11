@@ -13,6 +13,7 @@
     "build:container:webtrip": "docker build -t webtrip/webtrip -f containers/webtrip/Containerfile .",
     "check": "RUSTFLAGS=\"$npm_package_config_web_sys_cfg $npm_package_config_wasm_rustflags\" cargo check --target wasm32-unknown-unknown -Zbuild-std=std,panic_abort",
     "test": "RUSTFLAGS=\"$npm_package_config_web_sys_cfg\" cargo test",
+    "test:miri": "RUSTFLAGS=\"$npm_package_config_web_sys_cfg\" cargo miri test --lib audio::regulator",
     "coverage": "mkdir -p coverage && RUSTFLAGS=\"$npm_package_config_web_sys_cfg\" cargo llvm-cov --lcov --output-path coverage/lcov.info",
     "test:wasm": "RUSTFLAGS=\"$npm_package_config_web_sys_cfg $npm_package_config_wasm_rustflags\" scripts/wasm-browser-env.sh test wasm-pack test --headless --chrome -- -Zbuild-std=std,panic_abort",
     "test:integration": "npm run build && npm run test:integration:run",

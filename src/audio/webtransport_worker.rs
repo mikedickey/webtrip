@@ -122,7 +122,7 @@ fn classify_receive_error(receive_errors: u64, packets_received: u64) -> Receive
 /// realtime-correctness logic (deserialize → deliver, error accounting,
 /// high-error-rate classification) is unit-testable without a live
 /// WebTransport connection. The `unsafe` raw-pointer deref of the regulator
-/// stays at the [`receive_loop`] call site; here it is an ordinary `&mut`.
+/// stays at the [`receive_loop`] call site; here it is an ordinary `&`.
 /// Deserialize-and-push itself lives in
 /// [`deliver_received_packet`](crate::audio::transport::deliver_received_packet),
 /// shared with the WebRTC transport's receive path; a rejected push outcome is
@@ -130,7 +130,7 @@ fn classify_receive_error(receive_errors: u64, packets_received: u64) -> Receive
 /// here.
 fn handle_datagram(
     data: &[u8],
-    regulator: Option<&mut Regulator>,
+    regulator: Option<&Regulator>,
     samples: &mut Vec<f32>,
     stats: &mut WebTransportWorkerStats,
 ) {
@@ -203,7 +203,7 @@ fn signal_connection_lost() {
 struct WorkerState {
     /// Shared pointer to RingBuffer (send path: AudioWorklet -> Network); `&self` API.
     ring_buffer_ptr: SharedPtr<RingBuffer>,
-    /// Shared pointer to Regulator (receive path: Network -> AudioWorklet); still `&mut`.
+    /// Shared pointer to Regulator (receive path: Network -> AudioWorklet); `&self` SPSC API.
     regulator_ptr: SharedPtr<Regulator>,
     /// Audio buffer configuration
     buffer_size: usize,
@@ -718,10 +718,9 @@ async fn receive_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(
                 WORKER_STATE.with(|state| {
                     let state = state.borrow();
 
-                    // SAFETY: `Regulator::push` is `&mut self`; see
-                    // `SharedPtr::as_mut`. Null (init/teardown race) yields None,
-                    // so the datagram is still counted but the push is skipped.
-                    let regulator = unsafe { state.regulator_ptr.as_mut() };
+                    // SAFETY: pointer lifecycle is owned by WebTripSession; the
+                    // pointee is reached via `&Regulator` (SPSC interior mutability).
+                    let regulator = state.regulator_ptr.as_ref();
                     let mut samples = state.samples_buffer.borrow_mut();
                     STATS.with(|stats| {
                         handle_datagram(&data, regulator, &mut samples, &mut stats.borrow_mut());
@@ -916,7 +915,7 @@ mod tests {
         // regulator adopted its channel count from the peer, this fixture
         // reproduced the production bug: the local toggle's channel count
         // permanently silenced a peer whose count differed from it.
-        let mut regulator = Regulator::with_params(2, 128, 48_000, 5.0);
+        let regulator = Regulator::with_params(2, 128, 48_000, 5.0);
         let mut samples = Vec::new();
         let mut stats = WebTransportWorkerStats::default();
         assert!(!regulator.is_initialized());
@@ -926,7 +925,7 @@ mod tests {
         let audio: Vec<f32> = (0..128).map(|i| (i as f32) / 128.0).collect();
         let datagram = AudioPacket::mono(5, 0, audio).serialize().unwrap();
 
-        handle_datagram(&datagram, Some(&mut regulator), &mut samples, &mut stats);
+        handle_datagram(&datagram, Some(&regulator), &mut samples, &mut stats);
 
         // The decoded packet reached the regulator (initialized + seq recorded),
         // adopting the peer's mono count rather than being rejected for
@@ -950,7 +949,7 @@ mod tests {
         let audio2: Vec<f32> = (0..128).map(|i| (i as f32) / 128.0).collect();
         let stereo: Vec<f32> = audio2.iter().flat_map(|&s| [s, s]).collect();
         let datagram2 = AudioPacket::stereo(6, 0, stereo).serialize().unwrap();
-        handle_datagram(&datagram2, Some(&mut regulator), &mut samples, &mut stats);
+        handle_datagram(&datagram2, Some(&regulator), &mut samples, &mut stats);
 
         assert_eq!(stats.packets_received, 2);
         assert_eq!(
@@ -965,13 +964,13 @@ mod tests {
 
     #[test]
     fn handle_datagram_corrupt_counts_error_and_skips_push() {
-        let mut regulator = Regulator::new();
+        let regulator = Regulator::new();
         let mut samples = Vec::new();
         let mut stats = WebTransportWorkerStats::default();
 
         // Too short to contain even the 16-byte header → deserialize fails.
         let garbage = [0u8; 4];
-        handle_datagram(&garbage, Some(&mut regulator), &mut samples, &mut stats);
+        handle_datagram(&garbage, Some(&regulator), &mut samples, &mut stats);
 
         assert!(
             !regulator.is_initialized(),

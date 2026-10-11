@@ -29,6 +29,8 @@
 //!    └─> tick() loop sends/receives packets via Transport trait
 //! ```
 
+use std::mem::ManuallyDrop;
+
 use wasm_bindgen::prelude::*;
 
 use crate::audio::engine::AudioEngine;
@@ -92,8 +94,6 @@ pub struct SessionStats {
     pub regulator_packets_played: u64,
     /// Number of PLC activations (packet loss concealment)
     pub regulator_plc_count: u64,
-    /// Number of packets skipped (late/reordered)
-    pub regulator_skipped: u64,
     /// Last packet sequence number received (u16, wraps at 65535)
     pub regulator_last_seq: u16,
     /// Packets rejected by the regulator (bad channel count, a channel count
@@ -226,7 +226,6 @@ pub(crate) fn build_session_stats(
         regulator_initialized,
         regulator_packets_played: reg_stats.packets_played,
         regulator_plc_count: reg_stats.glitches,
-        regulator_skipped: reg_stats.skipped,
         regulator_last_seq: reg_stats.last_seq_received,
         regulator_packets_rejected: reg_stats.packets_rejected,
     }
@@ -239,9 +238,11 @@ pub struct WebTripSession {
     audio_params_ptr: *const AudioParams,
     audio_engine: Option<AudioEngine>,
 
-    // Owned buffers (shared with AudioWorklet and Transport via pointers)
-    local_to_network_buffer: Box<RingBuffer>,
-    network_to_local_buffer: Box<Regulator>,
+    // Owned buffers (shared with AudioWorklet and Transport via pointers).
+    // `ManuallyDrop` because `Drop` must hand them to a deferred task that
+    // frees them only once both consumers have quiesced (see `Drop`).
+    local_to_network_buffer: ManuallyDrop<Box<RingBuffer>>,
+    network_to_local_buffer: ManuallyDrop<Box<Regulator>>,
 
     // Network components
     transport: Option<Box<dyn Transport>>,
@@ -304,17 +305,20 @@ impl WebTripSession {
 
         // Create owned buffers
         let local_to_network_buffer = Box::new(RingBuffer::new());
-        let mut network_to_local_buffer = Box::new(Regulator::new());
-
-        // Configure regulator with auto-adaptive tolerance and headroom (-500.0).
+        // Regulator with auto-adaptive tolerance and headroom (-500.0).
         // The peer's actual count is still adopted from its first packet.
-        network_to_local_buffer.configure(receive_channels as usize, buffer_size, sample_rate, -500.0);
+        let network_to_local_buffer = Box::new(Regulator::with_params(
+            receive_channels as usize,
+            buffer_size,
+            sample_rate,
+            -500.0,
+        ));
 
         Ok(WebTripSession {
             audio_params_ptr,
             audio_engine: None,
-            local_to_network_buffer,
-            network_to_local_buffer,
+            local_to_network_buffer: ManuallyDrop::new(local_to_network_buffer),
+            network_to_local_buffer: ManuallyDrop::new(network_to_local_buffer),
             transport: None,
             transport_type: TransportType::WebRTC, // Default to WebRTC
             state: SessionState::Idle,
@@ -335,8 +339,8 @@ impl WebTripSession {
     /// transport before it connects.
     fn audio_buffer_config(&mut self) -> AudioBufferConfig {
         AudioBufferConfig {
-            local_to_network: SharedPtr::new(&mut *self.local_to_network_buffer),
-            network_to_local: SharedPtr::new(&mut *self.network_to_local_buffer),
+            local_to_network: SharedPtr::new(&mut **self.local_to_network_buffer),
+            network_to_local: SharedPtr::new(&mut **self.network_to_local_buffer),
             buffer_size: self.buffer_size,
             send_channels: self.send_channels,
             receive_channels: self.receive_channels,
@@ -552,8 +556,8 @@ impl WebTripSession {
         // Get raw pointers to owned buffers. `AudioEngine` is a `#[wasm_bindgen]`
         // boundary type, so it takes raw pointers here and wraps them in
         // `SharedPtr` internally when it builds the `AudioProcessor`.
-        let local_to_network_ptr = &mut *self.local_to_network_buffer as *mut RingBuffer;
-        let network_to_local_ptr = &mut *self.network_to_local_buffer as *mut Regulator;
+        let local_to_network_ptr = &mut **self.local_to_network_buffer as *mut RingBuffer;
+        let network_to_local_ptr = &mut **self.network_to_local_buffer as *mut Regulator;
 
         // Create audio engine with network support
         let engine = AudioEngine::create_with_network(
@@ -597,15 +601,20 @@ impl WebTripSession {
         Ok(())
     }
 
-    /// Stop audio capture (internal use only)
-    fn stop_capture(&mut self) {
+    /// Stop audio capture (internal use only).
+    ///
+    /// Awaits worklet quiescence (via [`AudioEngine::stop_capture`]'s
+    /// `AudioContext.suspend`) before returning, so the caller may safely
+    /// [`Regulator::reset`](crate::audio::regulator::Regulator::reset)
+    /// afterwards (WEB-53 Bug 7).
+    async fn stop_capture(&mut self) {
         // Stop audio callback loop first (no more ticks)
         self.stop_audio_callback_loop();
         
         // IMPORTANT: Stop audio engine before dropping
         // This ensures AudioWorklet stops using buffer pointers
         if let Some(ref mut engine) = self.audio_engine {
-            engine.stop_capture();
+            engine.stop_capture().await;
         }
         self.audio_engine = None;
 
@@ -805,8 +814,9 @@ impl WebTripSession {
             // no-op on already-closed state.
         }
 
-        // Stop audio capture when disconnecting (this will also stop the audio callback loop)
-        self.stop_capture();
+        // Stop audio capture when disconnecting (this will also stop the audio callback loop
+        // and quiesce the worklet via AudioContext.suspend — required before reset).
+        self.stop_capture().await;
 
         // Clear any pending capture parameters
         self.pending_capture_params = None;
@@ -955,13 +965,33 @@ impl WebTripSession {
 
 impl Drop for WebTripSession {
     fn drop(&mut self) {
-        // `disconnect()` is now async and can't be awaited from Drop. Instead,
-        // best-effort teardown: drop the transport (its own Drop impl fires
-        // off the shutdown message and schedules the fallback terminate) and
-        // stop audio capture. The Regulator doesn't need to be reset in Drop
-        // because the whole session is being deallocated.
-        self.transport = None;
-        self.stop_capture();
+        // Drop can't await, but the worklet render thread and the WebTransport
+        // worker both hold raw pointers into the buffers, and neither stops
+        // synchronously (`"stop"` and `{type:"disconnect"}` are just posted
+        // messages). Freeing the buffers here would let a pending `process()`
+        // or worker `push()` dereference freed storage. Instead, move the
+        // buffers into a task that runs the same quiescing teardown as
+        // `disconnect()` and frees them only afterwards. No reset needed: the
+        // buffers are being deallocated.
+        self.stop_audio_callback_loop();
+        let transport = self.transport.take();
+        let engine = self.audio_engine.take();
+        // SAFETY: `Drop::drop` runs once and nothing reads the fields after.
+        let buffers = unsafe {
+            (
+                ManuallyDrop::take(&mut self.local_to_network_buffer),
+                ManuallyDrop::take(&mut self.network_to_local_buffer),
+            )
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(mut transport) = transport {
+                transport.close().await;
+            }
+            if let Some(mut engine) = engine {
+                engine.stop_capture().await;
+            }
+            drop(buffers);
+        });
     }
 }
 
@@ -1094,7 +1124,6 @@ mod tests {
             headroom_ms: 5.0,
             max_latency_ms: 30.0,
             glitches: 3,
-            skipped: 1,
             packets_received: 1000,
             packets_played: 997,
             last_seq_received: 42,
@@ -1120,7 +1149,6 @@ mod tests {
         assert!((s.regulator_headroom_ms - 5.0).abs() < 1e-9);
         assert!((s.regulator_max_latency_ms - 30.0).abs() < 1e-9);
         assert_eq!(s.regulator_plc_count, 3);
-        assert_eq!(s.regulator_skipped, 1);
         assert_eq!(s.regulator_packets_played, 997);
         assert_eq!(s.regulator_last_seq, 42);
         assert_eq!(s.regulator_packets_rejected, 7);

@@ -253,7 +253,7 @@ pub struct AudioProcessor {
     /// Null when no network is attached; reached via its `&self` API through [`SharedPtr::as_ref`].
     local_to_network_buffer: SharedPtr<RingBuffer>,
     /// Jitter buffer for receiving audio from network (network → main thread → jitter buffer → worklet → audio device).
-    /// Null when no network is attached; still `&mut`-accessed via [`SharedPtr::as_mut`].
+    /// Null when no network is attached; reached via its `&self` SPSC API through [`SharedPtr::as_ref`].
     network_to_local_buffer: SharedPtr<Regulator>,
     /// Temporary buffer for gained audio. Planar multi-channel, same layout
     /// as `process()`'s `input`: `in_channels * frames` samples, `gained[ch *
@@ -482,39 +482,34 @@ impl AudioProcessor {
     }
 
     /// Receive remote audio from network via jitter buffer into
-    /// `remote_interleaved`. Returns the regulator's channel count, or `0`
-    /// when no network buffer is attached (the caller treats that as
-    /// silence).
+    /// `remote_interleaved`. Returns the regulator's channel count **after**
+    /// `pop` (so it is ordered by that call's Acquire — WEB-53 Bug 3), or `0`
+    /// when no network buffer is attached (the caller treats that as silence).
     ///
     /// `Regulator::pop()`'s return value is informational metadata (real vs.
     /// concealed) and must NOT gate playback — concealed audio is the entire
     /// point of jitter buffering and must be played to avoid clicks.
     fn receive_from_network(&mut self, frames: usize) -> usize {
-        // SAFETY: `Regulator::pop` is still `&mut self`, so we take a `&mut`
-        // through `SharedPtr::as_mut`. The push side runs on the network thread;
-        // this remains the not-yet-sound path documented on `SharedPtr::as_mut`.
-        let Some(regulator) = (unsafe { self.network_to_local_buffer.as_mut() }) else {
+        let Some(regulator) = self.network_to_local_buffer.as_ref() else {
             return 0;
         };
 
-        // The pop width is the regulator's own — it is the peer's channel
-        // count (adopted from their first packet) and fpp, not a local
-        // playback-device setting. `AudioParams::send_channels` governs
-        // only the send path.
-        let channels = regulator.channels();
+        // Size the scratch to the max wire width so we can pop before reading
+        // the adopted channel count. `pop` only writes `channels * fpp` samples;
+        // the Acquire inside it makes the subsequent `channels()` read coherent.
         let fpp = regulator.fpp();
         debug_assert_eq!(fpp, frames, "regulator fpp must match the worklet's frame count");
-        let interleaved_len = fpp * channels;
+        let interleaved_cap = fpp * MAX_CHANNELS as usize;
 
-        if self.remote_interleaved.len() < interleaved_len {
-            self.remote_interleaved.resize(interleaved_len, 0.0);
+        if self.remote_interleaved.len() < interleaved_cap {
+            self.remote_interleaved.resize(interleaved_cap, 0.0);
         }
 
         // Read the regulator's output (always populates the buffer; pop()'s
         // bool distinguishes real vs concealed but is irrelevant for mixing).
-        regulator.pop(&mut self.remote_interleaved[..interleaved_len]);
+        regulator.pop(&mut self.remote_interleaved[..interleaved_cap]);
 
-        channels
+        regulator.channels()
     }
 }
 

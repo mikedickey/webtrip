@@ -33,7 +33,7 @@ pub(crate) const HIGH_RATE_WARN_INTERVAL: u64 = 50;
 /// `console::warn` so a persistently silent stream is diagnosable instead of
 /// failing with no stat and no log.
 pub(crate) fn deliver_received_packet(
-    regulator: &mut Regulator,
+    regulator: &Regulator,
     data: &[u8],
     samples: &mut Vec<f32>,
 ) -> Result<PushOutcome, ProtocolError> {
@@ -111,8 +111,8 @@ pub enum TransportState {
 pub struct AudioBufferConfig {
     /// Ring buffer (local-to-network); reached via its `&self` API.
     pub local_to_network: SharedPtr<crate::audio::ring_buffer::RingBuffer>,
-    /// Jitter buffer (network-to-local); still `&mut`-accessed via
-    /// [`SharedPtr::as_mut`].
+    /// Jitter buffer (network-to-local); reached via its `&self` SPSC API
+    /// through [`SharedPtr::as_ref`].
     pub network_to_local: SharedPtr<crate::audio::regulator::Regulator>,
     /// Buffer size in samples per channel
     pub buffer_size: usize,

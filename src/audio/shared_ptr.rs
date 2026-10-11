@@ -13,9 +13,11 @@
 //!   `unsafe { &*ptr }` incantation being copy-pasted at every call site.
 //!
 //! The pointee is expected to coordinate cross-thread access through atomics
-//! (e.g. [`RingBuffer`](crate::audio::ring_buffer::RingBuffer)'s `&self` API).
-//! For pointees that still expose `&mut self` methods, [`SharedPtr::as_mut`] is
-//! provided but marked `unsafe` — see its docs.
+//! and/or interior mutability (e.g. [`RingBuffer`](crate::audio::ring_buffer::RingBuffer)
+//! and [`Regulator`](crate::audio::regulator::Regulator)'s `&self` APIs). Prefer
+//! [`as_ref`](SharedPtr::as_ref). [`as_mut`](SharedPtr::as_mut) remains for the
+//! rare case where exclusive access is genuinely proven; nothing in the audio
+//! path uses it after WEB-53.
 
 /// An integer address into shared WASM linear memory, typed as a pointer to `T`.
 ///
@@ -86,8 +88,8 @@ impl<T> SharedPtr<T> {
     ///
     /// This is the sound way to reach the pointee: `&T` may freely alias across
     /// threads, so both the producer and consumer may hold one simultaneously.
-    /// The pointee must therefore use interior mutability (atomics) for any
-    /// state it mutates through `&self`.
+    /// The pointee must therefore use interior mutability (atomics / `UnsafeCell`)
+    /// for any state it mutates through `&self`.
     pub fn as_ref<'a>(&self) -> Option<&'a T> {
         if self.ptr.is_null() {
             return None;
@@ -107,12 +109,9 @@ impl<T> SharedPtr<T> {
     /// exclusive access to the whole pointee. It is sound only if no other
     /// reference to the pointee is live for the duration of the returned borrow.
     ///
-    /// Prefer [`as_ref`](Self::as_ref). This exists for pointees that still
-    /// expose `&mut self` methods — currently only
-    /// [`Regulator`](crate::audio::regulator::Regulator), whose `push`/`pop` are
-    /// driven from different threads. That pattern is not yet provably sound (a
-    /// concurrency redesign of the ported jitter buffer is tracked separately);
-    /// routing it through here at least keeps the raw deref in one module.
+    /// Prefer [`as_ref`](Self::as_ref). The audio path no longer needs this for
+    /// [`Regulator`](crate::audio::regulator::Regulator) (WEB-53); it remains for
+    /// any future pointee that genuinely requires exclusive access.
     pub unsafe fn as_mut<'a>(&self) -> Option<&'a mut T> {
         if self.ptr.is_null() {
             return None;
