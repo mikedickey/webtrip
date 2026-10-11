@@ -6,7 +6,8 @@
 //! Note: Receiving is handled directly by the LockFreeJitterBuffer,
 //! which the worklet reads from directly - no intermediate buffer needed!
 
-use std::cell::Cell;
+use std::cell::UnsafeCell;
+use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use wasm_bindgen::prelude::*;
 
@@ -18,21 +19,32 @@ const RING_BUFFER_SIZE: usize = 4096;
 /// Data flow:
 ///   Worklet: write() -> ring buffer -> Atomics.notify()
 ///   Main thread: Atomics.waitAsync() -> read() -> WebRTC send
+///
+/// # Concurrency contract
+///
+/// Single-producer, single-consumer: one thread calls [`write`](Self::write)
+/// and one (other) thread calls [`read`](Self::read). Calling `write` from two
+/// threads at once, or `read` from two threads at once, is undefined behavior.
+/// Everything else is atomic and may be called from any thread.
 #[wasm_bindgen]
 pub struct RingBuffer {
     /// Ring buffer for audio going TO the network (local mic -> network).
     ///
-    /// Each sample sits in a [`Cell`] so `write`/`read` can take `&self` rather
-    /// than `&mut self`. That matters because the producer (AudioWorklet) and
-    /// consumer (main-thread tick) reach this buffer concurrently through a
+    /// Each sample sits in an [`UnsafeCell`] so `write`/`read` can take `&self`
+    /// rather than `&mut self`. That matters because the producer (AudioWorklet)
+    /// and consumer (main-thread tick) reach this buffer concurrently through a
     /// shared pointer: a `&mut self` API would force both sides to materialise a
     /// `&mut RingBuffer` to the *same* object, which is aliasing UB even though
-    /// they touch disjoint regions. With `&self` + interior mutability both sides
-    /// hold a freely-aliasable `&RingBuffer` instead. Producer and consumer only
-    /// ever touch disjoint indices — the range they write/read is bounded by the
-    /// `write_pos`/`read_pos` gap — and those positions are published with
-    /// Acquire/Release ordering, so no two threads access the same `Cell` at once.
-    buffer: Vec<Cell<f32>>,
+    /// they touch disjoint regions.
+    ///
+    /// Producer and consumer never touch the same slot: `write` only fills the
+    /// free gap from `write_pos` and refuses if it would overrun `read_pos`;
+    /// `read` only drains the filled gap from `read_pos` and refuses if
+    /// `write_pos` has not reached the end. Each side publishes its position
+    /// with `Release` only after its slot accesses, and loads the other side's
+    /// with `Acquire`, so a slot changes hands only after the previous owner is
+    /// done with it. See the `unsafe impl Sync` below.
+    buffer: Box<[UnsafeCell<f32>]>,
 
     /// Write position (worklet writes, main thread reads)
     write_pos: AtomicU32,
@@ -62,7 +74,7 @@ impl RingBuffer {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
         Self {
-            buffer: vec![Cell::new(0.0); RING_BUFFER_SIZE],
+            buffer: (0..RING_BUFFER_SIZE).map(|_| UnsafeCell::new(0.0)).collect(),
             write_pos: AtomicU32::new(0),
             read_pos: AtomicU32::new(0),
             overruns: AtomicU64::new(0),
@@ -145,10 +157,15 @@ impl RingBuffer {
             return false;
         }
 
-        let start = (write_pos as usize) % RING_BUFFER_SIZE;
-        for (i, &sample) in samples.iter().enumerate() {
-            let idx = (start + i) % RING_BUFFER_SIZE;
-            self.buffer[idx].set(sample);
+        let (start, head_len) = wrap_split(write_pos, samples.len());
+        let (head, tail) = samples.split_at(head_len);
+        // SAFETY: both runs lie in the free gap `[write_pos, read_pos + SIZE)`,
+        // which the consumer does not touch (see `buffer`), and only the single
+        // producer writes (see the concurrency contract). `wrap_split` keeps
+        // each run inside `buffer`.
+        unsafe {
+            ptr::copy_nonoverlapping(head.as_ptr(), self.slot_ptr(start), head.len());
+            ptr::copy_nonoverlapping(tail.as_ptr(), self.slot_ptr(0), tail.len());
         }
 
         self.write_pos.store(
@@ -185,10 +202,15 @@ impl RingBuffer {
             return false;
         }
 
-        let start = (read_pos as usize) % RING_BUFFER_SIZE;
-        for (i, sample) in output.iter_mut().enumerate() {
-            let idx = (start + i) % RING_BUFFER_SIZE;
-            *sample = self.buffer[idx].get();
+        let (start, head_len) = wrap_split(read_pos, output.len());
+        let (head, tail) = output.split_at_mut(head_len);
+        // SAFETY: both runs lie in the filled gap `[read_pos, write_pos)`, whose
+        // writes the `Acquire` load of `write_pos` made visible and which the
+        // producer does not touch until `read_pos` passes it. `wrap_split`
+        // keeps each run inside `buffer`.
+        unsafe {
+            ptr::copy_nonoverlapping(self.slot_ptr(start), head.as_mut_ptr(), head.len());
+            ptr::copy_nonoverlapping(self.slot_ptr(0), tail.as_mut_ptr(), tail.len());
         }
 
         self.read_pos.store(
@@ -205,16 +227,31 @@ impl RingBuffer {
 
         true
     }
+}
 
-    /// Clear the buffer
-    pub fn clear(&self) {
-        for slot in &self.buffer {
-            slot.set(0.0);
-        }
-        self.write_pos.store(0, Ordering::SeqCst);
-        self.read_pos.store(0, Ordering::SeqCst);
+impl RingBuffer {
+    /// Raw pointer to slot `idx`, valid for access up to the end of `buffer`.
+    /// `UnsafeCell<f32>` has the same layout as `f32`, so the slots from `idx`
+    /// on form a contiguous `f32` run.
+    fn slot_ptr(&self, idx: usize) -> *mut f32 {
+        UnsafeCell::raw_get(self.buffer[idx..].as_ptr())
     }
 }
+
+/// Split a `len`-sample access starting at ring position `pos` into the two
+/// contiguous runs it covers: `[start, start + head_len)` up to the end of the
+/// buffer, then `[0, len - head_len)` after wrapping. `len` must not exceed
+/// `RING_BUFFER_SIZE`, which `write`/`read` guarantee by checking the gap first.
+fn wrap_split(pos: u32, len: usize) -> (usize, usize) {
+    let start = pos as usize % RING_BUFFER_SIZE;
+    (start, len.min(RING_BUFFER_SIZE - start))
+}
+
+// SAFETY: every field except `buffer` is atomic. Each `buffer` slot is owned by
+// exactly one of the single producer or single consumer at a time, and handed
+// over through the `write_pos`/`read_pos` Release/Acquire pair (see `buffer` and
+// the concurrency contract on the struct).
+unsafe impl Sync for RingBuffer {}
 
 impl Default for RingBuffer {
     fn default() -> Self {
@@ -381,22 +418,6 @@ mod tests {
     }
 
     #[test]
-    fn clear_resets_positions() {
-        let rb = streaming_buffer();
-        assert!(rb.write(&[1.0, 2.0, 3.0]));
-        assert_eq!(rb.available(), 3);
-
-        rb.clear();
-        assert_eq!(rb.available(), 0);
-
-        // Buffer is usable again after clearing.
-        assert!(rb.write(&[4.0, 5.0]));
-        let mut out = [0.0; 2];
-        assert!(rb.read(&mut out));
-        assert_eq!(out, [4.0, 5.0]);
-    }
-
-    #[test]
     fn reset_stats_zeros_counters() {
         let rb = streaming_buffer();
         let full: Vec<f32> = vec![0.0; RING_BUFFER_SIZE];
@@ -417,26 +438,19 @@ mod tests {
         // Share one buffer across two threads as a plain `&RingBuffer`. This
         // mirrors real usage where the buffer lives in a SharedArrayBuffer and
         // the producer (worklet) and consumer (main thread) touch disjoint
-        // regions of it concurrently. Because `write`/`read` take `&self`, no
-        // `&mut` aliasing (or `UnsafeCell`) is needed — the two threads simply
-        // hold a shared reference each.
+        // regions of it concurrently. Because `write`/`read` take `&self` and
+        // `RingBuffer` is `Sync`, the two threads simply hold a shared
+        // reference each.
         use std::sync::Arc;
 
-        struct Shared(RingBuffer);
-        // Safe: producer touches only the write half (write_pos + tail of buffer)
-        // and consumer touches only the read half (read_pos + head of buffer);
-        // both halves are synchronised through Acquire/Release atomics. `RingBuffer`
-        // is `!Sync` (its samples sit in `Cell`s), so the assertion is made here.
-        unsafe impl Sync for Shared {}
-
-        let shared = Arc::new(Shared(streaming_buffer()));
+        let shared = Arc::new(streaming_buffer());
 
         const CHUNK: usize = 128;
         const TOTAL: usize = CHUNK * 2000;
 
         let producer_shared = Arc::clone(&shared);
         let producer = thread::spawn(move || {
-            let rb = &producer_shared.0;
+            let rb = &*producer_shared;
             let mut next: usize = 0;
             while next < TOTAL {
                 let chunk: Vec<f32> = (next..next + CHUNK).map(|i| i as f32).collect();
@@ -448,7 +462,7 @@ mod tests {
             }
         });
 
-        let rb = &shared.0;
+        let rb = &*shared;
         let mut received: usize = 0;
         let mut out = vec![0.0; CHUNK];
         while received < TOTAL {
