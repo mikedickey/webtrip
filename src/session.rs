@@ -314,14 +314,13 @@ struct CaptureParams {
 /// connect in flight, one teardown at a time) live in the atomic
 /// [`Lifecycle`]. The remaining interior mutability (`Cell`/`RefCell`/`Rc`)
 /// holds browser objects and the JS callbacks wired to them. It is confined to
-/// the agent that created the session: the session holds `js_sys` values and
-/// raw pointers, so it is neither `Send` nor `Sync`, and its callbacks run on
-/// that same agent's event loop. No `RefCell` borrow is held across an
-/// `.await`.
+/// the agent that created the session: the session holds `js_sys` values, so
+/// it is neither `Send` nor `Sync`, and its callbacks run on that same
+/// agent's event loop. No `RefCell` borrow is held across an `.await`.
 #[wasm_bindgen]
 pub struct WebTripSession {
     // Audio components
-    audio_params_ptr: *const AudioParams,
+    audio_params: SharedPtr<AudioParams>,
     audio_engine: RefCell<Option<AudioEngine>>,
 
     // Owned buffers (shared with AudioWorklet and Transport via pointers).
@@ -369,7 +368,8 @@ pub struct WebTripSession {
 impl WebTripSession {
     /// Create a new session
     #[wasm_bindgen(constructor)]
-    pub fn new(audio_params_ptr: *const AudioParams) -> Result<WebTripSession, JsValue> {
+    pub fn new(audio_params_addr: usize) -> Result<WebTripSession, JsValue> {
+        let audio_params = SharedPtr::<AudioParams>::from_addr(audio_params_addr);
         let buffer_size = 128;
         let sample_rate = 48000;
         let send_channels = 1;
@@ -377,10 +377,8 @@ impl WebTripSession {
 
         // Sync the send width to AudioParams: the render thread conforms
         // captured audio to it (see `conform_interleaved_channels`).
-        if !audio_params_ptr.is_null() {
-            unsafe {
-                (*audio_params_ptr).set_send_channels(send_channels as u32);
-            }
+        if let Some(params) = audio_params.as_ref() {
+            params.set_send_channels(send_channels as u32);
         }
 
         // Create owned buffers
@@ -395,7 +393,7 @@ impl WebTripSession {
         ));
 
         Ok(WebTripSession {
-            audio_params_ptr,
+            audio_params,
             audio_engine: RefCell::new(None),
             local_to_network_buffer: ManuallyDrop::new(local_to_network_buffer),
             network_to_local_buffer: ManuallyDrop::new(network_to_local_buffer),
@@ -470,10 +468,8 @@ impl WebTripSession {
             return;
         }
         self.send_channels.set(channels);
-        if !self.audio_params_ptr.is_null() {
-            unsafe {
-                (*self.audio_params_ptr).set_send_channels(channels as u32);
-            }
+        if let Some(params) = self.audio_params.as_ref() {
+            params.set_send_channels(channels as u32);
         }
     }
 
@@ -954,11 +950,11 @@ impl WebTripSession {
     /// if capture fails to start.
     async fn start_engine(&self, capture: CaptureParams) -> Result<AudioEngine, JsValue> {
         // `AudioEngine` is a `#[wasm_bindgen]` boundary type, so it takes raw
-        // pointers here and wraps them in `SharedPtr` internally when it
-        // builds the `AudioProcessor`.
+        // pointers / addresses here and wraps them in `SharedPtr` internally
+        // when it builds the `AudioProcessor`.
         let (local_to_network, network_to_local) = self.buffer_ptrs();
         let mut engine =
-            AudioEngine::create_with_network(self.audio_params_ptr, local_to_network, network_to_local).await?;
+            AudioEngine::create_with_network(self.audio_params.addr(), local_to_network, network_to_local).await?;
 
         web_sys::console::log_1(&"🎙️ Starting audio capture after connection established".into());
         let output_device_id = self.output_device_id.borrow().clone();
@@ -1244,11 +1240,11 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    /// A session over `params`, which must outlive it (the session holds a raw
-    /// pointer to it): declare `params` first so it is dropped last.
+    /// A session over `params`, which must outlive it (the session holds its
+    /// address): declare `params` first so it is dropped last.
     #[cfg(target_arch = "wasm32")]
     fn new_session(params: &AudioParams) -> Rc<WebTripSession> {
-        Rc::new(WebTripSession::new(params as *const AudioParams).expect("session construction should succeed"))
+        Rc::new(WebTripSession::new(SharedPtr::from_ref(params).addr()).expect("session construction should succeed"))
     }
 
     /// The session's (send, receive, input, output) channel counts.

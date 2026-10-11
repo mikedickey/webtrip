@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use wasm_bindgen::prelude::*;
 
 use crate::audio::protocol::MAX_CHANNELS;
+use crate::audio::shared_ptr::SharedPtr;
 
 /// Minimum dB level (silence threshold)
 pub const MIN_DB: f32 = -60.0;
@@ -145,95 +146,91 @@ impl AudioParams {
 // Pointer-based helper functions for cross-thread access
 // ==============================================================================
 
-/// Create a new AudioParams instance for sharing state between threads
+/// Create a new AudioParams instance for sharing state between threads.
+///
+/// Returns its address in shared WASM linear memory; every consumer rebuilds a
+/// [`SharedPtr`] from it with [`SharedPtr::from_addr`]. The allocation is leaked
+/// so it outlives every agent that holds the address.
 #[wasm_bindgen(js_name = createAudioParams)]
-pub fn create_audio_params() -> *const AudioParams {
-    let params: &'static AudioParams = Box::leak(Box::default());
-    params as *const AudioParams
+pub fn create_audio_params() -> usize {
+    SharedPtr::from_ref(Box::leak(Box::<AudioParams>::default())).addr()
 }
 
-/// Run `f` against the [`AudioParams`] behind `ptr`, returning `fallback` when
-/// the pointer is null.
+/// Run `f` against the [`AudioParams`] at `addr`, returning `fallback` when the
+/// address is null.
 ///
-/// This is the single place the cross-thread `AudioParams` pointer is
-/// dereferenced. Every exported `*FromPtr` accessor funnels through here so the
-/// null guard and the `unsafe` deref live in exactly one audited spot instead of
-/// being copy-pasted per accessor. All `AudioParams` methods take `&self` (state
-/// is atomic interior mutability), so setters pass a `()` fallback and mutate
-/// through the shared reference.
-fn with_params<R>(ptr: *const AudioParams, fallback: R, f: impl FnOnce(&AudioParams) -> R) -> R {
-    if ptr.is_null() {
-        return fallback;
-    }
-    // SAFETY: `ptr` is non-null here and, per `create_audio_params`, points at a
-    // `Box::leak`ed `AudioParams` living for the lifetime of the module in shared
-    // WASM linear memory, so the reference is valid for the duration of `f`.
-    f(unsafe { &*ptr })
+/// Every exported `*FromPtr` accessor funnels through here, so the null guard
+/// and the deref are [`SharedPtr::as_ref`]'s rather than copy-pasted per
+/// accessor. All `AudioParams` methods take `&self` (state is atomic interior
+/// mutability), so setters pass a `()` fallback and mutate through the shared
+/// reference.
+fn with_params<R>(addr: usize, fallback: R, f: impl FnOnce(&AudioParams) -> R) -> R {
+    SharedPtr::<AudioParams>::from_addr(addr).as_ref().map_or(fallback, f)
 }
 
 /// Get volume level from params pointer (0.0 to 100.0)
 #[wasm_bindgen(js_name = getVolumeLevelFromPtr)]
-pub fn get_volume_level_from_ptr(ptr: *const AudioParams) -> f32 {
+pub fn get_volume_level_from_ptr(ptr: usize) -> f32 {
     with_params(ptr, 0.0, |p| p.get_volume_level())
 }
 
 /// Get dB level from params pointer (-60.0 to 0.0)
 #[wasm_bindgen(js_name = getDbLevelFromPtr)]
-pub fn get_db_level_from_ptr(ptr: *const AudioParams) -> f32 {
+pub fn get_db_level_from_ptr(ptr: usize) -> f32 {
     with_params(ptr, -60.0, |p| p.get_db_level())
 }
 
 /// Get peak level from params pointer (0.0 to 100.0)
 #[wasm_bindgen(js_name = getPeakLevelFromPtr)]
-pub fn get_peak_level_from_ptr(ptr: *const AudioParams) -> f32 {
+pub fn get_peak_level_from_ptr(ptr: usize) -> f32 {
     with_params(ptr, 0.0, |p| p.get_peak_level())
 }
 
 /// Get peak dB level from params pointer (-60.0 to 0.0)
 #[wasm_bindgen(js_name = getPeakDbLevelFromPtr)]
-pub fn get_peak_db_level_from_ptr(ptr: *const AudioParams) -> f32 {
+pub fn get_peak_db_level_from_ptr(ptr: usize) -> f32 {
     with_params(ptr, -60.0, |p| p.get_peak_db_level())
 }
 
 /// Set monitor volume from params pointer (0.0 to 1.0)
 #[wasm_bindgen(js_name = setMonitorVolumeFromPtr)]
-pub fn set_monitor_volume_from_ptr(ptr: *const AudioParams, volume: f32) {
+pub fn set_monitor_volume_from_ptr(ptr: usize, volume: f32) {
     with_params(ptr, (), |p| p.set_monitor_volume(volume));
 }
 
 /// Get monitor volume from params pointer (0.0 to 1.0)
 #[wasm_bindgen(js_name = getMonitorVolumeFromPtr)]
-pub fn get_monitor_volume_from_ptr(ptr: *const AudioParams) -> f32 {
+pub fn get_monitor_volume_from_ptr(ptr: usize) -> f32 {
     with_params(ptr, 0.0, |p| p.get_monitor_volume())
 }
 
 /// Set input gain from params pointer (-20.0 to +20.0 dB)
 #[wasm_bindgen(js_name = setInputGainFromPtr)]
-pub fn set_input_gain_from_ptr(ptr: *const AudioParams, gain_db: f32) {
+pub fn set_input_gain_from_ptr(ptr: usize, gain_db: f32) {
     with_params(ptr, (), |p| p.set_input_gain(gain_db));
 }
 
 /// Get input gain from params pointer (dB)
 #[wasm_bindgen(js_name = getInputGainFromPtr)]
-pub fn get_input_gain_from_ptr(ptr: *const AudioParams) -> f32 {
+pub fn get_input_gain_from_ptr(ptr: usize) -> f32 {
     with_params(ptr, 0.0, |p| p.get_input_gain())
 }
 
 /// Set output volume from params pointer (0.0 to 1.0)
 #[wasm_bindgen(js_name = setOutputVolumeFromPtr)]
-pub fn set_output_volume_from_ptr(ptr: *const AudioParams, volume: f32) {
+pub fn set_output_volume_from_ptr(ptr: usize, volume: f32) {
     with_params(ptr, (), |p| p.set_output_volume(volume));
 }
 
 /// Get output volume from params pointer (0.0 to 1.0)
 #[wasm_bindgen(js_name = getOutputVolumeFromPtr)]
-pub fn get_output_volume_from_ptr(ptr: *const AudioParams) -> f32 {
+pub fn get_output_volume_from_ptr(ptr: usize) -> f32 {
     with_params(ptr, 1.0, |p| p.get_output_volume())
 }
 
 /// Get callback count from params pointer
 #[wasm_bindgen(js_name = getCallbackCountFromPtr)]
-pub fn get_callback_count_from_ptr(ptr: *const AudioParams) -> u64 {
+pub fn get_callback_count_from_ptr(ptr: usize) -> u64 {
     with_params(ptr, 0, |p| p.get_callback_count())
 }
 
@@ -401,10 +398,10 @@ mod tests {
 
     #[test]
     fn test_pointer_helpers_roundtrip() {
-        // `create_audio_params` leaks a 'static AudioParams and returns a raw pointer;
+        // `create_audio_params` leaks a 'static AudioParams and returns its address;
         // the *_from_ptr helpers are how JS threads read/write the shared state.
         let ptr = create_audio_params();
-        assert!(!ptr.is_null());
+        assert_ne!(ptr, 0);
 
         // Defaults observed through the pointer.
         assert!((get_db_level_from_ptr(ptr) - MIN_DB).abs() < EPS);
@@ -433,7 +430,7 @@ mod tests {
     #[test]
     fn test_pointer_helpers_null_safe() {
         // Every helper must tolerate a null pointer and return its documented fallback.
-        let null = std::ptr::null::<AudioParams>();
+        let null = SharedPtr::<AudioParams>::null().addr();
         assert!((get_db_level_from_ptr(null) - (-60.0)).abs() < EPS);
         assert!((get_peak_db_level_from_ptr(null) - (-60.0)).abs() < EPS);
         assert!((get_volume_level_from_ptr(null) - 0.0).abs() < EPS);

@@ -102,7 +102,7 @@ pub struct AudioEngine {
     worklet_node: Option<AudioWorkletNode>,
     source_node: Option<MediaStreamAudioSourceNode>,
     current_stream: Option<MediaStream>,
-    params_ptr: *const AudioParams,
+    params: SharedPtr<AudioParams>,
     local_to_network_buffer_ptr: *mut RingBuffer,
     network_to_local_buffer_ptr: *mut Regulator,
     /// The output channel count the current `worklet_node` was built with
@@ -125,8 +125,8 @@ pub struct AudioEngine {
 impl AudioEngine {
     /// Create a new audio engine (without network support)
     #[wasm_bindgen(js_name = create)]
-    pub async fn create(params_ptr: *const AudioParams) -> Result<AudioEngine, JsValue> {
-        Self::create_with_network(params_ptr, std::ptr::null_mut(), std::ptr::null_mut()).await
+    pub async fn create(params_addr: usize) -> Result<AudioEngine, JsValue> {
+        Self::create_with_network(params_addr, std::ptr::null_mut(), std::ptr::null_mut()).await
     }
 
     /// Create a new audio engine with network audio support
@@ -134,7 +134,7 @@ impl AudioEngine {
     /// - network_to_local_buffer_ptr: jitter buffer for receiving audio from network
     #[wasm_bindgen(js_name = createWithNetwork)]
     pub async fn create_with_network(
-        params_ptr: *const AudioParams,
+        params_addr: usize,
         local_to_network_buffer_ptr: *mut RingBuffer,
         network_to_local_buffer_ptr: *mut Regulator,
     ) -> Result<AudioEngine, JsValue> {
@@ -150,7 +150,7 @@ impl AudioEngine {
             worklet_node: None,
             source_node: None,
             current_stream: None,
-            params_ptr,
+            params: SharedPtr::from_addr(params_addr),
             local_to_network_buffer_ptr,
             network_to_local_buffer_ptr,
             worklet_output_channels: 0,
@@ -286,10 +286,13 @@ impl AudioEngine {
     /// reconfigure.
     fn build_and_connect_worklet_node(&mut self, input_channels: usize, output_channels: usize) -> Result<(), JsValue> {
         // Create processor with network support. `AudioEngine` stores raw
-        // pointers (it is a `#[wasm_bindgen]` boundary type); wrap them in
-        // `SharedPtr` here so the processor and the flag read below go through
-        // the one audited deref.
-        let params = unsafe { &*self.params_ptr };
+        // buffer pointers (it is a `#[wasm_bindgen]` boundary type); wrap them
+        // in `SharedPtr` here so the processor and the flag read below go
+        // through the one audited deref.
+        let params = self
+            .params
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("AudioEngine requires a non-null AudioParams pointer"))?;
         let local_to_network = SharedPtr::new(self.local_to_network_buffer_ptr);
         let network_to_local = SharedPtr::new(self.network_to_local_buffer_ptr);
 
@@ -586,7 +589,7 @@ mod tests {
     /// `AudioEngine::create(...).await.expect(...)` dance.
     #[cfg(target_arch = "wasm32")]
     async fn create_engine(params: &AudioParams) -> AudioEngine {
-        AudioEngine::create(params as *const AudioParams)
+        AudioEngine::create(SharedPtr::from_ref(params).addr())
             .await
             .expect("AudioEngine::create should succeed in the browser")
     }

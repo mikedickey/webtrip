@@ -64,6 +64,13 @@ impl<T> SharedPtr<T> {
         Self { ptr }
     }
 
+    /// Point at a value the caller already holds a shared reference to. The
+    /// pointee is only ever reached again through [`as_ref`](Self::as_ref), so
+    /// casting away `const` here grants nothing the `&T` didn't.
+    pub fn from_ref(value: &T) -> Self {
+        Self::new(std::ptr::from_ref(value).cast_mut())
+    }
+
     /// A null `SharedPtr` (points at nothing; [`is_null`](Self::is_null) is true).
     pub const fn null() -> Self {
         Self {
