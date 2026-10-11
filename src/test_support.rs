@@ -276,6 +276,13 @@ impl crate::audio::transport::Transport for MockTransport {
     fn close(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
         self.probe.closes.set(self.probe.closes.get() + 1);
         self.state = crate::audio::transport::TransportState::Closed;
+        // Match WebRTC's `close_sync`: notify `"closed"` before the async
+        // part returns. `MockTransport` reports `TransportType::WebRTC`, and
+        // the session treats that string as a failure — so Drop must retire
+        // the lifecycle epoch or this report would emit `"error"` (WEB-68).
+        if let Some(callback) = self.probe.on_state_change.borrow().clone() {
+            let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("closed"));
+        }
         Box::pin(pass(self.close_gate.take()))
     }
 }
