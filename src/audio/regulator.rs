@@ -1063,7 +1063,8 @@ impl Regulator {
     /// The caller must have quiesced both the producer and the consumer first:
     /// this rewrites slot payloads and the consumer's state in place.
     /// `WebTripSession::disconnect` does that by awaiting transport teardown
-    /// and `AudioContext.suspend()` before calling it (WEB-53 Bug 7).
+    /// and `AudioContext.close()` (with a timeout) before calling it
+    /// (WEB-53 Bug 7 / WEB-66).
     pub fn reset(&self) {
         self.shared.reset();
         // SAFETY: the consumer is quiesced (see above), so this is the only
@@ -1229,8 +1230,9 @@ impl Shared {
     /// peer then adopts a different channel count here — that `pop` could read
     /// a slot already resized out from under it.
     /// `WebTripSession::disconnect` closes that window by awaiting
-    /// `AudioContext.suspend()` inside `stop_capture` before `reset()` (WEB-53
-    /// Bug 7), so no worklet callback can still be inside `pop` when this runs.
+    /// `AudioContext.close()` inside `stop_capture` before `reset()` (WEB-53
+    /// Bug 7 / WEB-66), so no worklet callback can still be inside `pop` when
+    /// this runs.
     fn adopt_channel_count(&self, channels: usize) {
         let samples_per_packet = self.fpp * channels;
         for slot in self.slots.iter() {

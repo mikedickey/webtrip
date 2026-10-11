@@ -126,15 +126,52 @@ pub(crate) fn assert_valid_sdp(sdp: &str) {
     );
 }
 
+/// What a test can observe of a [`MockTransport`] after handing it to the
+/// session (which takes ownership of the transport itself).
+#[derive(Default)]
+pub(crate) struct MockProbe {
+    /// Calls to `connect`
+    pub(crate) connects: std::cell::Cell<u32>,
+    /// Calls to `close`
+    pub(crate) closes: std::cell::Cell<u32>,
+    /// The state-change callback the session installed
+    on_state_change: std::cell::RefCell<Option<js_sys::Function>>,
+    /// Run once, just before a `connect` resolves (after any gate opens)
+    on_connected: std::cell::RefCell<Option<Box<dyn FnOnce()>>>,
+}
+
+impl MockProbe {
+    /// Report a transport-level state string to the session, as a real
+    /// transport's event handlers would.
+    pub(crate) fn report(&self, state: &str) {
+        let callback = self.on_state_change.borrow().clone();
+        let callback = callback.expect("the session installs a state callback before connecting");
+        let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(state));
+    }
+
+    /// Run `hook` just before the next `connect` resolves.
+    pub(crate) fn on_connected(&self, hook: impl FnOnce() + 'static) {
+        *self.on_connected.borrow_mut() = Some(Box::new(hook));
+    }
+}
+
+/// A promise the test opens by calling the returned function, for holding a
+/// [`MockTransport`] operation pending.
+pub(crate) fn gate() -> (js_sys::Promise, js_sys::Function) {
+    let (promise, open, _reject) = crate::audio::make_promise();
+    (promise, open)
+}
+
 /// Minimal in-process [`Transport`] for driving the session's connect/disconnect
 /// lifecycle in unit tests without a live hub.
 ///
-/// It performs no network I/O and touches no browser APIs: `connect` transitions
-/// synchronously to `Connected`, `close` to `Closed`, and `tick` discards
-/// whatever the worklet has queued for sending. Pass it to
+/// It performs no network I/O and touches no browser APIs: `connect`
+/// transitions to `Connected`, `close` to `Closed`, and `tick` discards
+/// whatever the worklet has queued for sending. Either operation can be held
+/// pending on a [`gate`], and [`probe`](Self::probe) observes it after the
+/// session takes ownership. Pass it to
 /// [`WebTripSession::connect_with_test_transport`] so a test can exercise the
-/// real connect → `AudioEngine` → `disconnect` path against a transport that
-/// always succeeds instantly.
+/// real connect → `AudioEngine` → `disconnect` path.
 ///
 /// [`WebTripSession::connect_with_test_transport`]: crate::session::WebTripSession::connect_with_test_transport
 pub(crate) struct MockTransport {
@@ -143,6 +180,9 @@ pub(crate) struct MockTransport {
     audio_buffers: Option<crate::audio::transport::AudioBufferConfig>,
     /// One packet of scratch for draining the send ring buffer.
     drain_scratch: Vec<f32>,
+    probe: std::rc::Rc<MockProbe>,
+    connect_gate: Option<js_sys::Promise>,
+    close_gate: Option<js_sys::Promise>,
 }
 
 impl MockTransport {
@@ -151,7 +191,33 @@ impl MockTransport {
             state: crate::audio::transport::TransportState::Disconnected,
             audio_buffers: None,
             drain_scratch: Vec::new(),
+            probe: Default::default(),
+            connect_gate: None,
+            close_gate: None,
         }
+    }
+
+    pub(crate) fn probe(&self) -> std::rc::Rc<MockProbe> {
+        self.probe.clone()
+    }
+
+    /// Hold `connect` pending until `gate` resolves.
+    pub(crate) fn with_connect_gate(mut self, gate: js_sys::Promise) -> Self {
+        self.connect_gate = Some(gate);
+        self
+    }
+
+    /// Hold `close` pending until `gate` resolves.
+    pub(crate) fn with_close_gate(mut self, gate: js_sys::Promise) -> Self {
+        self.close_gate = Some(gate);
+        self
+    }
+}
+
+/// Await `gate`, if any.
+async fn pass(gate: Option<js_sys::Promise>) {
+    if let Some(gate) = gate {
+        let _ = wasm_bindgen_futures::JsFuture::from(gate).await;
     }
 }
 
@@ -165,6 +231,10 @@ impl crate::audio::transport::Transport for MockTransport {
     fn set_audio_buffers(&mut self, config: crate::audio::transport::AudioBufferConfig) {
         self.drain_scratch.resize(config.samples_per_packet(), 0.0);
         self.audio_buffers = Some(config);
+    }
+
+    fn set_on_state_change(&mut self, callback: js_sys::Function) {
+        *self.probe.on_state_change.borrow_mut() = Some(callback);
     }
 
     /// Drain the send ring buffer, as `WebRtcTransport` does before its data
@@ -190,12 +260,22 @@ impl crate::audio::transport::Transport for MockTransport {
         _port: u16,
         _client_name: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), JsValue>> + '_>> {
-        self.state = crate::audio::transport::TransportState::Connected;
-        Box::pin(async { Ok(()) })
+        self.probe.connects.set(self.probe.connects.get() + 1);
+        let gate = self.connect_gate.take();
+        Box::pin(async move {
+            pass(gate).await;
+            self.state = crate::audio::transport::TransportState::Connected;
+            let hook = self.probe.on_connected.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            Ok(())
+        })
     }
 
     fn close(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
+        self.probe.closes.set(self.probe.closes.get() + 1);
         self.state = crate::audio::transport::TransportState::Closed;
-        Box::pin(async {})
+        Box::pin(pass(self.close_gate.take()))
     }
 }

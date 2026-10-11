@@ -450,6 +450,12 @@ impl HubSignaling {
         self.js_on_state_change = Some(callback);
     }
 
+    /// Stop reporting state changes, e.g. before a deliberate `disconnect`
+    /// that the callback would otherwise mistake for the hub hanging up.
+    pub(crate) fn clear_on_state_change(&mut self) {
+        self.js_on_state_change = None;
+    }
+
     /// Get current connection state
     pub fn state(&self) -> HubConnectionState {
         self.state

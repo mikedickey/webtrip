@@ -61,7 +61,7 @@ Therefore:
   why the existing uses are the `web_sys` callback wiring inside `session.rs`,
   `audio/webrtc.rs`, `audio/webtransport.rs`, and `audio/signaling.rs`. That is a
   description of where the argument holds today, **not an allowlist**: those same
-  modules also contain portable logic — the session state machine and `SessionStats`,
+  modules also contain portable logic — `SessionStats` and the transport-failure mapping,
   `SignalingMessage`/`HubConnectionState`, `tick_decision`,
   `parse_ice_candidate_json` — that a native host will reuse against OS threads and a
   non-`web_sys` transport. Keep that logic free of thread-affine types, and keep the
@@ -132,7 +132,8 @@ When deleting or refactoring production code, delete its tests rather than porti
 
 ### Key Modules
 
-- **`src/session.rs`** — `WebTripSession`: top-level orchestrator, connection state machine, owns shared buffers
+- **`src/session.rs`** — `WebTripSession`: top-level orchestrator; owns the transport, audio engine, and shared buffers
+- **`src/lifecycle.rs`** — Portable connect/disconnect state machine (one atomic epoch+state word) that `WebTripSession` consults before acquiring, publishing, or releasing resources
 - **`src/audio/regulator.rs`** — Jitter buffer with Burg PLC (packet loss concealment), ported from JackTrip C++
 - **`src/audio/protocol.rs`** — JackTrip 16-byte wire protocol (serialization, sample rate encoding)
 - **`src/audio/signaling.rs`** — Hub server WebSocket signaling for WebRTC/WebTransport

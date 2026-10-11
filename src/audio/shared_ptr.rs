@@ -7,13 +7,15 @@
 //!
 //! `SharedPtr<T>` is the single place that deref happens. It:
 //!
-//! - carries the [`Send`]/[`Sync`] assertion **once** (so container structs no
-//!   longer need their own `unsafe impl Send`), and
+//! - carries the [`Send`]/[`Sync`] assertion **once**, bounded on `T: Sync` (so
+//!   container structs no longer need their own `unsafe impl Send`, and a
+//!   pointee that is not thread-safe fails to compile rather than being
+//!   laundered across threads), and
 //! - hands out a shared `&T` through one audited `unsafe` block instead of the
 //!   `unsafe { &*ptr }` incantation being copy-pasted at every call site.
 //!
-//! The pointee is expected to coordinate cross-thread access through atomics
-//! and/or interior mutability (e.g. [`RingBuffer`](crate::audio::ring_buffer::RingBuffer)
+//! The pointee must coordinate cross-thread access through atomics and/or
+//! interior mutability, and say so by being `Sync` (e.g. [`RingBuffer`](crate::audio::ring_buffer::RingBuffer)
 //! and [`Regulator`](crate::audio::regulator::Regulator)'s `&self` APIs). Prefer
 //! [`as_ref`](SharedPtr::as_ref). [`as_mut`](SharedPtr::as_mut) remains for the
 //! rare case where exclusive access is genuinely proven; nothing in the audio
@@ -28,14 +30,17 @@ pub struct SharedPtr<T> {
     ptr: *mut T,
 }
 
-// SAFETY: a `SharedPtr` is only an integer address. Moving/sharing that address
-// between threads is always sound; any real data-race hazard lives in how the
-// *pointee* is accessed, which is the pointee's responsibility to coordinate
-// (the buffers live in a `SharedArrayBuffer` and synchronise via atomics). This
-// is the one place that assertion is made, rather than an `unsafe impl` per
-// container struct that happens to hold one of these pointers.
-unsafe impl<T> Send for SharedPtr<T> {}
-unsafe impl<T> Sync for SharedPtr<T> {}
+// SAFETY: a `SharedPtr` is an integer address that [`as_ref`](SharedPtr::as_ref)
+// turns into a `&T` on whichever thread holds it, so sending or sharing one
+// across threads is equivalent to sharing `&T` — sound exactly when `T: Sync`.
+// The bound makes the compiler check that the pointee coordinates cross-thread
+// access itself (atomics / `UnsafeCell` with a proven protocol) instead of this
+// impl asserting it for any `T`. Lifetime (the pointee outliving every borrow)
+// is still the caller's responsibility; see `as_ref`. This is the one place the
+// assertion is made, rather than an `unsafe impl` per container struct that
+// happens to hold one of these pointers.
+unsafe impl<T: Sync> Send for SharedPtr<T> {}
+unsafe impl<T: Sync> Sync for SharedPtr<T> {}
 
 // Manual `Copy`/`Clone` (not derived) so they carry no `T: Copy`/`T: Clone`
 // bound — the pointee (`RingBuffer`, `Regulator`) is not `Copy`, but its address
@@ -57,6 +62,13 @@ impl<T> SharedPtr<T> {
     /// Wrap a raw pointer.
     pub const fn new(ptr: *mut T) -> Self {
         Self { ptr }
+    }
+
+    /// Point at a value the caller already holds a shared reference to. The
+    /// pointee is only ever reached again through [`as_ref`](Self::as_ref), so
+    /// casting away `const` here grants nothing the `&T` didn't.
+    pub fn from_ref(value: &T) -> Self {
+        Self::new(std::ptr::from_ref(value).cast_mut())
     }
 
     /// A null `SharedPtr` (points at nothing; [`is_null`](Self::is_null) is true).
