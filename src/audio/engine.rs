@@ -199,6 +199,35 @@ impl AudioEngine {
         input_channels: u32,
         output_channels: u32,
     ) -> Result<(), JsValue> {
+        self.start_capture_cancellable(
+            device_id,
+            output_device_id,
+            auto_gain_control,
+            echo_cancellation,
+            noise_suppression,
+            input_channels,
+            output_channels,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`start_capture`](Self::start_capture), but checks `cancelled`
+    /// after each await that cannot itself be aborted (`getUserMedia`,
+    /// `setSinkId`). When set, stops any acquired tracks and returns
+    /// `AbortError` without installing a worklet — so an abandoned connect
+    /// cannot race a later connection's regulator (WEB-69).
+    pub(crate) async fn start_capture_cancellable(
+        &mut self,
+        device_id: Option<String>,
+        output_device_id: Option<String>,
+        auto_gain_control: bool,
+        echo_cancellation: bool,
+        noise_suppression: bool,
+        input_channels: u32,
+        output_channels: u32,
+        cancelled: Option<&Cell<bool>>,
+    ) -> Result<(), JsValue> {
         // Stop any existing capture without closing the context — a closed
         // AudioContext cannot be restarted (see [`stop_capture`](Self::stop_capture)).
         self.stop_nodes();
@@ -213,6 +242,10 @@ impl AudioEngine {
         )
         .to_js()?;
         let stream = get_user_media_audio(&media_devices, &audio_constraints).await?;
+        if cancelled.is_some_and(|c| c.get()) {
+            stop_media_stream(&stream);
+            return Err(capture_cancelled_error());
+        }
 
         // The constraints open the device at its native width; the worklet
         // node's Explicit/Discrete `channelCount` then keeps only its first
@@ -235,6 +268,10 @@ impl AudioEngine {
         // default output's.
         if output_device_id.is_some() {
             route_output_sink(self.ctx.as_ref(), output_device_id).await?;
+            if cancelled.is_some_and(|c| c.get()) {
+                self.stop_nodes();
+                return Err(capture_cancelled_error());
+            }
         }
 
         // Configure the destination (explicit/discrete, so the browser never
@@ -525,6 +562,15 @@ impl AudioEngine {
 /// AudioContext promises on iOS Safari) from leaving the session stuck in
 /// `"disconnecting"` forever (WEB-66).
 pub(crate) const AUDIO_CONTEXT_CLOSE_TIMEOUT_MS: i32 = 500;
+
+/// `AbortError` returned when capture is cancelled mid-`getUserMedia` /
+/// `setSinkId` (WEB-69). Named to match the DOM convention so callers can
+/// tell a cancellation from a failure.
+fn capture_cancelled_error() -> JsValue {
+    let error = js_sys::Error::new("Audio capture cancelled");
+    error.set_name("AbortError");
+    error.into()
+}
 
 /// Resume `ctx`, resolving once the browser has granted it.
 pub(crate) async fn resume_context(ctx: &AudioContext) -> Result<(), JsValue> {
