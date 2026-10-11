@@ -349,13 +349,46 @@ impl ChannelState {
         self.ring_wptr = (self.ring_wptr + 1) % self.ring_size;
     }
 
-    /// Pull a past packet from ring buffer
-    ///
-    /// # Arguments
-    /// * `past` - How many packets in the past (1 = most recent)
-    fn ring_buffer_pull(&mut self, past: usize) {
-        let idx = (self.ring_wptr + self.ring_size - past) % self.ring_size;
-        self.tmp_buf.copy_from_slice(&self.packet_ring[idx]);
+    /// Lay the real-packet history into the front of `prediction`, oldest
+    /// first. The oldest packet is the one `ring_wptr` will overwrite next.
+    fn real_past_into_prediction(&mut self) {
+        let (newer, older) = self.packet_ring.split_at(self.ring_wptr);
+        concat_packets(&mut self.prediction, older.iter().chain(newer));
+    }
+}
+
+/// Copy `packets` back to back into the front of `dst`, one block copy each.
+fn concat_packets<'a>(dst: &mut [f32], packets: impl Iterator<Item = &'a Vec<f32>>) {
+    let mut offset = 0;
+    for packet in packets {
+        dst[offset..offset + packet.len()].copy_from_slice(packet);
+        offset += packet.len();
+    }
+}
+
+/// Copy channel `ch` out of `interleaved` (an `n`-channel frame sequence) into
+/// `dst`, stopping at whichever runs out first.
+fn deinterleave_channel(interleaved: &[f32], n: usize, ch: usize, dst: &mut [f32]) {
+    if n == 1 {
+        let len = dst.len().min(interleaved.len());
+        dst[..len].copy_from_slice(&interleaved[..len]);
+        return;
+    }
+    for (d, &s) in dst.iter_mut().zip(interleaved.iter().skip(ch).step_by(n)) {
+        *d = s;
+    }
+}
+
+/// Copy `src` into channel `ch` of `interleaved` (an `n`-channel frame
+/// sequence), stopping at whichever runs out first.
+fn interleave_channel(src: &[f32], n: usize, ch: usize, interleaved: &mut [f32]) {
+    if n == 1 {
+        let len = src.len().min(interleaved.len());
+        interleaved[..len].copy_from_slice(&src[..len]);
+        return;
+    }
+    for (d, &s) in interleaved.iter_mut().skip(ch).step_by(n).zip(src) {
+        *d = s;
     }
 }
 
@@ -1331,9 +1364,7 @@ impl ConsumerState {
                 let channels = &mut self.channels[..n];
                 let copied = sh.slots[slot_idx].read(seq, |payload| {
                     for (ch, channel) in channels.iter_mut().enumerate() {
-                        for s in 0..sh.fpp {
-                            channel.tmp_buf[s] = payload.data[s * n + ch];
-                        }
+                        deinterleave_channel(&payload.data, n, ch, &mut channel.tmp_buf);
                     }
                 });
                 if copied.is_none() {
@@ -1346,7 +1377,7 @@ impl ConsumerState {
 
                 // Process with Burg algorithm
                 self.process_burg(sh.fpp, false);
-                self.interleave_output(sh.fpp, output);
+                self.interleave_output(output);
 
                 sh.last_seq_out.store(seq as i32, Ordering::Release);
                 self.packet_count += 1;
@@ -1395,18 +1426,13 @@ impl ConsumerState {
             channel.tmp_buf.fill(0.0);
         }
         self.process_burg(fpp, true);
-        self.interleave_output(fpp, output);
+        self.interleave_output(output);
     }
 
-    fn interleave_output(&self, fpp: usize, output: &mut [f32]) {
+    fn interleave_output(&self, output: &mut [f32]) {
         let n = self.num_channels;
         for (ch, channel) in self.channels[..n].iter().enumerate() {
-            for s in 0..fpp {
-                let idx = s * n + ch;
-                if idx < output.len() {
-                    output[idx] = channel.output_now_packet[s];
-                }
-            }
+            interleave_channel(&channel.output_now_packet, n, ch, output);
         }
     }
 
@@ -1600,41 +1626,23 @@ impl ConsumerState {
         let primed = self.plc_packet_count > self.packets_in_past as u64;
 
         for channel in &mut self.channels[..self.num_channels] {
-            // Copy real packet data
-            for s in 0..fpp {
-                channel.real_now_packet[s] = if !glitch { channel.tmp_buf[s] } else { 0.0 };
-            }
-
-            // If not a glitch, push to ring buffer
-            if !glitch {
+            // Copy real packet data, and if not a glitch push it to the ring
+            if glitch {
+                channel.real_now_packet.fill(0.0);
+            } else {
+                channel.real_now_packet.copy_from_slice(&channel.tmp_buf);
                 channel.ring_buffer_push();
             }
 
             // Build real past from ring buffer
             if primed {
-                let mut offset = 0;
-                for i in 0..self.packets_in_past {
-                    channel.ring_buffer_pull(self.packets_in_past - i);
-                    for s in 0..fpp {
-                        if offset + s < channel.prediction.len() {
-                            channel.prediction[offset + s] = channel.tmp_buf[s];
-                        }
-                    }
-                    offset += fpp;
-                }
+                channel.real_past_into_prediction();
             }
 
             // Perform prediction on glitch
             if glitch {
                 // Copy predicted past into prediction buffer
-                for i in 0..self.packets_in_past {
-                    for s in 0..fpp {
-                        let idx = i * fpp + s;
-                        if idx < channel.prediction.len() {
-                            channel.prediction[idx] = channel.predicted_past[i][s];
-                        }
-                    }
-                }
+                concat_packets(&mut channel.prediction, channel.predicted_past.iter());
 
                 // Train Burg model using pre-allocated buffer (no allocation!)
                 channel.train_data[..self.up_to_now].copy_from_slice(&channel.prediction[..self.up_to_now]);
@@ -1645,28 +1653,28 @@ impl ConsumerState {
                 self.burg.predict(&channel.coeffs, &mut channel.prediction, tail_size);
 
                 // Extract predicted now packet
-                for s in 0..fpp {
-                    let idx = self.up_to_now + s;
-                    channel.predicted_now_packet[s] =
-                        channel.prediction.get(idx).copied().unwrap_or(0.0);
-                }
+                channel
+                    .predicted_now_packet
+                    .copy_from_slice(&channel.prediction[self.up_to_now..self.up_to_now + fpp]);
             }
 
             // Generate output with crossfade
-            for s in 0..fpp {
-                channel.output_now_packet[s] = if glitch {
-                    if primed {
-                        channel.predicted_now_packet[s]
-                    } else {
-                        0.0
-                    }
-                } else if self.last_was_glitch {
-                    // Crossfade from prediction to real
-                    self.fade_down[s] * channel.future_predicted_packet[s]
-                        + self.fade_up[s] * channel.real_now_packet[s]
+            let output = &mut channel.output_now_packet;
+            if glitch {
+                if primed {
+                    output.copy_from_slice(&channel.predicted_now_packet);
                 } else {
-                    channel.real_now_packet[s]
-                };
+                    output.fill(0.0);
+                }
+            } else if self.last_was_glitch {
+                // Crossfade from prediction to real
+                let fades = self.fade_down.iter().zip(&self.fade_up);
+                let sources = channel.future_predicted_packet.iter().zip(&channel.real_now_packet);
+                for (out, ((&down, &up), (&predicted, &real))) in output.iter_mut().zip(fades.zip(sources)) {
+                    *out = down * predicted + up * real;
+                }
+            } else {
+                output.copy_from_slice(&channel.real_now_packet);
             }
 
             // Copy output to tmp_buf for consistency
@@ -1680,11 +1688,9 @@ impl ConsumerState {
                 .copy_from_slice(&channel.output_now_packet);
 
             // Store future prediction for next crossfade
-            for s in 0..fpp {
-                let idx = self.beyond_now + s;
-                channel.future_predicted_packet[s] =
-                    channel.prediction.get(idx).copied().unwrap_or(0.0);
-            }
+            channel
+                .future_predicted_packet
+                .copy_from_slice(&channel.prediction[self.beyond_now..self.beyond_now + fpp]);
         }
 
         self.last_was_glitch = glitch;
@@ -1832,27 +1838,21 @@ mod tests {
     }
 
     #[test]
-    fn test_channel_ring_buffer() {
-        let mut channel = ChannelState::new(128, 256, 2);
-
-        // Fill tmp_buf with test data
-        for i in 0..128 {
-            channel.tmp_buf[i] = i as f32;
+    fn real_past_lands_oldest_first_across_ring_wrap() {
+        // 3 packets of 4 samples; 4 pushes into a 3-packet ring, so the write
+        // pointer has wrapped and the oldest surviving packet is mid-ring.
+        let mut channel = ChannelState::new(4, 12, 3);
+        for packet in 1..=4 {
+            channel.tmp_buf.fill(packet as f32);
+            channel.ring_buffer_push();
         }
 
-        // Push to ring
-        channel.ring_buffer_push();
+        channel.real_past_into_prediction();
 
-        // Clear tmp_buf
-        channel.tmp_buf.fill(0.0);
-
-        // Pull back
-        channel.ring_buffer_pull(1);
-
-        // Verify data
-        for i in 0..128 {
-            assert!((channel.tmp_buf[i] - i as f32).abs() < 1e-6);
-        }
+        let expected: Vec<f32> = [2.0, 3.0, 4.0].iter().flat_map(|&p| [p; 4]).collect();
+        assert_eq!(channel.prediction[..12], expected[..]);
+        // The future region past the history is left alone.
+        assert!(channel.prediction[12..].iter().all(|&s| s == 0.0));
     }
 
     #[test]
