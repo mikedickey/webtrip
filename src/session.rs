@@ -837,7 +837,12 @@ impl WebTripSession {
         let mut transport = new_transport()?;
         let transport_type = transport.transport_type();
         transport.set_audio_buffers(self.audio_buffer_config());
-        transport.set_on_state_change(self.failure_bridge(epoch, transport_type));
+        let failed_while_connecting = Rc::new(Cell::new(false));
+        transport.set_on_state_change(self.failure_bridge(
+            epoch,
+            transport_type,
+            Rc::clone(&failed_while_connecting),
+        ));
 
         let dialed = dial_unless_aborted(transport.connect(server, port, client_name), abort).await;
         let dialed = dialed.and_then(|()| {
@@ -856,6 +861,12 @@ impl WebTripSession {
             }
         };
 
+        // A failure reported before `Connected` cannot fail the connection
+        // (there is none yet), so it fails the connect instead.
+        if failed_while_connecting.get() {
+            self.release(Some(transport), Some(engine)).await;
+            return Err(js_error("The connection failed while it was being set up"));
+        }
         if !self.lifecycle.finish_connect(epoch) {
             self.release(Some(transport), Some(engine)).await;
             return Err(cancelled_error());
@@ -871,12 +882,24 @@ impl WebTripSession {
 
     /// The state-change callback handed to the transport admitted under
     /// `epoch`: a failure report fails that connection (and only that one).
-    fn failure_bridge(&self, epoch: u64, transport_type: TransportType) -> js_sys::Function {
+    /// One reported before the connection is published sets
+    /// `failed_while_connecting` for `bring_up` to act on.
+    fn failure_bridge(
+        &self,
+        epoch: u64,
+        transport_type: TransportType,
+        failed_while_connecting: Rc<Cell<bool>>,
+    ) -> js_sys::Function {
         let lifecycle = Arc::clone(&self.lifecycle);
         let on_state_change = Rc::clone(&self.on_state_change);
         Closure::<dyn FnMut(String)>::new(move |state: String| {
-            if transport_state_is_failure(transport_type, &state) && lifecycle.fail(epoch) {
+            if !transport_state_is_failure(transport_type, &state) {
+                return;
+            }
+            if lifecycle.fail(epoch) {
                 emit_state(&on_state_change, SessionState::Error);
+            } else {
+                failed_while_connecting.set(true);
             }
         })
         // The transport keeps the function for its lifetime; leak the closure
@@ -1442,6 +1465,33 @@ mod tests {
         assert!(!session.has_engine(), "the cancelled connect must not publish its engine");
         assert_eq!(session.get_state(), "idle");
         assert_log(&log, &["connecting", "disconnecting", "idle"], "around a cancelled bring-up");
+    }
+
+    /// A transport failure reported after the dial succeeded but before the
+    /// connection is published (while audio is starting) must fail the
+    /// connect rather than be dropped: otherwise the session would report
+    /// `connected` over a dead transport. The connect releases what it created
+    /// and rejects, leaving the session `idle`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_connect_fails_when_the_transport_fails_during_bring_up() {
+        let params = AudioParams::default();
+        let session = new_session(&params);
+        let (log, _cb) = attach_state_log(&session);
+
+        let transport = MockTransport::new();
+        let probe = transport.probe();
+        let reporter = probe.clone();
+        probe.on_connected(move || reporter.report("failed"));
+
+        let result = session.connect_with_test_transport(Box::new(transport), CONNECT_TIMEOUT_MS).await;
+        let (name, message) = rejection(result);
+        assert_eq!(name, "Error", "a failed bring-up is a failure, not a cancellation: {message}");
+        assert_eq!(probe.closes.get(), 1, "the failed connect must close its transport");
+        assert!(!session.has_transport());
+        assert!(!session.has_engine(), "the failed connect must not publish its engine");
+        assert_eq!(session.get_state(), "idle");
+        assert_log(&log, &["connecting", "idle"], "around a failed bring-up");
     }
 
     /// A dial that outlasts the connect timeout is abandoned: the connect

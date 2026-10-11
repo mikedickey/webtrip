@@ -10,7 +10,8 @@
 //! ```text
 //! Idle          ── begin_connect ─────▶ Connecting
 //! Connecting    ── finish_connect(e) ─▶ Connected
-//! Connecting    ── abort_connect(e) ──▶ Idle           (connect failed, cleaned up)
+//! Connecting    ── abort_connect(e) ──▶ Idle           (connect failed, cleaned up;
+//!                                                        bumps the epoch)
 //! Connected     ── fail(e) ───────────▶ Error          (transport reported failure)
 //! Connecting  ┐
 //! Connected   ├─ begin_disconnect ────▶ Disconnecting  (bumps the epoch)
@@ -18,7 +19,8 @@
 //! Disconnecting ── finish_disconnect ─▶ Idle
 //! ```
 //!
-//! Each `begin_disconnect` bumps the **epoch**. A connect remembers the epoch
+//! Ending a connect attempt bumps the **epoch**: `begin_disconnect`, and
+//! `abort_connect` after a failed connect. A connect remembers the epoch
 //! it was admitted under and passes it to every later transition, so a
 //! connect that a disconnect has overtaken can never publish its connection,
 //! even if a *newer* connect has since moved the state back to `Connecting`
@@ -174,18 +176,20 @@ impl Lifecycle {
 
     /// `Connecting → Connected`, only for the connect admitted under `epoch`.
     pub(crate) fn finish_connect(&self, epoch: u64) -> bool {
-        self.connecting_to(epoch, SessionState::Connected)
+        self.connecting_to(epoch, epoch, SessionState::Connected)
     }
 
     /// `Connecting → Idle` after a failed connect has released what it
-    /// created, only for the connect admitted under `epoch`.
+    /// created, only for the connect admitted under `epoch`. Bumps the epoch
+    /// so a late report from the failed attempt's transport cannot reach the
+    /// next connection.
     pub(crate) fn abort_connect(&self, epoch: u64) -> bool {
-        self.connecting_to(epoch, SessionState::Idle)
+        self.connecting_to(epoch, epoch.wrapping_add(1), SessionState::Idle)
     }
 
-    fn connecting_to(&self, epoch: u64, to: SessionState) -> bool {
+    fn connecting_to(&self, epoch: u64, next_epoch: u64, to: SessionState) -> bool {
         self.transition(|e, state| {
-            (e == epoch && state == SessionState::Connecting).then_some((e, to))
+            (e == epoch && state == SessionState::Connecting).then_some((next_epoch, to))
         })
         .is_ok()
     }
@@ -328,7 +332,8 @@ mod tests {
 
     /// Only the live connection may fail: a transport reporting failure while
     /// still dialing (the connect's own `Err` handles that) or after being torn
-    /// down (a late "closed" from the old transport) must change nothing.
+    /// down (a late "closed" from the old transport, whether a disconnect or a
+    /// failed connect ended it) must change nothing.
     #[test]
     fn only_the_current_connection_can_fail() {
         let (lc, epoch) = lifecycle_in(SessionState::Connecting);
@@ -346,6 +351,14 @@ mod tests {
         assert!(lc.fail(new));
         assert_eq!(lc.state(), SessionState::Error);
         assert!(!lc.fail(new), "Error is not re-entered");
+
+        let (lc, failed) = lifecycle_in(SessionState::Connecting);
+        assert!(lc.abort_connect(failed));
+        let next = lc.begin_connect().unwrap();
+        assert_ne!(next, failed, "a failed connect must retire its epoch");
+        assert!(lc.finish_connect(next));
+        assert!(!lc.fail(failed), "late failure from a failed connect's transport");
+        assert_eq!(lc.state(), SessionState::Connected);
     }
 
     /// Racing threads must each see exactly one winner. A check-then-set built

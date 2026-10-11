@@ -154,6 +154,11 @@ export default function Demo() {
   const [showIosPrompt, setShowIosPrompt] = useState(false);
 
   const engineRef = useRef<DemoEngine | null>(null);
+  // Synchronous re-entry guard for handleConnect: `busy` disables the button
+  // only after a re-render, so two clicks dispatched in one task would both
+  // run it. The session dials once either way, but the second call's
+  // "already in progress" rejection would show as an error on a live connect.
+  const connectingRef = useRef(false);
 
   // Bumped by the retry button on the engine-error screen; getDemoEngine()
   // clears its cache on failure, so re-running the effect starts a fresh load.
@@ -288,7 +293,9 @@ export default function Demo() {
     const port = parseInt(serverPort, 10) || 4464;
     const outputChannels = outputDeviceChannels >= 2 ? 2 : 1;
     const mode = CAPTURE_MODES[inputDeviceChannels === 1 ? "mono" : captureMode];
+    if (connectingRef.current) return;
 
+    connectingRef.current = true;
     setConnectError(null);
     setBusy(true);
     try {
@@ -326,6 +333,7 @@ export default function Demo() {
       console.error("Failed to connect:", error);
       setConnectError(`Connection failed: ${errorMessage(error)}`);
     } finally {
+      connectingRef.current = false;
       setBusy(false);
     }
   };
