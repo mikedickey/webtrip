@@ -15,12 +15,14 @@ export interface AudioDevices {
   outputDevices: DeviceInfo[];
 }
 
+// The strings WebTripSession.getState() returns and its state-change callback
+// receives (SessionState::as_str in src/lifecycle.rs).
 export type SessionState =
   | "idle"
   | "connecting"
-  | "negotiating"
   | "connected"
-  | "error";
+  | "error"
+  | "disconnecting";
 
 export interface DemoEngine {
   m: WebtripModule;

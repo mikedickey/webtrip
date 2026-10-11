@@ -201,7 +201,7 @@ async function inPageDrive({ transportName, host, port, connectTimeoutMs, sendPo
     /* best-effort */
   }
 
-  const connected = session.isConnected();
+  const connected = session.getState() === "connected";
 
   // Poll the send path: captured (fake-device) audio must reach the ring buffer.
   const deadline = Date.now() + sendPollMs;

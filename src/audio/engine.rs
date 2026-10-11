@@ -377,8 +377,7 @@ impl AudioEngine {
     /// "Tap to enable audio" button after the connection is established.
     #[wasm_bindgen(js_name = resumeCtx)]
     pub async fn resume_ctx(&self) -> Result<(), JsValue> {
-        JsFuture::from(self.ctx.resume()?).await?;
-        Ok(())
+        resume_context(&self.ctx).await
     }
 
     /// Fully stop capture: suspend the AudioContext (so the worklet render
@@ -457,7 +456,22 @@ impl AudioEngine {
     #[wasm_bindgen(js_name = setOutputDevice)]
     pub async fn set_output_device(&mut self, device_id: Option<String>) -> Result<(), JsValue> {
         route_output_sink(self.ctx.as_ref(), device_id).await?;
+        self.reconfigure_for_sink()
+    }
+}
 
+impl AudioEngine {
+    /// The engine's `AudioContext`, for a caller that must await on it
+    /// without holding a borrow of the engine (see `WebTripSession`).
+    pub(crate) fn context(&self) -> AudioContext {
+        self.ctx.clone()
+    }
+
+    /// Re-clamp the requested output channels against the sink that
+    /// [`route_output_sink`] just routed to, rebuilding the worklet node if
+    /// the width changed. The synchronous second half of
+    /// [`set_output_device`](Self::set_output_device).
+    pub(crate) fn reconfigure_for_sink(&mut self) -> Result<(), JsValue> {
         if self.worklet_node.is_some() {
             let output_channels = self.configure_destination(self.requested_output_channels)?;
             if output_channels as usize != self.worklet_output_channels {
@@ -467,6 +481,12 @@ impl AudioEngine {
 
         Ok(())
     }
+}
+
+/// Resume `ctx`, resolving once the browser has granted it.
+pub(crate) async fn resume_context(ctx: &AudioContext) -> Result<(), JsValue> {
+    JsFuture::from(ctx.resume()?).await?;
+    Ok(())
 }
 
 /// Route playback to the requested output sink on `ctx_obj` via `setSinkId`.
