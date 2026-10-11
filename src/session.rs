@@ -914,7 +914,9 @@ impl WebTripSession {
             // no-op on already-closed state.
         }
         // Awaits worklet quiescence (via `AudioEngine::stop_capture`'s
-        // `AudioContext.suspend`), as `Regulator::reset` requires (WEB-53 Bug 7).
+        // `AudioContext.close`, with timeout), as `Regulator::reset` requires
+        // (WEB-53 Bug 7 / WEB-66). Closing also releases the worklet global so
+        // the context cannot leak across reconnects.
         if let Some(mut engine) = engine {
             engine.stop_capture().await;
         }
@@ -1399,6 +1401,122 @@ mod tests {
             configured,
             "disconnect must retain the configured channel counts"
         );
+    }
+
+    /// Connect → disconnect must close the first engine's `AudioContext`
+    /// before `Regulator::reset` runs (and before disconnect returns), so a
+    /// reconnect cannot leave a suspended worklet as a second consumer
+    /// (WEB-66). A second connect then succeeds with a fresh engine.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_closes_audiocontext_before_reset_on_disconnect() {
+        use crate::audio::engine::audio_context_state;
+
+        let params = AudioParams::default();
+        let session = new_session(&params);
+
+        session
+            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .await
+            .expect("first mock connect should succeed");
+
+        let first_ctx = session
+            .audio_engine
+            .borrow()
+            .as_ref()
+            .expect("connected session must own an AudioEngine")
+            .context();
+        assert_ne!(
+            audio_context_state(&first_ctx).as_deref(),
+            Some("closed"),
+            "live engine context must not already be closed"
+        );
+
+        session.disconnect().await;
+        assert_eq!(session.get_state(), "idle");
+        assert_eq!(
+            audio_context_state(&first_ctx).as_deref(),
+            Some("closed"),
+            "disconnect must close the first AudioContext before reset returns (WEB-66)"
+        );
+        assert!(
+            session.audio_engine.borrow().is_none(),
+            "disconnect must drop the engine after closing its context"
+        );
+
+        session
+            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .await
+            .expect("reconnect after a closed context must succeed");
+        assert_eq!(session.get_state(), "connected");
+        let second_ctx = session
+            .audio_engine
+            .borrow()
+            .as_ref()
+            .expect("reconnect must publish a new AudioEngine")
+            .context();
+        assert_ne!(
+            audio_context_state(&second_ctx).as_deref(),
+            Some("closed"),
+            "the reconnect's AudioContext must be live"
+        );
+
+        session.disconnect().await;
+        assert_eq!(session.get_state(), "idle");
+    }
+
+    /// A hanging `AudioContext.close()` must not leave the session stuck in
+    /// `"disconnecting"`: the close timeout lets `disconnect()` finish so a
+    /// later connect is not blocked on `teardown_in_flight` forever (WEB-66).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_disconnect_finishes_when_audiocontext_close_hangs() {
+        use crate::audio::engine::AUDIO_CONTEXT_CLOSE_TIMEOUT_MS;
+        use wasm_bindgen::closure::Closure;
+
+        let params = AudioParams::default();
+        let session = new_session(&params);
+        session
+            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .await
+            .expect("mock connect should succeed");
+
+        let ctx = session
+            .audio_engine
+            .borrow()
+            .as_ref()
+            .expect("connected session must own an AudioEngine")
+            .context();
+        let original_close = js_sys::Reflect::get(ctx.as_ref(), &"close".into())
+            .expect("AudioContext must expose close");
+        let hanging = js_sys::Promise::new(&mut |_resolve, _reject| {});
+        let hanging_for_stub = hanging.clone();
+        let stub = Closure::wrap(Box::new(move || -> js_sys::Promise {
+            hanging_for_stub.clone()
+        }) as Box<dyn FnMut() -> js_sys::Promise>);
+        js_sys::Reflect::set(ctx.as_ref(), &"close".into(), stub.as_ref().unchecked_ref())
+            .expect("installing the hanging close stub should succeed");
+
+        let started = js_sys::Date::now();
+        session.disconnect().await;
+        let elapsed = js_sys::Date::now() - started;
+        assert_eq!(session.get_state(), "idle");
+        let min_ms = f64::from(AUDIO_CONTEXT_CLOSE_TIMEOUT_MS) - 50.0;
+        let max_ms = f64::from(AUDIO_CONTEXT_CLOSE_TIMEOUT_MS) + 1500.0;
+        assert!(
+            elapsed >= min_ms && elapsed < max_ms,
+            "disconnect should finish around the {AUDIO_CONTEXT_CLOSE_TIMEOUT_MS}ms close \
+             timeout, got {elapsed}ms"
+        );
+
+        // Restore the real close and finish tearing down so this test does not
+        // leave a live context for the rest of the suite.
+        js_sys::Reflect::set(ctx.as_ref(), &"close".into(), &original_close)
+            .expect("restoring AudioContext.close should succeed");
+        drop(stub);
+        if let Ok(promise) = ctx.close() {
+            let _ = JsFuture::from(promise).await;
+        }
     }
 
     /// A disconnect while the transport is still dialing cancels the connect:
