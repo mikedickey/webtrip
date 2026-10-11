@@ -45,7 +45,7 @@
 //! explicitly instead.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 /// Sentinel value for "no sequence number" (None)
 const SEQ_NONE: i32 = -1;
@@ -549,24 +549,42 @@ struct SlotPayload {
 ///
 /// # Publication
 ///
-/// `seq` is the per-slot publication stamp. The producer writes the payload,
-/// then stores `seq` with [`Ordering::Release`]. The consumer reaches the
-/// payload only through [`read`](Self::read), which loads `seq` with
-/// [`Ordering::Acquire`] first. This is independent of the stream-wide
-/// [`Shared::last_seq_in`] pointer: a reordered straggler must still publish
-/// its slot without advancing that pointer.
+/// `seq` is the per-slot publication stamp, used as a seqlock. The producer
+/// ([`store`](Self::store)) clears `seq`, writes the payload, then stores the
+/// new `seq` with [`Ordering::Release`]. The consumer ([`read`](Self::read))
+/// loads `seq` with [`Ordering::Acquire`], copies, and loads `seq` again: the
+/// copy counts only if both loads show the `seq` it expects. This is
+/// independent of the stream-wide [`Shared::last_seq_in`] pointer: a reordered
+/// straggler must still publish its slot without advancing that pointer.
 ///
-/// The payload sits in its own [`UnsafeCell`] so the producer's `&mut` to one
-/// slot never overlaps a reference to any other slot or to the rest of the
-/// regulator.
+/// # Tolerated race
+///
+/// The payload is plain data, so a producer that laps the ring onto the slot
+/// the consumer is copying — a whole ring ([`NUM_SLOTS`] packets, ~10.9 s at
+/// fpp=128/48 kHz) ahead of a copy in progress — races that copy. This is a
+/// deliberate exception to the crate's no-data-race rule, taken because the
+/// lap is out of reach of today's transports and callback timing, and the
+/// alternative (atomic samples) costs code for no practical gain:
+///
+/// - On every target we build for, aligned `f32`/`f64` accesses do not tear,
+///   so the overlapping copy yields a mix of whole old and new samples, and
+///   the stamp reload in `read` discards it. The consumer conceals instead.
+/// - The formal hazard: because the race is undefined behavior, the compiler
+///   may assume the payload is not written during the copy, and could in
+///   principle sink the copy's loads past the stamp reload (an `Acquire`
+///   fence keeps later loads from moving earlier, not earlier loads from
+///   moving later), defeating the check. LLVM treats fences as full barriers
+///   and does not do this today.
+///
+/// Making the samples `AtomicU32` (with `Relaxed` accesses) would remove the
+/// race entirely if either assumption stops holding.
 struct PacketSlot {
     payload: UnsafeCell<SlotPayload>,
-    /// Sequence number occupying this slot, or [`SEQ_NONE`] if empty.
-    /// Because every `NUM_SLOTS`th sequence number aliases onto the same slot
-    /// (see the module header), `data` alone doesn't say *which* packet it
-    /// belongs to — this is the identity check the read side verifies before
-    /// trusting it. Atomic so a straggler's store synchronizes-with the
-    /// consumer without needing to advance `last_seq_in`.
+    /// Sequence number occupying this slot, or [`SEQ_NONE`] if empty or
+    /// mid-write. Because every `NUM_SLOTS`th sequence number aliases onto the
+    /// same slot (see the module header), `data` alone doesn't say *which*
+    /// packet it belongs to — this is the identity check the read side
+    /// verifies before and after trusting it.
     seq: AtomicI32,
 }
 
@@ -587,43 +605,62 @@ impl PacketSlot {
     ///
     /// Only the producer may call this (or [`Regulator::reset`] once both
     /// sides are quiesced), and no reference from an earlier call may still be
-    /// live. The consumer must not be reading this slot — see "Slot lapping"
-    /// on [`Regulator`] for the one case the stamps do not rule out.
+    /// live. The consumer must not be reading this slot, other than in the
+    /// tolerated race documented on [`PacketSlot`].
     #[allow(clippy::mut_from_ref)]
     unsafe fn payload_mut(&self) -> &mut SlotPayload {
         &mut *self.payload.get()
     }
 
-    /// The payload, if this slot currently holds `seq` (Acquire).
-    fn read(&self, seq: u16) -> Option<&SlotPayload> {
-        if !self.holds(seq) {
-            return None;
+    /// Producer side: write a packet into this slot and publish it as `seq`.
+    fn store(&self, seq: u16, timestamp: f64, samples: &[f32]) {
+        // Invalidate first, so a reader whose copy overlaps these writes sees
+        // the stamp change. The fence orders the invalidation before the
+        // payload writes for any reader that observes one of them.
+        self.seq.store(SEQ_NONE, Ordering::Relaxed);
+        fence(Ordering::Release);
+        {
+            // SAFETY: this is the producer, and the borrow ends before the
+            // Release below publishes the slot.
+            let payload = unsafe { self.payload_mut() };
+            payload.timestamp = timestamp;
+            payload.data.copy_from_slice(samples);
         }
-        // SAFETY: the Acquire in `holds` synchronizes-with the producer's
-        // Release in `publish_seq`, so every payload write for `seq`
-        // happened-before this read, and the producer does not write this
-        // slot again until the ring laps it (see "Slot lapping" on
-        // `Regulator`).
-        Some(unsafe { &*self.payload.get() })
-    }
-
-    /// Publish `seq` as the identity of the data currently in this slot.
-    /// Must be called **after** the payload is written.
-    #[inline]
-    fn publish_seq(&self, seq: u16) {
+        // Publish last: Release-store of seq synchronizes-with the consumer's
+        // Acquire identity check.
         self.seq.store(seq as i32, Ordering::Release);
     }
 
-    /// Clear the identity stamp (reset / invalidate).
-    #[inline]
-    fn clear_seq(&self) {
-        self.seq.store(SEQ_NONE, Ordering::Release);
+    /// Consumer side: run `copy` on the payload if this slot holds `seq`
+    /// both before and after it. `None` means the slot held something else,
+    /// or the producer overwrote it while `copy` ran — in which case whatever
+    /// `copy` produced is torn and must be discarded.
+    ///
+    /// An overwrite goes undetected only if it leaves the same `seq` behind:
+    /// the transport delivering one packet twice (both copies carry the same
+    /// audio) or the producer getting 65536 packets ahead mid-copy.
+    fn read<R>(&self, seq: u16, copy: impl FnOnce(&SlotPayload) -> R) -> Option<R> {
+        if self.seq.load(Ordering::Acquire) != seq as i32 {
+            return None;
+        }
+        // SAFETY: the Acquire above synchronizes-with the producer's Release
+        // in `store`, so every payload write for `seq` happened-before this
+        // read. A concurrent overwrite is the tolerated race on `PacketSlot`.
+        let result = copy(unsafe { &*self.payload.get() });
+        // Pairs with the fence in `store`: if `copy` saw any write made after
+        // an invalidation, the reload below sees that invalidation or later.
+        fence(Ordering::Acquire);
+        (self.seq.load(Ordering::Relaxed) == seq as i32).then_some(result)
     }
 
-    /// Whether this slot currently holds `seq` (Acquire).
-    #[inline]
-    fn holds(&self, seq: u16) -> bool {
-        self.seq.load(Ordering::Acquire) == seq as i32
+    /// Empty the slot and zero its payload. See [`Regulator::reset`] for the
+    /// quiescence the caller must provide.
+    fn clear(&self) {
+        self.seq.store(SEQ_NONE, Ordering::Release);
+        // SAFETY: producer and consumer are quiesced (`Regulator::reset`).
+        let payload = unsafe { self.payload_mut() };
+        payload.timestamp = 0.0;
+        payload.data.fill(0.0);
     }
 }
 
@@ -674,27 +711,23 @@ pub struct RegulatorStats {
 ///   fixed at construction, the atomics (the `last_seq_in` / `last_seq_out`
 ///   pointers, the stream's adopted channel count and start time, and the
 ///   published stats snapshot), and the slot ring.
-/// - Each slot's payload sits behind its own [`UnsafeCell`]. The producer
-///   writes it before a `Release` store of the slot's `seq` stamp; the consumer
-///   reads it only after an `Acquire` load of that stamp shows the `seq` it
-///   expects ([`PacketSlot::read`]).
+/// - Each slot's payload is guarded by the slot's `seq` stamp as a
+///   seqlock: the producer invalidates the stamp, writes, then `Release`s the
+///   new `seq`; the consumer trusts a copy only if an `Acquire` load of the
+///   stamp before it and a reload after it both show the `seq` it expects
+///   ([`PacketSlot::read`]). A producer that laps the ring onto the slot the
+///   consumer is copying — a whole ring ([`NUM_SLOTS`] packets, ~10.9 s at
+///   fpp=128/48 kHz) ahead — therefore turns that copy into a concealed
+///   packet rather than torn audio. The copy itself races the overwrite —
+///   the one data race this type tolerates; see [`PacketSlot`].
 /// - [`ConsumerState`] — tolerance, timing stats, Burg/channel state — sits
 ///   behind one [`UnsafeCell`] that only `pop` (and a quiesced `reset`)
-///   borrows mutably. The producer has no non-atomic state of its own, so it
-///   never needs a `&mut` to anything but the one slot payload it is writing.
+///   borrows mutably. The producer has no non-atomic state of its own, and
+///   takes a `&mut` only to resize slot payloads before a stream starts
+///   ([`Shared::adopt_channel_count`]).
 ///
 /// Calling `push` from two threads at once, or `pop` from two threads at once,
 /// breaks this and is undefined behavior.
-///
-/// # Slot lapping
-///
-/// The slot stamps do not cover one case: the producer overwriting the slot
-/// the consumer is in the middle of copying. That needs the producer to be a
-/// whole ring ([`NUM_SLOTS`] packets, ~10.9 s at fpp=128/48 kHz) ahead of a
-/// read the consumer is performing right now, or the transport to deliver the
-/// same sequence number twice. Neither is possible with today's transports and
-/// callback timing, but nothing here enforces it: if it happens, the copy
-/// races the producer's write.
 ///
 /// See WEB-53. Do not weaken this to `&mut self` + concurrent `SharedPtr::as_mut`.
 pub struct Regulator {
@@ -705,7 +738,8 @@ pub struct Regulator {
 // SAFETY: `Regulator` is shared across the network producer, audio consumer, and
 // main-thread stats readers. The only non-`Sync` parts are the `UnsafeCell`s:
 // `consumer` is borrowed mutably only by the single consumer (or a quiesced
-// `reset`), and each slot payload only per the stamp protocol on `PacketSlot`.
+// `reset`), and each slot payload only while no stream is running
+// (`Shared::adopt_channel_count`).
 // See the struct docs.
 unsafe impl Sync for Regulator {}
 
@@ -1110,18 +1144,9 @@ impl Shared {
         // Store the audio unconditionally, even for a packet the ordering check
         // below rejects: it is still the freshest thing that belongs in this
         // slot, and a straggler the read side has not passed yet is playable.
-        let slot = &self.slots[slot_index(seq_num)];
-        {
-            // SAFETY: this is the producer, and the borrow ends before the
-            // Release below publishes the slot.
-            let payload = unsafe { slot.payload_mut() };
-            payload.timestamp = relative_now;
-            payload.data.copy_from_slice(samples);
-        }
-        // Publish last: Release-store of seq synchronizes-with the consumer's
-        // Acquire identity check. Independent of the conditional last_seq_in
+        // Publishing the slot is independent of the conditional last_seq_in
         // advance below — stragglers must still publish their slots.
-        slot.publish_seq(seq_num);
+        self.slots[slot_index(seq_num)].store(seq_num, relative_now, samples);
 
         // Advance the write pointer only for packets that are actually newer;
         // reordered stragglers leave it where it is. Sequence numbers on the
@@ -1200,11 +1225,7 @@ impl Shared {
         // soon as they fall inside the new stream's span. Silence there is a
         // dropout; the previous connection's audio is a burst of garbage.
         for slot in self.slots.iter() {
-            // SAFETY: producer and consumer are quiesced (`Regulator::reset`).
-            let payload = unsafe { slot.payload_mut() };
-            payload.timestamp = 0.0;
-            payload.data.fill(0.0);
-            slot.clear_seq();
+            slot.clear();
         }
     }
 
@@ -1301,20 +1322,26 @@ impl ConsumerState {
                 // find_best_packet's own check, and if this thread stalled
                 // since then the producer may have lapped the ring onto
                 // this slot (WEB-53).
+                //
+                // Deinterleave from slot directly into channel tmp buffers (NO
+                // allocation). If the producer overwrote the slot mid-copy,
+                // `read` returns `None` and the torn tmp buffers are discarded
+                // by the concealment path, which zeroes them first.
                 let n = self.num_channels;
-                let Some(payload) = sh.slots[slot_idx].read(seq) else {
+                let channels = &mut self.channels[..n];
+                let copied = sh.slots[slot_idx].read(seq, |payload| {
+                    for (ch, channel) in channels.iter_mut().enumerate() {
+                        for s in 0..sh.fpp {
+                            channel.tmp_buf[s] = payload.data[s * n + ch];
+                        }
+                    }
+                });
+                if copied.is_none() {
                     // Stamp mismatch: conceal rather than play torn audio.
                     self.pull_stats.underruns += 1;
                     self.output_concealment(sh.fpp, output);
                     self.publish_stats(sh);
                     return false;
-                };
-
-                // Deinterleave from slot directly into channel tmp buffers (NO allocation)
-                for (ch, channel) in self.channels[..n].iter_mut().enumerate() {
-                    for s in 0..sh.fpp {
-                        channel.tmp_buf[s] = payload.data[s * n + ch];
-                    }
                 }
 
                 // Process with Burg algorithm
@@ -1349,8 +1376,8 @@ impl ConsumerState {
         let last_out_raw = sh.last_seq_out.load(Ordering::Acquire);
         if last_out_raw != SEQ_NONE {
             let last_out = last_out_raw as u16;
-            if let Some(payload) = sh.slots[slot_index(last_out)].read(last_out) {
-                if now - payload.timestamp > 10000.0 {
+            if let Some(timestamp) = sh.slots[slot_index(last_out)].read(last_out, |p| p.timestamp) {
+                if now - timestamp > 10000.0 {
                     // Stuck - output silence
                     output.fill(0.0);
                     return false;
@@ -1430,7 +1457,7 @@ impl ConsumerState {
             let seq = last_seq_in.wrapping_sub(i as u16);
             let slot_idx = slot_index(seq);
 
-            let Some(timestamp) = sh.slots[slot_idx].read(seq).map(|p| p.timestamp) else {
+            let Some(timestamp) = sh.slots[slot_idx].read(seq, |p| p.timestamp) else {
                 continue;
             };
 
@@ -1492,10 +1519,10 @@ impl ConsumerState {
         let pkts = seq.wrapping_sub(last_out.wrapping_add(1)) as usize;
 
         // Stamp check before trusting timestamp (WEB-53 Bug 4).
-        let Some(last_payload) = sh.slots[slot_index(last_out)].read(last_out) else {
+        let Some(last_timestamp) = sh.slots[slot_index(last_out)].read(last_out, |p| p.timestamp) else {
             return;
         };
-        let prev_time = last_payload.timestamp + (pkts as f64 + 1.0) * sh.fpp_duration_ms();
+        let prev_time = last_timestamp + (pkts as f64 + 1.0) * sh.fpp_duration_ms();
         if prev_time < timestamp {
             let elapsed = timestamp - prev_time;
             let updated = self.push_stats.tick(elapsed, now);
@@ -1736,12 +1763,8 @@ mod tests {
     /// lay out an arrival timeline (timestamps, gaps, out-of-order arrivals)
     /// without driving the wall clock. `samples` must be a full packet — the
     /// same contract `push` enforces.
-    fn plant_packet(reg: &mut Regulator, seq: u16, timestamp: f64, samples: &[f32]) {
-        let slot = &mut reg.shared.slots[slot_index(seq)];
-        let payload = slot.payload.get_mut();
-        payload.timestamp = timestamp;
-        payload.data.copy_from_slice(samples);
-        slot.publish_seq(seq);
+    fn plant_packet(reg: &Regulator, seq: u16, timestamp: f64, samples: &[f32]) {
+        reg.shared.slots[slot_index(seq)].store(seq, timestamp, samples);
     }
 
     /// Push a packet a test expects the regulator to store, asserting the
@@ -1952,7 +1975,7 @@ mod tests {
     /// catch it — only a direct seq check can.
     #[test]
     fn test_stale_aliased_slot_is_not_played_as_missing_packet() {
-        let mut reg = Regulator::with_params(1, 32, 48_000, 10.0);
+        let reg = Regulator::with_params(1, 32, 48_000, 10.0);
         let last_seq = 5u16;
         let candidate_seq = last_seq.wrapping_add(1); // 6 — genuinely lost, never planted
         let stale_seq = candidate_seq.wrapping_sub(NUM_SLOTS as u16); // aliases to same slot
@@ -1961,8 +1984,8 @@ mod tests {
         set_last_seq_out(&reg, Some(last_seq));
         reg.shared.last_seq_in.store(candidate_seq as i32, Ordering::Release);
 
-        plant_packet(&mut reg, last_seq, 40.0, &last_packet);
-        plant_packet(&mut reg, stale_seq, 41.0, &stale_packet); // candidate_seq never planted
+        plant_packet(&reg, last_seq, 40.0, &last_packet);
+        plant_packet(&reg, stale_seq, 41.0, &stale_packet); // candidate_seq never planted
 
         let mut output = vec![0.0f32; reg.fpp()];
         let result = reg.pop_internal(&mut output, 50.0);
@@ -2043,8 +2066,8 @@ mod tests {
         set_last_seq_out(&reg, Some(last_seq));
         reg.shared.last_seq_in.store(good_seq as i32, Ordering::Release);
 
-        plant_packet(&mut reg, last_seq, 40.0, &last_packet);
-        plant_packet(&mut reg, good_seq, 45.0, &packet);
+        plant_packet(&reg, last_seq, 40.0, &last_packet);
+        plant_packet(&reg, good_seq, 45.0, &packet);
 
         let mut concealment = vec![0.0f32; reg.fpp()];
         let concealment_result = reg.pop_internal(&mut concealment, 50.0);
@@ -2088,13 +2111,13 @@ mod tests {
 
         // Previously-played packet, reference point for push-stats timing.
         let silent_packet = vec![0.0f32; reg.fpp()];
-        plant_packet(&mut reg, last_seq, 40.0, &silent_packet);
+        plant_packet(&reg, last_seq, 40.0, &silent_packet);
         // Stale but valid packet: misses tolerance at now=60 (41 + 10 < 60),
         // so the scan records it as `first_good_skipped` instead of playing it.
-        plant_packet(&mut reg, stale_seq, 41.0, &stale_packet);
+        plant_packet(&reg, stale_seq, 41.0, &stale_packet);
         // Fresh packet within tolerance (55 + 10 >= 60); playing it would skip
         // exactly one good packet, which triggers the deferral.
-        plant_packet(&mut reg, fresh_seq, 55.0, &fresh_packet);
+        plant_packet(&reg, fresh_seq, 55.0, &fresh_packet);
 
         let mut output = vec![0.0f32; reg.fpp()];
         let first_result = reg.pop_internal(&mut output, 60.0);
@@ -2189,7 +2212,7 @@ mod tests {
         reg.shared.last_seq_in.store(9, Ordering::Release);
         set_last_seq_out(&reg, Some(7));
         consumer(&mut reg).last_stashed = Some((9, slot_index(9)));
-        plant_packet(&mut reg, 9, 100.0, &samples);
+        plant_packet(&reg, 9, 100.0, &samples);
 
         reg.reset();
 
@@ -2719,7 +2742,7 @@ mod tests {
         // still the last good packet's.
         assert_eq!(reg.shared.last_seq_in.load(Ordering::Acquire), 10);
         let slot = &mut reg.shared.slots[slot_index(11)];
-        assert!(slot.read(11).is_none());
+        assert!(slot.read(11, |_| ()).is_none());
         let payload = slot.payload.get_mut();
         assert_eq!(payload.timestamp, 0.0);
         assert!(payload.data.iter().all(|&s| s == 0.0));
@@ -2795,13 +2818,81 @@ mod tests {
             12,
             "straggler must not advance last_seq_in"
         );
-        let payload = reg.shared.slots[slot_index(11)]
-            .read(11)
+        let first_sample = reg.shared.slots[slot_index(11)]
+            .read(11, |payload| payload.data[0])
             .expect("straggler must Release-publish its slot stamp");
         assert!(
-            (payload.data[0] - 0.75).abs() < 1e-6,
+            (first_sample - 0.75).abs() < 1e-6,
             "straggler payload must be stored"
         );
+    }
+
+    /// A producer that laps the ring onto the slot the consumer is copying
+    /// must make that copy fail, not pass off a mix of two packets as the one
+    /// the consumer asked for. Without the post-copy stamp reload, `read`
+    /// returns `Some`. Skipped under Miri: the overwrite is the tolerated race
+    /// documented on `PacketSlot`.
+    #[test]
+    #[cfg_attr(miri, ignore = "exercises the tolerated race documented on PacketSlot")]
+    fn test_slot_read_rejects_copy_overlapping_a_producer_write() {
+        let slot = PacketSlot::new(4);
+        let seq = 7u16;
+        let lapped = seq.wrapping_add(NUM_SLOTS as u16);
+
+        slot.store(seq, 1.0, &[0.25; 4]);
+        assert_eq!(slot.read(seq, |p| p.data[0]), Some(0.25));
+
+        let torn = slot.read(seq, |p| {
+            let before = p.data[0];
+            slot.store(lapped, 2.0, &[0.75; 4]);
+            (before, p.data[3])
+        });
+        assert_eq!(torn, None, "a copy spanning an overwrite must be discarded");
+        assert_eq!(slot.read(lapped, |p| p.data[3]), Some(0.75));
+    }
+
+    /// The other half of the seqlock: a copy that ends while the producer is
+    /// still mid-write sees the old stamp on reload unless `store` invalidates
+    /// it before writing. Every copy `read` accepts must be one whole packet.
+    /// Timing-dependent: a missing invalidation is caught on some runs, not
+    /// all. Skipped under Miri, which correctly reports the overlapping copy
+    /// as the data race `PacketSlot` documents as tolerated.
+    #[test]
+    #[cfg_attr(miri, ignore = "exercises the tolerated race documented on PacketSlot")]
+    fn test_slot_read_never_accepts_a_torn_packet() {
+        const LEN: usize = 16;
+        let packets: u16 = 20_000;
+        // Through a `Regulator`, which is what carries the `Sync` assertion.
+        let reg = &Regulator::with_params(1, LEN, 48_000, 5.0);
+        let done = &AtomicI32::new(0);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let slot = &reg.shared.slots[0];
+                for seq in 1..=packets {
+                    slot.store(seq, seq as f64, &[seq as f32; LEN]);
+                }
+                done.store(1, Ordering::Release);
+            });
+            scope.spawn(move || {
+                let slot = &reg.shared.slots[0];
+                while done.load(Ordering::Acquire) == 0 {
+                    let seq = slot.seq.load(Ordering::Relaxed);
+                    if seq == SEQ_NONE {
+                        continue;
+                    }
+                    let copy = slot.read(seq as u16, |p| {
+                        (p.timestamp, p.data.clone())
+                    });
+                    if let Some((timestamp, samples)) = copy {
+                        assert_eq!(timestamp, seq as f64, "accepted a torn timestamp");
+                        assert!(
+                            samples.iter().all(|&s| s == seq as f32),
+                            "accepted a torn packet for seq {seq}: {samples:?}"
+                        );
+                    }
+                }
+            });
+        });
     }
 
     /// PR #89 review: `push` and `pop` each used to create a `&mut` to the
