@@ -134,6 +134,8 @@ pub(crate) struct MockProbe {
     pub(crate) connects: std::cell::Cell<u32>,
     /// Calls to `close`
     pub(crate) closes: std::cell::Cell<u32>,
+    /// Calls to `tick` (the audio-callback network loop)
+    pub(crate) ticks: std::cell::Cell<u32>,
     /// The state-change callback the session installed
     on_state_change: std::cell::RefCell<Option<js_sys::Function>>,
     /// Run once, just before a `connect` resolves (after any gate opens)
@@ -244,6 +246,7 @@ impl crate::audio::transport::Transport for MockTransport {
     /// never yielded, and the renderer hung (the intermittent CI
     /// `coverage:wasm` "Timed out receiving message from renderer").
     fn tick(&mut self) {
+        self.probe.ticks.set(self.probe.ticks.get() + 1);
         let ring = self.audio_buffers.and_then(|buffers| buffers.local_to_network.as_ref());
         if let Some(ring) = ring {
             while ring.read(&mut self.drain_scratch) {}
