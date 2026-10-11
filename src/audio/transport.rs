@@ -124,6 +124,16 @@ pub struct AudioBufferConfig {
     pub receive_channels: u8,
 }
 
+// `AudioBufferConfig` is handed to the transport's network loop, which runs on a
+// different agent (worker) or OS thread from the audio thread. Nothing in the
+// build otherwise *requires* it to be `Send + Sync` — addresses cross agents as
+// integers over `postMessage` — so without this assertion `SharedPtr`'s
+// `T: Sync` bound would never be checked against the real pointees (WEB-54).
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<AudioBufferConfig>();
+};
+
 impl AudioBufferConfig {
     /// Interleaved samples in one outbound packet: `buffer_size` frames at
     /// `send_channels` wide.
