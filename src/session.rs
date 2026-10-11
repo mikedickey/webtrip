@@ -29,6 +29,8 @@
 //!    └─> tick() loop sends/receives packets via Transport trait
 //! ```
 
+use std::mem::ManuallyDrop;
+
 use wasm_bindgen::prelude::*;
 
 use crate::audio::engine::AudioEngine;
@@ -236,9 +238,11 @@ pub struct WebTripSession {
     audio_params_ptr: *const AudioParams,
     audio_engine: Option<AudioEngine>,
 
-    // Owned buffers (shared with AudioWorklet and Transport via pointers)
-    local_to_network_buffer: Box<RingBuffer>,
-    network_to_local_buffer: Box<Regulator>,
+    // Owned buffers (shared with AudioWorklet and Transport via pointers).
+    // `ManuallyDrop` because `Drop` must hand them to a deferred task that
+    // frees them only once both consumers have quiesced (see `Drop`).
+    local_to_network_buffer: ManuallyDrop<Box<RingBuffer>>,
+    network_to_local_buffer: ManuallyDrop<Box<Regulator>>,
 
     // Network components
     transport: Option<Box<dyn Transport>>,
@@ -313,8 +317,8 @@ impl WebTripSession {
         Ok(WebTripSession {
             audio_params_ptr,
             audio_engine: None,
-            local_to_network_buffer,
-            network_to_local_buffer,
+            local_to_network_buffer: ManuallyDrop::new(local_to_network_buffer),
+            network_to_local_buffer: ManuallyDrop::new(network_to_local_buffer),
             transport: None,
             transport_type: TransportType::WebRTC, // Default to WebRTC
             state: SessionState::Idle,
@@ -335,8 +339,8 @@ impl WebTripSession {
     /// transport before it connects.
     fn audio_buffer_config(&mut self) -> AudioBufferConfig {
         AudioBufferConfig {
-            local_to_network: SharedPtr::new(&mut *self.local_to_network_buffer),
-            network_to_local: SharedPtr::new(&mut *self.network_to_local_buffer),
+            local_to_network: SharedPtr::new(&mut **self.local_to_network_buffer),
+            network_to_local: SharedPtr::new(&mut **self.network_to_local_buffer),
             buffer_size: self.buffer_size,
             send_channels: self.send_channels,
             receive_channels: self.receive_channels,
@@ -552,8 +556,8 @@ impl WebTripSession {
         // Get raw pointers to owned buffers. `AudioEngine` is a `#[wasm_bindgen]`
         // boundary type, so it takes raw pointers here and wraps them in
         // `SharedPtr` internally when it builds the `AudioProcessor`.
-        let local_to_network_ptr = &mut *self.local_to_network_buffer as *mut RingBuffer;
-        let network_to_local_ptr = &mut *self.network_to_local_buffer as *mut Regulator;
+        let local_to_network_ptr = &mut **self.local_to_network_buffer as *mut RingBuffer;
+        let network_to_local_ptr = &mut **self.network_to_local_buffer as *mut Regulator;
 
         // Create audio engine with network support
         let engine = AudioEngine::create_with_network(
@@ -961,18 +965,33 @@ impl WebTripSession {
 
 impl Drop for WebTripSession {
     fn drop(&mut self) {
-        // `disconnect()` is now async and can't be awaited from Drop. Instead,
-        // best-effort teardown: drop the transport (its own Drop impl fires
-        // off the shutdown message and schedules the fallback terminate) and
-        // stop audio capture without awaiting worklet quiescence. The Regulator
-        // doesn't need to be reset in Drop because the whole session is being
-        // deallocated.
-        self.transport = None;
+        // Drop can't await, but the worklet render thread and the WebTransport
+        // worker both hold raw pointers into the buffers, and neither stops
+        // synchronously (`"stop"` and `{type:"disconnect"}` are just posted
+        // messages). Freeing the buffers here would let a pending `process()`
+        // or worker `push()` dereference freed storage. Instead, move the
+        // buffers into a task that runs the same quiescing teardown as
+        // `disconnect()` and frees them only afterwards. No reset needed: the
+        // buffers are being deallocated.
         self.stop_audio_callback_loop();
-        if let Some(ref mut engine) = self.audio_engine {
-            engine.stop_capture_now();
-        }
-        self.audio_engine = None;
+        let transport = self.transport.take();
+        let engine = self.audio_engine.take();
+        // SAFETY: `Drop::drop` runs once and nothing reads the fields after.
+        let buffers = unsafe {
+            (
+                ManuallyDrop::take(&mut self.local_to_network_buffer),
+                ManuallyDrop::take(&mut self.network_to_local_buffer),
+            )
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(mut transport) = transport {
+                transport.close().await;
+            }
+            if let Some(mut engine) = engine {
+                engine.stop_capture().await;
+            }
+            drop(buffers);
+        });
     }
 }
 
