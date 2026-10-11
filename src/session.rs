@@ -905,8 +905,8 @@ impl WebTripSession {
     }
 
     /// Quiesce and drop a connection's transport and engine, then reset the
-    /// regulator for the next connection. The caller must already have
-    /// stopped the network loop if it was started.
+    /// regulator for the next connection when worklet quiescence is proven.
+    /// The caller must already have stopped the network loop if it was started.
     async fn release(&self, transport: Option<Box<dyn Transport>>, engine: Option<AudioEngine>) {
         if let Some(mut transport) = transport {
             transport.close().await;
@@ -916,13 +916,22 @@ impl WebTripSession {
         // Awaits worklet quiescence (via `AudioEngine::stop_capture`'s
         // `AudioContext.close`, with timeout), as `Regulator::reset` requires
         // (WEB-53 Bug 7 / WEB-66). Closing also releases the worklet global so
-        // the context cannot leak across reconnects.
-        if let Some(mut engine) = engine {
-            engine.stop_capture().await;
+        // the context cannot leak across reconnects. Reset only when close
+        // fulfilled — a timeout must not race `reset` against a live `pop`.
+        let quiescent = match engine {
+            Some(mut engine) => engine.stop_capture().await,
+            // No engine means nothing is popping the regulator.
+            None => true,
+        };
+        if quiescent {
+            self.network_to_local_buffer.reset();
+        } else {
+            web_sys::console::warn_1(
+                &"⚠️ AudioContext.close did not finish in time; skipping Regulator::reset \
+                  to avoid racing a live worklet"
+                    .into(),
+            );
         }
-        // Now that no further writes to the Regulator are possible, reset it
-        // so the next connection starts from a clean slate.
-        self.network_to_local_buffer.reset();
     }
 
     /// Raw pointers to the owned buffers, for consumers that cross agents.

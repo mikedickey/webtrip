@@ -1,3 +1,6 @@
+use std::cell::Cell;
+use std::rc::Rc;
+
 use crate::audio::devices::{
     clamp_channel_count, first_audio_track, get_media_devices, get_user_media_audio,
     resolve_input_channels, settings_channels, stop_media_stream,
@@ -10,6 +13,7 @@ use crate::audio::regulator::Regulator;
 use crate::audio::ring_buffer::RingBuffer;
 use crate::audio::shared_ptr::SharedPtr;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -389,26 +393,32 @@ impl AudioEngine {
     /// prevents a leaked context from being resumed and racing a freed
     /// regulator as a second consumer.
     ///
+    /// Returns `true` only when `close()`'s promise **fulfilled** (worklet
+    /// quiescence established). A timeout or rejection returns `false`; the
+    /// caller must not [`Regulator::reset`](crate::audio::regulator::Regulator::reset)
+    /// in that case.
+    ///
     /// This is terminal for the engine: a closed context cannot be restarted.
     /// Callers that only need to rebuild capture on the same context (e.g.
     /// [`start_capture`](Self::start_capture)) must use node teardown alone.
     #[wasm_bindgen(js_name = stopCapture)]
-    pub async fn stop_capture(&mut self) {
+    pub async fn stop_capture(&mut self) -> bool {
         self.stop_capture_with_timeout(AUDIO_CONTEXT_CLOSE_TIMEOUT_MS)
-            .await;
+            .await
     }
 
     /// Like [`stop_capture`](Self::stop_capture), but with an explicit close
     /// timeout. Used by wasm tests that stub `close()` to never settle.
-    pub(crate) async fn stop_capture_with_timeout(&mut self, timeout_ms: i32) {
+    pub(crate) async fn stop_capture_with_timeout(&mut self, timeout_ms: i32) -> bool {
         self.stop_nodes();
-        close_audio_context(&self.ctx, timeout_ms).await;
+        close_audio_context(&self.ctx, timeout_ms).await
     }
 
     /// Tear down the worklet and media tracks and fire `AudioContext.close()`
-    /// without awaiting it. Used from [`Drop`] and other sync paths that
-    /// cannot await; prefer [`stop_capture`](Self::stop_capture) whenever
-    /// async is available so close can finish (or time out) before
+    /// without awaiting it (skipped when already closed). Used from [`Drop`]
+    /// and other sync paths that cannot await; prefer
+    /// [`stop_capture`](Self::stop_capture) whenever async is available so
+    /// close can finish (or time out) before
     /// [`Regulator::reset`](crate::audio::regulator::Regulator::reset).
     pub(crate) fn stop_capture_now(&mut self) {
         self.stop_nodes();
@@ -529,37 +539,119 @@ pub(crate) fn audio_context_state(ctx: &AudioContext) -> Option<String> {
         .and_then(|v| v.as_string())
 }
 
-/// Fire `AudioContext.close()` without awaiting the returned promise.
+/// Outcome of racing a JS promise against a timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimeoutRace {
+    /// The raced promise fulfilled.
+    Fulfilled,
+    /// The raced promise rejected.
+    Rejected,
+    /// The timer won before the promise settled.
+    TimedOut,
+}
+
+/// Fire `AudioContext.close()` without awaiting, unless the context is already
+/// `"closed"`.
+///
+/// A second `close()` on a closed context rejects with `InvalidStateError`;
+/// discarding that promise surfaces an unhandled rejection, so we must not
+/// call `close()` again after a successful teardown (or after `stop_capture`
+/// already closed). When we do fire `close()`, the returned promise is
+/// absorbed on a microtask so a rare reject-between-check-and-call cannot
+/// leak as an unhandled rejection.
 pub(crate) fn close_audio_context_now(ctx: &AudioContext) {
-    let _ = ctx.close();
+    if audio_context_state(ctx).as_deref() == Some("closed") {
+        return;
+    }
+    if let Ok(promise) = ctx.close() {
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = JsFuture::from(promise).await;
+        });
+    }
 }
 
 /// Await `AudioContext.close()`, racing a timer so a never-settling promise
-/// cannot hang teardown. A second `close()` on an already-closed context
-/// resolves immediately per the Web Audio spec.
-pub(crate) async fn close_audio_context(ctx: &AudioContext, timeout_ms: i32) {
+/// cannot hang teardown.
+///
+/// Returns `true` only when the close promise **fulfilled** (or the context
+/// was already `"closed"`). A timeout or rejection returns `false` — the
+/// worklet is not proven quiescent, so callers must not
+/// [`Regulator::reset`](crate::audio::regulator::Regulator::reset).
+pub(crate) async fn close_audio_context(ctx: &AudioContext, timeout_ms: i32) -> bool {
+    if audio_context_state(ctx).as_deref() == Some("closed") {
+        return true;
+    }
     let Ok(promise) = ctx.close() else {
-        return;
+        return audio_context_state(ctx).as_deref() == Some("closed");
     };
-    await_with_timeout(promise, timeout_ms).await;
+    match await_with_timeout(promise, timeout_ms).await {
+        TimeoutRace::Fulfilled => true,
+        // Rejected after our pre-check usually means another close won the race
+        // and the context is already closed — that is still quiescent.
+        TimeoutRace::Rejected => audio_context_state(ctx).as_deref() == Some("closed"),
+        TimeoutRace::TimedOut => false,
+    }
 }
 
-/// Resolve when `promise` settles or `timeout_ms` elapses, whichever is first.
+/// Race `promise` against a `timeout_ms` timer and report which won.
 ///
 /// Shared by AudioContext close teardown and its wasm hang-regression test so
-/// the race is implemented once.
-pub(crate) async fn await_with_timeout(promise: js_sys::Promise, timeout_ms: i32) {
-    let timeout = js_sys::Promise::new(&mut |resolve, _reject| {
-        let Some(window) = web_sys::window() else {
-            // No window (e.g. worker scope): resolve immediately so teardown
-            // cannot hang without a timer.
-            let _ = resolve.call0(&JsValue::NULL);
-            return;
-        };
-        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, timeout_ms);
-    });
-    let raced = js_sys::Promise::race(&js_sys::Array::of2(&promise, &timeout));
+/// the race is implemented once. Fulfillment and rejection are distinguished
+/// from a timeout so callers can require a successful close before acting.
+pub(crate) async fn await_with_timeout(promise: js_sys::Promise, timeout_ms: i32) -> TimeoutRace {
+    let outcome = Rc::new(Cell::new(None::<TimeoutRace>));
+
+    let on_fulfill = {
+        let outcome = Rc::clone(&outcome);
+        Closure::wrap(Box::new(move |_value: JsValue| {
+            if outcome.get().is_none() {
+                outcome.set(Some(TimeoutRace::Fulfilled));
+            }
+        }) as Box<dyn FnMut(JsValue)>)
+    };
+    let on_reject = {
+        let outcome = Rc::clone(&outcome);
+        Closure::wrap(Box::new(move |_error: JsValue| {
+            if outcome.get().is_none() {
+                outcome.set(Some(TimeoutRace::Rejected));
+            }
+        }) as Box<dyn FnMut(JsValue)>)
+    };
+    // `then2` turns fulfill/reject into a follow-up that always fulfills, so
+    // `Promise.race` against the timer cannot reject and hang the await.
+    let settled = promise.then2(&on_fulfill, &on_reject);
+
+    let timeout = {
+        let outcome = Rc::clone(&outcome);
+        js_sys::Promise::new(&mut move |resolve, _reject| {
+            let resolve_timeout = resolve.clone();
+            let outcome = Rc::clone(&outcome);
+            let fire = move || {
+                if outcome.get().is_none() {
+                    outcome.set(Some(TimeoutRace::TimedOut));
+                }
+                let _ = resolve_timeout.call0(&JsValue::NULL);
+            };
+            let Some(window) = web_sys::window() else {
+                // No window (e.g. worker scope): treat as timed out immediately
+                // so teardown cannot hang without a timer.
+                fire();
+                return;
+            };
+            let cb = Closure::once_into_js(fire);
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.as_ref().unchecked_ref(),
+                timeout_ms,
+            );
+        })
+    };
+
+    let raced = js_sys::Promise::race(&js_sys::Array::of2(&settled, &timeout));
     let _ = JsFuture::from(raced).await;
+    // Keep the then-closures alive until the race has observed a settle.
+    drop(on_fulfill);
+    drop(on_reject);
+    outcome.get().unwrap_or(TimeoutRace::TimedOut)
 }
 
 /// Route playback to the requested output sink on `ctx_obj` via `setSinkId`.
@@ -674,13 +766,17 @@ mod tests {
     /// `Drop`'s fire-and-forget close alone.
     #[cfg(target_arch = "wasm32")]
     async fn close_engine(engine: AudioEngine) {
-        close_audio_context(&engine.ctx, AUDIO_CONTEXT_CLOSE_TIMEOUT_MS).await;
+        assert!(
+            close_audio_context(&engine.ctx, AUDIO_CONTEXT_CLOSE_TIMEOUT_MS).await,
+            "close_engine must observe a fulfilled AudioContext.close"
+        );
         assert_eq!(
             audio_context_state(&engine.ctx).as_deref(),
             Some("closed"),
             "close_engine must leave the AudioContext closed"
         );
-        // `Drop` fires a second, already-closed `close()` — harmless.
+        // `Drop` must not call `close()` again on an already-closed context
+        // (that rejects with InvalidStateError).
         drop(engine);
     }
 
@@ -842,7 +938,10 @@ mod tests {
             "get_worklet_port must return Some(MessagePort) while capturing"
         );
 
-        engine.stop_capture().await;
+        assert!(
+            engine.stop_capture().await,
+            "stop_capture must report quiescence after a real close"
+        );
 
         assert!(
             !engine.is_capturing(),
@@ -862,7 +961,7 @@ mod tests {
     }
 
     /// A `close()` promise that never settles must not hang teardown: the
-    /// timeout races it so `stop_capture` still returns (WEB-66).
+    /// timeout races it so `stop_capture` still returns `false` (WEB-66).
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn stop_capture_returns_when_close_hangs() {
@@ -884,8 +983,12 @@ mod tests {
             .expect("installing the hanging close stub should succeed");
 
         let started = js_sys::Date::now();
-        engine.stop_capture_with_timeout(50).await;
+        let quiescent = engine.stop_capture_with_timeout(50).await;
         let elapsed = js_sys::Date::now() - started;
+        assert!(
+            !quiescent,
+            "a hanging close must not claim worklet quiescence"
+        );
         assert!(
             elapsed >= 40.0 && elapsed < 400.0,
             "stop_capture must return around the 50ms close timeout, got {elapsed}ms"
@@ -905,12 +1008,43 @@ mod tests {
     async fn await_with_timeout_completes_when_promise_hangs() {
         let hanging = js_sys::Promise::new(&mut |_resolve, _reject| {});
         let started = js_sys::Date::now();
-        await_with_timeout(hanging, 50).await;
+        assert_eq!(
+            await_with_timeout(hanging, 50).await,
+            TimeoutRace::TimedOut,
+            "a hanging promise must lose to the timer"
+        );
         let elapsed = js_sys::Date::now() - started;
         assert!(
             elapsed >= 40.0 && elapsed < 400.0,
             "await_with_timeout must resolve on the timer, got {elapsed}ms"
         );
+    }
+
+    /// Spec pin: a second `AudioContext.close()` on an already-closed context
+    /// rejects with `InvalidStateError`. `close_audio_context_now` / `Drop`
+    /// must therefore skip `close()` when state is already `"closed"` —
+    /// otherwise every normal disconnect surfaces an unhandled rejection.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn second_close_on_closed_context_rejects() {
+        let ctx = AudioContext::new().expect("AudioContext construction should succeed");
+        JsFuture::from(ctx.close().expect("first close should be issuable"))
+            .await
+            .expect("first close should fulfill");
+        assert_eq!(audio_context_state(&ctx).as_deref(), Some("closed"));
+
+        let second = ctx
+            .close()
+            .expect("second close is still issuable as a promise");
+        assert!(
+            JsFuture::from(second).await.is_err(),
+            "second close on a closed AudioContext must reject (InvalidStateError)"
+        );
+
+        // The guarded helper must be a no-op on an already-closed context —
+        // it must not fire another rejecting close().
+        close_audio_context_now(&ctx);
+        assert_eq!(audio_context_state(&ctx).as_deref(), Some("closed"));
     }
 
     /// Wiring buffer pointers via the setters must route a later `start_capture`
@@ -984,7 +1118,10 @@ mod tests {
              wired via set_local_to_network_buffer (samples_written stayed 0)"
         );
 
-        engine.stop_capture().await;
+        assert!(
+            engine.stop_capture().await,
+            "stop_capture after networked capture must report quiescence"
+        );
         close_engine(engine).await;
     }
 
