@@ -196,7 +196,122 @@ fn post_error_to_main(msg: &str) {
 /// in one place rather than being duplicated per loop.
 fn signal_connection_lost() {
     WORKER_STATE.with(|state| state.borrow().stop());
+    // Cancel any pending datagram read so the receive loop exits promptly.
+    cancel_datagram_reader();
     post_error_to_main("Connection lost");
+}
+
+/// Whether the worker may post `"disconnected"` to the main thread.
+///
+/// The ack is the synchronization point the session awaits before
+/// `Regulator::reset()`: both the send loop (after flushing exit packets) and
+/// the receive loop must have exited. Posting earlier would let a still-running
+/// receive task push into the regulator after the main thread proceeds.
+fn should_post_disconnected(
+    pending_disconnect_ack: bool,
+    send_loop_exited: bool,
+    receive_loop_exited: bool,
+) -> bool {
+    pending_disconnect_ack && send_loop_exited && receive_loop_exited
+}
+
+/// After `reader.read()` resolves with datagram bytes, deliver them only when
+/// the worker is still running.
+///
+/// The receive loop checks [`WorkerState::is_running`] *before* awaiting the
+/// read. A `worker_disconnect()` that lands while that read is pending would
+/// otherwise still push. Callers re-check `running` after the read settles and
+/// pass the result here; when it is `false` this returns without calling
+/// [`handle_datagram`].
+///
+/// Returns `true` when the receive loop should keep reading, `false` when it
+/// should exit (disconnect observed after the read).
+fn deliver_datagram_if_running(
+    running: bool,
+    data: &[u8],
+    regulator: Option<&Regulator>,
+    samples: &mut Vec<f32>,
+    stats: &mut WebTransportWorkerStats,
+) -> bool {
+    if !running {
+        return false;
+    }
+    handle_datagram(data, regulator, samples, stats);
+    true
+}
+
+/// Cancel the datagram reader's pending `read()`, if any.
+///
+/// Fire-and-forget: the pending `JsFuture` in [`receive_loop`] settles as an
+/// error (or done), and that loop's post-read `running` check / Err branch
+/// exits without pushing. Uses `Reflect` so we do not depend on a web-sys
+/// mixin feature for `cancel()`.
+fn cancel_datagram_reader() {
+    WORKER_STATE.with(|state| {
+        let state = state.borrow();
+        let reader = state.datagram_reader.borrow();
+        let Some(reader) = reader.as_ref() else {
+            return;
+        };
+        if let Ok(cancel) = Reflect::get(reader.as_ref(), &"cancel".into()) {
+            if let Ok(cancel_fn) = cancel.dyn_into::<js_sys::Function>() {
+                let _ = cancel_fn.call0(reader.as_ref());
+            }
+        }
+    });
+}
+
+/// Record that the send loop has finished. When `want_disconnect_ack` is set
+/// (graceful `worker_disconnect` path after exit packets), arm the pending
+/// ack and post `"disconnected"` once the receive loop has also exited.
+fn mark_send_loop_exited(want_disconnect_ack: bool) {
+    WORKER_STATE.with(|state| {
+        let state = state.borrow();
+        if want_disconnect_ack {
+            state
+                .pending_disconnect_ack
+                .store(true, Ordering::SeqCst);
+        }
+        state.send_loop_exited.store(true, Ordering::SeqCst);
+    });
+    maybe_post_disconnected();
+}
+
+/// Record that the receive loop has finished, then try to post the graceful
+/// disconnect ack if the send loop already armed it.
+fn mark_receive_loop_exited() {
+    WORKER_STATE.with(|state| {
+        state
+            .borrow()
+            .receive_loop_exited
+            .store(true, Ordering::SeqCst);
+        // Drop the reader handle so a later connect cannot cancel a stale one.
+        *state.borrow().datagram_reader.borrow_mut() = None;
+    });
+    maybe_post_disconnected();
+}
+
+/// Post `"disconnected"` exactly once when both loops have exited and a
+/// graceful ack is pending.
+fn maybe_post_disconnected() {
+    let should_post = WORKER_STATE.with(|state| {
+        let state = state.borrow();
+        let pending = state.pending_disconnect_ack.load(Ordering::SeqCst);
+        let send_done = state.send_loop_exited.load(Ordering::SeqCst);
+        let recv_done = state.receive_loop_exited.load(Ordering::SeqCst);
+        if should_post_disconnected(pending, send_done, recv_done) {
+            // Clear pending first so a cooperative re-entry cannot double-post.
+            state
+                .pending_disconnect_ack
+                .store(false, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    });
+    if should_post {
+        post_message_to_main(&JsValue::from_str("disconnected"));
+    }
 }
 
 /// Worker state shared between message handler and transport loops
@@ -217,6 +332,13 @@ struct WorkerState {
     timestamp: AtomicU64,
     /// Flag to signal loops to stop
     running: AtomicBool,
+    /// Set when [`send_loop`] has returned (after any graceful exit-packet flush).
+    send_loop_exited: AtomicBool,
+    /// Set when [`receive_loop`] has returned.
+    receive_loop_exited: AtomicBool,
+    /// Armed by the send loop on graceful disconnect; [`maybe_post_disconnected`]
+    /// posts `"disconnected"` once both loops have exited.
+    pending_disconnect_ack: AtomicBool,
     /// Reusable buffers for packet processing (avoid allocations in hot path)
     audio_buffer: RefCell<Vec<f32>>,
     packet_buffer: RefCell<Vec<u8>>,
@@ -225,6 +347,10 @@ struct WorkerState {
     /// Only touched on the single worker thread that owns this state
     /// (lives in the `WORKER_STATE` thread-local below).
     has_data_int32_array: RefCell<Option<js_sys::Int32Array>>,
+    /// Datagram stream reader held so [`worker_disconnect`] / connection-lost
+    /// can `cancel()` a pending `read()` and unblock [`receive_loop`].
+    /// Confined to the worker agent that registered it.
+    datagram_reader: RefCell<Option<web_sys::ReadableStreamDefaultReader>>,
 }
 
 impl WorkerState {
@@ -238,10 +364,14 @@ impl WorkerState {
             sequence_number: AtomicU16::new(0),
             timestamp: AtomicU64::new(0),
             running: AtomicBool::new(false),
+            send_loop_exited: AtomicBool::new(true),
+            receive_loop_exited: AtomicBool::new(true),
+            pending_disconnect_ack: AtomicBool::new(false),
             audio_buffer: RefCell::new(Vec::new()),
             packet_buffer: RefCell::new(Vec::new()),
             samples_buffer: RefCell::new(Vec::new()),
             has_data_int32_array: RefCell::new(None),
+            datagram_reader: RefCell::new(None),
         }
     }
 
@@ -291,6 +421,11 @@ impl WorkerState {
 
     fn start(&self) {
         self.running.store(true, Ordering::SeqCst);
+        // Loops are about to be spawned; clear prior-exit / ack state.
+        self.send_loop_exited.store(false, Ordering::SeqCst);
+        self.receive_loop_exited.store(false, Ordering::SeqCst);
+        self.pending_disconnect_ack.store(false, Ordering::SeqCst);
+        *self.datagram_reader.borrow_mut() = None;
     }
 
     fn stop(&self) {
@@ -402,10 +537,13 @@ pub async fn worker_connect(server_url: String) -> Result<(), JsValue> {
 
 /// Disconnect from the server and stop all loops
 ///
-/// Sets `running = false` and then wakes any thread currently sleeping in
-/// `Atomics.waitAsync` on the ring-buffer's has_data flag, so the send loop
-/// notices the shutdown immediately (µs-scale) without relying on a polling
-/// timeout.
+/// Sets `running = false`, cancels any pending datagram `read()` so the
+/// receive loop unblocks, and wakes any sleeper in `Atomics.waitAsync` on the
+/// ring-buffer's has_data flag so the send loop notices immediately
+/// (µs-scale) without relying on a polling timeout.
+///
+/// `"disconnected"` is posted later by [`maybe_post_disconnected`] once
+/// **both** loops have exited (send flushes JackTrip exit packets first).
 #[wasm_bindgen(js_name = workerDisconnect)]
 pub fn worker_disconnect() {
     // Clone out the Int32Array first so we don't hold the RefCell borrow across
@@ -416,6 +554,9 @@ pub fn worker_disconnect() {
         let cloned = state.has_data_int32_array.borrow().clone();
         cloned
     });
+    // Unblock a pending `reader.read()` so receive_loop can observe
+    // running=false without waiting for the next datagram (~2.7 ms).
+    cancel_datagram_reader();
     // Wake any Atomics.waitAsync sleeper on the has_data flag. The value of the
     // flag is unchanged; we're only sending a wake-up signal so the send loop's
     // awaited Promise resolves and it can observe running=false.
@@ -505,16 +646,30 @@ fn build_next_packet(state: &WorkerState) -> Option<(Uint8Array, usize)> {
 }
 
 async fn send_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(), JsValue> {
+    // Always record exit here so early errors (e.g. get_writer) cannot leave
+    // `send_loop_exited` false and hang a pending disconnect ack.
+    let (result, want_disconnect_ack) = send_loop_body(transport).await;
+    mark_send_loop_exited(want_disconnect_ack);
+    result
+}
+
+/// Returns `(result, want_disconnect_ack)`. `want_disconnect_ack` is true only
+/// after a graceful exit-packet flush.
+async fn send_loop_body(
+    transport: Rc<RefCell<web_sys::WebTransport>>,
+) -> (Result<(), JsValue>, bool) {
     // Get the writable datagram stream
     let datagrams = transport.borrow().datagrams();
     let writable = datagrams.writable();
-    
+
     // get_writer() returns Result<WritableStreamDefaultWriter, JsValue>
-    let writer = writable.get_writer()
-        .map_err(|e| {
+    let writer = match writable.get_writer() {
+        Ok(w) => w,
+        Err(e) => {
             web_sys::console::error_1(&format!("[WebTransport Worker] ❌ Failed to get datagram writer: {:?}", e).into());
-            e
-        })?;
+            return (Err(e), false);
+        }
+    };
 
     // Tracks whether the loop exited due to a graceful worker_disconnect() call (as opposed
     // to a connection error). Only a graceful exit warrants sending an exit packet.
@@ -621,20 +776,20 @@ async fn send_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(), 
         }
     }
 
-    // On graceful disconnect: send two JackTrip exit packets (63-byte control packets,
-    // all 0xFF) so the hub reclaims the client slot immediately, then notify the
-    // main thread so it can terminate this worker.
+    // On graceful disconnect: send two JackTrip exit packets (63-byte control
+    // packets, all 0xFF) so the hub reclaims the client slot immediately. The
+    // outer [`send_loop`] arms the disconnect ack; `"disconnected"` is posted
+    // only once the receive loop has also exited (see
+    // [`maybe_post_disconnected`]).
     if graceful_exit {
         let exit_bytes = make_exit_packet();
         let array = Uint8Array::new_with_length(exit_bytes.len() as u32);
         array.copy_from(&exit_bytes);
         let _ = JsFuture::from(writer.write_with_chunk(&array)).await; // best-effort
         let _ = JsFuture::from(writer.write_with_chunk(&array)).await; // best-effort
-
-        post_message_to_main(&JsValue::from_str("disconnected"));
     }
 
-    Ok(())
+    (Ok(()), graceful_exit)
 }
 
 /// Outcome of reading one item from the datagram
@@ -679,17 +834,34 @@ fn parse_read_result(result: &JsValue) -> Result<DatagramRead, JsValue> {
 }
 
 /// Receive loop: receives QUIC datagrams, writes to Regulator
-/// 
+///
 /// This loop runs continuously while connected, receiving audio packets as
-/// unreliable QUIC datagrams via the browser's API and writing them to the Regulator.
+/// unreliable QUIC datagrams via the browser's API and writing them to the
+/// Regulator. On every exit path it calls [`mark_receive_loop_exited`] so a
+/// graceful disconnect ack can wait for this loop, not only the send loop.
 async fn receive_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(), JsValue> {
     // Get the readable datagram stream
     let datagrams = transport.borrow().datagrams();
     let readable = datagrams.readable();
-    
+
     // get_reader() returns Object, cast to ReadableStreamDefaultReader
     let reader: web_sys::ReadableStreamDefaultReader = readable.get_reader().unchecked_into();
+    // Stash a handle so `worker_disconnect` / connection-lost can cancel a
+    // pending `read()` (same JS object as the local `reader`).
+    WORKER_STATE.with(|state| {
+        *state.borrow().datagram_reader.borrow_mut() = Some(reader.clone());
+    });
 
+    let result = receive_loop_body(&reader).await;
+
+    mark_receive_loop_exited();
+    result
+}
+
+/// Body of [`receive_loop`], separated so the exit marker always runs.
+async fn receive_loop_body(
+    reader: &web_sys::ReadableStreamDefaultReader,
+) -> Result<(), JsValue> {
     loop {
         // Check if we should stop
         let running = WORKER_STATE.with(|state| state.borrow().is_running());
@@ -699,7 +871,7 @@ async fn receive_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(
 
         // Read next datagram (event-driven, not polling!)
         let read_result = JsFuture::from(reader.read()).await;
-        
+
         match read_result {
             Ok(result) => {
                 // Parse the {done, value} item: stop on `done`, surface a typed
@@ -709,13 +881,14 @@ async fn receive_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(
                     DatagramRead::Bytes(data) => data,
                 };
 
-                // Account for and deserialize/push the datagram. The raw-pointer
-                // deref of the regulator stays here; the per-datagram logic
-                // (counting, deserialize → push, error accounting) lives in the
-                // testable `handle_datagram` helper. A null regulator pointer
-                // (init/teardown race) still counts the datagram but skips the
-                // push.
-                WORKER_STATE.with(|state| {
+                // Re-check `running` after the await: disconnect may have
+                // cleared it while this read was pending. Without this check
+                // we would push into the Regulator after the session has been
+                // told the worker is quiescent (WEB-67).
+                let still_running =
+                    WORKER_STATE.with(|state| state.borrow().is_running());
+
+                let keep_going = WORKER_STATE.with(|state| {
                     let state = state.borrow();
 
                     // SAFETY: pointer lifecycle is owned by WebTripSession; the
@@ -723,18 +896,28 @@ async fn receive_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(
                     let regulator = state.regulator_ptr.as_ref();
                     let mut samples = state.samples_buffer.borrow_mut();
                     STATS.with(|stats| {
-                        handle_datagram(&data, regulator, &mut samples, &mut stats.borrow_mut());
-                    });
+                        deliver_datagram_if_running(
+                            still_running,
+                            &data,
+                            regulator,
+                            &mut samples,
+                            &mut stats.borrow_mut(),
+                        )
+                    })
                 });
-            }
-            Err(e) => {
-                // Check if this is a normal close or an error
-                let running = WORKER_STATE.with(|state| state.borrow().is_running());
-                if !running {
-                    // Normal shutdown
+                if !keep_going {
                     break;
                 }
-                
+            }
+            Err(e) => {
+                // Check if this is a normal close or an error. `cancel()` on
+                // disconnect also lands here; treat !running as clean exit.
+                let running = WORKER_STATE.with(|state| state.borrow().is_running());
+                if !running {
+                    // Normal shutdown (including cancelled pending read)
+                    break;
+                }
+
                 web_sys::console::error_1(&format!(
                     "[WebTransport Worker] ❌ Datagram receive error: {:?}",
                     e
@@ -829,8 +1012,8 @@ pub fn handle_worker_message(msg: JsValue) -> js_sys::Promise {
             })
         }
         "disconnect" => {
-            // Signal the send loop to stop. It will send the JackTrip exit packet
-            // and post "disconnected" to the main thread before returning.
+            // Signal both loops to stop. The send loop flushes JackTrip exit
+            // packets; `"disconnected"` is posted only after *both* loops exit.
             worker_disconnect();
 
             js_sys::Promise::resolve(&JsValue::from_str("ok"))
@@ -905,6 +1088,81 @@ mod tests {
         // isolated — exactly 50% is not "high".
         assert_eq!(classify_receive_error(50, 100), ReceiveErrorLevel::Isolated);
         assert_eq!(classify_receive_error(11, 1000), ReceiveErrorLevel::Isolated);
+    }
+
+    // --- deliver_datagram_if_running / disconnect ack (WEB-67) ---------------
+
+    /// Receive-loop body: when `running` was cleared after the read was issued
+    /// (disconnect during a pending `reader.read()`), the datagram must not be
+    /// pushed and the loop must stop.
+    #[test]
+    fn deliver_datagram_skips_push_when_running_cleared_after_read() {
+        let regulator = Regulator::with_params(1, 128, 48_000, 5.0);
+        let mut samples = Vec::new();
+        let mut stats = WebTransportWorkerStats::default();
+        let audio: Vec<f32> = (0..128).map(|i| (i as f32) / 128.0).collect();
+        let datagram = AudioPacket::mono(1, 0, audio).serialize().unwrap();
+
+        let keep_going = deliver_datagram_if_running(
+            false, // running cleared while the read was pending
+            &datagram,
+            Some(&regulator),
+            &mut samples,
+            &mut stats,
+        );
+
+        assert!(!keep_going, "loop must exit when running is false after read");
+        assert_eq!(
+            stats.packets_received, 0,
+            "handle_datagram must not run — no accounting, no push"
+        );
+        assert!(
+            !regulator.is_initialized(),
+            "regulator must stay untouched (no push after disconnect)"
+        );
+    }
+
+    /// Symmetric case: still running after the read → deliver as usual.
+    #[test]
+    fn deliver_datagram_pushes_when_still_running_after_read() {
+        let regulator = Regulator::with_params(1, 128, 48_000, 5.0);
+        let mut samples = Vec::new();
+        let mut stats = WebTransportWorkerStats::default();
+        let audio: Vec<f32> = (0..128).map(|i| (i as f32) / 128.0).collect();
+        let datagram = AudioPacket::mono(1, 0, audio).serialize().unwrap();
+
+        let keep_going = deliver_datagram_if_running(
+            true,
+            &datagram,
+            Some(&regulator),
+            &mut samples,
+            &mut stats,
+        );
+
+        assert!(keep_going);
+        assert_eq!(stats.packets_received, 1);
+        assert!(regulator.is_initialized());
+    }
+
+    /// `"disconnected"` is posted only when the graceful ack is armed *and*
+    /// both loops have exited — every other combination must stay silent.
+    #[test]
+    fn disconnect_ack_requires_both_loops_and_pending_flag() {
+        let cases = [
+            // (pending, send_exited, recv_exited, expect_post)
+            (false, true, true, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, false, false, false),
+            (true, true, true, true),
+        ];
+        for (pending, send_done, recv_done, expect) in cases {
+            assert_eq!(
+                should_post_disconnected(pending, send_done, recv_done),
+                expect,
+                "pending={pending} send={send_done} recv={recv_done}"
+            );
+        }
     }
 
     // --- handle_datagram (deserialize -> Regulator::push + error accounting) --

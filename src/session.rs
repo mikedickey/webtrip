@@ -655,9 +655,12 @@ impl WebTripSession {
     /// late `regulator.push()` from the old connection pins `last_seq_in`
     /// high and causes the *next* connection's packets to be rejected by the
     /// wrap-distance check. Awaiting `transport.close()` establishes the
-    /// happens-before ordering we need: for WebTransport the future only
-    /// resolves after `worker.terminate()`; for WebRTC the teardown is
-    /// fully synchronous. A connect issued meanwhile waits for this to finish.
+    /// happens-before ordering we need: for WebTransport the future resolves
+    /// after the worker posts `"disconnected"` (both send and receive loops
+    /// have exited); for WebRTC the teardown is fully synchronous. The 2s
+    /// WebTransport force-terminate fallback is a residual race — see
+    /// `WebTransportImpl::close`. A connect issued meanwhile waits for this
+    /// to finish.
     pub async fn disconnect(&self) {
         match self.lifecycle.begin_disconnect() {
             DisconnectStart::AlreadyIdle => return,
