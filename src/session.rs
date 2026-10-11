@@ -25,10 +25,11 @@
 //!    └─> tick() loop sends/receives packets via Transport trait
 //! ```
 //!
-//! `disconnect()` may be called at any point: it cancels a connect in flight,
-//! waits for that connect to release what it created, then tears down the
-//! published connection. Every state change is reported through
-//! `set_on_state_change` and readable with `getState()`.
+//! `disconnect()` may be called at any point: it cancels a connect in flight
+//! (transport dial *and* `AudioEngine` bring-up), waits for that connect to
+//! release what it created (or to hand abandoned engine cleanup to a detached
+//! task), then tears down the published connection. Every state change is
+//! reported through `set_on_state_change` and readable with `getState()`.
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -260,16 +261,20 @@ fn abort_signal(timeout_ms: i32) -> Result<(js_sys::Promise, js_sys::Function, i
     Ok((promise, abort, timer))
 }
 
-/// Await `dial` unless `abort` settles first, in which case the dial future is
-/// dropped (abandoning it; the caller closes the transport) and the abort's
-/// value becomes the error.
-async fn dial_unless_aborted(
-    mut dial: Pin<Box<dyn Future<Output = Result<(), JsValue>> + '_>>,
+/// Await `work` unless `abort` settles first, in which case `work` is dropped
+/// and the abort's value becomes the error.
+///
+/// Used for the transport dial (the caller closes the abandoned transport) and
+/// as the outer race for engine bring-up (where `work` awaits a spawned task's
+/// "done" signal — see [`WebTripSession::start_engine_unless_aborted`]).
+async fn unless_aborted<T>(
+    work: impl Future<Output = Result<T, JsValue>>,
     abort: js_sys::Promise,
-) -> Result<(), JsValue> {
+) -> Result<T, JsValue> {
+    let mut work = std::pin::pin!(work);
     let mut abort = JsFuture::from(abort);
     std::future::poll_fn(|cx| {
-        if let Poll::Ready(result) = dial.as_mut().poll(cx) {
+        if let Poll::Ready(result) = work.as_mut().poll(cx) {
             return Poll::Ready(result);
         }
         match Pin::new(&mut abort).poll(cx) {
@@ -278,6 +283,14 @@ async fn dial_unless_aborted(
         }
     })
     .await
+}
+
+/// Await a transport dial unless `abort` settles first.
+async fn dial_unless_aborted(
+    dial: Pin<Box<dyn Future<Output = Result<(), JsValue>> + '_>>,
+    abort: js_sys::Promise,
+) -> Result<(), JsValue> {
+    unless_aborted(dial, abort).await
 }
 
 /// Construct an unconnected transport of `transport_type`.
@@ -301,6 +314,68 @@ struct CaptureParams {
     auto_gain_control: bool,
     echo_cancellation: bool,
     noise_suppression: bool,
+}
+
+/// Create an `AudioEngine` and start capture, honouring `cancelled` after each
+/// await so an aborted connect never installs a worklet on shared buffers.
+///
+/// `capture_gate` (tests) holds bring-up after construction to simulate a
+/// stuck permission prompt; `capture_waiting` is set while that gate is held.
+async fn bring_up_engine(
+    params_addr: usize,
+    local_to_network: *mut RingBuffer,
+    network_to_local: *mut Regulator,
+    capture: CaptureParams,
+    output_device_id: Option<String>,
+    input_channels: u32,
+    output_channels: u32,
+    cancelled: Rc<Cell<bool>>,
+    capture_gate: Option<js_sys::Promise>,
+    capture_waiting: Option<Rc<Cell<bool>>>,
+) -> Result<AudioEngine, JsValue> {
+    // `AudioEngine` is a `#[wasm_bindgen]` boundary type, so it takes raw
+    // pointers / addresses here and wraps them in `SharedPtr` internally
+    // when it builds the `AudioProcessor`.
+    let mut engine =
+        AudioEngine::create_with_network(params_addr, local_to_network, network_to_local).await?;
+    if cancelled.get() {
+        engine.stop_capture().await;
+        return Err(cancelled_error());
+    }
+
+    if let Some(gate) = capture_gate {
+        if let Some(flag) = &capture_waiting {
+            flag.set(true);
+        }
+        let _ = JsFuture::from(gate).await;
+        if cancelled.get() {
+            engine.stop_capture().await;
+            return Err(cancelled_error());
+        }
+    }
+
+    web_sys::console::log_1(&"🎙️ Starting audio capture after connection established".into());
+    let started = engine
+        .start_capture_cancellable(
+            capture.device_id,
+            output_device_id,
+            capture.auto_gain_control,
+            capture.echo_cancellation,
+            capture.noise_suppression,
+            input_channels,
+            output_channels,
+            Some(&cancelled),
+        )
+        .await;
+    if let Err(e) = started {
+        engine.stop_capture().await;
+        return Err(e);
+    }
+    if cancelled.get() {
+        engine.stop_capture().await;
+        return Err(cancelled_error());
+    }
+    Ok(engine)
 }
 
 /// WebTrip Session - coordinates all audio and network components
@@ -337,10 +412,18 @@ pub struct WebTripSession {
     /// Settles when the connect in flight has finished (successfully or after
     /// releasing everything it created)
     connect_in_flight: RefCell<Option<js_sys::Promise>>,
-    /// Aborts the in-flight connect's transport dial
+    /// Aborts the in-flight connect's transport dial and/or engine bring-up
     abort_dial: RefCell<Option<js_sys::Function>>,
     /// Settles when the disconnect in flight has returned the session to `Idle`
     teardown_in_flight: RefCell<Option<js_sys::Promise>>,
+    /// Test-only: when set, engine bring-up awaits this promise after creating
+    /// the `AudioEngine` and before `start_capture` (simulates a stuck
+    /// `getUserMedia` / permission prompt).
+    #[cfg(all(test, target_arch = "wasm32"))]
+    capture_gate: RefCell<Option<js_sys::Promise>>,
+    /// Test-only: set when bring-up is blocked on [`capture_gate`].
+    #[cfg(all(test, target_arch = "wasm32"))]
+    capture_waiting: Rc<Cell<bool>>,
 
     // Configuration. The four channel counts are independent, set only
     // while Idle, and fixed for the life of a connection.
@@ -403,6 +486,10 @@ impl WebTripSession {
             connect_in_flight: RefCell::new(None),
             abort_dial: RefCell::new(None),
             teardown_in_flight: RefCell::new(None),
+            #[cfg(all(test, target_arch = "wasm32"))]
+            capture_gate: RefCell::new(None),
+            #[cfg(all(test, target_arch = "wasm32"))]
+            capture_waiting: Rc::new(Cell::new(false)),
             buffer_size,
             send_channels: Cell::new(send_channels),
             receive_channels: Cell::new(receive_channels),
@@ -675,8 +762,9 @@ impl WebTripSession {
         let teardown = InFlight::publish(&self.teardown_in_flight);
         emit_state(&self.on_state_change, SessionState::Disconnecting);
 
-        // Abort a dial still in progress, then let that connect release what
-        // it created (it may own a live transport or engine not yet published).
+        // Abort a dial or engine bring-up still in progress, then let that
+        // connect release what it created (or detach engine cleanup when
+        // capture cannot be aborted — WEB-69).
         let abort = self.abort_dial.borrow_mut().take();
         if let Some(abort) = abort {
             let _ = abort.call1(&JsValue::NULL, &cancelled_error());
@@ -766,6 +854,21 @@ impl WebTripSession {
         self.audio_engine.borrow().is_some()
     }
 
+    /// Hold engine bring-up after `AudioEngine` creation until `gate` resolves
+    /// (test-only). Simulates a never-settling capture step such as an
+    /// unanswered mic-permission prompt.
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub(crate) fn set_capture_gate(&self, gate: js_sys::Promise) {
+        self.capture_waiting.set(false);
+        *self.capture_gate.borrow_mut() = Some(gate);
+    }
+
+    /// Whether bring-up is currently blocked on the capture gate (test-only).
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub(crate) fn is_capture_waiting(&self) -> bool {
+        self.capture_waiting.get()
+    }
+
     /// Admit, dial, and bring up a connection; the transport-agnostic body of
     /// `connect_to_studio`. On failure (including cancellation) everything the
     /// attempt created is released before this returns.
@@ -843,7 +946,10 @@ impl WebTripSession {
             Rc::clone(&failed_while_connecting),
         ));
 
-        let dialed = dial_unless_aborted(transport.connect(server, port, client_name), abort).await;
+        // Clone so engine bring-up can race the same abort (disconnect /
+        // timeout) after the dial; `dial_unless_aborted` only drops its
+        // JsFuture, not the underlying promise.
+        let dialed = dial_unless_aborted(transport.connect(server, port, client_name), abort.clone()).await;
         let dialed = dialed.and_then(|()| {
             if self.lifecycle.is_current(epoch) { Ok(()) } else { Err(cancelled_error()) }
         });
@@ -852,7 +958,7 @@ impl WebTripSession {
             return Err(e);
         }
 
-        let engine = match self.start_engine(capture).await {
+        let engine = match self.start_engine_unless_aborted(capture, abort).await {
             Ok(engine) => engine,
             Err(e) => {
                 self.release(Some(transport), None).await;
@@ -960,34 +1066,95 @@ impl WebTripSession {
         }
     }
 
-    /// Create the `AudioEngine` and start capture, stopping the engine again
-    /// if capture fails to start.
-    async fn start_engine(&self, capture: CaptureParams) -> Result<AudioEngine, JsValue> {
-        // `AudioEngine` is a `#[wasm_bindgen]` boundary type, so it takes raw
-        // pointers / addresses here and wraps them in `SharedPtr` internally
-        // when it builds the `AudioProcessor`.
+    /// Create the `AudioEngine` and start capture, racing the work against
+    /// `abort` so a disconnect (or the connect timeout) can finish while
+    /// `getUserMedia` is still pending.
+    ///
+    /// On abort the `AbortError` is returned immediately and a detached task
+    /// finishes bring-up then stops the engine (tracks + `AudioContext.close`).
+    /// A cancel flag checked after each await prevents an abandoned capture
+    /// from installing a worklet against buffers a later connect may already
+    /// own.
+    async fn start_engine_unless_aborted(
+        &self,
+        capture: CaptureParams,
+        abort: js_sys::Promise,
+    ) -> Result<AudioEngine, JsValue> {
+        let params_addr = self.audio_params.addr();
         let (local_to_network, network_to_local) = self.buffer_ptrs();
-        let mut engine =
-            AudioEngine::create_with_network(self.audio_params.addr(), local_to_network, network_to_local).await?;
-
-        web_sys::console::log_1(&"🎙️ Starting audio capture after connection established".into());
         let output_device_id = self.output_device_id.borrow().clone();
-        let started = engine
-            .start_capture(
-                capture.device_id,
-                output_device_id,
-                capture.auto_gain_control,
-                capture.echo_cancellation,
-                capture.noise_suppression,
-                self.input_channels.get() as u32,
-                self.output_channels.get() as u32,
-            )
-            .await;
-        if let Err(e) = started {
-            engine.stop_capture().await;
-            return Err(e);
+        let input_channels = self.input_channels.get() as u32;
+        let output_channels = self.output_channels.get() as u32;
+        let (capture_gate, capture_waiting) = {
+            #[cfg(all(test, target_arch = "wasm32"))]
+            {
+                (
+                    self.capture_gate.borrow_mut().take(),
+                    Some(Rc::clone(&self.capture_waiting)),
+                )
+            }
+            #[cfg(not(all(test, target_arch = "wasm32")))]
+            {
+                (None, None)
+            }
+        };
+
+        let cancelled = Rc::new(Cell::new(false));
+        let outcome: Rc<RefCell<Option<Result<AudioEngine, JsValue>>>> = Rc::new(RefCell::new(None));
+        let (done, resolve_done, _) = crate::audio::make_promise();
+
+        {
+            let cancelled = Rc::clone(&cancelled);
+            let outcome = Rc::clone(&outcome);
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = bring_up_engine(
+                    params_addr,
+                    local_to_network,
+                    network_to_local,
+                    capture,
+                    output_device_id,
+                    input_channels,
+                    output_channels,
+                    Rc::clone(&cancelled),
+                    capture_gate,
+                    capture_waiting,
+                )
+                .await;
+                // Abort may have won the outer race between bring-up finishing
+                // and this task storing the engine: dispose rather than hand it
+                // back to a connect that already returned AbortError.
+                let result = match result {
+                    Ok(mut engine) if cancelled.get() => {
+                        engine.stop_capture().await;
+                        Err(cancelled_error())
+                    }
+                    other => other,
+                };
+                *outcome.borrow_mut() = Some(result);
+                let _ = resolve_done.call0(&JsValue::NULL);
+            });
         }
-        Ok(engine)
+
+        let raced = unless_aborted(async move { JsFuture::from(done).await.map(|_| ()) }, abort).await;
+
+        match raced {
+            Ok(()) => outcome
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| Err(js_error("engine bring-up produced no result"))),
+            Err(reason) => {
+                cancelled.set(true);
+                // If bring-up already stored an engine before we flipped the
+                // flag, dispose it on a detached task so disconnect is not
+                // blocked on `AudioContext.close`.
+                if let Some(Ok(mut engine)) = outcome.borrow_mut().take() {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        engine.stop_capture().await;
+                    });
+                }
+                Err(reason)
+            }
+        }
     }
 
     /// Start moving audio between the buffers and the published transport.
@@ -1558,6 +1725,62 @@ mod tests {
         crate::test_support::sleep_ms(20).await;
         assert_eq!(session.get_state(), "idle");
         assert_log(&log, &["connecting", "disconnecting", "idle"], "around a cancelled dial");
+    }
+
+    /// A disconnect while capture is stuck (gated mid-bring-up, as when the
+    /// mic-permission prompt is left unanswered) must resolve promptly: the
+    /// connect rejects with `AbortError`, the session returns to `idle`, and a
+    /// later connect is admitted — without waiting for the gated capture to
+    /// finish (WEB-69).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_disconnect_during_gated_capture_resolves_promptly() {
+        let params = AudioParams::default();
+        let session = new_session(&params);
+        let (log, _cb) = attach_state_log(&session);
+
+        let (capture_gate, finish_capture) = gate();
+        session.set_capture_gate(capture_gate);
+
+        let transport = MockTransport::new();
+        let probe = transport.probe();
+        let connect = spawn_connect(&session, transport, CONNECT_TIMEOUT_MS);
+        assert!(
+            wait_until(|| session.is_capture_waiting(), 2000, 5).await,
+            "bring-up never reached the capture gate"
+        );
+
+        let started = js_sys::Date::now();
+        session.disconnect().await;
+        let elapsed = js_sys::Date::now() - started;
+        assert!(
+            elapsed < 500.0,
+            "disconnect must not wait for a stuck capture step, got {elapsed}ms"
+        );
+
+        let (name, message) = rejection(settled(&connect, "cancelled connect").await);
+        assert_eq!(name, "AbortError", "unexpected rejection: {message}");
+        assert_eq!(probe.closes.get(), 1, "the cancelled connect must close its transport");
+        assert!(!session.has_transport());
+        assert!(!session.has_engine());
+        assert_eq!(session.get_state(), "idle");
+        assert_log(&log, &["connecting", "disconnecting", "idle"], "around a gated capture abort");
+
+        // A later connect is admitted while the abandoned bring-up is still
+        // blocked on the gate.
+        session
+            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .await
+            .expect("connect after aborting a gated capture should succeed");
+        assert_eq!(session.get_state(), "connected");
+
+        // Release the abandoned bring-up so it can observe cancel and close
+        // its AudioContext without leaking across the suite.
+        let _ = finish_capture.call0(&JsValue::NULL);
+        crate::test_support::sleep_ms(50).await;
+
+        session.disconnect().await;
+        assert_eq!(session.get_state(), "idle");
     }
 
     /// A disconnect that lands after the dial succeeded but while audio is
