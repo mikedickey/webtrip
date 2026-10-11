@@ -1085,6 +1085,13 @@ impl Drop for WebTripSession {
         // `disconnect()` and frees them only afterwards. No reset needed: the
         // buffers are being deallocated. (No connect can be in flight: it
         // borrows the session for its whole duration.)
+        //
+        // Retire the lifecycle epoch before the deferred `transport.close()`
+        // runs: WebRTC's close notifies `"closed"`, which `failure_bridge`
+        // treats as a failure, and that leaked callback still holds
+        // `Arc<Lifecycle>`. Without this, `fail(epoch)` would succeed and
+        // emit `"error"` for a session that no longer exists (WEB-68).
+        let _ = self.lifecycle.begin_disconnect();
         self.stop_network_loop();
         let transport = self.transport.borrow_mut().take();
         let engine = self.audio_engine.get_mut().take();
@@ -1812,5 +1819,46 @@ mod tests {
             .resume_audio()
             .await
             .expect("resume_audio with no engine must resolve Ok");
+    }
+
+    /// Dropping a connected session must not emit `"error"` when the deferred
+    /// teardown closes a WebRTC-typed transport. `MockTransport` reports
+    /// `TransportType::WebRTC` and notifies `"closed"` from `close`, matching
+    /// the real WebRTC path that would otherwise reach `failure_bridge` after
+    /// free (WEB-68).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_drop_does_not_emit_error_from_webrtc_close() {
+        let params = AudioParams::default();
+        let session = new_session(&params);
+        let (log, _cb) = attach_state_log(&session);
+
+        let (close_gate, finish_close) = gate();
+        let transport = MockTransport::new().with_close_gate(close_gate);
+        let probe = transport.probe();
+        session
+            .connect_with_test_transport(Box::new(transport), CONNECT_TIMEOUT_MS)
+            .await
+            .expect("mock connect should succeed");
+        assert_log(&log, &["connecting", "connected"], "after connect");
+
+        // Release the sole `Rc` so `Drop` runs and spawns the deferred close.
+        drop(session);
+        assert!(
+            wait_until(|| probe.closes.get() == 1, 2000, 5).await,
+            "Drop's teardown task must reach transport.close"
+        );
+        // `"closed"` was already reported synchronously at the start of close
+        // (before the gate). Opening the gate lets the task finish freeing
+        // buffers / stopping the engine.
+        let _ = finish_close.call0(&JsValue::NULL);
+        crate::test_support::sleep_ms(50).await;
+
+        assert!(
+            !log.borrow().iter().any(|s| s == "error"),
+            "Drop must not emit error from WebRTC close teardown, got {:?}",
+            *log.borrow()
+        );
+        assert_log(&log, &["connecting", "connected"], "after Drop teardown");
     }
 }
