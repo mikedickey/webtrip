@@ -205,9 +205,10 @@ pub struct WebTransportImpl {
     //
     // `worker` is wrapped in `Rc<RefCell<_>>` so the onmessage closure can take
     // ownership of it and terminate the worker as soon as the worker reports
-    // "disconnected" (i.e. after the send loop has flushed the JackTrip exit
-    // packets). The `close()` fallback timer also holds a clone and is a no-op
-    // if the happy path already terminated the worker.
+    // "disconnected" (after *both* send and receive loops have exited; send
+    // flushes JackTrip exit packets first). The `close()` fallback timer also
+    // holds a clone and is a no-op if the happy path already terminated the
+    // worker.
     worker: Rc<RefCell<Option<web_sys::Worker>>>,
     worker_message_closure: Option<Closure<dyn FnMut(web_sys::MessageEvent)>>,
     worker_error_closure: Option<Closure<dyn FnMut(web_sys::ErrorEvent)>>,
@@ -306,18 +307,24 @@ impl WebTransportImpl {
                     }
                     "disconnected" => {
                         web_sys::console::log_1(&"[WebTransport] ⚠️ Worker reports: DISCONNECTED".into());
-                        // Worker has flushed the JackTrip exit packets — tear it
-                        // down immediately so we don't wait for the close()
-                        // fallback timer. Safe to call set_onmessage(None) from
-                        // inside the onmessage handler itself; the current
-                        // invocation keeps the closure alive via its outer
-                        // reference.
+                        // Worker posted this only after *both* send and receive
+                        // loops exited (send flushed JackTrip exit packets
+                        // first). That worker-side ack is the synchronization
+                        // point: no further regulator pushes will be issued by
+                        // those loops. Tear the worker down so we don't wait
+                        // for the close() fallback timer.
                         //
-                        // Ordering is important: terminate the worker FIRST so
-                        // no further pushes to the shared Regulator can occur,
-                        // THEN resolve the close() future. The session layer
-                        // relies on this ordering to safely reset() the
-                        // Regulator after awaiting close().
+                        // Safe to call set_onmessage(None) from inside the
+                        // onmessage handler itself; the current invocation
+                        // keeps the closure alive via its outer reference.
+                        //
+                        // `worker.terminate()` does *not* join the worker: the
+                        // HTML spec runs termination in parallel with the
+                        // worker's main loop, and engines interrupt wasm at
+                        // their next interrupt check. Do not treat terminate()
+                        // returning as proof the agent has stopped executing —
+                        // the `"disconnected"` message is the happens-before
+                        // edge the session relies on before Regulator::reset().
                         if let Some(worker) = worker_slot.borrow_mut().take() {
                             worker.set_onmessage(None);
                             worker.set_onerror(None);
@@ -587,24 +594,29 @@ impl Transport for WebTransportImpl {
 
     fn close(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
         // Snapshot current state and eagerly fire off the synchronous shutdown
-        // work, then return a future that resolves once the worker is
-        // guaranteed not to issue further writes to the shared Regulator.
+        // work, then return a future that resolves once the worker has
+        // acknowledged that both send and receive loops have exited (happy
+        // path), so the session may `Regulator::reset()` without racing a
+        // late push.
         //
         // Ordering for the happy path:
         //   1. Post `{type:"disconnect"}` to the worker.
-        //   2. Worker's `send_loop` flushes JackTrip exit packets, then posts
-        //      `"disconnected"` back to the main thread.
-        //   3. `onmessage` handler (see `create_worker`) calls
-        //      `worker.terminate()` — after this returns, the worker thread
-        //      is dead and cannot push to the Regulator.
-        //   4. `onmessage` handler resolves the promise returned below.
+        //   2. Worker clears `running`, cancels the datagram reader, and wakes
+        //      the send loop. Send flushes JackTrip exit packets; receive
+        //      re-checks `running` after any in-flight read and does not push.
+        //   3. Only after *both* loops exit does the worker post
+        //      `"disconnected"`. That message — not `terminate()` — is the
+        //      happens-before edge for "no further regulator pushes".
+        //   4. `onmessage` handler (see `create_worker`) calls
+        //      `worker.terminate()` (best-effort agent teardown; does not join)
+        //      and resolves the promise returned below.
         //
-        // Fallback (worker hung for >2s): the timer below terminates the
-        // worker itself and resolves the promise. Either way, the future
-        // only resolves *after* `worker.terminate()` has run, so awaiting it
-        // establishes a happens-before relationship between any in-flight
-        // `regulator.push()` inside the worker and subsequent operations on
-        // the main thread (e.g. `Regulator::reset()`).
+        // Fallback (worker hung for >2s): the timer below force-terminates the
+        // worker and resolves the promise. Residual risk: `Worker.terminate()`
+        // runs in parallel with the worker's main loop (HTML spec); an
+        // in-flight wasm `regulator.push()` may still be executing when the
+        // main thread proceeds to `Regulator::reset()`. Prefer the happy path;
+        // the fallback exists so a hung writer cannot block disconnect forever.
 
         let worker_opt = self.worker.borrow().clone();
 
@@ -637,6 +649,12 @@ impl Transport for WebTransportImpl {
         // (e.g. `writer.write_with_chunk` stalls after a network loss) and
         // never gets to post "disconnected".
         //
+        // Residual risk (WEB-67): unlike the happy path, force-terminate does
+        // not wait for the receive loop to exit. `terminate()` is not a join;
+        // a push that was already in wasm may still race `Regulator::reset()`
+        // on the main thread. Acceptable only because the alternative is an
+        // unbounded hang on disconnect.
+        //
         // Transfer ownership of the worker-level closures into the fallback
         // callback so they stay alive long enough to receive the worker's
         // "disconnected" message. They're dropped when the fallback fires
@@ -649,7 +667,7 @@ impl Transport for WebTransportImpl {
         let cb = Closure::wrap(Box::new(move || {
             if let Some(worker) = worker_slot.borrow_mut().take() {
                 web_sys::console::warn_1(
-                    &"[WebTransport] Worker did not report disconnect within 2s — force-terminating".into(),
+                    &"[WebTransport] Worker did not report disconnect within 2s — force-terminating (may race Regulator::reset)".into(),
                 );
                 worker.set_onmessage(None);
                 worker.set_onerror(None);
