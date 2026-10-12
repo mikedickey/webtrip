@@ -766,6 +766,14 @@ impl WebTripSession {
         self.audio_engine.borrow().is_some()
     }
 
+    /// Whether the audio-callback network loop is still installed (test-only).
+    /// Taking the transport from its slot alone stops `Transport::tick` calls;
+    /// this observes `stop_network_loop` itself (WEB-73).
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub(crate) fn has_network_loop(&self) -> bool {
+        self.audio_callback_loop.borrow().is_some()
+    }
+
     /// Admit, dial, and bring up a connection; the transport-agnostic body of
     /// `connect_to_studio`. On failure (including cancellation) everything the
     /// attempt created is released before this returns.
@@ -963,6 +971,8 @@ impl WebTripSession {
     /// Create the `AudioEngine` and start capture, stopping the engine again
     /// if capture fails to start.
     async fn start_engine(&self, capture: CaptureParams) -> Result<AudioEngine, JsValue> {
+        #[cfg(all(test, target_arch = "wasm32"))]
+        crate::test_support::note_start_engine();
         // `AudioEngine` is a `#[wasm_bindgen]` boundary type, so it takes raw
         // pointers / addresses here and wraps them in `SharedPtr` internally
         // when it builds the `AudioProcessor`.
@@ -1348,11 +1358,13 @@ mod tests {
     /// callback sequence (and `getState()` agreeing with it), exercises the
     /// `AudioContext`-backed `is_audio_suspended`/`resume_audio` on the
     /// now-live engine, and checks the transport is published while connected
-    /// and closed once by teardown. Along the way it pins the channel-count
-    /// setters' contract: applied while `Idle`, ignored while connected, and
-    /// retained across disconnect (nothing narrows them). This runs the real
-    /// async/await connect path, `AudioEngine::create`, worklet bootstrap, and
-    /// the `Atomics.waitAsync` audio-callback loop in the browser — only the
+    /// and closed once by teardown. Also asserts the network tick loop calls
+    /// `Transport::tick` while connected and stops after `disconnect()`
+    /// (WEB-73). Along the way it pins the channel-count setters' contract:
+    /// applied while `Idle`, ignored while connected, and retained across
+    /// disconnect (nothing narrows them). This runs the real async/await
+    /// connect path, `AudioEngine::create`, worklet bootstrap, and the
+    /// `Atomics.waitAsync` audio-callback loop in the browser — only the
     /// network transport is mocked.
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
@@ -1410,6 +1422,19 @@ mod tests {
         );
         assert_eq!(params.get_send_channels(), u32::from(configured.0));
 
+        // The mock reports WebRTC, so `start_network_loop` starts the
+        // audio-callback tick loop. Wait until it has actually called
+        // `Transport::tick` at least once before tearing down.
+        assert!(
+            wait_until(|| probe.ticks.get() > 0, 2000, 5).await,
+            "the network tick loop must call Transport::tick while connected (got {})",
+            probe.ticks.get()
+        );
+        assert!(
+            session.has_network_loop(),
+            "WebRTC connect must install the audio-callback network loop"
+        );
+
         session.disconnect().await;
         assert_eq!(session.get_state(), "idle");
         assert!(!session.has_transport());
@@ -1419,6 +1444,21 @@ mod tests {
             channel_config(&session),
             configured,
             "disconnect must retain the configured channel counts"
+        );
+
+        // Taking the transport from its slot stops `Transport::tick` even if
+        // the loop keeps running; `has_network_loop` is what fails if
+        // `stop_network_loop` is dropped from teardown (WEB-73 / WEB-58).
+        assert!(
+            !session.has_network_loop(),
+            "disconnect must stop the audio-callback network loop"
+        );
+        let ticks_after_disconnect = probe.ticks.get();
+        crate::test_support::sleep_ms(100).await;
+        assert_eq!(
+            probe.ticks.get(),
+            ticks_after_disconnect,
+            "Transport::tick must stop being called after disconnect"
         );
     }
 
@@ -1565,6 +1605,58 @@ mod tests {
         crate::test_support::sleep_ms(20).await;
         assert_eq!(session.get_state(), "idle");
         assert_log(&log, &["connecting", "disconnecting", "idle"], "around a cancelled dial");
+    }
+
+    /// A disconnect that races a dial which has already resolved `Ok` cancels
+    /// at the post-dial `is_current(epoch)` check — not via the abort promise
+    /// (still-gated dial) and not at `finish_connect` (audio already starting).
+    /// That branch must close the transport that *did* connect (WEB-73).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_disconnect_cancels_after_a_successful_dial() {
+        let params = AudioParams::default();
+        let session = new_session(&params);
+        let (log, _cb) = attach_state_log(&session);
+        let _ = crate::test_support::take_start_engine_calls();
+
+        let (dial_gate, finish_dial) = gate();
+        let transport = MockTransport::new().with_connect_gate(dial_gate);
+        let probe = transport.probe();
+        let dial_succeeded = Rc::new(std::cell::Cell::new(false));
+        let dial_flag = dial_succeeded.clone();
+        probe.on_connected(move || dial_flag.set(true));
+
+        let connect = spawn_connect(&session, transport, CONNECT_TIMEOUT_MS);
+        assert!(wait_until(|| probe.connects.get() == 1, 1000, 1).await, "the dial never started");
+
+        // Open the dial, then disconnect in the same turn (no yield between):
+        // `finish_dial` schedules the dial's `Ok`; `disconnect` then bumps the
+        // epoch and fires the abort. After yielding, `dial_unless_aborted`
+        // prefers a ready dial over a ready abort, so bring_up hits the
+        // post-Ok `is_current` check, rejects, and `release` closes the
+        // transport that connected — without ever calling `start_engine`.
+        let _ = finish_dial.call0(&JsValue::NULL);
+        session.disconnect().await;
+
+        let (name, message) = rejection(settled(&connect, "cancelled connect").await);
+        assert_eq!(name, "AbortError", "unexpected rejection: {message}");
+        assert!(
+            dial_succeeded.get(),
+            "the dial must have resolved Ok before the post-dial cancel check"
+        );
+        assert_eq!(
+            crate::test_support::take_start_engine_calls(),
+            0,
+            "post-dial cancel must not reach start_engine (that would be the finish_connect path)"
+        );
+        assert_eq!(probe.closes.get(), 1, "the cancelled connect must close its transport");
+        assert!(!session.has_transport());
+        assert_eq!(session.get_state(), "idle");
+        assert_log(
+            &log,
+            &["connecting", "disconnecting", "idle"],
+            "around a cancelled post-dial",
+        );
     }
 
     /// A disconnect that lands after the dial succeeded but while audio is

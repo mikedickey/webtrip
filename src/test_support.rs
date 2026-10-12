@@ -20,6 +20,23 @@ use wasm_bindgen_test::wasm_bindgen_test_configure;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
+// Calls to session `start_engine` observed by browser tests. Distinguishes a
+// post-dial cancel (engine never starts) from a cancel at `finish_connect`
+// (engine was created then released).
+std::thread_local! {
+    static START_ENGINE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Record that `start_engine` was entered (session tests only).
+pub(crate) fn note_start_engine() {
+    START_ENGINE_CALLS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Take and reset the [`note_start_engine`] counter.
+pub(crate) fn take_start_engine_calls() -> u32 {
+    START_ENGINE_CALLS.with(|c| c.replace(0))
+}
+
 /// Construct a synthetic `MessageEvent` carrying `data` and dispatch it to
 /// `target`, which invokes the target's registered `onmessage` handler
 /// synchronously.
@@ -134,6 +151,8 @@ pub(crate) struct MockProbe {
     pub(crate) connects: std::cell::Cell<u32>,
     /// Calls to `close`
     pub(crate) closes: std::cell::Cell<u32>,
+    /// Calls to `tick` (the audio-callback network loop)
+    pub(crate) ticks: std::cell::Cell<u32>,
     /// The state-change callback the session installed
     on_state_change: std::cell::RefCell<Option<js_sys::Function>>,
     /// Run once, just before a `connect` resolves (after any gate opens)
@@ -244,6 +263,7 @@ impl crate::audio::transport::Transport for MockTransport {
     /// never yielded, and the renderer hung (the intermittent CI
     /// `coverage:wasm` "Timed out receiving message from renderer").
     fn tick(&mut self) {
+        self.probe.ticks.set(self.probe.ticks.get() + 1);
         let ring = self.audio_buffers.and_then(|buffers| buffers.local_to_network.as_ref());
         if let Some(ring) = ring {
             while ring.read(&mut self.drain_scratch) {}
