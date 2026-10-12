@@ -20,6 +20,23 @@ use wasm_bindgen_test::wasm_bindgen_test_configure;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
+// Calls to session `start_engine` observed by browser tests. Distinguishes a
+// post-dial cancel (engine never starts) from a cancel at `finish_connect`
+// (engine was created then released).
+std::thread_local! {
+    static START_ENGINE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Record that `start_engine` was entered (session tests only).
+pub(crate) fn note_start_engine() {
+    START_ENGINE_CALLS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Take and reset the [`note_start_engine`] counter.
+pub(crate) fn take_start_engine_calls() -> u32 {
+    START_ENGINE_CALLS.with(|c| c.replace(0))
+}
+
 /// Construct a synthetic `MessageEvent` carrying `data` and dispatch it to
 /// `target`, which invokes the target's registered `onmessage` handler
 /// synchronously.

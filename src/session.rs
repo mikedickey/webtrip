@@ -766,6 +766,14 @@ impl WebTripSession {
         self.audio_engine.borrow().is_some()
     }
 
+    /// Whether the audio-callback network loop is still installed (test-only).
+    /// Taking the transport from its slot alone stops `Transport::tick` calls;
+    /// this observes `stop_network_loop` itself (WEB-73).
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub(crate) fn has_network_loop(&self) -> bool {
+        self.audio_callback_loop.borrow().is_some()
+    }
+
     /// Admit, dial, and bring up a connection; the transport-agnostic body of
     /// `connect_to_studio`. On failure (including cancellation) everything the
     /// attempt created is released before this returns.
@@ -963,6 +971,8 @@ impl WebTripSession {
     /// Create the `AudioEngine` and start capture, stopping the engine again
     /// if capture fails to start.
     async fn start_engine(&self, capture: CaptureParams) -> Result<AudioEngine, JsValue> {
+        #[cfg(all(test, target_arch = "wasm32"))]
+        crate::test_support::note_start_engine();
         // `AudioEngine` is a `#[wasm_bindgen]` boundary type, so it takes raw
         // pointers / addresses here and wraps them in `SharedPtr` internally
         // when it builds the `AudioProcessor`.
@@ -1413,6 +1423,10 @@ mod tests {
             "the network tick loop must call Transport::tick while connected (got {})",
             probe.ticks.get()
         );
+        assert!(
+            session.has_network_loop(),
+            "WebRTC connect must install the audio-callback network loop"
+        );
 
         session.disconnect().await;
         assert_eq!(session.get_state(), "idle");
@@ -1425,9 +1439,13 @@ mod tests {
             "disconnect must retain the configured channel counts"
         );
 
-        // `stop_network_loop` must leave the tick closure inert: if it were
-        // dropped from the teardown path, ticks would keep climbing against the
-        // empty transport slot (WEB-73 / WEB-58).
+        // Taking the transport from its slot stops `Transport::tick` even if
+        // the loop keeps running; `has_network_loop` is what fails if
+        // `stop_network_loop` is dropped from teardown (WEB-73 / WEB-58).
+        assert!(
+            !session.has_network_loop(),
+            "disconnect must stop the audio-callback network loop"
+        );
         let ticks_after_disconnect = probe.ticks.get();
         crate::test_support::sleep_ms(100).await;
         assert_eq!(
@@ -1592,6 +1610,7 @@ mod tests {
         let params = AudioParams::default();
         let session = new_session(&params);
         let (log, _cb) = attach_state_log(&session);
+        let _ = crate::test_support::take_start_engine_calls();
 
         let (dial_gate, finish_dial) = gate();
         let transport = MockTransport::new().with_connect_gate(dial_gate);
@@ -1608,7 +1627,7 @@ mod tests {
         // epoch and fires the abort. After yielding, `dial_unless_aborted`
         // prefers a ready dial over a ready abort, so bring_up hits the
         // post-Ok `is_current` check, rejects, and `release` closes the
-        // transport that connected.
+        // transport that connected — without ever calling `start_engine`.
         let _ = finish_dial.call0(&JsValue::NULL);
         session.disconnect().await;
 
@@ -1617,6 +1636,11 @@ mod tests {
         assert!(
             dial_succeeded.get(),
             "the dial must have resolved Ok before the post-dial cancel check"
+        );
+        assert_eq!(
+            crate::test_support::take_start_engine_calls(),
+            0,
+            "post-dial cancel must not reach start_engine (that would be the finish_connect path)"
         );
         assert_eq!(probe.closes.get(), 1, "the cancelled connect must close its transport");
         assert!(!session.has_transport());
