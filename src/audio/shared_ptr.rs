@@ -5,14 +5,19 @@
 //! Rust references (see [`docs/ARCHITECTURE.md`](../../../docs/ARCHITECTURE.md)).
 //! On the receiving side the address is turned back into a reference.
 //!
-//! `SharedPtr<T>` is the single place that deref happens. It:
+//! `SharedPtr<T>` is the single place that address reconstruction and deref
+//! happen. It:
 //!
 //! - carries the [`Send`]/[`Sync`] assertion **once**, bounded on `T: Sync` (so
 //!   container structs no longer need their own `unsafe impl Send`, and a
 //!   pointee that is not thread-safe fails to compile rather than being
-//!   laundered across threads), and
-//! - hands out a shared `&T` through one audited `unsafe` block instead of the
-//!   `unsafe { &*ptr }` incantation being copy-pasted at every call site.
+//!   laundered across threads),
+//! - makes [`new`](SharedPtr::new) / [`from_addr`](SharedPtr::from_addr)
+//!   `unsafe` so each call site must acknowledge that the address points at a
+//!   live `T` (WEB-71), and
+//! - hands out a shared `&T` through one audited `unsafe` block inside
+//!   [`as_ref`](SharedPtr::as_ref) instead of the `unsafe { &*ptr }`
+//!   incantation being copy-pasted at every call site.
 //!
 //! The pointee must coordinate cross-thread access through atomics and/or
 //! interior mutability, and say so by being `Sync` (e.g. [`RingBuffer`](crate::audio::ring_buffer::RingBuffer)
@@ -25,7 +30,7 @@
 ///
 /// Cheap to copy (it is just an address). Construct with [`SharedPtr::new`] from
 /// a raw pointer or [`SharedPtr::from_addr`] from an integer received over
-/// `postMessage`.
+/// `postMessage` — both are `unsafe` and require a live pointee.
 pub struct SharedPtr<T> {
     ptr: *mut T,
 }
@@ -36,9 +41,10 @@ pub struct SharedPtr<T> {
 // The bound makes the compiler check that the pointee coordinates cross-thread
 // access itself (atomics / `UnsafeCell` with a proven protocol) instead of this
 // impl asserting it for any `T`. Lifetime (the pointee outliving every borrow)
-// is still the caller's responsibility; see `as_ref`. This is the one place the
-// assertion is made, rather than an `unsafe impl` per container struct that
-// happens to hold one of these pointers.
+// is asserted at construction (`new` / `from_addr`); see those `# Safety`
+// sections. This is the one place the Send/Sync assertion is made, rather than
+// an `unsafe impl` per container struct that happens to hold one of these
+// pointers.
 unsafe impl<T: Sync> Send for SharedPtr<T> {}
 unsafe impl<T: Sync> Sync for SharedPtr<T> {}
 
@@ -60,7 +66,15 @@ impl<T> std::fmt::Debug for SharedPtr<T> {
 
 impl<T> SharedPtr<T> {
     /// Wrap a raw pointer.
-    pub const fn new(ptr: *mut T) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be null, or point to a live `T` that outlives every borrow
+    /// obtained through [`as_ref`](Self::as_ref) / [`as_mut`](Self::as_mut).
+    /// Reconstructing from an arbitrary address and then calling those methods
+    /// is otherwise undefined behaviour — that is why construction, not deref,
+    /// is the `unsafe` boundary (WEB-71).
+    pub const unsafe fn new(ptr: *mut T) -> Self {
         Self { ptr }
     }
 
@@ -68,7 +82,10 @@ impl<T> SharedPtr<T> {
     /// pointee is only ever reached again through [`as_ref`](Self::as_ref), so
     /// casting away `const` here grants nothing the `&T` didn't.
     pub fn from_ref(value: &T) -> Self {
-        Self::new(std::ptr::from_ref(value).cast_mut())
+        // SAFETY: pointer derived from a live `&T`; the pointee outlives any
+        // borrow obtained while that reference (or an equivalent lifecycle
+        // guarantee) remains valid.
+        unsafe { Self::new(std::ptr::from_ref(value).cast_mut()) }
     }
 
     /// A null `SharedPtr` (points at nothing; [`is_null`](Self::is_null) is true).
@@ -79,7 +96,15 @@ impl<T> SharedPtr<T> {
     }
 
     /// Rebuild a `SharedPtr` from an integer address received over `postMessage`.
-    pub fn from_addr(addr: usize) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// `addr` must be 0 (null), or the address of a live `T` that outlives
+    /// every borrow obtained through [`as_ref`](Self::as_ref) /
+    /// [`as_mut`](Self::as_mut). The integer typically arrives from another
+    /// agent via `postMessage`; the sender must have published a real
+    /// allocation that remains alive for the receiver's use.
+    pub const unsafe fn from_addr(addr: usize) -> Self {
         Self {
             ptr: addr as *mut T,
         }
@@ -102,14 +127,15 @@ impl<T> SharedPtr<T> {
     /// threads, so both the producer and consumer may hold one simultaneously.
     /// The pointee must therefore use interior mutability (atomics / `UnsafeCell`)
     /// for any state it mutates through `&self`.
+    ///
+    /// Safe because [`new`](Self::new) / [`from_addr`](Self::from_addr) already
+    /// required the address to point at a live `T` that outlives every borrow.
     pub fn as_ref<'a>(&self) -> Option<&'a T> {
         if self.ptr.is_null() {
             return None;
         }
-        // SAFETY: non-null here. The caller-side lifecycle (buffers are owned by
-        // `WebTripSession`/the worker and are torn down only after the worklet
-        // and network loops have stopped, per docs/ARCHITECTURE.md) guarantees
-        // the pointee outlives the returned borrow.
+        // SAFETY: non-null; construction (`new` / `from_addr`) asserted the
+        // pointee is live for the duration of every borrow obtained here.
         Some(unsafe { &*self.ptr })
     }
 

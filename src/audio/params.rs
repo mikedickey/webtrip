@@ -149,8 +149,9 @@ impl AudioParams {
 /// Create a new AudioParams instance for sharing state between threads.
 ///
 /// Returns its address in shared WASM linear memory; every consumer rebuilds a
-/// [`SharedPtr`] from it with [`SharedPtr::from_addr`]. The allocation is leaked
-/// so it outlives every agent that holds the address.
+/// [`SharedPtr`] from it with [`SharedPtr::from_addr`] (unsafe — see the
+/// `// SAFETY:` comment in [`with_params`]). The allocation is leaked so it
+/// outlives every agent that holds the address.
 #[wasm_bindgen(js_name = createAudioParams)]
 pub fn create_audio_params() -> usize {
     SharedPtr::from_ref(Box::leak(Box::<AudioParams>::default())).addr()
@@ -165,7 +166,12 @@ pub fn create_audio_params() -> usize {
 /// mutability), so setters pass a `()` fallback and mutate through the shared
 /// reference.
 fn with_params<R>(addr: usize, fallback: R, f: impl FnOnce(&AudioParams) -> R) -> R {
-    SharedPtr::<AudioParams>::from_addr(addr).as_ref().map_or(fallback, f)
+    // SAFETY: `addr` is a wasm-bindgen boundary value from JS. Null falls
+    // through `as_ref` to `fallback`. Non-null addresses must be ones
+    // previously returned by [`create_audio_params`] (a leaked `AudioParams`
+    // that outlives every agent holding the integer).
+    let params = unsafe { SharedPtr::<AudioParams>::from_addr(addr) };
+    params.as_ref().map_or(fallback, f)
 }
 
 /// Get volume level from params pointer (0.0 to 100.0)
