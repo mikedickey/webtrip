@@ -977,7 +977,7 @@ impl WebTripSession {
             return Err(e);
         }
 
-        let (engine, used_output_device_id) =
+        let (mut engine, used_output_device_id) =
             match self.start_engine_unless_aborted(capture, abort).await {
                 Ok(pair) => pair,
                 Err((e, engine)) => {
@@ -985,6 +985,22 @@ impl WebTripSession {
                     return Err(e);
                 }
             };
+
+        // WEB-72: `set_output_device` during bring-up stores a new id but finds
+        // no published engine, so nothing is routed. Compare against the id
+        // `start_engine` used and apply via `AudioEngine::set_output_device`
+        // (same route + reconfigure path the session method uses once an
+        // engine exists) *before* `finish_connect`. Awaiting after Connected
+        // would keep `connect_in_flight` pending — blocking disconnect and
+        // leaving `connectToStudio` unresolved after callers already saw
+        // `connected`.
+        let current_output_device_id = self.output_device_id.borrow().clone();
+        if current_output_device_id != used_output_device_id {
+            if let Err(e) = engine.set_output_device(current_output_device_id).await {
+                self.release(Some(transport), Some(engine)).await;
+                return Err(e);
+            }
+        }
 
         // A failure reported before `Connected` cannot fail the connection
         // (there is none yet), so it fails the connect instead.
@@ -1002,19 +1018,6 @@ impl WebTripSession {
         *self.audio_engine.borrow_mut() = Some(engine);
         self.start_network_loop(transport_type);
         emit_state(&self.on_state_change, SessionState::Connected);
-
-        // WEB-72: `set_output_device` during bring-up stores a new id but finds
-        // no published engine, so nothing is routed. Now that the engine is
-        // published, compare against the id `start_engine` used and re-enter
-        // the existing `set_output_device` path when they differ. A sink-route
-        // failure here must not unwind the already-published connection — the
-        // id stays stored for a later retry, same as a post-connect call.
-        let current_output_device_id = self.output_device_id.borrow().clone();
-        if current_output_device_id != used_output_device_id {
-            if let Err(e) = self.set_output_device(current_output_device_id).await {
-                web_sys::console::warn_1(&e);
-            }
-        }
         Ok(())
     }
 
