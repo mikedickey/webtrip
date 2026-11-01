@@ -14,7 +14,13 @@ pub const RENDER_QUANTUM_FRAMES: usize = 128;
 /// `input` is planar across `in_channels` input channels: `input[ch * frames
 /// + frame]`. `output` is planar across `out_channels` output channels:
 /// `output[ch * frames + frame]`, `frames == input.len() / in_channels`.
-pub type ProcessorCallback = Box<dyn FnMut(&[f32], usize, &mut [f32], usize) -> bool>;
+///
+/// `+ Send` is required because [`ProcessorHandle::into_raw_ptr`] builds the
+/// closure on the main thread and [`ProcessorHandle::from_raw_ptr`] rebuilds
+/// it on the AudioWorklet render thread (via an integer address over
+/// `postMessage`). Without the bound, a capture of `Rc`/`RefCell`/a JS handle
+/// would compile and go unnoticed.
+pub type ProcessorCallback = Box<dyn FnMut(&[f32], usize, &mut [f32], usize) -> bool + Send>;
 
 /// Handle for a WASM audio processor that can be passed to the AudioWorklet.
 ///
@@ -70,12 +76,23 @@ impl ProcessorHandle {
         )
     }
 
-    /// Convert the processor into a raw pointer for passing to JavaScript
+    /// Convert the processor into a raw pointer for passing to JavaScript.
+    ///
+    /// The address crosses to the AudioWorklet thread as an integer; soundness
+    /// of that handoff rests on [`ProcessorCallback`]'s `Send` bound (and on
+    /// the scratch `Vec`s already being `Send`).
     pub fn into_raw_ptr(self) -> usize {
         Box::into_raw(Box::new(self)) as usize
     }
 
-    /// Reconstruct the processor from a raw pointer (unsafe)
+    /// Reconstruct the processor from a raw pointer received on the AudioWorklet
+    /// thread. Sound because [`ProcessorCallback`] is `Send` — see
+    /// [`into_raw_ptr`](Self::into_raw_ptr).
+    ///
+    /// # Safety
+    ///
+    /// `val` must be an address previously returned by [`into_raw_ptr`] and must
+    /// not have been reconstructed already.
     pub unsafe fn from_raw_ptr(val: usize) -> Self {
         *Box::from_raw(val as *mut _)
     }
@@ -92,6 +109,16 @@ impl ProcessorHandle {
         }
     }
 }
+
+// `ProcessorHandle` is built on the main thread and reconstructed on the
+// AudioWorklet thread via an integer address (`into_raw_ptr` /
+// `from_raw_ptr`). Nothing in that ABI otherwise requires `Send` — so without
+// this assertion (and [`ProcessorCallback`]'s `+ Send` bound) a non-`Send`
+// field could land in the handle and cross unnoticed (WEB-70).
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<ProcessorHandle>();
+};
 
 /// Register the audio worklet module with the AudioContext
 pub async fn register_audio_worklet(ctx: &AudioContext) -> Result<(), JsValue> {
