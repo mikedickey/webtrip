@@ -150,7 +150,7 @@ impl Lifecycle {
         transition: impl Fn(u64, SessionState) -> Option<(u64, SessionState)>,
     ) -> Result<(u64, SessionState), (u64, SessionState)> {
         self.word
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |word| {
                 let (epoch, state) = unpack(word);
                 transition(epoch, state).map(|(e, s)| pack(e, s))
             })

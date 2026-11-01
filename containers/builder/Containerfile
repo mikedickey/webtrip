@@ -20,7 +20,7 @@
 
 FROM debian:bookworm-slim
 
-ARG RUST_NIGHTLY=nightly-2026-06-13
+ARG RUST_NIGHTLY=nightly-2026-10-31
 ARG NODE_MAJOR=22
 ARG WASM_PACK_VERSION=0.15.0
 # NOTE: WASM_BINDGEN_VERSION must stay in sync with the wasm-bindgen version in
