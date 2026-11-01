@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::audio::devices::{
     clamp_channel_count, first_audio_track, get_media_devices, get_user_media_audio,
@@ -199,6 +200,37 @@ impl AudioEngine {
         input_channels: u32,
         output_channels: u32,
     ) -> Result<(), JsValue> {
+        self.start_capture_cancellable(
+            device_id,
+            output_device_id,
+            auto_gain_control,
+            echo_cancellation,
+            noise_suppression,
+            input_channels,
+            output_channels,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`start_capture`](Self::start_capture), but checks `cancelled`
+    /// after each await that cannot itself be aborted (`getUserMedia`,
+    /// `setSinkId`). When set, stops any acquired tracks and returns
+    /// `AbortError` without installing a worklet — so an abandoned connect
+    /// cannot race a later connection's regulator (WEB-69). The flag is an
+    /// atomic so the API carries no confinement assumption: a native host can
+    /// set it from any thread.
+    pub(crate) async fn start_capture_cancellable(
+        &mut self,
+        device_id: Option<String>,
+        output_device_id: Option<String>,
+        auto_gain_control: bool,
+        echo_cancellation: bool,
+        noise_suppression: bool,
+        input_channels: u32,
+        output_channels: u32,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<(), JsValue> {
         // Stop any existing capture without closing the context — a closed
         // AudioContext cannot be restarted (see [`stop_capture`](Self::stop_capture)).
         self.stop_nodes();
@@ -213,6 +245,10 @@ impl AudioEngine {
         )
         .to_js()?;
         let stream = get_user_media_audio(&media_devices, &audio_constraints).await?;
+        if cancelled.is_some_and(|c| c.load(Ordering::Acquire)) {
+            stop_media_stream(&stream);
+            return Err(crate::audio::cancelled_error());
+        }
 
         // The constraints open the device at its native width; the worklet
         // node's Explicit/Discrete `channelCount` then keeps only its first
@@ -235,6 +271,10 @@ impl AudioEngine {
         // default output's.
         if output_device_id.is_some() {
             route_output_sink(self.ctx.as_ref(), output_device_id).await?;
+            if cancelled.is_some_and(|c| c.load(Ordering::Acquire)) {
+                self.stop_nodes();
+                return Err(crate::audio::cancelled_error());
+            }
         }
 
         // Configure the destination (explicit/discrete, so the browser never
@@ -958,6 +998,68 @@ mod tests {
         );
 
         close_engine(engine).await;
+    }
+
+    /// A capture cancelled after an un-abortable await must return `AbortError`
+    /// and leave no worklet node behind (WEB-69). Two checkpoints in
+    /// `start_capture_cancellable`, each in a fresh engine:
+    ///
+    /// - after `getUserMedia` (flag already set; the fake device still
+    ///   resolves, so the stream must be stopped and no worklet built);
+    /// - after `setSinkId` (a stub on the context sets the flag while the
+    ///   sink switch is "in flight"; the source node and stream wired just
+    ///   before it must be torn down and no worklet built).
+    ///
+    /// The session-level test gates bring-up *before* this function, so it
+    /// cannot reach either check.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn cancelled_capture_aborts_without_installing_a_worklet() {
+        use std::sync::Arc;
+        use wasm_bindgen::closure::Closure;
+
+        for after_sink in [false, true] {
+            let params = AudioParams::default();
+            let mut engine = create_engine(&params).await;
+            let cancelled = Arc::new(AtomicBool::new(!after_sink));
+            let flag = cancelled.clone();
+            let stub = Closure::wrap(Box::new(move |_id: JsValue| -> js_sys::Promise {
+                flag.store(true, Ordering::Release);
+                js_sys::Promise::resolve(&JsValue::UNDEFINED)
+            }) as Box<dyn FnMut(JsValue) -> js_sys::Promise>);
+            let ctx = engine.context();
+            // Own property shadows any native `setSinkId` for this context only.
+            js_sys::Reflect::set(ctx.as_ref(), &"setSinkId".into(), stub.as_ref().unchecked_ref())
+                .expect("installing the setSinkId stub should succeed");
+
+            let result = engine
+                .start_capture_cancellable(
+                    None,
+                    after_sink.then(|| "speaker".to_string()),
+                    false,
+                    false,
+                    false,
+                    2,
+                    2,
+                    Some(&cancelled),
+                )
+                .await;
+
+            let error = result.expect_err("a cancelled capture must not resolve Ok");
+            let name = js_sys::Reflect::get(&error, &"name".into()).unwrap();
+            assert_eq!(
+                name.as_string().as_deref(),
+                Some("AbortError"),
+                "after_sink={after_sink}: cancellation must be an AbortError"
+            );
+            assert!(
+                !engine.is_capturing() && engine.get_worklet_port().is_none(),
+                "after_sink={after_sink}: a cancelled capture must not install a worklet"
+            );
+
+            drop(stub);
+            close_engine(engine).await;
+        }
     }
 
     /// A `close()` promise that never settles must not hang teardown: the
