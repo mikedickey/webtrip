@@ -300,7 +300,8 @@ struct CaptureParams {
 /// await so an aborted connect never installs a worklet on shared buffers.
 ///
 /// `capture_gate` (tests) holds bring-up after construction to simulate a
-/// stuck permission prompt; `capture_waiting` is set while that gate is held.
+/// stuck permission prompt; `capture_waiting` is set while that gate is held,
+/// and `capture_context` exposes the engine's `AudioContext` for test stubs.
 async fn bring_up_engine(
     params_addr: usize,
     local_to_network: *mut RingBuffer,
@@ -313,6 +314,7 @@ async fn bring_up_engine(
     context_slot: Rc<RefCell<Option<web_sys::AudioContext>>>,
     capture_gate: Option<js_sys::Promise>,
     capture_waiting: Option<Rc<Cell<bool>>>,
+    capture_context: Option<Rc<RefCell<Option<web_sys::AudioContext>>>>,
 ) -> Result<AudioEngine, JsValue> {
     // `AudioEngine` is a `#[wasm_bindgen]` boundary type, so it takes raw
     // pointers / addresses here and wraps them in `SharedPtr` internally
@@ -321,6 +323,9 @@ async fn bring_up_engine(
         AudioEngine::create_with_network(params_addr, local_to_network, network_to_local).await?;
     // Lets an abort close the context while `getUserMedia` is still pending.
     *context_slot.borrow_mut() = Some(engine.context());
+    if let Some(slot) = &capture_context {
+        *slot.borrow_mut() = Some(engine.context());
+    }
     if cancelled.load(Ordering::Acquire) {
         engine.stop_capture().await;
         return Err(cancelled_error());
@@ -331,6 +336,9 @@ async fn bring_up_engine(
             flag.set(true);
         }
         let _ = JsFuture::from(gate).await;
+        if let Some(slot) = &capture_context {
+            *slot.borrow_mut() = None;
+        }
         if cancelled.load(Ordering::Acquire) {
             engine.stop_capture().await;
             return Err(cancelled_error());
@@ -406,6 +414,10 @@ pub struct WebTripSession {
     /// Test-only: set when bring-up is blocked on [`capture_gate`].
     #[cfg(all(test, target_arch = "wasm32"))]
     capture_waiting: Rc<Cell<bool>>,
+    /// Test-only: the `AudioContext` of an engine held behind [`capture_gate`],
+    /// so a test can stub `setSinkId` before capture proceeds (WEB-72).
+    #[cfg(all(test, target_arch = "wasm32"))]
+    capture_context: Rc<RefCell<Option<web_sys::AudioContext>>>,
 
     // Configuration. The four channel counts are independent, set only
     // while Idle, and fixed for the life of a connection.
@@ -472,6 +484,8 @@ impl WebTripSession {
             capture_gate: RefCell::new(None),
             #[cfg(all(test, target_arch = "wasm32"))]
             capture_waiting: Rc::new(Cell::new(false)),
+            #[cfg(all(test, target_arch = "wasm32"))]
+            capture_context: Rc::new(RefCell::new(None)),
             buffer_size,
             send_channels: Cell::new(send_channels),
             receive_channels: Cell::new(receive_channels),
@@ -850,6 +864,7 @@ impl WebTripSession {
     #[cfg(all(test, target_arch = "wasm32"))]
     pub(crate) fn set_capture_gate(&self, gate: js_sys::Promise) {
         self.capture_waiting.set(false);
+        *self.capture_context.borrow_mut() = None;
         *self.capture_gate.borrow_mut() = Some(gate);
     }
 
@@ -857,6 +872,12 @@ impl WebTripSession {
     #[cfg(all(test, target_arch = "wasm32"))]
     pub(crate) fn is_capture_waiting(&self) -> bool {
         self.capture_waiting.get()
+    }
+
+    /// The `AudioContext` of an engine blocked on [`capture_gate`] (test-only).
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub(crate) fn capture_context(&self) -> Option<web_sys::AudioContext> {
+        self.capture_context.borrow().clone()
     }
 
     /// Admit, dial, and bring up a connection; the transport-agnostic body of
@@ -956,13 +977,14 @@ impl WebTripSession {
             return Err(e);
         }
 
-        let engine = match self.start_engine_unless_aborted(capture, abort).await {
-            Ok(engine) => engine,
-            Err((e, engine)) => {
-                self.release(Some(transport), engine).await;
-                return Err(e);
-            }
-        };
+        let (engine, used_output_device_id) =
+            match self.start_engine_unless_aborted(capture, abort).await {
+                Ok(pair) => pair,
+                Err((e, engine)) => {
+                    self.release(Some(transport), engine).await;
+                    return Err(e);
+                }
+            };
 
         // A failure reported before `Connected` cannot fail the connection
         // (there is none yet), so it fails the connect instead.
@@ -980,6 +1002,19 @@ impl WebTripSession {
         *self.audio_engine.borrow_mut() = Some(engine);
         self.start_network_loop(transport_type);
         emit_state(&self.on_state_change, SessionState::Connected);
+
+        // WEB-72: `set_output_device` during bring-up stores a new id but finds
+        // no published engine, so nothing is routed. Now that the engine is
+        // published, compare against the id `start_engine` used and re-enter
+        // the existing `set_output_device` path when they differ. A sink-route
+        // failure here must not unwind the already-published connection — the
+        // id stays stored for a later retry, same as a post-connect call.
+        let current_output_device_id = self.output_device_id.borrow().clone();
+        if current_output_device_id != used_output_device_id {
+            if let Err(e) = self.set_output_device(current_output_device_id).await {
+                web_sys::console::warn_1(&e);
+            }
+        }
         Ok(())
     }
 
@@ -1068,6 +1103,10 @@ impl WebTripSession {
     /// `abort` so a disconnect (or the connect timeout) can finish while
     /// `getUserMedia` is still pending.
     ///
+    /// On success returns the engine and the `output_device_id` snapshotted
+    /// before bring-up began (so the caller can detect a `set_output_device`
+    /// that landed while capture was pending — WEB-72).
+    ///
     /// On abort the `AbortError` is returned immediately. If bring-up is still
     /// pending, a detached task finishes it and stops the engine (no worklet
     /// is installed once cancelled). If bring-up had already stored a live
@@ -1080,25 +1119,27 @@ impl WebTripSession {
         &self,
         capture: CaptureParams,
         abort: js_sys::Promise,
-    ) -> Result<AudioEngine, (JsValue, Option<AudioEngine>)> {
+    ) -> Result<(AudioEngine, Option<String>), (JsValue, Option<AudioEngine>)> {
         #[cfg(all(test, target_arch = "wasm32"))]
         crate::test_support::note_start_engine();
         let params_addr = self.audio_params.addr();
         let (local_to_network, network_to_local) = self.buffer_ptrs();
         let output_device_id = self.output_device_id.borrow().clone();
+        let used_output_device_id = output_device_id.clone();
         let input_channels = self.input_channels.get() as u32;
         let output_channels = self.output_channels.get() as u32;
-        let (capture_gate, capture_waiting) = {
+        let (capture_gate, capture_waiting, capture_context) = {
             #[cfg(all(test, target_arch = "wasm32"))]
             {
                 (
                     self.capture_gate.borrow_mut().take(),
                     Some(Rc::clone(&self.capture_waiting)),
+                    Some(Rc::clone(&self.capture_context)),
                 )
             }
             #[cfg(not(all(test, target_arch = "wasm32")))]
             {
-                (None, None)
+                (None, None, None)
             }
         };
 
@@ -1124,6 +1165,7 @@ impl WebTripSession {
                     context_slot,
                     capture_gate,
                     capture_waiting,
+                    capture_context,
                 )
                 .await;
                 // No `cancelled` re-check here: nothing awaits between the last
@@ -1141,6 +1183,7 @@ impl WebTripSession {
                 .borrow_mut()
                 .take()
                 .unwrap_or_else(|| Err(js_error("engine bring-up produced no result")))
+                .map(|engine| (engine, used_output_device_id))
                 .map_err(|e| (e, None)),
             Err(reason) => {
                 cancelled.store(true, Ordering::Release);
@@ -1827,6 +1870,69 @@ mod tests {
             &["connecting", "disconnecting", "idle"],
             "around a cancelled post-dial",
         );
+    }
+
+    /// A `setOutputDevice` that lands while capture is gated (simulating a
+    /// stuck `getUserMedia` / permission prompt) must still reach the engine
+    /// published at the end of connect. Bring-up snapshots the id before the
+    /// gate; without a post-bring-up re-apply the new sink would be stored but
+    /// never routed (WEB-72).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_set_output_device_during_gated_capture_is_applied() {
+        let params = AudioParams::default();
+        let session = new_session(&params);
+
+        let (capture_gate, finish_capture) = gate();
+        session.set_capture_gate(capture_gate);
+
+        let connect = spawn_connect(&session, MockTransport::new(), CONNECT_TIMEOUT_MS);
+        assert!(
+            wait_until(|| session.is_capture_waiting(), 2000, 5).await,
+            "bring-up never reached the capture gate"
+        );
+
+        // Stub `setSinkId` on the pending engine's context so a synthetic
+        // device id can be observed without needing a real output device.
+        let routed = Rc::new(RefCell::new(Vec::<String>::new()));
+        let routed_for_stub = routed.clone();
+        let sink_stub = Closure::wrap(Box::new(move |id: JsValue| -> js_sys::Promise {
+            routed_for_stub
+                .borrow_mut()
+                .push(id.as_string().unwrap_or_default());
+            js_sys::Promise::resolve(&JsValue::UNDEFINED)
+        }) as Box<dyn FnMut(JsValue) -> js_sys::Promise>);
+        let ctx = session
+            .capture_context()
+            .expect("gated bring-up must expose the pending AudioContext");
+        js_sys::Reflect::set(ctx.as_ref(), &"setSinkId".into(), sink_stub.as_ref().unchecked_ref())
+            .expect("installing the setSinkId stub should succeed");
+
+        // Change the sink while bring-up is still held: stores the id, finds
+        // no published engine, applies nothing yet.
+        session
+            .set_output_device(Some("speaker-during-bringup".to_string()))
+            .await
+            .expect("storing an output device with no published engine must succeed");
+        assert!(
+            routed.borrow().is_empty(),
+            "setOutputDevice during gated bring-up must not route yet (no published engine)"
+        );
+
+        let _ = finish_capture.call0(&JsValue::NULL);
+        settled(&connect, "connect after gated setOutputDevice")
+            .await
+            .expect("connect must succeed after the capture gate opens");
+        assert!(session.has_engine(), "connect must publish the engine");
+        assert_eq!(
+            *routed.borrow(),
+            vec!["speaker-during-bringup".to_string()],
+            "the published engine must be routed to the id set during bring-up"
+        );
+
+        drop(sink_stub);
+        session.disconnect().await;
+        assert_eq!(session.get_state(), "idle");
     }
 
     /// A disconnect while capture is stuck (gated mid-bring-up, as when the
