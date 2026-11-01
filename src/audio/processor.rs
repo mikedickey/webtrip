@@ -984,7 +984,10 @@ mod tests {
     /// keeps a raw pointer to it.
     fn networked_processor(params: &'static AudioParams, ring: &mut RingBuffer) -> AudioProcessor {
         ring.set_streaming(true);
-        AudioProcessor::with_network(params, SharedPtr::new(ring as *mut RingBuffer), SharedPtr::null())
+        // SAFETY: `ring` is borrowed for the processor's lifetime in these
+        // tests; the processor never outlives the stack local.
+        let ring_ptr = unsafe { SharedPtr::new(ring as *mut RingBuffer) };
+        AudioProcessor::with_network(params, ring_ptr, SharedPtr::null())
     }
 
     /// `frames` of planar capture (`[ch * frames + frame]`) where channel `ch`

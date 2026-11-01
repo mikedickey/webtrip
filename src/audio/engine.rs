@@ -155,7 +155,10 @@ impl AudioEngine {
             worklet_node: None,
             source_node: None,
             current_stream: None,
-            params: SharedPtr::from_addr(params_addr),
+            // SAFETY: `params_addr` is a wasm-bindgen boundary value from JS /
+            // the session. Callers pass the address from `create_audio_params`
+            // (a leaked `AudioParams` that outlives the engine).
+            params: unsafe { SharedPtr::from_addr(params_addr) },
             local_to_network_buffer_ptr,
             network_to_local_buffer_ptr,
             worklet_output_channels: 0,
@@ -338,8 +341,11 @@ impl AudioEngine {
             .params
             .as_ref()
             .ok_or_else(|| JsValue::from_str("AudioEngine requires a non-null AudioParams pointer"))?;
-        let local_to_network = SharedPtr::new(self.local_to_network_buffer_ptr);
-        let network_to_local = SharedPtr::new(self.network_to_local_buffer_ptr);
+        // SAFETY: both raw pointers were published by the session from buffers
+        // it owns; the session keeps those buffers alive until after the
+        // worklet (and therefore this processor) has stopped.
+        let local_to_network = unsafe { SharedPtr::new(self.local_to_network_buffer_ptr) };
+        let network_to_local = unsafe { SharedPtr::new(self.network_to_local_buffer_ptr) };
 
         let mut processor = if local_to_network.is_null() && network_to_local.is_null() {
             AudioProcessor::new(params)

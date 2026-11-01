@@ -383,8 +383,11 @@ impl WorkerState {
         send_channels: u8,
         receive_channels: u8,
     ) {
-        self.ring_buffer_ptr = SharedPtr::from_addr(ring_ptr);
-        self.regulator_ptr = SharedPtr::from_addr(reg_ptr);
+        // SAFETY: addresses published by the main-thread session from buffers
+        // it owns; the worker is terminated (and its loops exit) before those
+        // buffers are dropped or `Regulator::reset` runs.
+        self.ring_buffer_ptr = unsafe { SharedPtr::from_addr(ring_ptr) };
+        self.regulator_ptr = unsafe { SharedPtr::from_addr(reg_ptr) };
         self.buffer_size = buffer_size;
         self.send_channels = send_channels;
         self.receive_channels = receive_channels;

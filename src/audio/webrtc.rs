@@ -1383,12 +1383,16 @@ mod tests {
         send_channels: u8,
         receive_channels: u8,
     ) -> AudioBufferConfig {
-        AudioBufferConfig {
-            local_to_network: SharedPtr::new(ring as *mut RingBuffer),
-            network_to_local: SharedPtr::new(reg as *mut Regulator),
-            buffer_size,
-            send_channels,
-            receive_channels,
+        // SAFETY: both buffers are stack locals kept alive by the test for the
+        // duration of any `tick` that may dereference these pointers.
+        unsafe {
+            AudioBufferConfig {
+                local_to_network: SharedPtr::new(ring as *mut RingBuffer),
+                network_to_local: SharedPtr::new(reg as *mut Regulator),
+                buffer_size,
+                send_channels,
+                receive_channels,
+            }
         }
     }
 

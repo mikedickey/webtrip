@@ -434,7 +434,10 @@ impl WebTripSession {
     /// Create a new session
     #[wasm_bindgen(constructor)]
     pub fn new(audio_params_addr: usize) -> Result<WebTripSession, JsValue> {
-        let audio_params = SharedPtr::<AudioParams>::from_addr(audio_params_addr);
+        // SAFETY: `audio_params_addr` is a wasm-bindgen boundary value from JS.
+        // Callers pass the address from [`create_audio_params`] (a leaked
+        // `AudioParams` that outlives the session and every agent holding it).
+        let audio_params = unsafe { SharedPtr::<AudioParams>::from_addr(audio_params_addr) };
         let buffer_size = 128;
         let sample_rate = 48000;
         let send_channels = 1;
@@ -1031,7 +1034,12 @@ impl WebTripSession {
             None => true,
         };
         if quiescent {
-            self.network_to_local_buffer.reset();
+            // SAFETY: producer is quiesced — `transport.close().await` above
+            // stopped the network loop (no more `push`). Consumer is quiesced —
+            // `AudioEngine::stop_capture` awaited `AudioContext.close` (or
+            // there was no engine), so the worklet is no longer calling `pop`
+            // (WEB-53 Bug 7 / WEB-66 / WEB-71).
+            unsafe { self.network_to_local_buffer.reset() };
         } else {
             web_sys::console::warn_1(
                 &"⚠️ AudioContext.close did not finish in time; skipping Regulator::reset \
@@ -1055,12 +1063,17 @@ impl WebTripSession {
     /// transport before it connects.
     fn audio_buffer_config(&self) -> AudioBufferConfig {
         let (local_to_network, network_to_local) = self.buffer_ptrs();
-        AudioBufferConfig {
-            local_to_network: SharedPtr::new(local_to_network),
-            network_to_local: SharedPtr::new(network_to_local),
-            buffer_size: self.buffer_size,
-            send_channels: self.send_channels.get(),
-            receive_channels: self.receive_channels.get(),
+        // SAFETY: both pointers are from `buffer_ptrs()` into session-owned
+        // buffers that outlive every transport/worklet borrow; those agents
+        // are stopped before the session drops the buffers.
+        unsafe {
+            AudioBufferConfig {
+                local_to_network: SharedPtr::new(local_to_network),
+                network_to_local: SharedPtr::new(network_to_local),
+                buffer_size: self.buffer_size,
+                send_channels: self.send_channels.get(),
+                receive_channels: self.receive_channels.get(),
+            }
         }
     }
 

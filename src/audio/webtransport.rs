@@ -1290,12 +1290,16 @@ mod tests {
 
     #[test]
     fn worker_init_message_has_expected_fields() {
-        let config = AudioBufferConfig {
-            local_to_network: SharedPtr::from_addr(0x1000),
-            network_to_local: SharedPtr::from_addr(0x2000),
-            buffer_size: 128,
-            send_channels: 1,
-            receive_channels: 2,
+        // SAFETY: this test only serializes the addresses into the worker init
+        // JSON; nothing dereferences the pointees.
+        let config = unsafe {
+            AudioBufferConfig {
+                local_to_network: SharedPtr::from_addr(0x1000),
+                network_to_local: SharedPtr::from_addr(0x2000),
+                buffer_size: 128,
+                send_channels: 1,
+                receive_channels: 2,
+            }
         };
 
         let msg = build_worker_init_message(&config);

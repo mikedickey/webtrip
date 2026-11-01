@@ -1060,15 +1060,17 @@ impl Regulator {
 
     /// Reset the regulator state.
     ///
+    /// # Safety
+    ///
     /// The caller must have quiesced both the producer and the consumer first:
-    /// this rewrites slot payloads and the consumer's state in place.
-    /// `WebTripSession::disconnect` does that by awaiting transport teardown
-    /// and `AudioContext.close()` (with a timeout) before calling it
-    /// (WEB-53 Bug 7 / WEB-66).
-    pub fn reset(&self) {
+    /// this rewrites slot payloads and the consumer's state in place through
+    /// `UnsafeCell`. Concurrent `push` / `pop` is a data race (WEB-53 Bug 7).
+    /// `WebTripSession::release` upholds that by awaiting transport teardown
+    /// and `AudioContext.close()` (with a timeout) before calling it (WEB-66).
+    pub unsafe fn reset(&self) {
         self.shared.reset();
-        // SAFETY: the consumer is quiesced (see above), so this is the only
-        // borrow of its state.
+        // SAFETY: the consumer is quiesced (caller contract above), so this is
+        // the only borrow of its state.
         let consumer = unsafe { self.consumer_mut() };
         consumer.reset(&self.shared);
     }
@@ -2162,7 +2164,8 @@ mod tests {
         assert!(consumer(&mut reg).packet_count > 0);
         assert!(consumer(&mut reg).pull_stats.underruns > 0);
 
-        reg.reset();
+        // SAFETY: single-threaded test; no concurrent push/pop.
+        unsafe { reg.reset() };
 
         assert!(!reg.is_initialized(), "last_seq_in should be cleared");
         assert_eq!(last_seq_out_opt(&reg), None);
@@ -2216,7 +2219,8 @@ mod tests {
         consumer(&mut reg).last_stashed = Some((9, slot_index(9)));
         plant_packet(&reg, 9, 100.0, &samples);
 
-        reg.reset();
+        // SAFETY: single-threaded test; no concurrent push/pop.
+        unsafe { reg.reset() };
 
         assert_eq!(
             consumer(&mut reg).last_stashed, None,
