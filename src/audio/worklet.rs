@@ -14,7 +14,13 @@ pub const RENDER_QUANTUM_FRAMES: usize = 128;
 /// `input` is planar across `in_channels` input channels: `input[ch * frames
 /// + frame]`. `output` is planar across `out_channels` output channels:
 /// `output[ch * frames + frame]`, `frames == input.len() / in_channels`.
-pub type ProcessorCallback = Box<dyn FnMut(&[f32], usize, &mut [f32], usize) -> bool>;
+///
+/// `+ Send` is required because [`ProcessorHandle::into_raw_ptr`] builds the
+/// closure on the main thread and [`ProcessorHandle::from_raw_ptr`] rebuilds
+/// it on the AudioWorklet render thread (via an integer address over
+/// `postMessage`). Without the bound, a capture of `Rc`/`RefCell`/a JS handle
+/// would compile and go unnoticed.
+pub type ProcessorCallback = Box<dyn FnMut(&[f32], usize, &mut [f32], usize) -> bool + Send>;
 
 /// Handle for a WASM audio processor that can be passed to the AudioWorklet.
 ///
@@ -70,12 +76,23 @@ impl ProcessorHandle {
         )
     }
 
-    /// Convert the processor into a raw pointer for passing to JavaScript
+    /// Convert the processor into a raw pointer for passing to JavaScript.
+    ///
+    /// The address crosses to the AudioWorklet thread as an integer; soundness
+    /// of that handoff rests on [`ProcessorCallback`]'s `Send` bound (and on
+    /// the scratch `Vec`s already being `Send`).
     pub fn into_raw_ptr(self) -> usize {
         Box::into_raw(Box::new(self)) as usize
     }
 
-    /// Reconstruct the processor from a raw pointer (unsafe)
+    /// Reconstruct the processor from a raw pointer received on the AudioWorklet
+    /// thread. Sound because [`ProcessorCallback`] is `Send` — see
+    /// [`into_raw_ptr`](Self::into_raw_ptr).
+    ///
+    /// # Safety
+    ///
+    /// `val` must be an address previously returned by [`into_raw_ptr`] and must
+    /// not have been reconstructed already.
     pub unsafe fn from_raw_ptr(val: usize) -> Self {
         *Box::from_raw(val as *mut _)
     }
@@ -92,6 +109,16 @@ impl ProcessorHandle {
         }
     }
 }
+
+// `ProcessorHandle` is built on the main thread and reconstructed on the
+// AudioWorklet thread via an integer address (`into_raw_ptr` /
+// `from_raw_ptr`). Nothing in that ABI otherwise requires `Send` — so without
+// this assertion (and [`ProcessorCallback`]'s `+ Send` bound) a non-`Send`
+// field could land in the handle and cross unnoticed (WEB-70).
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<ProcessorHandle>();
+};
 
 /// Register the audio worklet module with the AudioContext
 pub async fn register_audio_worklet(ctx: &AudioContext) -> Result<(), JsValue> {
@@ -162,6 +189,8 @@ pub fn create_worklet_node_with_flag(
 #[cfg(all(test, target_arch = "wasm32"))]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     // Browser-test opt-in (`wasm_bindgen_test_configure!(run_in_browser)`) lives
     // once in `crate::test_support`.
@@ -230,14 +259,15 @@ mod tests {
         let frames = 4usize;
         let in_channels = 2usize;
 
-        let seen_in_channels = std::rc::Rc::new(std::cell::Cell::new(0usize));
-        let seen = seen_in_channels.clone();
-        let seen_samples = std::rc::Rc::new(std::cell::RefCell::new(Vec::<f32>::new()));
-        let samples = seen_samples.clone();
+        // Arc + atomics/Mutex (not Rc/Cell) — ProcessorCallback is Send.
+        let seen_in_channels = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&seen_in_channels);
+        let seen_samples = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let samples = Arc::clone(&seen_samples);
 
         let mut handle = ProcessorHandle::new(Box::new(move |input, in_ch, output, _out_ch| {
-            seen.set(in_ch);
-            samples.borrow_mut().extend_from_slice(input);
+            seen.store(in_ch, Ordering::Relaxed);
+            samples.lock().unwrap().extend_from_slice(input);
             output.fill(1.0);
             true
         }));
@@ -264,12 +294,12 @@ mod tests {
         let result = handle.render(in_channels, 1, frames);
         assert!(result, "render must return the callback's result");
         assert_eq!(
-            seen_in_channels.get(),
+            seen_in_channels.load(Ordering::Relaxed),
             in_channels,
             "callback must observe the clamped in_channels value"
         );
 
-        let received = seen_samples.borrow();
+        let received = seen_samples.lock().unwrap();
         assert_eq!(received.len(), in_channels * frames);
         for ch in 0..in_channels {
             for f in 0..frames {
@@ -293,11 +323,11 @@ mod tests {
     fn render_clamps_out_channels_above_max_channels() {
         let frames = RENDER_QUANTUM_FRAMES;
         let requested_out_channels = MAX_CHANNELS as usize + 1;
-        let seen_out_channels = std::rc::Rc::new(std::cell::Cell::new(0usize));
-        let seen = seen_out_channels.clone();
+        let seen_out_channels = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&seen_out_channels);
 
         let mut handle = ProcessorHandle::new(Box::new(move |_input, _in_ch, output, out_ch| {
-            seen.set(out_ch);
+            seen.store(out_ch, Ordering::Relaxed);
             output.fill(1.0);
             true
         }));
@@ -308,7 +338,7 @@ mod tests {
             "render must not panic when out_channels exceeds MAX_CHANNELS"
         );
         assert_eq!(
-            seen_out_channels.get(),
+            seen_out_channels.load(Ordering::Relaxed),
             MAX_CHANNELS as usize,
             "render must clamp out_channels to MAX_CHANNELS before invoking the callback"
         );
@@ -322,11 +352,11 @@ mod tests {
     #[wasm_bindgen_test]
     fn render_clamps_out_channels_below_one() {
         let frames = RENDER_QUANTUM_FRAMES;
-        let seen_out_channels = std::rc::Rc::new(std::cell::Cell::new(usize::MAX));
-        let seen = seen_out_channels.clone();
+        let seen_out_channels = Arc::new(AtomicUsize::new(usize::MAX));
+        let seen = Arc::clone(&seen_out_channels);
 
         let mut handle = ProcessorHandle::new(Box::new(move |_input, _in_ch, output, out_ch| {
-            seen.set(out_ch);
+            seen.store(out_ch, Ordering::Relaxed);
             output.fill(1.0);
             true
         }));
@@ -334,7 +364,7 @@ mod tests {
         let result = handle.render(1, 0, frames);
         assert!(result, "render must not panic when out_channels is 0");
         assert_eq!(
-            seen_out_channels.get(),
+            seen_out_channels.load(Ordering::Relaxed),
             1,
             "render must clamp out_channels up to 1 before invoking the callback"
         );
@@ -348,11 +378,11 @@ mod tests {
     fn render_clamps_in_channels_above_max_channels() {
         let frames = RENDER_QUANTUM_FRAMES;
         let requested_in_channels = MAX_CHANNELS as usize + 1;
-        let seen_in_channels = std::rc::Rc::new(std::cell::Cell::new(0usize));
-        let seen = seen_in_channels.clone();
+        let seen_in_channels = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&seen_in_channels);
 
         let mut handle = ProcessorHandle::new(Box::new(move |_input, in_ch, output, _out_ch| {
-            seen.set(in_ch);
+            seen.store(in_ch, Ordering::Relaxed);
             output.fill(1.0);
             true
         }));
@@ -363,7 +393,7 @@ mod tests {
             "render must not panic when in_channels exceeds MAX_CHANNELS"
         );
         assert_eq!(
-            seen_in_channels.get(),
+            seen_in_channels.load(Ordering::Relaxed),
             MAX_CHANNELS as usize,
             "render must clamp in_channels to MAX_CHANNELS before invoking the callback"
         );
@@ -376,11 +406,11 @@ mod tests {
     #[wasm_bindgen_test]
     fn render_clamps_in_channels_below_one() {
         let frames = RENDER_QUANTUM_FRAMES;
-        let seen_in_channels = std::rc::Rc::new(std::cell::Cell::new(usize::MAX));
-        let seen = seen_in_channels.clone();
+        let seen_in_channels = Arc::new(AtomicUsize::new(usize::MAX));
+        let seen = Arc::clone(&seen_in_channels);
 
         let mut handle = ProcessorHandle::new(Box::new(move |_input, in_ch, output, _out_ch| {
-            seen.set(in_ch);
+            seen.store(in_ch, Ordering::Relaxed);
             output.fill(1.0);
             true
         }));
@@ -388,7 +418,7 @@ mod tests {
         let result = handle.render(0, 1, frames);
         assert!(result, "render must not panic when in_channels is 0");
         assert_eq!(
-            seen_in_channels.get(),
+            seen_in_channels.load(Ordering::Relaxed),
             1,
             "render must clamp in_channels up to 1 before invoking the callback"
         );
@@ -403,11 +433,11 @@ mod tests {
     #[wasm_bindgen_test]
     fn render_clamps_frames_above_render_quantum() {
         let requested_frames = RENDER_QUANTUM_FRAMES + 1;
-        let seen_frames = std::rc::Rc::new(std::cell::Cell::new(0usize));
-        let seen = seen_frames.clone();
+        let seen_frames = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&seen_frames);
 
         let mut handle = ProcessorHandle::new(Box::new(move |input, _in_ch, output, _out_ch| {
-            seen.set(input.len());
+            seen.store(input.len(), Ordering::Relaxed);
             output.fill(1.0);
             true
         }));
@@ -418,7 +448,7 @@ mod tests {
             "render must not panic when frames exceeds RENDER_QUANTUM_FRAMES"
         );
         assert_eq!(
-            seen_frames.get(),
+            seen_frames.load(Ordering::Relaxed),
             RENDER_QUANTUM_FRAMES,
             "render must clamp frames to RENDER_QUANTUM_FRAMES before invoking the callback"
         );
