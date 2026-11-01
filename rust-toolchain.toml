@@ -1,6 +1,6 @@
 [toolchain]
 # Pinned to match the build container (Containerfile RUST_NIGHTLY). Bump both together.
-channel = "nightly-2026-06-13"
+channel = "nightly-2026-10-31"
 components = ["rust-src"]
 profile = "minimal"
 targets = ["wasm32-unknown-unknown"]

@@ -80,7 +80,7 @@ Pinned versions are `--build-arg`s (`RUST_NIGHTLY`, `NODE_MAJOR`,
 
 `RUST_NIGHTLY` in `Containerfile` and `channel` in `rust-toolchain.toml` **must
 stay in sync**. They are different toolchains to rustup (`nightly` vs
-`nightly-2026-06-13`); if they diverge, rustup downloads a second nightly at
+`nightly-2026-10-31`); if they diverge, rustup downloads a second nightly at
 build time inside the container and the baked-in pin is wasted. Bump both
 together.
 

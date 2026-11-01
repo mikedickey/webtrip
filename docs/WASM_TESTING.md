@@ -270,7 +270,12 @@ The mechanism, encoded in the npm script:
 - **`--cfg=wasm_bindgen_unstable_test_coverage`** — opts the test runner into
   writing `.profraw` data out of the browser.
 - **`-Clink-args=--no-gc-sections`** — keeps coverage symbols from being
-  stripped by the linker.
+  stripped by the linker. It also keeps `compiler_builtins` code that
+  references `fmal` (long-double fma), which no wasm target provides.
+- **`-Clink-args=--unresolved-symbols=ignore-all`** — makes `wasm-ld` stub the
+  unresolved `fmal` (a trapping function that nothing calls) instead of failing
+  the link. Needed since the LLVM 23 nightly. Side effect: any unresolved symbol
+  in a coverage build is silently stubbed, not just `fmal`.
 - **`CFLAGS_wasm32_unknown_unknown="-matomics -mbulk-memory"`** — `minicov`
   compiles its runtime C via the `cc` crate; on our `+atomics` build that C must
   be compiled with the matching wasm features or the instrumented module fails to
