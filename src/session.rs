@@ -634,15 +634,18 @@ impl WebTripSession {
 
     /// Set the output audio device for playback
     ///
-    /// This can be called at any time to change the output device,
-    /// even while audio is playing. If the audio engine hasn't been
-    /// created yet, the device will be stored and applied when the
-    /// engine is initialized.
+    /// Call while `Idle` to store a sink for the next connect, or while
+    /// `Connected` to route a live engine. Rejected while `Connecting`: there
+    /// is no published engine yet, and a store-only update would be lost or
+    /// force a deferred re-apply that races connect/disconnect (WEB-72).
     ///
     /// # Arguments
     /// * `device_id` - The device ID from the output device selector, or empty string/None for default
     #[wasm_bindgen(js_name = setOutputDevice)]
     pub async fn set_output_device(&self, device_id: Option<String>) -> Result<(), JsValue> {
+        if self.state() == SessionState::Connecting {
+            return Err(js_error("Cannot change output device while connecting"));
+        }
         *self.output_device_id.borrow_mut() = device_id.clone();
 
         // If audio engine exists, apply immediately
@@ -860,6 +863,13 @@ impl WebTripSession {
     #[cfg(all(test, target_arch = "wasm32"))]
     pub(crate) fn is_capture_waiting(&self) -> bool {
         self.capture_waiting.get()
+    }
+
+    /// The stored output-device id (test-only), for asserting a rejected
+    /// `set_output_device` did not overwrite it (WEB-72).
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub(crate) fn stored_output_device_id(&self) -> Option<String> {
+        self.output_device_id.borrow().clone()
     }
 
     /// Admit, dial, and bring up a connection; the transport-agnostic body of
@@ -1840,6 +1850,77 @@ mod tests {
             &["connecting", "disconnecting", "idle"],
             "around a cancelled post-dial",
         );
+    }
+
+    /// `setOutputDevice` during `Connecting` must reject without overwriting
+    /// the stored sink: a store-only update would be lost (no published
+    /// engine) or force a deferred re-apply that races connect/disconnect
+    /// (WEB-72). Idle store and post-connect apply remain allowed.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_set_output_device_rejected_while_connecting() {
+        let params = AudioParams::default();
+        let session = new_session(&params);
+
+        session
+            .set_output_device(Some("speaker-before-connect".to_string()))
+            .await
+            .expect("setOutputDevice while Idle must store the sink");
+        assert_eq!(
+            session.stored_output_device_id().as_deref(),
+            Some("speaker-before-connect")
+        );
+        // Clear before dialing so `start_capture` does not call `setSinkId`
+        // with a synthetic id the browser would reject.
+        session
+            .set_output_device(None)
+            .await
+            .expect("clearing the stored sink while Idle must succeed");
+
+        let (capture_gate, finish_capture) = gate();
+        session.set_capture_gate(capture_gate);
+
+        let connect = spawn_connect(&session, MockTransport::new(), CONNECT_TIMEOUT_MS);
+        assert!(
+            wait_until(|| session.is_capture_waiting(), 2000, 5).await,
+            "bring-up never reached the capture gate"
+        );
+        assert_eq!(session.get_state(), "connecting");
+
+        let err = session
+            .set_output_device(Some("speaker-during-connect".to_string()))
+            .await
+            .expect_err("setOutputDevice while Connecting must reject");
+        let message = js_sys::Reflect::get(&err, &"message".into())
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+        assert!(
+            message.contains("while connecting"),
+            "rejection must name the Connecting restriction, got {message:?}"
+        );
+        assert_eq!(
+            session.stored_output_device_id(),
+            None,
+            "a rejected setOutputDevice must not overwrite the stored sink"
+        );
+
+        let _ = finish_capture.call0(&JsValue::NULL);
+        settled(&connect, "connect after rejected setOutputDevice")
+            .await
+            .expect("connect must succeed after the capture gate opens");
+        assert_eq!(session.get_state(), "connected");
+
+        // Connected still accepts changes (default sink via `None` so we need
+        // no real device id / `setSinkId` stub).
+        session
+            .set_output_device(None)
+            .await
+            .expect("setOutputDevice while Connected must still apply");
+        assert_eq!(session.stored_output_device_id(), None);
+
+        session.disconnect().await;
+        assert_eq!(session.get_state(), "idle");
     }
 
     /// A disconnect while capture is stuck (gated mid-bring-up, as when the
