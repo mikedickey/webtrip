@@ -3,7 +3,7 @@
 //! User profile management, preferences, and related operations.
 
 use super::{to_js_value, PaginationQuery, ApiClient, ApiError, urlencode};
-use crate::models;
+use crate::webtrip_api::models;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
@@ -232,7 +232,7 @@ impl UsersApi {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use crate::api::test_helpers::{assert_http_status, mock_api, mock_empty, mock_json};
+    use crate::webtrip_api::api::test_helpers::{assert_http_status, mock_api, mock_empty, mock_json};
 
     fn api(client: &ApiClient) -> UsersApi {
         UsersApi::from_client(client)

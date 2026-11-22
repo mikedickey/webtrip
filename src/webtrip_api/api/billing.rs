@@ -6,7 +6,7 @@
 //! coupon redemption, and studio usage.
 
 use super::{ApiClient, ApiError, urlencode};
-use crate::models;
+use crate::webtrip_api::models;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -165,7 +165,7 @@ impl BillingApi {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use crate::api::test_helpers::{assert_http_status, mock_api, mock_json};
+    use crate::webtrip_api::api::test_helpers::{assert_http_status, mock_api, mock_json};
 
     fn api(client: &ApiClient) -> BillingApi {
         BillingApi::from_client(client)

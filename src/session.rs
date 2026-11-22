@@ -11,7 +11,7 @@
 //! ```text
 //! 1. connect_to_studio(server_host, port, ...)
 //!    └─> Waits out any disconnect still tearing down
-//!    └─> Admitted only from Idle (see `crate::lifecycle`)
+//!    └─> Admitted only from Idle (see `crate::webtrip_core::lifecycle`)
 //!    └─> Dials the hub over the selected transport; WebRTC signaling
 //!        (WebSocket, SDP offer/answer, ICE, data channel) happens inside
 //!        WebRtcTransport.connect_to_hub()
@@ -47,17 +47,17 @@ use wasm_bindgen_futures::JsFuture;
 use crate::audio::audio_callback_loop::AudioCallbackLoop;
 use crate::audio::{cancelled_error, named_error};
 use crate::audio::engine::{close_audio_context_now, resume_context, route_output_sink, AudioEngine};
-use crate::audio::params::AudioParams;
-use crate::audio::protocol::MAX_CHANNELS;
-use crate::audio::regulator::{Regulator, RegulatorStats};
-use crate::audio::ring_buffer::RingBuffer;
-use crate::audio::shared_ptr::SharedPtr;
-use crate::audio::transport::{AudioBufferConfig, Transport, TransportType};
-use crate::audio::webrtc::{TransportConfig as WebRtcConfig, WebRtcTransport};
-use crate::audio::webtransport::{is_webtransport_available, WebTransportImpl};
-use crate::lifecycle::{ConnectRejected, DisconnectStart, Lifecycle};
+use crate::webtrip_core::audio::params::AudioParams;
+use crate::webtrip_core::network::protocol::MAX_CHANNELS;
+use crate::webtrip_core::stream::regulator::{Regulator, RegulatorStats};
+use crate::webtrip_core::stream::ring_buffer::RingBuffer;
+use crate::webtrip_core::stream::shared_ptr::SharedPtr;
+use crate::webtrip_core::network::transport::{AudioBufferConfig, Transport, TransportType};
+use crate::network::webrtc::{TransportConfig as WebRtcConfig, WebRtcTransport};
+use crate::network::webtransport::{is_webtransport_available, WebTransportImpl};
+use crate::webtrip_core::lifecycle::{ConnectRejected, DisconnectStart, Lifecycle};
 
-pub use crate::lifecycle::SessionState;
+pub use crate::webtrip_core::lifecycle::SessionState;
 
 /// Default signaling port (same as JackTrip TCP port)
 pub const DEFAULT_SIGNALING_PORT: u16 = 4464;
@@ -557,7 +557,7 @@ impl WebTripSession {
     ///
     /// The peer decides what it actually sends: the regulator adopts the
     /// count from its first packet
-    /// ([`Regulator::push`](crate::audio::regulator::Regulator::push)) and
+    /// ([`Regulator::push`](crate::webtrip_core::stream::regulator::Regulator::push)) and
     /// `map_to_output` maps it onto the output device.
     #[wasm_bindgen(js_name = setReceiveChannels)]
     pub fn set_receive_channels(&self, channels: u8) {
@@ -1320,7 +1320,7 @@ impl Drop for WebTripSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::regulator::RegulatorStats;
+    use crate::webtrip_core::stream::regulator::RegulatorStats;
 
     // -----------------------------------------------------------------------
     // Channel-count validation
@@ -1439,7 +1439,7 @@ mod tests {
     // `crate::test_support`.
     //
     // The lifecycle state machine's transitions are covered natively in
-    // `crate::lifecycle`; these tests cover the session's use of it: that the
+    // `crate::webtrip_core::lifecycle`; these tests cover the session's use of it: that the
     // resources follow the state (a cancelled connect releases its transport
     // and never publishes, teardown is serialized and coalesced) and that the
     // state-change callback reports it in order.

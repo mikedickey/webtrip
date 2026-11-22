@@ -8,9 +8,9 @@ use std::future::Future;
 use wasm_bindgen::prelude::*;
 use web_sys;
 
-use crate::audio::protocol::{AudioPacket, PacketHeader, ProtocolError};
-use crate::audio::regulator::{PushOutcome, Regulator};
-use crate::audio::shared_ptr::SharedPtr;
+use crate::webtrip_core::network::protocol::{AudioPacket, PacketHeader, ProtocolError};
+use crate::webtrip_core::stream::regulator::{PushOutcome, Regulator};
+use crate::webtrip_core::stream::shared_ptr::SharedPtr;
 
 /// In the high-error/reject-rate regime, emit at most one warning per this
 /// many occurrences, so a degraded link or a persistently mismatched peer
@@ -110,10 +110,10 @@ pub enum TransportState {
 #[derive(Debug, Clone, Copy)]
 pub struct AudioBufferConfig {
     /// Ring buffer (local-to-network); reached via its `&self` API.
-    pub local_to_network: SharedPtr<crate::audio::ring_buffer::RingBuffer>,
+    pub local_to_network: SharedPtr<crate::webtrip_core::stream::ring_buffer::RingBuffer>,
     /// Jitter buffer (network-to-local); reached via its `&self` SPSC API
     /// through [`SharedPtr::as_ref`].
-    pub network_to_local: SharedPtr<crate::audio::regulator::Regulator>,
+    pub network_to_local: SharedPtr<crate::webtrip_core::stream::regulator::Regulator>,
     /// Buffer size in samples per channel
     pub buffer_size: usize,
     /// Channels this client sends: the ring buffer's interleaved width and

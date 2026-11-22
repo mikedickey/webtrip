@@ -20,8 +20,8 @@
 //!   incantation being copy-pasted at every call site.
 //!
 //! The pointee must coordinate cross-thread access through atomics and/or
-//! interior mutability, and say so by being `Sync` (e.g. [`RingBuffer`](crate::audio::ring_buffer::RingBuffer)
-//! and [`Regulator`](crate::audio::regulator::Regulator)'s `&self` APIs). Prefer
+//! interior mutability, and say so by being `Sync` (e.g. [`RingBuffer`](crate::webtrip_core::stream::ring_buffer::RingBuffer)
+//! and [`Regulator`](crate::webtrip_core::stream::regulator::Regulator)'s `&self` APIs). Prefer
 //! [`as_ref`](SharedPtr::as_ref). [`as_mut`](SharedPtr::as_mut) remains for the
 //! rare case where exclusive access is genuinely proven; nothing in the audio
 //! path uses it after WEB-53.
@@ -148,7 +148,7 @@ impl<T> SharedPtr<T> {
     /// reference to the pointee is live for the duration of the returned borrow.
     ///
     /// Prefer [`as_ref`](Self::as_ref). The audio path no longer needs this for
-    /// [`Regulator`](crate::audio::regulator::Regulator) (WEB-53); it remains for
+    /// [`Regulator`](crate::webtrip_core::stream::regulator::Regulator) (WEB-53); it remains for
     /// any future pointee that genuinely requires exclusive access.
     pub unsafe fn as_mut<'a>(&self) -> Option<&'a mut T> {
         if self.ptr.is_null() {
