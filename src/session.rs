@@ -49,15 +49,17 @@ use crate::audio::{cancelled_error, named_error};
 use crate::audio::engine::{close_audio_context_now, resume_context, route_output_sink, AudioEngine};
 use crate::webtrip_core::audio::params::AudioParams;
 use crate::webtrip_core::network::protocol::MAX_CHANNELS;
-use crate::webtrip_core::stream::regulator::{Regulator, RegulatorStats};
+use crate::webtrip_core::stream::regulator::Regulator;
+use crate::webtrip_core::session_stats::build_session_stats;
 use crate::webtrip_core::stream::ring_buffer::RingBuffer;
 use crate::webtrip_core::stream::shared_ptr::SharedPtr;
-use crate::webtrip_core::network::transport::{AudioBufferConfig, Transport, TransportType};
+use crate::webtrip_core::network::transport::{transport_state_is_failure, transport_state_str, AudioBufferConfig, StateCallback, Transport, TransportState, TransportType};
 use crate::network::webrtc::{TransportConfig as WebRtcConfig, WebRtcTransport};
 use crate::network::webtransport::{is_webtransport_available, WebTransportImpl};
 use crate::webtrip_core::lifecycle::{ConnectRejected, DisconnectStart, Lifecycle};
 
 pub use crate::webtrip_core::lifecycle::SessionState;
+pub use crate::webtrip_core::session_stats::SessionStats;
 
 /// Default signaling port (same as JackTrip TCP port)
 pub const DEFAULT_SIGNALING_PORT: u16 = 4464;
@@ -66,52 +68,6 @@ pub const DEFAULT_SIGNALING_PORT: u16 = 4464;
 /// giving up and rejecting.
 pub const CONNECT_TIMEOUT_MS: i32 = 45_000;
 
-/// Session statistics
-#[wasm_bindgen]
-#[derive(Debug, Clone, Default)]
-pub struct SessionStats {
-    pub packets_sent: u64,
-    pub packets_received: u64,
-
-    // Ring buffer stats (send path)
-    pub send_buffer_available: u32,
-    pub ring_buffer_writes: u64,
-    pub ring_buffer_samples_written: u64,
-    pub ring_buffer_overruns: u64,
-
-    // Regulator stats (receive path with Burg PLC)
-    /// Current adaptive tolerance in milliseconds
-    pub regulator_tolerance_ms: f64,
-    /// Current headroom (extra buffering) in milliseconds
-    pub regulator_headroom_ms: f64,
-    /// Maximum latency observed in this period (ms)
-    pub regulator_max_latency_ms: f64,
-    /// Current buffer depth (packets buffered)
-    pub regulator_depth: u32,
-    /// Current latency in milliseconds
-    pub regulator_latency_ms: f32,
-    /// Whether regulator is initialized (received first packet)
-    pub regulator_initialized: bool,
-    /// Packets successfully played
-    pub regulator_packets_played: u64,
-    /// Number of PLC activations (packet loss concealment)
-    pub regulator_plc_count: u64,
-    /// Last packet sequence number received (u16, wraps at 65535)
-    pub regulator_last_seq: u16,
-    /// Packets rejected by the regulator (bad channel count, a channel count
-    /// that changed mid-stream, or a size mismatch)
-    pub regulator_packets_rejected: u64,
-}
-
-#[wasm_bindgen]
-impl SessionStats {
-    #[wasm_bindgen(constructor)]
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-
 // ============================================================================
 // Pure decision helpers (no browser APIs — fully testable with `cargo test`)
 // ============================================================================
@@ -119,67 +75,6 @@ impl SessionStats {
 /// Returns `true` when `channels` is within the supported range [1, `MAX_CHANNELS`].
 pub(crate) fn is_valid_channel_count(channels: u8) -> bool {
     channels >= 1 && channels <= MAX_CHANNELS
-}
-
-/// Whether a transport-level state string reports that the connection failed.
-///
-/// Only failures cross from the transport into the session: the session
-/// drives `connecting`/`connected` itself, so a transport's own (possibly
-/// late) reports of those are dropped.
-///
-/// The two transports deliberately differ on `"disconnected"`:
-///
-/// * **WebRTC** reports `"disconnected"`/`"closed"` only when the peer
-///   connection or data channel drops, which from the session's point of view
-///   is a failure.
-/// * **WebTransport** posts `"disconnected"` from the worker after a
-///   *graceful*, user-initiated close (once the JackTrip exit packets have been
-///   flushed); genuine failures arrive separately as `"failed"`. Treating
-///   `"disconnected"` as a failure there flips the UI from "Not Connected" to
-///   "Connection Error" ~20 ms after the user clicks Disconnect.
-pub(crate) fn transport_state_is_failure(transport_type: TransportType, transport_state: &str) -> bool {
-    match (transport_type, transport_state) {
-        (_, "failed") => true,
-        (TransportType::WebRTC, "disconnected" | "closed") => true,
-        _ => false,
-    }
-}
-
-/// Construct a [`SessionStats`] from its raw component values.
-///
-/// This is the single authoritative mapping point; [`WebTripSession::get_stats`]
-/// delegates here so the aggregation logic can be tested without constructing the
-/// full session (which requires a live `AudioEngine` and `Transport`).
-pub(crate) fn build_session_stats(
-    reg_stats: RegulatorStats,
-    regulator_depth: u32,
-    regulator_latency_ms: f32,
-    regulator_initialized: bool,
-    send_buffer_available: u32,
-    ring_buffer_writes: u64,
-    ring_buffer_samples_written: u64,
-    ring_buffer_overruns: u64,
-) -> SessionStats {
-    SessionStats {
-        packets_sent: 0, // TODO: Get from transport if needed
-        packets_received: reg_stats.packets_received,
-
-        send_buffer_available,
-        ring_buffer_writes,
-        ring_buffer_samples_written,
-        ring_buffer_overruns,
-
-        regulator_tolerance_ms: reg_stats.tolerance_ms,
-        regulator_headroom_ms: reg_stats.headroom_ms,
-        regulator_max_latency_ms: reg_stats.max_latency_ms,
-        regulator_depth,
-        regulator_latency_ms,
-        regulator_initialized,
-        regulator_packets_played: reg_stats.packets_played,
-        regulator_plc_count: reg_stats.glitches,
-        regulator_last_seq: reg_stats.last_seq_received,
-        regulator_packets_rejected: reg_stats.packets_rejected,
-    }
 }
 
 // ============================================================================
@@ -954,7 +849,11 @@ impl WebTripSession {
         // Clone so engine bring-up can race the same abort (disconnect /
         // timeout) after the dial; `unless_aborted` only drops its
         // JsFuture, not the underlying promise.
-        let dialed = unless_aborted(transport.connect(server, port, client_name), abort.clone()).await;
+        let dialed = unless_aborted(
+            async { transport.connect(server, port, client_name).await.map_err(|e| js_error(e.message())) },
+            abort.clone(),
+        )
+        .await;
         // `CONNECT_TIMEOUT_MS` bounds the dial only. Engine bring-up may wait
         // on the user (mic-permission prompt), so from here only a
         // disconnect() can settle `abort`.
@@ -1005,11 +904,11 @@ impl WebTripSession {
         epoch: u64,
         transport_type: TransportType,
         failed_while_connecting: Rc<Cell<bool>>,
-    ) -> js_sys::Function {
+    ) -> StateCallback {
         let lifecycle = Arc::clone(&self.lifecycle);
         let on_state_change = Rc::clone(&self.on_state_change);
-        Closure::<dyn FnMut(String)>::new(move |state: String| {
-            if !transport_state_is_failure(transport_type, &state) {
+        Box::new(move |state: TransportState| {
+            if !transport_state_is_failure(transport_type, transport_state_str(state)) {
                 return;
             }
             if lifecycle.fail(epoch) {
@@ -1018,10 +917,6 @@ impl WebTripSession {
                 failed_while_connecting.set(true);
             }
         })
-        // The transport keeps the function for its lifetime; leak the closure
-        // so it outlives the transport.
-        .into_js_value()
-        .unchecked_into()
     }
 
     /// Quiesce and drop a connection's transport and engine, then reset the
@@ -1320,7 +1215,6 @@ impl Drop for WebTripSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::webtrip_core::stream::regulator::RegulatorStats;
 
     // -----------------------------------------------------------------------
     // Channel-count validation
@@ -1332,100 +1226,6 @@ mod tests {
         assert!(is_valid_channel_count(1));
         assert!(is_valid_channel_count(8));
         assert!(!is_valid_channel_count(9));
-    }
-
-    // -----------------------------------------------------------------------
-    // Transport-state → session failure mapping
-    // -----------------------------------------------------------------------
-
-    /// Full matrix over both transports and every state string either of them
-    /// can emit. The rows that matter most:
-    ///
-    /// * WebTransport `"disconnected"` must not be a failure (regression: a
-    ///   graceful user-initiated disconnect flipped the UI to "Connection
-    ///   Error" ~20 ms after the exit packets were flushed).
-    /// * WebRTC `"disconnected"`/`"closed"` must be a failure (the peer
-    ///   connection really did drop).
-    /// * `"connected"`/`"connecting"` are never forwarded: the session drives
-    ///   those itself, and a late transport report must not regress the UI.
-    #[test]
-    fn transport_failure_reports_per_transport() {
-        use TransportType::{WebRTC, WebTransport};
-
-        let cases: &[(TransportType, &str, bool)] = &[
-            (WebRTC, "failed", true),
-            (WebTransport, "failed", true),
-            // Divergent: a dropped peer connection vs. a graceful worker close.
-            (WebRTC, "disconnected", true),
-            (WebRTC, "closed", true),
-            (WebTransport, "disconnected", false),
-            (WebTransport, "closed", false),
-            // Progress reports belong to the session, not the transport.
-            (WebRTC, "connected", false),
-            (WebTransport, "connected", false),
-            (WebRTC, "connecting", false),
-            (WebTransport, "connecting", false),
-            // Anything unrecognized is dropped rather than guessed at.
-            (WebRTC, "", false),
-            (WebTransport, "", false),
-        ];
-
-        for &(transport, state, expected) in cases {
-            assert_eq!(
-                transport_state_is_failure(transport, state),
-                expected,
-                "{transport:?} transport state {state:?} mapped incorrectly"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // SessionStats aggregation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn build_session_stats_maps_all_fields() {
-        let reg = RegulatorStats {
-            tolerance_ms: 12.5,
-            headroom_ms: 5.0,
-            max_latency_ms: 30.0,
-            glitches: 3,
-            packets_received: 1000,
-            packets_played: 997,
-            last_seq_received: 42,
-            packets_rejected: 7,
-        };
-
-        let s = build_session_stats(
-            reg,
-            /* regulator_depth */ 5,
-            /* regulator_latency_ms */ 15.0,
-            /* regulator_initialized */ true,
-            /* send_buffer_available */ 128,
-            /* ring_buffer_writes */ 200,
-            /* ring_buffer_samples_written */ 25_600,
-            /* ring_buffer_overruns */ 0,
-        );
-
-        // packets_sent is always 0 (not yet tracked by transport)
-        assert_eq!(s.packets_sent, 0);
-        assert_eq!(s.packets_received, 1000);
-
-        assert!((s.regulator_tolerance_ms - 12.5).abs() < 1e-9);
-        assert!((s.regulator_headroom_ms - 5.0).abs() < 1e-9);
-        assert!((s.regulator_max_latency_ms - 30.0).abs() < 1e-9);
-        assert_eq!(s.regulator_plc_count, 3);
-        assert_eq!(s.regulator_packets_played, 997);
-        assert_eq!(s.regulator_last_seq, 42);
-        assert_eq!(s.regulator_packets_rejected, 7);
-        assert_eq!(s.regulator_depth, 5);
-        assert!((s.regulator_latency_ms - 15.0).abs() < 1e-4);
-        assert!(s.regulator_initialized);
-
-        assert_eq!(s.send_buffer_available, 128);
-        assert_eq!(s.ring_buffer_writes, 200);
-        assert_eq!(s.ring_buffer_samples_written, 25_600);
-        assert_eq!(s.ring_buffer_overruns, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -2027,7 +1827,7 @@ mod tests {
         let transport = MockTransport::new();
         let probe = transport.probe();
         let reporter = probe.clone();
-        probe.on_connected(move || reporter.report("failed"));
+        probe.on_connected(move || reporter.report(TransportState::Failed));
 
         let result = session.connect_with_test_transport(Box::new(transport), CONNECT_TIMEOUT_MS).await;
         let (name, message) = rejection(result);
@@ -2095,7 +1895,7 @@ mod tests {
         assert_eq!(session.get_state(), "connected");
 
         // Connect while in error.
-        first_probe.report("failed");
+        first_probe.report(TransportState::Failed);
         assert_eq!(session.get_state(), "error");
         let from_error = MockTransport::new();
         let from_error_probe = from_error.probe();
@@ -2112,7 +1912,7 @@ mod tests {
             .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("connect after clearing the error should succeed");
-        first_probe.report("failed");
+        first_probe.report(TransportState::Failed);
         assert_eq!(session.get_state(), "connected", "a stale failure report must be ignored");
 
         session.disconnect().await;

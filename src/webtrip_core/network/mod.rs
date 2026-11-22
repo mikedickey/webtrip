@@ -5,6 +5,7 @@
 //! use `stream`. Nothing here may depend on `web-sys` or `js-sys`.
 
 pub mod protocol;
+pub mod signaling_message;
 pub mod transport;
 
 pub use protocol::{AudioFormat, AudioPacket, PacketHeader, StreamStats};

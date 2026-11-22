@@ -2,12 +2,15 @@
 
 use super::{BufferStrategy, Channels, Period, Quality, QueueBuffer};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "wasm")]
 use tsify_next::Tsify;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 /// A JackTrip hardware device
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct Device {
     /// Device ID
@@ -128,8 +131,9 @@ pub struct Device {
 }
 
 /// Device configuration (returned from agent config endpoints)
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceAgentConfig {
     /// Device configuration
@@ -146,8 +150,9 @@ pub struct DeviceAgentConfig {
 }
 
 /// Agent credentials for device authentication
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCredentials {
     /// API key
@@ -160,8 +165,9 @@ pub struct AgentCredentials {
 }
 
 /// ALSA audio device configuration
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct AlsaConfig {
     /// ALSA device name

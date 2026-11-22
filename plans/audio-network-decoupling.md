@@ -271,25 +271,51 @@ step.
   (`Regulator::push_internal`/`pop_internal(.., now_ms)`, `regulator.rs:1036`,
   `:1049`); expose them as `push_at`/`pop_at` in place of `push`/`pop`. Web
   callers supply the time from the same source `Regulator::now_ms`
-  uses today (`js_sys::Date::now()`). Delete `Regulator::now_ms` and its `cfg`
-  branches. `deliver_received_packet` gains
-  a `now_ms` parameter.
+  uses today (`js_sys::Date::now()`, as `crate::now_ms()`). Delete
+  `Regulator::now_ms` and its `cfg` branches. `deliver_received_packet`,
+  `AudioProcessor::process` (which pops the regulator inside the worklet
+  callback) and the WebTransport worker's `handle_datagram` /
+  `deliver_datagram_if_running` each gain a `now_ms` parameter; the
+  `ProcessorCallback` ABI is unchanged, the engine's closure supplies the time.
 - **Bindings:** move every `#[wasm_bindgen]`/`tsify` on core and api types
   behind `cfg_attr(feature = "wasm", ...)`, with the JS names unchanged. The
-  generated `pkg/webtrip.d.ts` must be byte-identical before and after.
+  generated `pkg/webtrip.d.ts` must be unchanged before and after: every public
+  declaration identical (the internal `InitOutput` export list reorders between
+  builds, so compare the sorted file or the part above `InitOutput`, not raw
+  bytes). In the single crate `wasm` is a placeholder feature (`default =
+  ["wasm"]`, `wasm = []`); 0c turns it into an optional-dependency feature on
+  core and api. Each api `#[wasm_bindgen] impl` that holds only JS wrappers
+  (the `_js` methods) is gated whole with `#[cfg(feature = "wasm")]`; `ApiClient`
+  and the `api_module_struct!` macro use `cfg_attr` because their methods are
+  also called natively. Keep `WebRtcTransport`'s inherent JS-facing
+  `set_on_state_change(js_sys::Function)` (it wraps the function into the
+  portable callback) — removing it changes the `.d.ts`.
 - **Transport trait:** `set_on_state_change` takes
   `Box<dyn Fn(TransportState)>`; `connect` returns a portable
   `TransportError`. Web converts to `JsValue` / `named_error` at its
-  `#[wasm_bindgen]` boundary, and `notify_transport_state`'s
-  `js_sys::Function` call (`transport.rs:173`) moves to web.
+  `#[wasm_bindgen]` boundary (a `TransportError` carries only a message; web
+  turns it into a JS `Error`, where some errors were plain strings before).
+  `notify_transport_state` moves to web (`network/mod.rs`) and operates on a
+  `SharedStateCallback = Rc<dyn Fn(TransportState)>`: the web transports convert
+  the `Box` to an `Rc` once and clone it into their JS event closures, so `Rc`
+  stays at the callback boundary and out of core.
 - **Extract the portable logic AGENTS.md already names** out of the browser
   modules into core: `SessionStats`/`build_session_stats`
   (`session.rs:72,153`), `tick_decision` and `parse_ice_candidate_json`
   (`webrtc.rs:93,59`), `SignalingMessage`/`HubConnectionState`
-  (`signaling.rs`). Their tests move with them, never duplicated.
+  (`signaling.rs`), and `transport_state_is_failure` (`session.rs`; AGENTS.md
+  names the transport-failure mapping; it lands in core's `transport.rs`).
+  `SessionStats`/`build_session_stats`/`tick_decision` go to
+  `session_stats.rs`; the signaling types and `parse_ice_candidate_json` to
+  `network/signaling_message.rs`. Their tests move with them, never duplicated.
+  `signaling_state_is_closed` / `signaling_close_error_message` (pure, in
+  `webrtc.rs`) and `is_valid_channel_count` (`session.rs`) stay in web for now.
 - **Acceptance:** `grep -rE 'web_sys::|js_sys::' src/webtrip_core src/webtrip_api`
   is empty, and nothing under those two trees imports a web module
   (`crate::session`, `crate::audio`, `crate::network`, `crate::test_support`). This is what makes 0c mechanical.
+  Because one crate cannot prove the platform rule, also build the two trees as
+  standalone native crates (no wasm-bindgen/web-sys/js-sys) in a scratch
+  workspace and run their tests; 0c's `check:core` then enforces it for good.
 
 #### Phase 0c — Lift into a Cargo workspace (mechanical)
 
@@ -735,6 +761,7 @@ Config to update: root `Cargo.toml` (workspace) and the three crate manifests,
 `package.json` scripts, the CI workflow (add `check:core`), `AGENTS.md`
 (*Build Commands*, *Key Modules*), `README.md`.
 
-Docs to update: `docs/CHANNEL_MODEL.md` (asserts the 8-channel limit at
+Docs to update: `docs/ARCHITECTURE.md` (final crate/module layout, in Phase
+6's wrap-up), `docs/CHANNEL_MODEL.md` (asserts the 8-channel limit at
 `:432-441`; `:179-182` and `:428-431` describe the settings-only capture
 behaviour that Phase 1 fixes), `docs/WASM_TESTING.md:491`.

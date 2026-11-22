@@ -4,7 +4,9 @@
 //! `_meta` carries [`PaginationMeta`] and `results` is a typed array.
 
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "wasm")]
 use tsify_next::Tsify;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 use super::{BackingTrack, PublicUpcomingEvent, RecordingMetadata, StreamInfo, StreamInfoSearchResult};
@@ -12,8 +14,9 @@ use super::{BackingTrack, PublicUpcomingEvent, RecordingMetadata, StreamInfo, St
 /// Pagination metadata returned in the `_meta` field of every paginated response.
 ///
 /// All fields are required per the spec.
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct PaginationMeta {
     /// Total number of items that match the query criteria
@@ -36,8 +39,9 @@ pub struct PaginationMeta {
 ///
 /// Concrete paginated types (e.g. [`PaginatedChannels`]) mirror this shape with
 /// a typed `results` array.
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 pub struct PaginatedResponse<T> {
     /// Pagination metadata
     #[serde(rename = "_meta")]
@@ -48,8 +52,9 @@ pub struct PaginatedResponse<T> {
 }
 
 /// Paginated channels/streams response
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 pub struct PaginatedChannels {
     /// Pagination metadata
     #[serde(rename = "_meta")]
@@ -60,8 +65,9 @@ pub struct PaginatedChannels {
 }
 
 /// Paginated events response
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 pub struct PaginatedEvents {
     /// Pagination metadata
     #[serde(rename = "_meta")]
@@ -72,8 +78,9 @@ pub struct PaginatedEvents {
 }
 
 /// Paginated recordings response
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 pub struct PaginatedRecordings {
     /// Pagination metadata
     #[serde(rename = "_meta")]
@@ -84,8 +91,9 @@ pub struct PaginatedRecordings {
 }
 
 /// Paginated stream search results response
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 pub struct PaginatedStreamSearchResults {
     /// Pagination metadata
     #[serde(rename = "_meta")]
@@ -96,8 +104,9 @@ pub struct PaginatedStreamSearchResults {
 }
 
 /// Paginated backing tracks response
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 pub struct PaginatedBackingTracks {
     /// Pagination metadata
     #[serde(rename = "_meta")]

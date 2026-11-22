@@ -1,12 +1,15 @@
 //! User-related models
 
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "wasm")]
 use tsify_next::Tsify;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 /// A JackTrip user account
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct User {
     /// Unique user identifier
@@ -35,8 +38,9 @@ pub struct User {
 }
 
 /// User-editable profile metadata
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct UserMetadata {
     /// User's email address
@@ -65,8 +69,9 @@ pub struct UserMetadata {
 }
 
 /// Application-managed user metadata (read-only for users)
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct AppMetadata {
     /// User's subscription plan ID
@@ -91,8 +96,9 @@ pub struct AppMetadata {
 }
 
 /// A user referral
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct Referral {
     /// Referral ID
@@ -117,8 +123,9 @@ pub struct Referral {
 }
 
 /// A user notification
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct Notification {
     /// Notification ID

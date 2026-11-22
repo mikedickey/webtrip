@@ -2,12 +2,15 @@
 
 use super::Visibility;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "wasm")]
 use tsify_next::Tsify;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 /// Public stream/channel information
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct StreamInfo {
     /// Stream ID
@@ -51,8 +54,9 @@ pub struct StreamInfo {
 ///
 /// Spec models this as an `allOf` over [`StreamInfo`]; we mirror that with a
 /// flattened `base`.
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct StreamInfoSearchResult {
     /// Base stream information
@@ -105,8 +109,9 @@ pub struct StreamInfoSearchResult {
 }
 
 /// Stream info with engagement metrics
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct StreamInfoWithEngagement {
     /// Base stream information
@@ -130,8 +135,9 @@ pub struct StreamInfoWithEngagement {
 ///
 /// Mirrors the spec's query parameters; all fields are optional and omitted from
 /// the request when `None`.
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct StreamSearchQuery {
     /// Free-text search term
@@ -168,8 +174,9 @@ pub struct StreamSearchQuery {
 }
 
 /// Live stream configuration
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct LiveStream {
     /// Stream ID
@@ -206,8 +213,9 @@ pub struct LiveStream {
 }
 
 /// Simulcast destination configuration
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct SimulcastDestination {
     /// Destination ID
@@ -236,8 +244,9 @@ pub struct SimulcastDestination {
 }
 
 /// Stream activation options
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct ActivationRequestOpts {
     /// Whether to activate (true) or deactivate (false)
@@ -246,8 +255,9 @@ pub struct ActivationRequestOpts {
 }
 
 /// Backing track file stored for a studio
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct BackingTrack {
     /// Track ID

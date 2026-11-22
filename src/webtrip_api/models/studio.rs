@@ -2,12 +2,15 @@
 
 use super::{BroadcastVisibility, BufferStrategy, Period, QueueBuffer, ResourceStatus, ServerConfig};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "wasm")]
 use tsify_next::Tsify;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 /// Shared audio network properties used by devices and studios.
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct AudioProperties {
     /// Audio frame period
@@ -24,8 +27,9 @@ pub struct AudioProperties {
 }
 
 /// SuperCollider mix configuration.
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct ServerMix {
     /// SuperCollider mixer branch (from jacktrip-sc)
@@ -41,8 +45,9 @@ pub struct ServerMix {
 ///
 /// Spec composes this as `AudioProperties` + `ServerMix` + a few studio-level
 /// fields; we flatten the shared structs.
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct ServerAgentConfig {
     /// Shared audio network properties
@@ -73,8 +78,9 @@ pub struct ServerAgentConfig {
 /// `serverPort`, `sampleRate`, `public`, `stereo`, `loopback`, `enabled`) are
 /// flattened in from [`ServerConfig`] so create/update payloads and `/studios`
 /// responses preserve studio metadata.
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct Server {
     /// Studio configuration (type, name, host/port, sample rate, visibility flags)
@@ -169,8 +175,9 @@ pub struct Server {
 
 /// Access rights of the authenticated user for a studio (spec name: `ServerAccess`),
 /// returned by `GET /studios/{studioId}/access`.
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct ServerAccess {
     /// Studio ID
@@ -195,8 +202,9 @@ pub struct ServerAccess {
 }
 
 /// A single named permission entry within [`ServerAccess`].
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct ServerAccessPermission {
     /// Permission name
@@ -213,8 +221,9 @@ pub struct ServerAccessPermission {
 }
 
 /// Mixer definition (returned in the `GET /mixers` map).
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct Mixer {
     /// Mixer type
@@ -239,8 +248,9 @@ pub struct Mixer {
 }
 
 /// A single encoded mixer configuration entry.
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct MixerConfig {
     /// Encoded mixer configuration content
@@ -253,8 +263,9 @@ pub struct MixerConfig {
 }
 
 /// A participant in a studio session
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct Participant {
     /// Participant's user ID

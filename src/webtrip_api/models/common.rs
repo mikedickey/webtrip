@@ -2,13 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
+#[cfg(feature = "wasm")]
 use tsify_next::Tsify;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 /// Audio packet frames per period.
 /// Lower values = lower latency but may cause audio glitches.
-#[derive(Tsify, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[repr(u16)]
 pub enum Period {
     P16 = 16,
@@ -29,8 +32,9 @@ impl Default for Period {
 
 /// Network jitter buffer size.
 /// Larger values reduce jitter from unstable connections but add latency.
-#[derive(Tsify, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[repr(u8)]
 pub enum QueueBuffer {
     Q0 = 0,
@@ -62,8 +66,9 @@ impl Default for QueueBuffer {
 }
 
 /// Network jitter buffer strategy
-#[derive(Tsify, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[repr(u8)]
 pub enum BufferStrategy {
     /// Standard strategy
@@ -81,8 +86,9 @@ impl Default for BufferStrategy {
 }
 
 /// Audio connection quality level
-#[derive(Tsify, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[repr(u8)]
 pub enum Quality {
     /// Low quality (Jamulus)
@@ -100,8 +106,9 @@ impl Default for Quality {
 }
 
 /// Number of audio channels
-#[derive(Tsify, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[repr(u8)]
 pub enum Channels {
     Mono = 1,
@@ -115,8 +122,9 @@ impl Default for Channels {
 }
 
 /// Broadcast visibility level
-#[derive(Tsify, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[repr(u8)]
 pub enum BroadcastVisibility {
     /// Not broadcasting
@@ -134,8 +142,9 @@ impl Default for BroadcastVisibility {
 }
 
 /// Content visibility level
-#[derive(Tsify, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[repr(u8)]
 pub enum Visibility {
     /// Private/unlisted
@@ -151,8 +160,9 @@ impl Default for Visibility {
 }
 
 /// Generic status for resources
-#[derive(Tsify, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "PascalCase")]
 pub enum ResourceStatus {
     Starting,
@@ -169,8 +179,9 @@ impl Default for ResourceStatus {
 }
 
 /// Recording processing status
-#[derive(Tsify, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[repr(u8)]
 pub enum RecordingStatus {
     /// Recording in progress
@@ -190,8 +201,9 @@ impl Default for RecordingStatus {
 }
 
 /// Studio type (audio engine)
-#[derive(Tsify, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 pub enum StudioType {
     /// JackTrip audio engine only
     JackTrip,
@@ -207,8 +219,9 @@ impl Default for StudioType {
 }
 
 /// Audio sample rate in Hz
-#[derive(Tsify, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[repr(u32)]
 pub enum SampleRate {
     /// 44.1 kHz (CD quality)
@@ -228,8 +241,9 @@ impl Default for SampleRate {
 }
 
 /// RTT statistics shared across heartbeat and ping types.
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct RttStats {
     /// Minimum round-trip time (ms)
@@ -258,8 +272,9 @@ pub struct RttStats {
 }
 
 /// Device network statistics shared across heartbeat request types.
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceNetworkStats {
     /// Device MAC address

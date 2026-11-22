@@ -2,8 +2,11 @@
 //!
 //! JackTrip Radio upcoming events and broadcasts.
 
-use super::{to_js_value, PaginationQuery, ApiClient, ApiError, urlencode};
+#[cfg(feature = "wasm")]
+use super::to_js_value;
+use super::{PaginationQuery, ApiClient, ApiError, urlencode};
 use crate::webtrip_api::models;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 // =============================================================================
@@ -106,6 +109,7 @@ impl EventsApi {
 // JavaScript API (wasm_bindgen wrappers)
 // =============================================================================
 
+#[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl EventsApi {
     #[wasm_bindgen(js_name = listEvents)]

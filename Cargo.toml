@@ -10,6 +10,11 @@ version = "0.1.0"
 crate-type = ["cdylib"]
 
 [features]
+# JS exports for the portable core/api types (`wasm_bindgen`, `tsify`). Becomes
+# an optional-dependency feature on `webtrip-core`/`webtrip-api` in Phase 0c;
+# the web host always enables it.
+default = ["wasm"]
+wasm = []
 # Enables the `__coverage_dump` export used by the integration harness to pull
 # LLVM profile data out of the live (browser) WASM build. Pair with the
 # instrument-coverage rustflags (see `build:wasm:coverage` in package.json);
@@ -21,6 +26,7 @@ console_error_panic_hook = "0.1.7"
 # Supplies the LLVM profiler runtime (we build with `-Zno-profiler-runtime`) and
 # a `capture_coverage` sink. Only compiled under the `coverage` feature.
 minicov = { version = "0.3.8", optional = true }
+log = "0.4"
 js-sys = "0.3.83"
 wasm-bindgen = "0.2.106"
 wasm-bindgen-futures = "0.4.56"

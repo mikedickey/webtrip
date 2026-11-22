@@ -899,23 +899,6 @@ pub enum PushOutcome {
 
 
 impl Regulator {
-    /// Get current time in milliseconds.
-    fn now_ms() -> f64 {
-        #[cfg(target_arch = "wasm32")]
-        {
-            js_sys::Date::now()
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64()
-                * 1000.0
-        }
-    }
-
     /// Exclusive access to the consumer's state.
     ///
     /// # Safety
@@ -1026,14 +1009,13 @@ impl Regulator {
     /// * `channels` - The channel count this packet claims to carry, from the
     ///   wire header
     /// * `samples` - Interleaved audio samples
+    /// * `now_ms` - Wall-clock time of arrival in milliseconds. The regulator
+    ///   never reads a clock itself; every host supplies one (and must use the
+    ///   same epoch for `push_at` and `pop_at`).
     ///
     /// # Returns
     /// See [`PushOutcome`].
-    pub fn push(&self, sequence: u16, channels: usize, samples: &[f32]) -> PushOutcome {
-        self.push_internal(sequence, channels, samples, Self::now_ms())
-    }
-
-    fn push_internal(&self, sequence: u16, channels: usize, samples: &[f32], now_ms: f64) -> PushOutcome {
+    pub fn push_at(&self, sequence: u16, channels: usize, samples: &[f32], now_ms: f64) -> PushOutcome {
         self.shared.push_internal(sequence, channels, samples, now_ms)
     }
 
@@ -1042,11 +1024,9 @@ impl Regulator {
     /// Returns `true` if real packet data was output, `false` if concealment
     /// was used. After returning, [`channels`](Self::channels) reflects the
     /// peer width synchronized by this pop's Acquire (WEB-53 Bug 3).
-    pub fn pop(&self, output: &mut [f32]) -> bool {
-        self.pop_internal(output, Self::now_ms())
-    }
-
-    fn pop_internal(&self, output: &mut [f32], now_ms: f64) -> bool {
+    ///
+    /// `now_ms` is the caller's clock, on the same epoch as [`push_at`](Self::push_at).
+    pub fn pop_at(&self, output: &mut [f32], now_ms: f64) -> bool {
         // SAFETY: `pop` is only called from the single consumer thread
         // (struct docs), and the borrow ends before this returns.
         let consumer = unsafe { self.consumer_mut() };
@@ -1785,7 +1765,7 @@ mod tests {
     /// or as no failure at all.
     fn push_stored(reg: &Regulator, seq: u16, channels: usize, samples: &[f32], now_ms: f64) {
         assert_eq!(
-            reg.push_internal(seq, channels, samples, now_ms),
+            reg.push_at(seq, channels, samples, now_ms),
             PushOutcome::Stored,
             "setup push of seq {seq} ({channels}ch) must be stored"
         );
@@ -1880,9 +1860,9 @@ mod tests {
         
         // Pop packets - should work smoothly across wraparound
         // Pop after tolerance is met
-        let _result1 = reg.pop_internal(&mut output, 60.0);
-        let _result2 = reg.pop_internal(&mut output, 63.0);
-        let _result3 = reg.pop_internal(&mut output, 66.0);
+        let _result1 = reg.pop_at(&mut output, 60.0);
+        let _result2 = reg.pop_at(&mut output, 63.0);
+        let _result3 = reg.pop_at(&mut output, 66.0);
         
         // Verify depth calculation works across wraparound
         let depth = reg.depth();
@@ -1921,7 +1901,7 @@ mod tests {
         }
         let mut pop_t = 10.0;
         for _ in 0..10 {
-            reg.pop_internal(&mut out, pop_t);
+            reg.pop_at(&mut out, pop_t);
             pop_t += dt;
         }
         assert_eq!(last_seq_out_opt(&reg), Some(109), "stream should be playing out");
@@ -1938,7 +1918,7 @@ mod tests {
         for k in 0..600u16 {
             let now = resume_t + k as f64 * dt;
             push_stored(&reg, first_resumed + k, 1, &samples, now);
-            let real = reg.pop_internal(&mut out, now + 1.0);
+            let real = reg.pop_at(&mut out, now + 1.0);
             if real && first_real_pkt.is_none() {
                 first_real_pkt = Some(k);
             }
@@ -1992,7 +1972,7 @@ mod tests {
         plant_packet(&reg, stale_seq, 41.0, &stale_packet); // candidate_seq never planted
 
         let mut output = vec![0.0f32; reg.fpp()];
-        let result = reg.pop_internal(&mut output, 50.0);
+        let result = reg.pop_at(&mut output, 50.0);
 
         assert!(
             !result,
@@ -2074,7 +2054,7 @@ mod tests {
         plant_packet(&reg, good_seq, 45.0, &packet);
 
         let mut concealment = vec![0.0f32; reg.fpp()];
-        let concealment_result = reg.pop_internal(&mut concealment, 50.0);
+        let concealment_result = reg.pop_at(&mut concealment, 50.0);
         assert!(!concealment_result);
         assert_eq!(consumer(&mut reg).pull_stats.overruns, 1);
         assert_eq!(consumer(&mut reg).last_stashed.map(|(seq, _)| seq), Some(good_seq));
@@ -2085,7 +2065,7 @@ mod tests {
         );
 
         let mut real_output = vec![0.0f32; reg.fpp()];
-        let real_result = reg.pop_internal(&mut real_output, 50.0 + fpp_duration_ms);
+        let real_result = reg.pop_at(&mut real_output, 50.0 + fpp_duration_ms);
         assert!(real_result);
         assert_eq!(consumer(&mut reg).last_stashed, None);
         assert_eq!(last_seq_out_opt(&reg), Some(good_seq));
@@ -2124,7 +2104,7 @@ mod tests {
         plant_packet(&reg, fresh_seq, 55.0, &fresh_packet);
 
         let mut output = vec![0.0f32; reg.fpp()];
-        let first_result = reg.pop_internal(&mut output, 60.0);
+        let first_result = reg.pop_at(&mut output, 60.0);
         assert!(
             first_result,
             "deferral should play the stale packet as real audio, not concealment"
@@ -2134,7 +2114,7 @@ mod tests {
         assert_eq!(consumer(&mut reg).pull_stats.overruns, 0, "no glitch may be recorded");
         assert_eq!(consumer(&mut reg).packet_count, 1);
 
-        let second_result = reg.pop_internal(&mut output, 60.0 + fpp_duration_ms);
+        let second_result = reg.pop_at(&mut output, 60.0 + fpp_duration_ms);
         assert!(second_result);
         assert_eq!(consumer(&mut reg).last_stashed, None);
         assert_eq!(last_seq_out_opt(&reg), Some(fresh_seq));
@@ -2155,9 +2135,9 @@ mod tests {
         push_stored(&reg, 0, 2, &samples, 0.0);
         push_stored(&reg, 1, 2, &samples, 2.0);
         let mut out = vec![0.0f32; reg.fpp() * reg.channels()];
-        let _ = reg.pop_internal(&mut out, 10.0);
-        let _ = reg.pop_internal(&mut out, 12.0);
-        let _ = reg.pop_internal(&mut out, 14.0); // forces underrun -> PLC
+        let _ = reg.pop_at(&mut out, 10.0);
+        let _ = reg.pop_at(&mut out, 12.0);
+        let _ = reg.pop_at(&mut out, 14.0); // forces underrun -> PLC
 
         assert!(reg.is_initialized());
         assert!(last_seq_out_opt(&reg).is_some());
@@ -2196,7 +2176,7 @@ mod tests {
         // able to adopt again — reset() re-arms SEQ_NONE, which is the only
         // gate on adoption.
         let mono = vec![0.5f32; reg.fpp()];
-        let outcome = reg.push_internal(0, 1, &mono, 0.0);
+        let outcome = reg.push_at(0, 1, &mono, 0.0);
         assert_eq!(outcome, PushOutcome::Stored);
         assert_eq!(reg.channels(), 1, "reconnect must re-adopt the new peer's channel count");
         assert_eq!(reg.fpp() * reg.channels(), reg.fpp());
@@ -2233,7 +2213,7 @@ mod tests {
         // (startup), not the stale stashed buffer.
         push_stored(&reg, 0, 1, &samples, 0.0);
         let mut out = vec![0.0f32; reg.fpp()];
-        let result = reg.pop_internal(&mut out, 1.0); // still inside tolerance window
+        let result = reg.pop_at(&mut out, 1.0); // still inside tolerance window
         assert!(!result, "should not replay the pre-reset stash");
         assert!(out.iter().all(|s| *s == 0.0));
     }
@@ -2248,7 +2228,7 @@ mod tests {
 
         push_stored(&reg, 0, 1, &samples, 0.0);
         let mut out = vec![0.0f32; reg.fpp()];
-        let r1 = reg.pop_internal(&mut out, 10.0);
+        let r1 = reg.pop_at(&mut out, 10.0);
         assert!(r1);
         assert_eq!(last_seq_out_opt(&reg), Some(0));
 
@@ -2256,7 +2236,7 @@ mod tests {
         // regulator should treat this as a glitch, conceal, stash, and bump
         // overruns.
         push_stored(&reg, 3, 1, &samples, 20.0);
-        let r2 = reg.pop_internal(&mut out, 40.0);
+        let r2 = reg.pop_at(&mut out, 40.0);
         assert!(!r2, "skipped-gap path returns concealment (false)");
         assert_eq!(consumer(&mut reg).pull_stats.overruns, 2, "overrun counter tracks skip distance");
         // The good packet must have been stashed for replay on the next pop.
@@ -2264,7 +2244,7 @@ mod tests {
 
         // Next pop should consume the stashed real packet, no new overruns.
         let overruns_before = consumer(&mut reg).pull_stats.overruns;
-        let r3 = reg.pop_internal(&mut out, 42.0);
+        let r3 = reg.pop_at(&mut out, 42.0);
         assert!(r3, "stashed packet replay should be a real-packet pop");
         assert_eq!(last_seq_out_opt(&reg), Some(3));
         assert_eq!(consumer(&mut reg).pull_stats.overruns, overruns_before);
@@ -2279,7 +2259,7 @@ mod tests {
 
         push_stored(&reg, 0, 1, &samples, 0.0);
         let mut out = vec![0.0f32; reg.fpp()];
-        let r0 = reg.pop_internal(&mut out, 10.0);
+        let r0 = reg.pop_at(&mut out, 10.0);
         assert!(r0);
         let plc_after_first = consumer(&mut reg).plc_packet_count;
         let packets_after_first = consumer(&mut reg).packet_count;
@@ -2287,7 +2267,7 @@ mod tests {
         // Three consecutive underrun pops should each invoke PLC.
         for i in 0..3 {
             let t = 12.0 + i as f64 * 2.0;
-            let result = reg.pop_internal(&mut out, t);
+            let result = reg.pop_at(&mut out, t);
             assert!(!result, "missing packet at t={t} should produce PLC output");
         }
         assert_eq!(consumer(&mut reg).pull_stats.underruns, 3);
@@ -2303,7 +2283,7 @@ mod tests {
 
         // Real packet arrives — next pop should be real audio again.
         push_stored(&reg, 1, 1, &samples, 25.0);
-        let r_resume = reg.pop_internal(&mut out, 30.0);
+        let r_resume = reg.pop_at(&mut out, 30.0);
         assert!(r_resume, "PLC must disengage once a real packet is available");
         assert_eq!(last_seq_out_opt(&reg), Some(1));
         assert_eq!(consumer(&mut reg).packet_count, packets_after_first + 1);
@@ -2311,7 +2291,7 @@ mod tests {
 
         // No further underruns when consumption keeps pace.
         push_stored(&reg, 2, 1, &samples, 32.0);
-        let r_next = reg.pop_internal(&mut out, 38.0);
+        let r_next = reg.pop_at(&mut out, 38.0);
         assert!(r_next);
         assert_eq!(consumer(&mut reg).pull_stats.underruns, underruns_after);
     }
@@ -2335,7 +2315,7 @@ mod tests {
 
         // First pop sets last_seq_out; the in-flight buffer is consumed.
         let mut out = vec![0.0f32; reg.fpp() * reg.channels()];
-        let r = reg.pop_internal(&mut out, 10.0);
+        let r = reg.pop_at(&mut out, 10.0);
         assert!(r);
         let seq_after_first_pop = last_seq_out_opt(&reg).expect("pop must set last_seq_out");
 
@@ -2369,7 +2349,7 @@ mod tests {
             if reg.depth() == 0 {
                 break;
             }
-            let _ = reg.pop_internal(&mut out, t);
+            let _ = reg.pop_at(&mut out, t);
             let new_depth = reg.depth();
             assert!(
                 new_depth <= prev_depth,
@@ -2392,9 +2372,9 @@ mod tests {
         push_stored(&reg, 43, 1, &samples, 2.0);
 
         let mut out = vec![0.0f32; reg.fpp()];
-        let _ = reg.pop_internal(&mut out, 15.0);
-        let _ = reg.pop_internal(&mut out, 17.0);
-        let _ = reg.pop_internal(&mut out, 19.0); // underrun
+        let _ = reg.pop_at(&mut out, 15.0);
+        let _ = reg.pop_at(&mut out, 17.0);
+        let _ = reg.pop_at(&mut out, 19.0); // underrun
 
         let s = reg.stats();
         assert_eq!(s.tolerance_ms, consumer(&mut reg).tolerance_ms);
@@ -2692,11 +2672,11 @@ mod tests {
 
         // Peer sends 1 channel; this regulator was constructed for 2.
         let ramp: Vec<f32> = (0..reg.fpp()).map(|i| i as f32).collect();
-        assert_eq!(reg.push_internal(0, 1, &ramp, 0.0), PushOutcome::Stored);
+        assert_eq!(reg.push_at(0, 1, &ramp, 0.0), PushOutcome::Stored);
         assert_eq!(reg.channels(), 1, "first packet must adopt the peer's channel count");
 
         let mut out = vec![0.0f32; reg.fpp()];
-        let real = reg.pop_internal(&mut out, 10.0); // past the 5ms tolerance
+        let real = reg.pop_at(&mut out, 10.0); // past the 5ms tolerance
         assert!(real, "the adopted-stride packet must play back as real audio");
         assert_eq!(
             out, ramp,
@@ -2722,7 +2702,7 @@ mod tests {
     fn test_push_rejects_packets_that_are_not_exactly_one_packet_long() {
         let mut reg = Regulator::with_params(2, 64, 48_000, 5.0);
         let good = vec![0.5f32; reg.fpp() * reg.channels()];
-        assert_eq!(reg.push_internal(10, 2, &good, 0.0), PushOutcome::Stored);
+        assert_eq!(reg.push_at(10, 2, &good, 0.0), PushOutcome::Stored);
         assert_eq!(reg.shared.last_seq_in.load(Ordering::Acquire), 10);
 
         let wrong_sizes = [
@@ -2736,7 +2716,7 @@ mod tests {
         for len in wrong_sizes {
             let packet = vec![0.25f32; len];
             assert_eq!(
-                reg.push_internal(11, 2, &packet, 1.0),
+                reg.push_at(11, 2, &packet, 1.0),
                 PushOutcome::WrongPacketSize { expected: reg.fpp() * reg.channels(), got: len },
                 "accepted a {len}-sample packet on a {}-sample stream",
                 reg.fpp() * reg.channels()
@@ -2758,11 +2738,11 @@ mod tests {
         // check even runs.
         let rejected_before = reg.stats().packets_rejected;
         assert_eq!(
-            reg.push_internal(12, 0, &[], 2.0),
+            reg.push_at(12, 0, &[], 2.0),
             PushOutcome::UnsupportedChannelCount { got: 0 }
         );
         assert_eq!(
-            reg.push_internal(12, MAX_CHANNELS + 1, &[0.0], 2.0),
+            reg.push_at(12, MAX_CHANNELS + 1, &[0.0], 2.0),
             PushOutcome::UnsupportedChannelCount { got: MAX_CHANNELS + 1 }
         );
         assert_eq!(reg.stats().packets_rejected, rejected_before + 2);
@@ -2772,7 +2752,7 @@ mod tests {
         // re-adopted — see `PushOutcome::ChannelCountChanged`.
         let mismatched = vec![0.5f32; reg.fpp()]; // 1ch-sized; this stream adopted 2ch
         assert_eq!(
-            reg.push_internal(13, 1, &mismatched, 3.0),
+            reg.push_at(13, 1, &mismatched, 3.0),
             PushOutcome::ChannelCountChanged { adopted: 2, got: 1 }
         );
         assert_eq!(
@@ -2792,14 +2772,14 @@ mod tests {
     fn test_push_channel_count_is_explicit_not_inferred_from_sample_count() {
         let reg = Regulator::with_params(2, 128, 48_000, 5.0);
         let first = vec![0.1f32; 256]; // 2ch * 128fpp
-        assert_eq!(reg.push_internal(0, 2, &first, 0.0), PushOutcome::Stored);
+        assert_eq!(reg.push_at(0, 2, &first, 0.0), PushOutcome::Stored);
 
         // Same total sample count as a valid 2ch*128fpp packet, but claiming
         // 4 channels — must be rejected for its size (4*128=512 != 256), not
         // accepted as if it were secretly the 2ch stride.
         let same_len_but_4ch = vec![0.2f32; 256];
         assert_eq!(
-            reg.push_internal(1, 4, &same_len_but_4ch, 1.0),
+            reg.push_at(1, 4, &same_len_but_4ch, 1.0),
             PushOutcome::WrongPacketSize { expected: 4 * 128, got: 256 }
         );
     }
@@ -2922,7 +2902,7 @@ mod tests {
             scope.spawn(|| {
                 let mut out = vec![0.0f32; fpp * MAX_CHANNELS];
                 for i in 0..40 {
-                    reg.pop_internal(&mut out, 2.0 + i as f64);
+                    reg.pop_at(&mut out, 2.0 + i as f64);
                     let _ = reg.channels();
                 }
             });

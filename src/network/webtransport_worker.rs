@@ -133,6 +133,7 @@ fn handle_datagram(
     regulator: Option<&Regulator>,
     samples: &mut Vec<f32>,
     stats: &mut WebTransportWorkerStats,
+    now_ms: f64,
 ) {
     stats.packets_received += 1;
     stats.bytes_received += data.len() as u64;
@@ -141,7 +142,7 @@ fn handle_datagram(
         return;
     };
 
-    match deliver_received_packet(regulator, data, samples) {
+    match deliver_received_packet(regulator, data, samples, now_ms) {
         Ok(_outcome) => {}
         Err(_e) => {
             stats.receive_errors += 1;
@@ -232,11 +233,12 @@ fn deliver_datagram_if_running(
     regulator: Option<&Regulator>,
     samples: &mut Vec<f32>,
     stats: &mut WebTransportWorkerStats,
+    now_ms: f64,
 ) -> bool {
     if !running {
         return false;
     }
-    handle_datagram(data, regulator, samples, stats);
+    handle_datagram(data, regulator, samples, stats, now_ms);
     true
 }
 
@@ -905,6 +907,7 @@ async fn receive_loop_body(
                             regulator,
                             &mut samples,
                             &mut stats.borrow_mut(),
+                            crate::now_ms(),
                         )
                     })
                 });
@@ -1112,6 +1115,7 @@ mod tests {
             Some(&regulator),
             &mut samples,
             &mut stats,
+            0.0,
         );
 
         assert!(!keep_going, "loop must exit when running is false after read");
@@ -1140,6 +1144,7 @@ mod tests {
             Some(&regulator),
             &mut samples,
             &mut stats,
+            0.0,
         );
 
         assert!(keep_going);
@@ -1186,7 +1191,7 @@ mod tests {
         let audio: Vec<f32> = (0..128).map(|i| (i as f32) / 128.0).collect();
         let datagram = AudioPacket::mono(5, 0, audio).serialize().unwrap();
 
-        handle_datagram(&datagram, Some(&regulator), &mut samples, &mut stats);
+        handle_datagram(&datagram, Some(&regulator), &mut samples, &mut stats, 0.0);
 
         // The decoded packet reached the regulator (initialized + seq recorded),
         // adopting the peer's mono count rather than being rejected for
@@ -1210,7 +1215,7 @@ mod tests {
         let audio2: Vec<f32> = (0..128).map(|i| (i as f32) / 128.0).collect();
         let stereo: Vec<f32> = audio2.iter().flat_map(|&s| [s, s]).collect();
         let datagram2 = AudioPacket::stereo(6, 0, stereo).serialize().unwrap();
-        handle_datagram(&datagram2, Some(&regulator), &mut samples, &mut stats);
+        handle_datagram(&datagram2, Some(&regulator), &mut samples, &mut stats, 0.0);
 
         assert_eq!(stats.packets_received, 2);
         assert_eq!(
@@ -1231,7 +1236,7 @@ mod tests {
 
         // Too short to contain even the 16-byte header → deserialize fails.
         let garbage = [0u8; 4];
-        handle_datagram(&garbage, Some(&regulator), &mut samples, &mut stats);
+        handle_datagram(&garbage, Some(&regulator), &mut samples, &mut stats, 0.0);
 
         assert!(
             !regulator.is_initialized(),
@@ -1253,7 +1258,7 @@ mod tests {
         let mut stats = WebTransportWorkerStats::default();
 
         let garbage = [0u8; 4];
-        handle_datagram(&garbage, None, &mut samples, &mut stats);
+        handle_datagram(&garbage, None, &mut samples, &mut stats, 0.0);
 
         assert_eq!(stats.packets_received, 1, "the packet is still counted");
         assert_eq!(stats.bytes_received, garbage.len() as u64);

@@ -8,6 +8,7 @@
 use super::{ApiClient, ApiError, urlencode};
 use crate::webtrip_api::models;
 use serde::Serialize;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 // =============================================================================
@@ -107,6 +108,7 @@ impl BillingApi {
 // JavaScript API (wasm_bindgen wrappers)
 // =============================================================================
 
+#[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl BillingApi {
     #[wasm_bindgen(js_name = getBilling)]

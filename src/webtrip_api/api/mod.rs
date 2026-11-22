@@ -6,12 +6,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 // Macro to generate API module struct + constructors boilerplate
 macro_rules! api_module_struct {
     ($name:ident) => {
-        #[wasm_bindgen]
+        #[cfg_attr(feature = "wasm", wasm_bindgen)]
         pub struct $name {
             client: ApiClient,
         }
@@ -24,9 +25,9 @@ macro_rules! api_module_struct {
             }
         }
 
-        #[wasm_bindgen]
+        #[cfg_attr(feature = "wasm", wasm_bindgen)]
         impl $name {
-            #[wasm_bindgen(constructor)]
+            #[cfg_attr(feature = "wasm", wasm_bindgen(constructor))]
             pub fn new() -> Self {
                 Self {
                     client: ApiClient::new(),
@@ -82,7 +83,7 @@ pub const DEFAULT_BASE_URL: &str = "https://www.jacktrip.com/api";
 /// client.setBearerToken("your-jwt-token");
 /// const user = await client.users().getCurrentUser();
 /// ```
-#[wasm_bindgen]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(Debug)]
 pub struct ApiClient {
     http: reqwest::Client,
@@ -90,20 +91,20 @@ pub struct ApiClient {
     bearer_token: Option<String>,
     user_agent: Option<String>,
     timeout_ms: u32,
-    #[wasm_bindgen(skip)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(skip))]
     pub headers: HashMap<String, String>,
 }
 
-#[wasm_bindgen]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 impl ApiClient {
     /// Create a new API client with default settings
-    #[wasm_bindgen(constructor)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(constructor))]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Create an API client with a custom base URL
-    #[wasm_bindgen(js_name = withBaseUrl)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = withBaseUrl))]
     pub fn with_base_url(base_url: String) -> Self {
         Self {
             base_url,
@@ -112,67 +113,67 @@ impl ApiClient {
     }
 
     /// Set the base URL
-    #[wasm_bindgen(js_name = setBaseUrl)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setBaseUrl))]
     pub fn set_base_url(&mut self, base_url: String) {
         self.base_url = base_url;
     }
 
     /// Get the base URL
-    #[wasm_bindgen(js_name = getBaseUrl)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getBaseUrl))]
     pub fn get_base_url(&self) -> String {
         self.base_url.clone()
     }
 
     /// Set the bearer token for authentication
-    #[wasm_bindgen(js_name = setBearerToken)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setBearerToken))]
     pub fn set_bearer_token(&mut self, token: String) {
         self.bearer_token = Some(token);
     }
 
     /// Clear the bearer token
-    #[wasm_bindgen(js_name = clearBearerToken)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = clearBearerToken))]
     pub fn clear_bearer_token(&mut self) {
         self.bearer_token = None;
     }
 
     /// Check if a bearer token is set
-    #[wasm_bindgen(js_name = hasBearerToken)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = hasBearerToken))]
     pub fn has_bearer_token(&self) -> bool {
         self.bearer_token.is_some()
     }
 
     /// Set the user agent string
-    #[wasm_bindgen(js_name = setUserAgent)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setUserAgent))]
     pub fn set_user_agent(&mut self, user_agent: String) {
         self.user_agent = Some(user_agent);
     }
 
     /// Set the request timeout in milliseconds
-    #[wasm_bindgen(js_name = setTimeoutMs)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setTimeoutMs))]
     pub fn set_timeout_ms(&mut self, timeout_ms: u32) {
         self.timeout_ms = timeout_ms;
     }
 
     /// Get the request timeout in milliseconds
-    #[wasm_bindgen(js_name = getTimeoutMs)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getTimeoutMs))]
     pub fn get_timeout_ms(&self) -> u32 {
         self.timeout_ms
     }
 
     /// Add a custom header
-    #[wasm_bindgen(js_name = addHeader)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = addHeader))]
     pub fn add_header(&mut self, key: String, value: String) {
         self.headers.insert(key, value);
     }
 
     /// Remove a custom header
-    #[wasm_bindgen(js_name = removeHeader)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = removeHeader))]
     pub fn remove_header(&mut self, key: &str) {
         self.headers.remove(key);
     }
 
     /// Clear all custom headers
-    #[wasm_bindgen(js_name = clearHeaders)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = clearHeaders))]
     pub fn clear_headers(&mut self) {
         self.headers.clear();
     }
@@ -182,61 +183,61 @@ impl ApiClient {
     // =========================================================================
 
     /// Get the System API
-    #[wasm_bindgen]
+    #[cfg_attr(feature = "wasm", wasm_bindgen)]
     pub fn system(&self) -> system::SystemApi {
         system::SystemApi::from_client(self)
     }
 
     /// Get the Users API
-    #[wasm_bindgen]
+    #[cfg_attr(feature = "wasm", wasm_bindgen)]
     pub fn users(&self) -> users::UsersApi {
         users::UsersApi::from_client(self)
     }
 
     /// Get the Billing API
-    #[wasm_bindgen]
+    #[cfg_attr(feature = "wasm", wasm_bindgen)]
     pub fn billing(&self) -> billing::BillingApi {
         billing::BillingApi::from_client(self)
     }
 
     /// Get the Studios API
-    #[wasm_bindgen]
+    #[cfg_attr(feature = "wasm", wasm_bindgen)]
     pub fn studios(&self) -> studios::StudiosApi {
         studios::StudiosApi::from_client(self)
     }
 
     /// Get the Devices API
-    #[wasm_bindgen]
+    #[cfg_attr(feature = "wasm", wasm_bindgen)]
     pub fn devices(&self) -> devices::DevicesApi {
         devices::DevicesApi::from_client(self)
     }
 
     /// Get the Events API
-    #[wasm_bindgen]
+    #[cfg_attr(feature = "wasm", wasm_bindgen)]
     pub fn events(&self) -> events::EventsApi {
         events::EventsApi::from_client(self)
     }
 
     /// Get the Streams API
-    #[wasm_bindgen]
+    #[cfg_attr(feature = "wasm", wasm_bindgen)]
     pub fn streams(&self) -> streams::StreamsApi {
         streams::StreamsApi::from_client(self)
     }
 
     /// Get the Recordings API
-    #[wasm_bindgen]
+    #[cfg_attr(feature = "wasm", wasm_bindgen)]
     pub fn recordings(&self) -> recordings::RecordingsApi {
         recordings::RecordingsApi::from_client(self)
     }
 
     /// Get the Subscriptions (studio memberships) API
-    #[wasm_bindgen]
+    #[cfg_attr(feature = "wasm", wasm_bindgen)]
     pub fn subscriptions(&self) -> subscriptions::SubscriptionsApi {
         subscriptions::SubscriptionsApi::from_client(self)
     }
 
     /// Get the Backing Tracks API
-    #[wasm_bindgen]
+    #[cfg_attr(feature = "wasm", wasm_bindgen)]
     pub fn tracks(&self) -> tracks::TracksApi {
         tracks::TracksApi::from_client(self)
     }
@@ -537,6 +538,7 @@ impl From<serde_json::Error> for ApiError {
     }
 }
 
+#[cfg(feature = "wasm")]
 impl From<ApiError> for JsValue {
     fn from(err: ApiError) -> Self {
         JsValue::from_str(&err.to_string())
@@ -559,6 +561,7 @@ pub(crate) struct PaginationQuery {
     pub limit: Option<i32>,
 }
 
+#[cfg(feature = "wasm")]
 /// Convert a value to JsValue using serde_wasm_bindgen
 pub(crate) fn to_js_value<T: serde::Serialize>(val: &T) -> Result<JsValue, ApiError> {
     serde_wasm_bindgen::to_value(val).map_err(|e| ApiError::Serialization(e.to_string()))

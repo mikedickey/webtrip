@@ -2,8 +2,11 @@
 //!
 //! Virtual studio management, configuration, and related operations.
 
-use super::{to_js_value, ApiClient, ApiError, urlencode};
+#[cfg(feature = "wasm")]
+use super::to_js_value;
+use super::{ApiClient, ApiError, urlencode};
 use crate::webtrip_api::models;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 // =============================================================================
@@ -136,6 +139,7 @@ impl StudiosApi {
 // JavaScript API (wasm_bindgen wrappers)
 // =============================================================================
 
+#[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl StudiosApi {
     #[wasm_bindgen(js_name = listStudios)]
