@@ -132,7 +132,7 @@ impl SimpleMixer {
 /// Grow `buf` to `len` if a caller exceeded the prepared layout. Never taken
 /// when `prepare` saw the real maxima; it exists so an oversized callback
 /// degrades to one allocation rather than a panic on the render thread.
-fn ensure_len(buf: &mut Vec<f32>, len: usize) {
+pub(crate) fn ensure_len(buf: &mut Vec<f32>, len: usize) {
     if buf.len() < len {
         buf.resize(len, 0.0);
     }

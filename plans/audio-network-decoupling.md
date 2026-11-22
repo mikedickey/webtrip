@@ -116,7 +116,7 @@ crates/core/src/                  package `webtrip-core`; portable; no web-sys /
   network/  protocol, transport (trait + deliver_received_packet + state mapping),
             signaling_message (SignalingMessage, HubConnectionState,
             parse_ice_candidate_json)
-  stream/   shared_ptr, ring_buffer, regulator, frame_reader   (the bridge primitives)
+  stream/   shared_ptr, ring_buffer, regulator   (the bridge primitives)
   lifecycle.rs, session_stats.rs (SessionStats, build_session_stats, tick_decision)
 crates/api/src/                   package `webtrip-api`; portable; today's api/ + models/
 crates/web/src/                   package `webtrip-web`; the cdylib (built as pkg/webtrip.js);
@@ -173,7 +173,7 @@ Decisions behind the platform split, settled with the user:
 
 ### New modules
 
-Four new portable modules, all in `webtrip-core`, layered acyclically
+Three new portable modules, all in `webtrip-core`, layered acyclically
 `dsp ← mixer ← processor` (`limits.rs` sits at core's root, above both
 `audio` and `network`, since both use it):
 
@@ -185,7 +185,6 @@ Four new portable modules, all in `webtrip-core`, layered acyclically
   its tests. Makes the portability claim structural: `mixer.rs` then has no path
   to `params.rs`'s `#[wasm_bindgen]` types.
 - **`audio/mixer.rs`** — `trait MixEngine: Send` + `SimpleMixer`.
-- **`stream/frame_reader.rs`** — `FrameReader`, the frame-granular adapter.
 
 **`MixEngine`** is the device↔network bridge, expressed in N device streams / M
 network streams while the only implementation handles 1+1:
@@ -487,65 +486,76 @@ Known cost to state in the commit: the matched-width send case gains one
 (`max_frames`, `max_device_channels`); `AudioProcessor` still passes the 128-frame
 render quantum. Raising that basis so decoupled fpp can never trigger a
 `resize` on the audio thread (the `remote_interleaved` / `wire_staging`
-buffers and `receive_from_network`'s resize) moved to Phase 3, where
-`FrameReader` sizing determines the real maxima.
+buffers and `receive_from_network`'s resize) belongs to Phase 3, where the
+regulator's frame FIFO determines the real maxima.
 
-### Phase 3 — `FrameReader` + `Regulator::pop_at`
+### Phase 3 — Frame-granular `Regulator::pop_frames_at`
 *Delivers: callback size and packet size fully independent, both directions.*
 
-`Regulator::pop` must stay packet-granular: `interleave_output`
-(`regulator.rs:1434-1438`, via `interleave_channel` `:384`, whose `zip`
-truncates silently) drops the tail on a short output and leaves stale audio
-on a long one; `last_seq_out` advances once per pop (`:1384`); `pull_stats`
-ticks once per pop (`:1327-1330`); and the tolerance controller is
-packet-denominated throughout (`:1553`, `update_tolerance` `:1565-1621`).
+The regulator owns a frame FIFO (in its consumer-owned state) between its
+packet slots and the audio callback. `pop_frames_at(output, frames, now_ms) ->
+channels` serves exactly `frames` frames per call, pulling whole packets into
+the FIFO as needed; every audio callback makes exactly one call, so a packet
+larger than the callback is simply cached across calls. `pop_at(output,
+now_ms)` remains as the packet-granular call for a host whose callback is one
+packet long; a given regulator uses one or the other.
 
-`pop_at(output, now_ms)` already exists from Phase 0b's clock injection; this
-phase builds on it rather than introducing it. Add one up-front
-`debug_assert_eq!(output.len(), samples_per_packet)` to `interleave_output`:
-the reader always hands an exactly-sized buffer, so tail-drop and stale-tail
-become **unreachable by construction** rather than patched.
+**Packet pulls are internal and exactly sized.** `pull_packet` (the old pop
+body minus the stats tick) always writes into the FIFO's own `fpp * channels`
+target, so `interleave_output` (via `interleave_channel`, whose `zip` truncates
+silently) can neither drop a tail on a short output nor leave stale audio on
+a long one: tail-drop and stale-tail are **unreachable by construction**, and
+`interleave_output` carries a `debug_assert_eq!(output.len(), fpp * channels)`.
+`last_seq_out` still advances once per packet; the underrun/overrun counters
+and the tolerance controller remain packet-denominated.
 
-**The statistics-integrity mechanism is the heart of this.** Per callback,
-compute the pop count once, then space each pop's timestamp exactly one packet
-period apart, anchored so the last lands on `now`:
+**The pull clock is the audio callback.** `tick_pull` runs once per
+`pop_frames_at` call, recording the true interval since the previous call —
+including calls that pull no packet (callback smaller than the packet), and
+however many packets a call does pull. Every packet in one call is pulled as
+of the same `now_ms`; `TimingStats::tick` discards the resulting zero-length
+intervals. `pull_stats` therefore carries the device callback's real jitter
+into `pull_tol = calc_auto()`, the floor under the auto tolerance
+(`new_tolerance = max(push_tol + headroom, pull_tol)`), instead of the packet
+clock. Consequence: tolerance settles near the slower of the callback and
+packet periods, and a *fixed* tolerance below the callback span makes packets
+that queued within one callback look stale to `find_best_packet` — a tolerance
+that small cannot be honoured at that callback size.
 
-```
-pops = ceil_div(frames_needed.saturating_sub(queued_frames), fpp)
-for i in 0..pops:
-    reg.pop_at(&mut packet, now_ms - ((pops-1-i) as f64) * packet_period_ms)
-```
+**Startup and width.** `pop_frames_at` takes one Acquire per call; the stream's
+width is fixed for every packet pulled in it. Before the stream starts it
+fills the FIFO with the startup silence `pull_packet` would give (at the
+regulator's initial width). When the adopted width differs from the FIFO's, the
+FIFO (at the old stride) is flushed. `reset()` flushes it too, so audio pulled
+for one stream never plays in the next.
 
-This holds the invariant *`pull_stats` ticks exactly once per packet consumed,
-at one packet period of spacing, for every fpp/callback ratio*: at `fpp ==
-frames` it is bit-identical to today; at callback > packet it reports the
-device's true steady clock instead of manufacturing phantom jitter from
-zero-length intervals; at callback < packet most callbacks pop zero times and
-tick not at all. Anchoring at `now` (not running a virtual clock forward) keeps
-timestamps from ever running ahead of the push side's `Self::now_ms()`
-(`regulator.rs:1033`), so no packet is judged late by an adapter artifact.
+**Sizing.** `Regulator::with_callback_capacity(frames)` preallocates the FIFO
+at `(frames + fpp) * MAX_CHANNELS` samples (~200 KB) and the pull target at
+`fpp * MAX_CHANNELS`, once, before the regulator is shared; `pop_frames_at`
+never allocates, and a call asking for more than the capacity is a
+`debug_assert` and returns `0` (silence). The session builds the regulator with
+`RENDER_QUANTUM_FRAMES`, which lives in core's `limits.rs` (`worklet.rs`
+re-exports it). `AudioProcessor::with_network` takes `max_callback_frames` and
+sizes `MixLayout` and `remote_interleaved` / `wire_staging` at
+`max_callback_frames * MAX_WIRE_CHANNELS`. A callback never exceeds the
+maximum; if one ever did, `ensure_len` degrades to a single allocation rather
+than a panic on the render thread. `fpp` is fixed at
+construction until Phase 4 (see there).
 
-Carried from Phase 2: pass the real `max_callback_frames` into `MixLayout`
-(replacing the processor's hardcoded 128 `SCRATCH_FRAMES`) and size
-`remote_interleaved` and `wire_staging` from the same maxima, so no scratch
-buffer can `resize` on the render thread once fpp and callback size differ.
+**Latency.** The frames sitting in the FIFO are published with the regulator's
+other snapshot atomics (`pub_queued_frames`) and counted by `latency_ms()`
+alongside the packets queued in the slots, which would otherwise under-report
+by up to `fpp-1` frames. `Regulator::frames_to_ms` converts frames at the wire
+rate.
 
-Sizing: `(max_callback_frames + max_fpp) * MAX_WIRE_CHANNELS`, allocated once in
-`prepare()` from `build_and_connect_worklet_node` — main thread, ~200 KB.
-Startup needs no special case (`pop_internal` already returns silence before the
-first packet, `regulator.rs:1333-1335`). Mid-stream format change flushes the FIFO
-(queued frames are at the old stride) and reports it; capacity is at the ceiling
-so it never allocates.
-
-Delete `processor.rs:501`'s `debug_assert_eq!(fpp, frames)`. Add
-`reader.queued_frames()` into `regulator_latency_ms`, which otherwise
-under-reports by up to `fpp-1` frames.
+Delete `processor.rs:501`'s `debug_assert_eq!(fpp, frames)`.
 
 ### Phase 3b — Sample-rate conversion (device rate ↔ wire rate)
 *Delivers: a 48 kHz link works regardless of the device's native rate (e.g.
-48 kHz mic + 96 kHz speakers) with no spurious PLC. Builds on Phase 3: the
-`FrameReader` and the pop-count formula both assume device frames and wire
-frames are the same unit, and that assumption is what this phase removes.*
+48 kHz mic + 96 kHz speakers) with no spurious PLC. Builds on Phase 3:
+`pop_frames_at` and the processor's frames-needed arithmetic both assume device
+frames and wire frames are the same unit, and that assumption is what this
+phase removes.*
 
 Requirement: the device rate and the wire rate are independent values, and
 every place that converts between "frames the device needs" and "packets the
@@ -558,38 +568,31 @@ wire supplies" accounts for the ratio.
   (it derives packet duration and tolerance windows from it); it must never
   see the device rate.
 - **Receive direction:** convert the regulator's wire-rate output to the
-  device rate before the mixer's `net_in`. Phase 3's pop count then uses
-  `frames_needed` converted into wire-rate frames:
-  `ceil_div(frames_needed * wire_rate / device_rate - queued_wire_frames, fpp)`,
-  so `pull_stats` still ticks exactly once per packet consumed, one packet
-  period apart.
+  device rate before the mixer's `net_in`. The processor asks `pop_frames_at`
+  for `frames_needed` converted into wire-rate frames
+  (`ceil(frames_needed * wire_rate / device_rate)`), so the pull clock still
+  ticks exactly once per device callback.
 - **Send direction:** convert captured device-rate frames to the wire rate
   before they reach the ring buffer, so packets carry wire-rate audio and the
   header's rate field (`protocol.rs`) is truthful.
-- **Where the conversion lives is a decision to settle at the start of this
-  phase, not assumed here.** The candidates:
-  1. Create the `AudioContext` at the wire rate (`sampleRate: 48000`) and let
-     the browser resample at the device edge. Smallest change, but the
-     quality and latency are the browser's, the rate is only a *request* the
-     browser may not honour, and a native host (see AGENTS.md portability)
-     would have no equivalent.
-  2. Convert in our own portable code (a resampler in `dsp.rs`, used by the
-     mixer), with the context left at the device rate. More work, but it is
-     testable natively and reusable by non-browser hosts.
-  3. Both: request the wire rate, and fall back to our own conversion when
-     the browser does not give it.
-
-  Under the core/web split, option 1 lives entirely in `webtrip-web`; only
-  options 2 and 3 put a converter in `webtrip-core` where a native host can
-  reuse it. That is a fact to weigh, not a decision made here.
+- **Where the conversion lives: both (decided).** Request the wire rate when
+  creating the `AudioContext` (`sampleRate: 48000`), and fall back to our own
+  conversion when the browser does not give it. The converter is a resampler in
+  `webtrip-core`'s `dsp.rs`, used by the mixer, so it is testable natively and
+  reusable by a future native host, which has no browser to resample at the
+  device edge for it. The rate is only a *request* the browser may not
+  honour, so the context's actual rate is read back after creation and the
+  core resampler is engaged whenever it differs from the wire rate. Where the
+  browser does honour the request, no conversion runs and no quality or
+  latency is spent on it.
 - **Fail loudly in every case.** If the final device rate and wire rate
   differ and no conversion is active, `connect` must return an error naming
   both rates — never run silently at the wrong speed. This is the same
   "diagnosable rail" rule as the channel and packet-size limits.
-- **Open question:** the device clock and the peer's clock are separate
-  oscillators, so even at identical nominal rates they drift. Whether a
-  fixed-ratio converter is enough, or an adaptive ratio is needed, is not
-  decided here; the regulator's adaptive tolerance absorbs slow drift today.
+- **Clock drift needs no special handling.** The device clock and the peer's
+  clock are separate oscillators, so even at identical nominal rates they
+  drift. A fixed-ratio converter is sufficient: the regulator's adaptive
+  tolerance absorbs the slow drift, as it does today.
 
 ### Phase 4 — fpp fitting + peer-fpp adoption
 *Delivers: 5-channel links stop silently failing; a 256-fpp peer works instead
@@ -664,6 +667,13 @@ both halves first: `release` awaits `AudioContext.close` and skips the reset
 if that times out (`session.rs:1017-1045`, WEB-53 Bug 7 / WEB-66). Any new
 adoption path must keep that requirement.
 
+**Frame FIFO sizing uses `MAX_FPP`.** The regulator's frame FIFO and pull
+target are preallocated for the largest fpp a peer may announce, not the
+construction-time `fpp`: `with_callback_capacity` sizes them from `MAX_FPP`.
+That is what lets an adopted peer fpp (any value up to `MAX_FPP`) flow through
+`pop_frames_at` with no render-thread allocation. Adoption flushes the FIFO,
+which is at the old stride/packet size.
+
 **Ring-buffer invariant:** `RING_BUFFER_SIZE = 4096` (`ring_buffer.rs:15`) is a
 hard ceiling on `fpp × send_channels`, not a sizing nit — `write` rejects
 oversized writes (`:155-158`) while both send paths wait for
@@ -734,7 +744,7 @@ transport and engine and starts the network loop with no await in between
 ### Phase 6 — Per-connection restructuring
 *Groundwork only. Last, because it touches everything.*
 
-Introduce `Connection { id, transport, regulator, reader, ring, wire, state }`;
+Introduce `Connection { id, transport, regulator, ring, wire, state }`;
 session holds `Vec<Connection>` and `connect()` enforces `len <= 1` by
 **returning an error naming the limit**, not silently ignoring.
 
@@ -760,8 +770,8 @@ session holds `Vec<Connection>` and `connect()` enforces `len <= 1` by
   `ConnectionStats` and its builder are `webtrip-core`.
 
 **Non-negotiable sequencing:** 0a → 0b → 0c → 0d, all before Phase 1 (so later
-phases create new files in their final crate); 2 before 3 (the reader feeds the mixer's `net_in`); 3 before 4
-(adopting a peer fpp without the frame adapter breaks playback immediately —
+phases create new files in their final crate); 2 before 3 (the regulator's frame output feeds the mixer's `net_in`); 3 before 4
+(adopting a peer fpp without the frame FIFO breaks playback immediately —
 `remote_interleaved` would be `fpp*channels` while the mixer expects
 `frames*channels`); 3b after 3 (it changes the frame↔packet arithmetic that
 phase establishes). Phase 3b is independent of 4 in either order. Phase 1 is
@@ -779,10 +789,15 @@ the literal 8 that must retarget: `session.rs:1307-1312`,
 
 Genuinely new tests, each able to fail on a plausible bug:
 
-- `FrameReader` continuity over an (fpp × callback-frames × channels) matrix: a
-  known ramp arrives sample-exact with no gaps, repeats or drops, and the pop
-  count is as expected.
-- Pull-stats integrity: tolerance does not collapse at k pops/callback vs 1:1.
+- `pop_frames_at` continuity over an (fpp × callback-frames × channels) matrix:
+  a known ramp arrives sample-exact with no gaps, repeats or drops, and one
+  packet is consumed per packet of output.
+- Pull-clock integrity: across the same ratios (including callback < packet and
+  a non-divisor) the pull statistics see exactly one tick per callback at the
+  callback interval, and a steady peer's auto tolerance stays near the slower
+  of the two clocks.
+- Latency and reset: frames queued in the FIFO reach `latency_ms()`, and
+  `reset()` discards them.
 - `fit_fpp` boundary matrix including its `limited_by` reason.
 - Rate-mismatch matrix (device rate × wire rate, e.g. 48/48, 96/48, 44.1/48):
   per callback the pop count and the converted frame count are right, a known
@@ -809,8 +824,8 @@ Tests extracted in 0b move with their code.
 1. `npm run check` — first gate; catches missed renames and any const
    assertions. Never bare `cargo check` (`web_sys` unstable gating).
 2. `npm run test` — native units across the workspace (`--workspace`): `session.rs`, `protocol.rs`, `params.rs`,
-   `devices.rs`, `regulator.rs`, `processor.rs`, plus the new `dsp`/`mixer`/
-   `frame_reader` tests.
+   `devices.rs`, `regulator.rs`, `processor.rs`, plus the new `dsp`/`mixer` tests
+   and the regulator's frame-pop tests.
 3. `npm run test:wasm` — the **only** step exercising `worklet.js`, so the only
    proof the Rust→JS handoff works. Watch `buffer_setters_feed_capture_path`
    (`engine.rs:1172`) and `worklet_port_tracks_capture_lifecycle` (`:952`).
@@ -852,7 +867,7 @@ Paths below are post-Phase-0d. Pre-move, all of `src/audio/` (plus
 
 New in `crates/core/src/`: `limits.rs` (both ceilings — shared by
 `audio/` and `network/`, so it sits above both), `audio/dsp.rs`,
-`audio/mixer.rs`, `stream/frame_reader.rs`, `network/signaling_message.rs`,
+`audio/mixer.rs`, `network/signaling_message.rs`,
 `session_stats.rs`.
 
 Config to update: root `Cargo.toml` (workspace) and the four crate manifests (including the

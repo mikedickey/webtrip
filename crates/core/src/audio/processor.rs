@@ -1,8 +1,8 @@
 use std::sync::atomic::Ordering;
 
-use crate::audio::mixer::{DeviceIn, DeviceOut, MixControls, MixEngine, MixIo, MixLayout, NetIn, NetOut, SimpleMixer};
+use crate::audio::mixer::{ensure_len, DeviceIn, DeviceOut, MixControls, MixEngine, MixIo, MixLayout, NetIn, NetOut, SimpleMixer};
 use crate::audio::params::{AudioParams, MAX_DB, MIN_DB, decode_db, decode_volume, encode_db};
-use crate::limits::{MAX_DEVICE_CHANNELS, MAX_WIRE_CHANNELS};
+use crate::limits::{MAX_DEVICE_CHANNELS, MAX_WIRE_CHANNELS, RENDER_QUANTUM_FRAMES};
 use crate::stream::regulator::Regulator;
 use crate::stream::ring_buffer::RingBuffer;
 use crate::stream::shared_ptr::SharedPtr;
@@ -70,51 +70,62 @@ pub struct AudioProcessor {
     /// Null when no network is attached; reached via its `&self` SPSC API through [`SharedPtr::as_ref`].
     network_to_local_buffer: SharedPtr<Regulator>,
     mixer: Box<dyn MixEngine>,
-    /// Buffer for the regulator's interleaved output, before mapping to the
-    /// output device's channel count. Preallocated at `WIRE_SCRATCH_LEN` so
-    /// a widening `receive_from_network` resize never allocates on the render
-    /// thread.
+    /// The regulator's output (peer audio at the wire's channel count), before
+    /// mapping to the output device's channel count. Preallocated at
+    /// `max_callback_frames * MAX_WIRE_CHANNELS`: a callback never exceeds it,
+    /// so the render thread never resizes.
     remote_interleaved: Vec<f32>,
     /// Staging for the mixer's network output (the capture conformed to the
     /// session's fixed wire channel count), written to the ring afterwards.
-    /// Preallocated at `WIRE_SCRATCH_LEN`.
+    /// Same preallocation as `remote_interleaved`.
     wire_staging: Vec<f32>,
 }
 
-/// Frames per worklet render quantum the scratch buffers are sized for.
-const SCRATCH_FRAMES: usize = 128;
-/// Wire-width scratch (indexed by wire channel counts).
-const WIRE_SCRATCH_LEN: usize = SCRATCH_FRAMES * MAX_WIRE_CHANNELS as usize;
-
 impl AudioProcessor {
     pub fn new(params: &'static AudioParams) -> Self {
-        Self::with_network(params, SharedPtr::null(), SharedPtr::null())
+        Self::with_network(params, SharedPtr::null(), SharedPtr::null(), RENDER_QUANTUM_FRAMES)
     }
 
     /// Create processor with network audio support
     /// - local_to_network_buffer: ring buffer for sending local audio to network
     /// - network_to_local_buffer: jitter buffer for receiving audio from network
+    /// - max_callback_frames: the most frames any `process` call will carry;
+    ///   every render-thread scratch buffer is sized from it here, off the
+    ///   render thread
     pub fn with_network(
         params: &'static AudioParams,
         local_to_network_buffer: SharedPtr<RingBuffer>,
         network_to_local_buffer: SharedPtr<Regulator>,
+        max_callback_frames: usize,
     ) -> Self {
+        // The regulator's FIFO capacity and this callback ceiling are set
+        // independently; a regulator smaller than the callbacks it serves
+        // returns 0 from every pop (silent peer, nothing logged). Setup is off
+        // the render thread, so fail loudly here instead.
+        if let Some(regulator) = network_to_local_buffer.as_ref() {
+            assert!(
+                regulator.callback_capacity() >= max_callback_frames,
+                "regulator callback capacity ({}) is below the processor's max_callback_frames ({max_callback_frames})",
+                regulator.callback_capacity(),
+            );
+        }
         // Device-width scratch is sized from the device ceiling so a wide
         // interface never `resize`s on the render thread.
         let mut mixer = SimpleMixer::new();
         mixer
             .prepare(&MixLayout {
-                max_frames: SCRATCH_FRAMES,
+                max_frames: max_callback_frames,
                 max_device_channels: MAX_DEVICE_CHANNELS as usize,
             })
-            .expect("the static mix layout has no zero dimension");
+            .expect("the mix layout has no zero dimension");
+        let wire_scratch_len = max_callback_frames * MAX_WIRE_CHANNELS as usize;
         Self {
             params,
             local_to_network_buffer,
             network_to_local_buffer,
             mixer: Box::new(mixer),
-            remote_interleaved: vec![0.0; WIRE_SCRATCH_LEN],
-            wire_staging: vec![0.0; WIRE_SCRATCH_LEN],
+            remote_interleaved: vec![0.0; wire_scratch_len],
+            wire_staging: vec![0.0; wire_scratch_len],
         }
     }
 
@@ -126,7 +137,7 @@ impl AudioProcessor {
     /// frame]`.
     ///
     /// `now_ms` is the host's wall-clock time for this callback, handed to the
-    /// regulator's `pop_at`; the processor itself never reads a clock.
+    /// regulator's `pop_frames_at`; the processor itself never reads a clock.
     pub fn process(&mut self, input: &[f32], in_channels: usize, output: &mut [f32], out_channels: usize, now_ms: f64) -> bool {
         let in_channels = in_channels.max(1);
         let out_channels = out_channels.max(1);
@@ -143,6 +154,10 @@ impl AudioProcessor {
 
         // Pop the peer stream first; `remote_channels == 0` (no network buffer,
         // or nothing adopted yet) is the empty `net_in` — silence.
+        // A callback past `max_callback_frames` breaks the preallocation
+        // contract; degrade to one allocation (as the mixer does) rather than
+        // panic on the render thread.
+        ensure_len(&mut self.remote_interleaved, frames * MAX_WIRE_CHANNELS as usize);
         let remote_channels = self.receive_from_network(frames, now_ms);
         let net_in = [NetIn {
             interleaved: &self.remote_interleaved[..frames * remote_channels],
@@ -156,9 +171,7 @@ impl AudioProcessor {
         let ring = self.local_to_network_buffer.as_ref().filter(|ring| ring.is_streaming());
         let wire_channels = (self.params.get_send_channels() as usize).max(1);
         let wire_len = frames * wire_channels;
-        if ring.is_some() && self.wire_staging.len() < wire_len {
-            self.wire_staging.resize(wire_len, 0.0);
-        }
+        ensure_len(&mut self.wire_staging, wire_len);
         let mut net_out = [NetOut {
             interleaved: &mut self.wire_staging[..if ring.is_some() { wire_len } else { 0 }],
             channels: wire_channels,
@@ -203,35 +216,21 @@ impl AudioProcessor {
         }
     }
 
-    /// Receive remote audio from network via jitter buffer into
-    /// `remote_interleaved`. Returns the regulator's channel count **after**
-    /// `pop_at` (so it is ordered by that call's Acquire — WEB-53 Bug 3), or `0`
-    /// when no network buffer is attached (the caller treats that as silence).
+    /// Receive `frames` frames of remote audio into `remote_interleaved` from
+    /// the regulator. Returns the stream's channel count — read after the
+    /// regulator's Acquire (WEB-53 Bug 3) — or `0` when no network buffer is
+    /// attached or it cannot serve `frames` (the caller treats that as
+    /// silence). The regulator must have been built with a callback capacity of
+    /// at least `frames`.
     ///
-    /// `Regulator::pop()`'s return value is informational metadata (real vs.
-    /// concealed) and must NOT gate playback — concealed audio is the entire
-    /// point of jitter buffering and must be played to avoid clicks.
+    /// The regulator's concealed-vs-real distinction is informational and
+    /// must NOT gate playback: concealed audio is the entire point of jitter
+    /// buffering and must be played to avoid clicks.
     fn receive_from_network(&mut self, frames: usize, now_ms: f64) -> usize {
-        let Some(regulator) = self.network_to_local_buffer.as_ref() else {
-            return 0;
-        };
-
-        // Size the scratch to the max wire width so we can pop before reading
-        // the adopted channel count. `pop` only writes `channels * fpp` samples;
-        // the Acquire inside it makes the subsequent `channels()` read coherent.
-        let fpp = regulator.fpp();
-        debug_assert_eq!(fpp, frames, "regulator fpp must match the worklet's frame count");
-        let interleaved_cap = fpp * MAX_WIRE_CHANNELS as usize;
-
-        if self.remote_interleaved.len() < interleaved_cap {
-            self.remote_interleaved.resize(interleaved_cap, 0.0);
+        match self.network_to_local_buffer.as_ref() {
+            Some(regulator) => regulator.pop_frames_at(&mut self.remote_interleaved, frames, now_ms),
+            None => 0,
         }
-
-        // Read the regulator's output (always populates the buffer; pop()'s
-        // bool distinguishes real vs concealed but is irrelevant for mixing).
-        regulator.pop_at(&mut self.remote_interleaved[..interleaved_cap], now_ms);
-
-        regulator.channels()
     }
 }
 
@@ -343,7 +342,7 @@ mod tests {
         // SAFETY: `ring` is borrowed for the processor's lifetime in these
         // tests; the processor never outlives the stack local.
         let ring_ptr = unsafe { SharedPtr::new(ring as *mut RingBuffer) };
-        AudioProcessor::with_network(params, ring_ptr, SharedPtr::null())
+        AudioProcessor::with_network(params, ring_ptr, SharedPtr::null(), RENDER_QUANTUM_FRAMES)
     }
 
     /// `frames` of planar capture (`[ch * frames + frame]`) where channel `ch`
@@ -484,6 +483,29 @@ mod tests {
         assert_eq!(lens(&processor), before, "no scratch buffer may resize on the render thread");
     }
 
+    /// A callback larger than `max_callback_frames` (a host with a 256- or
+    /// 512-frame callback built with the default capacity) must degrade, not
+    /// panic on the render thread, and the oversized capture must still reach
+    /// the ring.
+    #[test]
+    fn test_process_callback_beyond_max_frames_degrades() {
+        const FRAMES: usize = RENDER_QUANTUM_FRAMES * 2;
+        const LEVEL: f32 = 0.25;
+
+        let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
+        params.set_send_channels(1);
+        let mut ring = RingBuffer::new();
+        let mut processor = networked_processor(params, &mut ring);
+
+        let input = planar_capture(&[LEVEL], FRAMES);
+        let mut output = vec![0.0f32; FRAMES];
+        assert!(processor.process(&input, 1, &mut output, 1, 0.0));
+
+        let mut wire = vec![0.0f32; FRAMES];
+        assert!(ring.read(&mut wire), "the whole oversized callback must reach the ring");
+        assert!(wire.iter().all(|&s| (s - LEVEL).abs() < EPS));
+    }
+
     #[test]
     fn test_peak_hold_then_decay_sequence() {
         // Simulate a full hold-then-decay scenario over several ticks.
@@ -516,5 +538,46 @@ mod tests {
         assert!(decayed < peak, "peak must start decaying after hold expires");
         assert!((decayed - (signal_peak - PEAK_DECAY_RATE).max(MIN_DB)).abs() < EPS);
         assert_eq!(dc, 0);
+    }
+
+    /// A regulator whose FIFO is smaller than the callbacks the processor will
+    /// carry would silence the peer on every pop; the mismatch must be caught
+    /// at construction, not discovered as silence.
+    #[test]
+    #[should_panic(expected = "below the processor's max_callback_frames")]
+    fn test_with_network_rejects_undersized_regulator() {
+        use crate::stream::regulator::Regulator;
+        let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
+        // Default capacity is one packet (64 frames); callbacks are 128.
+        let reg = Regulator::with_params(1, 64, 48_000, 5.0);
+        let _ = AudioProcessor::with_network(params, SharedPtr::null(), SharedPtr::from_ref(&reg), RENDER_QUANTUM_FRAMES);
+    }
+
+    /// The processor must hand the peer stream to the mixer at the width and
+    /// frame count the regulator returned: a 256-fpp peer served by 128-frame
+    /// callbacks (a packet split across callbacks) reaches the output intact.
+    /// Packet/callback ratios themselves are the regulator's contract, pinned
+    /// in its own tests.
+    #[test]
+    fn test_process_plays_peer_stream_to_output() {
+        use crate::stream::regulator::{test_support::*, Regulator};
+        const FPP: usize = 256;
+        const FRAMES: usize = 128;
+        const LEVEL: f32 = 0.5;
+
+        let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
+        let reg = Regulator::with_params(1, FPP, 48_000, 5.0).with_callback_capacity(FRAMES);
+        let mut processor = AudioProcessor::with_network(params, SharedPtr::null(), SharedPtr::from_ref(&reg), FRAMES);
+        let input = vec![0.0f32; FRAMES];
+        let mut output = vec![0.0f32; FRAMES];
+        let mut checked = 0;
+        drive_callbacks(&reg, (FPP, FRAMES, 1), 120, |_| vec![LEVEL; FPP], |k, now| {
+            processor.process(&input, 1, &mut output, 1, now);
+            if k >= SETTLE_CALLBACKS {
+                checked += 1;
+                assert!(output.iter().all(|&s| (s - LEVEL).abs() < EPS), "callback {k}: peer audio must fill the whole callback");
+            }
+        });
+        assert!(checked > 0);
     }
 }
