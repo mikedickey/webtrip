@@ -483,9 +483,12 @@ Known cost to state in the commit: the matched-width send case gains one
 `processor.rs:467`). Mitigate by passing the preallocated wire staging buffer
 *as* `net_out[0].interleaved`, bounding it to one ≤4 KB copy per callback.
 
-Also raise the `processor.rs:294-299`/`:315-320` preallocation basis off the
-bare `128`, so decoupled fpp can never trigger a `resize` on the audio thread
-(`processor.rs:503-506`).
+`SimpleMixer::prepare` sizes its device-width scratch from a `MixLayout`
+(`max_frames`, `max_device_channels`); `AudioProcessor` still passes the 128-frame
+render quantum. Raising that basis so decoupled fpp can never trigger a
+`resize` on the audio thread (the `remote_interleaved` / `wire_staging`
+buffers and `receive_from_network`'s resize) moved to Phase 3, where
+`FrameReader` sizing determines the real maxima.
 
 ### Phase 3 — `FrameReader` + `Regulator::pop_at`
 *Delivers: callback size and packet size fully independent, both directions.*
@@ -521,6 +524,11 @@ zero-length intervals; at callback < packet most callbacks pop zero times and
 tick not at all. Anchoring at `now` (not running a virtual clock forward) keeps
 timestamps from ever running ahead of the push side's `Self::now_ms()`
 (`regulator.rs:1033`), so no packet is judged late by an adapter artifact.
+
+Carried from Phase 2: pass the real `max_callback_frames` into `MixLayout`
+(replacing the processor's hardcoded 128 `SCRATCH_FRAMES`) and size
+`remote_interleaved` and `wire_staging` from the same maxima, so no scratch
+buffer can `resize` on the render thread once fpp and callback size differ.
 
 Sizing: `(max_callback_frames + max_fpp) * MAX_WIRE_CHANNELS`, allocated once in
 `prepare()` from `build_and_connect_worklet_node` — main thread, ~200 KB.
