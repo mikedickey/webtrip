@@ -2,7 +2,9 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-use crate::network::protocol::MAX_CHANNELS;
+use crate::limits::MAX_WIRE_CHANNELS;
+#[cfg(test)]
+use crate::limits::MAX_DEVICE_CHANNELS;
 use crate::stream::shared_ptr::SharedPtr;
 
 /// Minimum dB level (silence threshold)
@@ -61,9 +63,9 @@ impl Default for AudioParams {
 }
 
 impl AudioParams {
-    /// Set the wire send channel count, clamped to `[1, MAX_CHANNELS]`
+    /// Set the wire send channel count, clamped to `[1, MAX_WIRE_CHANNELS]`
     pub fn set_send_channels(&self, channels: u32) {
-        self.send_channels.store(channels.clamp(1, MAX_CHANNELS as u32), Ordering::Relaxed);
+        self.send_channels.store(channels.clamp(1, MAX_WIRE_CHANNELS as u32), Ordering::Relaxed);
     }
 
     /// Get the wire send channel count
@@ -308,15 +310,16 @@ mod tests {
     #[test]
     fn test_send_channels_roundtrip_and_clamp() {
         let p = AudioParams::default();
-        for c in [1_u32, 2, 4, 8] {
+        let max = MAX_WIRE_CHANNELS as u32;
+        for c in [1_u32, 2, 4, max] {
             p.set_send_channels(c);
             assert_eq!(p.get_send_channels(), c);
         }
-        // Clamp to [1, 8].
+        // Clamp to [1, MAX_WIRE_CHANNELS]: the wire ceiling, not the device one.
         p.set_send_channels(0);
         assert_eq!(p.get_send_channels(), 1);
-        p.set_send_channels(64);
-        assert_eq!(p.get_send_channels(), 8);
+        p.set_send_channels(MAX_DEVICE_CHANNELS as u32 * 2);
+        assert_eq!(p.get_send_channels(), max);
     }
 
     #[test]

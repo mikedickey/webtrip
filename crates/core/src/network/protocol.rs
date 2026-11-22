@@ -51,14 +51,10 @@
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
+use crate::limits::MAX_WIRE_CHANNELS;
+
 /// JackTrip native header size (16 bytes)
 pub const HEADER_SIZE: usize = 16;
-
-/// Maximum audio channels a single stream may carry. The wire format's
-/// `NumIncomingChannelsFromNet`/`NumOutgoingChannelsToNet` fields are single
-/// bytes with a special encoding above 254 (see the module docs), but this is
-/// the protocol's own, tighter limit.
-pub const MAX_CHANNELS: u8 = 8;
 
 /// Default sample rate (48kHz = code 3)
 pub const DEFAULT_SAMPLE_RATE: u32 = 48000;
@@ -289,16 +285,16 @@ impl PacketHeader {
         );
 
         // Validate the channel count the peer wants back (JackTrip rejects 0 too)
-        if num_incoming_channels == 0 || num_incoming_channels > MAX_CHANNELS {
+        if num_incoming_channels == 0 || num_incoming_channels > MAX_WIRE_CHANNELS {
             return Err(ProtocolError::InvalidChannelCount);
         }
 
         // Validate decoded outgoing channels — this packet's payload width.
-        // After decoding, it can be 0 (no audio) or 1-MAX_CHANNELS (normal range)
-        if num_outgoing_channels > MAX_CHANNELS {
+        // After decoding, it can be 0 (no audio) or 1-MAX_WIRE_CHANNELS (normal range)
+        if num_outgoing_channels > MAX_WIRE_CHANNELS {
             log::error!(
                 "❌ Invalid outgoing channel count: {} (too high, max is {})",
-                num_outgoing_channels, MAX_CHANNELS
+                num_outgoing_channels, MAX_WIRE_CHANNELS
             );
             return Err(ProtocolError::InvalidChannelCount);
         }

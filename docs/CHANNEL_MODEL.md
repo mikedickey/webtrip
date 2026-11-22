@@ -98,8 +98,8 @@ receive_channels, buffer)` is the single place both transports build outbound
 packets. With the defaults (send 1, receive 2) byte 14 is `2` and byte 15 is
 `1`, which asks the hub for stereo while sending mono.
 
-On receive, byte 14 must be `1`–`MAX_CHANNELS` (`0` is rejected, as JackTrip
-does), and byte 15 must decode to `0`–`MAX_CHANNELS`. A "no audio" packet
+On receive, byte 14 must be `1`–`MAX_WIRE_CHANNELS` (`0` is rejected, as JackTrip
+does), and byte 15 must decode to `0`–`MAX_WIRE_CHANNELS`. A "no audio" packet
 (byte 15 = `255`, decoded `0`) passes header validation, but the regulator
 then rejects it as `UnsupportedChannelCount`.
 
@@ -113,14 +113,14 @@ Device channel counts can be queried before any connection, with two
 module-level async functions in `devices.rs`:
 
 - **`getInputDeviceChannels(deviceId?)`** opens the device with `getUserMedia`
-  (processing toggles off, `channelCount: {ideal: MAX_CHANNELS}`), reads the
+  (processing toggles off, `channelCount: {ideal: MAX_DEVICE_CHANNELS}`), reads the
   first track's `getCapabilities().channelCount.max` — falling back to
   `getSettings().channelCount` when capabilities are unavailable (Safari
   doesn't implement `getCapabilities`) — then stops the stream. The pure
-  resolution, clamped to `[1, MAX_CHANNELS]`, is `resolve_input_channels`.
+  resolution, clamped to `[1, MAX_DEVICE_CHANNELS]`, is `resolve_input_channels`.
 - **`getOutputDeviceChannels(deviceId?)`** creates a throwaway `AudioContext`,
   routes it to the device via `setSinkId` when an id is given, reads
-  `destination.maxChannelCount` clamped to `[1, MAX_CHANNELS]`, and closes the
+  `destination.maxChannelCount` clamped to `[1, MAX_DEVICE_CHANNELS]`, and closes the
   context. Without `setSinkId` (Safari, Firefox) it reports the default
   output, which is the device those browsers play to anyway.
 
@@ -136,8 +136,8 @@ the defaults still works on any hardware.
 
 The four setters (`setSendChannels`, `setReceiveChannels`,
 `setInputChannels`, `setOutputChannels`) share one guard,
-`can_set_channel_count`: the count must be in `[1, MAX_CHANNELS]` and the
-session must be `Idle`. Otherwise the call logs a warning and does nothing.
+`can_set_channel_count`: the count must be in `[1, MAX_WIRE_CHANNELS]` (send/receive) or
+`[1, MAX_DEVICE_CHANNELS]` (input/output) and the session must be `Idle`. Otherwise the call logs a warning and does nothing.
 
 `Idle`-only is deliberate. The transports snapshot the wire counts into
 `AudioBufferConfig` at connect time, and the render thread reads the send
@@ -170,25 +170,26 @@ receive_channels, .. }` and hands it to the transport:
 Once the transport is connected, the session starts capture with its input and
 output counts (`engine.rs`):
 
-1. Call `getUserMedia` with `channelCount: {ideal: MAX_CHANNELS}`
+1. Call `getUserMedia` with `channelCount: {ideal: MAX_DEVICE_CHANNELS}`
    (`AudioConstraints::to_js`). Asking for the maximum makes the browser open
    the device at its native width instead of downmixing, so "input channels =
    N" reliably means the device's first N.
-2. Read the **granted** width from the track's `getSettings().channelCount`
-   (`resolve_input_channels(settings, None)`). A browser that doesn't report
-   it is treated as granting 1 channel.
+2. Read the device's width with `track_channels` — the same capability-max,
+   then settings, resolution `getInputDeviceChannels` uses — so the probe and
+   capture cannot disagree. (`getSettings().channelCount` alone reports the
+   narrower granted width and would narrow a multichannel interface to mono.)
+   A browser that reports neither is treated as 1 channel.
 3. Build the `AudioWorkletNode` with an input width of
    `min(input_channels, granted)`. The node's `channelCount` is
    `Explicit`/`Discrete`, so per the Web Audio spec the extra source channels
    are simply dropped. That is how an input count of 1 captures only channel 0.
-   When the browser granted fewer than requested (e.g. Chrome forcing mono
-   under echo cancellation), the narrower width is used and the send path's
-   conform fills the send width.
+   When the device is narrower than requested, the narrower width is used and
+   the send path's conform fills the send width.
 4. Route the context to the session's stored output device, if any
    (`route_output_sink`), before anything is connected to the destination, so
    playback never starts on the default output.
 5. Configure the destination `Explicit`/`Discrete` at
-   `min(output_channels, destination.maxChannelCount, MAX_CHANNELS)`
+   `min(output_channels, destination.maxChannelCount, MAX_DEVICE_CHANNELS)`
    (`configure_destination`). Setting a width above `maxChannelCount` throws.
    Because step 4 already ran, this is the selected device's
    `maxChannelCount`.
@@ -418,26 +419,31 @@ stay live.
   the raw byte 15 misreads it. WebTrip itself sends symmetric packets whenever
   the send and receive counts are equal (e.g. the demo's Stereo mode).
 - **Chrome forces mono capture when echo cancellation is on.** This is a
-  browser policy, not a WebTrip bug. The capture width drops to 1 and the
-  conform fills the send width. If stereo capture looks unavailable during
-  testing, check the AGC/Echo/Noise toggles first.
+  browser policy, not a WebTrip bug. The track delivers one plane, so the
+  second channel of a 2-channel capture is silent (capture width is the
+  device's capability, not the granted setting). If stereo capture looks
+  unavailable during testing, check the AGC/Echo/Noise toggles first.
 - **A browser reporting 0 channels is floored to 1** (`clamp_channel_count`),
   not surfaced as an error. Current browsers fail `getUserMedia` outright for
   an input with no channels rather than resolve with a degenerate track.
-- **An unreported channel count also means 1.** If a track's
-  `getSettings()` has no `channelCount`, capture narrows to 1 channel even on
-  a stereo device. If `getCapabilities()` is missing too, the input probe
-  resolves to 1, and the demo locks Mono.
-- **`RENDER_QUANTUM_FRAMES` (128) and `MAX_CHANNELS` (8) bound the worklet's
-  planar scratch buffers** (`ProcessorHandle::input_scratch`/`output_scratch`
-  in `worklet.rs`, sized `RENDER_QUANTUM_FRAMES * MAX_CHANNELS`). Every
-  per-callback buffer in `processor.rs` (`gained_buffer`,
-  `captured_interleaved`, `wire_conformed`, `remote_interleaved`,
-  `remote_mapped`, `monitor_mapped`) is preallocated at `128 * MAX_CHANNELS`
-  so a widening resize never allocates on the real-time render thread.
-- **A device with more than `MAX_CHANNELS` channels is addressed at its first
-  8 only.** The probes, capture, and destination all clamp to `MAX_CHANNELS`,
-  matching the wire protocol's own limit (`protocol.rs::MAX_CHANNELS`).
+- **An unreported channel count means 1.** If a track reports neither
+  `getCapabilities().channelCount` nor `getSettings().channelCount`, both the
+  input probe and capture resolve to 1, and the demo locks Mono.
+- **`RENDER_QUANTUM_FRAMES` (128) and `MAX_DEVICE_CHANNELS` (32) bound the
+  worklet's planar scratch buffers** (`ProcessorHandle::input_scratch`/
+  `output_scratch` in `worklet.rs`, sized `RENDER_QUANTUM_FRAMES *
+  MAX_DEVICE_CHANNELS`). `worklet.js` reads both from the handle
+  (`channel_capacity()`, `frames_per_quantum()`) rather than keeping copies.
+  The device-width buffers in `processor.rs` (`gained_buffer`,
+  `captured_interleaved`, `remote_mapped`, `monitor_mapped`) are preallocated
+  at `128 * MAX_DEVICE_CHANNELS` and the wire-width ones (`wire_conformed`,
+  `remote_interleaved`) at `128 * MAX_WIRE_CHANNELS`, so a resize never
+  allocates on the real-time render thread.
+- **Two ceilings.** A device is addressed up to `MAX_DEVICE_CHANNELS` (32);
+  the wire carries at most `MAX_WIRE_CHANNELS` (8) — a WebTrip choice that
+  keeps packets within one unfragmented datagram. Both live in
+  `webtrip_core::limits`. Captured audio wider than the wire is conformed
+  down on send; peers wider than the output device are mapped on receive.
 
 ---
 
@@ -453,7 +459,7 @@ stay live.
 | Worklet ABI (planar scratch buffers, `ProcessorCallback`/`ProcessorHandle::render`) | `crates/web/src/audio/worklet.rs` |
 | Worklet JS bridge (copies each channel plane in/out of WASM memory) | `crates/web/src/audio/worklet.js` |
 | Gain, metering, planar↔interleaved conversion, channel-mapping policy, send/receive wiring | `crates/core/src/audio/processor.rs` |
-| Wire protocol header (bytes 14/15, payload sizing, `MAX_CHANNELS`) | `crates/core/src/network/protocol.rs` |
+| Wire protocol header (bytes 14/15, payload sizing) | `crates/core/src/network/protocol.rs` |
 | Peer channel-count adoption (jitter buffer) | `crates/core/src/stream/regulator.rs` |
 | Per-transport packet framing at the send/receive counts | `crates/web/src/network/webrtc.rs`, `crates/web/src/network/webtransport.rs`, `crates/web/src/network/webtransport_worker.rs` |
 | Demo UI: probing, `devicechange`, capture modes, config locking | `website/src/pages/demo/Demo.tsx` |

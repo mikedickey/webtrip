@@ -8,6 +8,7 @@
 //!   `js-sys`; only the browser host does (enforced by Cargo: `npm run check:core`).
 
 pub mod audio;
+pub mod limits;
 pub mod network;
 pub mod stream;
 #[doc(hidden)]

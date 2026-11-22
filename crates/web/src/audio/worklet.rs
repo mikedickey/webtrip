@@ -1,4 +1,4 @@
-use webtrip_core::network::protocol::MAX_CHANNELS;
+use webtrip_core::limits::MAX_DEVICE_CHANNELS;
 use crate::dependent_module;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
@@ -25,7 +25,7 @@ pub type ProcessorCallback = Box<dyn FnMut(&[f32], usize, &mut [f32], usize) -> 
 /// Handle for a WASM audio processor that can be passed to the AudioWorklet.
 ///
 /// Owns preallocated planar scratch buffers in WASM linear memory
-/// (`RENDER_QUANTUM_FRAMES * MAX_CHANNELS` each) so `worklet.js` can build
+/// (`RENDER_QUANTUM_FRAMES * MAX_DEVICE_CHANNELS` each) so `worklet.js` can build
 /// stable `Float32Array` views over them once and `.set()` each channel in
 /// place every callback, instead of wasm-bindgen copying a `&[f32]` argument
 /// on every call.
@@ -51,10 +51,22 @@ impl ProcessorHandle {
         self.output_scratch.as_ptr() as usize
     }
 
+    /// Channels each scratch buffer holds, derived from the buffer itself so
+    /// `worklet.js` never keeps its own copy of the ceiling (a stale copy is a
+    /// `TypeError` in the render callback, which kills the processor).
+    pub fn channel_capacity(&self) -> usize {
+        self.input_scratch.len() / RENDER_QUANTUM_FRAMES
+    }
+
+    /// Frames per render quantum (fixed by the Web Audio spec).
+    pub fn frames_per_quantum(&self) -> usize {
+        RENDER_QUANTUM_FRAMES
+    }
+
     /// Render one callback's worth of audio through the wrapped processor.
     ///
     /// `frames` is clamped to [`RENDER_QUANTUM_FRAMES`] and `in_channels`/
-    /// `out_channels` to [`MAX_CHANNELS`] — both scratch buffers' actual
+    /// `out_channels` to [`MAX_DEVICE_CHANNELS`] — both scratch buffers' actual
     /// capacity — because this is the ABI boundary crossed from JS:
     /// `debug_assert!` alone does not run in an optimized (release) Wasm
     /// build, so an out-of-range value from a caller would otherwise slice
@@ -65,8 +77,8 @@ impl ProcessorHandle {
     /// builds its views at when `frames == RENDER_QUANTUM_FRAMES` — true for
     /// every live AudioWorklet callback.
     pub fn render(&mut self, in_channels: usize, out_channels: usize, frames: usize) -> bool {
-        let in_channels = in_channels.max(1).min(MAX_CHANNELS as usize);
-        let out_channels = out_channels.max(1).min(MAX_CHANNELS as usize);
+        let in_channels = in_channels.max(1).min(MAX_DEVICE_CHANNELS as usize);
+        let out_channels = out_channels.max(1).min(MAX_DEVICE_CHANNELS as usize);
         let frames = frames.min(RENDER_QUANTUM_FRAMES);
         (self.callback)(
             &self.input_scratch[..in_channels * frames],
@@ -101,7 +113,7 @@ impl ProcessorHandle {
 impl ProcessorHandle {
     /// Create a new processor handle from a callback
     pub fn new(callback: ProcessorCallback) -> Self {
-        let capacity = RENDER_QUANTUM_FRAMES * MAX_CHANNELS as usize;
+        let capacity = RENDER_QUANTUM_FRAMES * MAX_DEVICE_CHANNELS as usize;
         Self {
             callback,
             input_scratch: vec![0.0; capacity],
@@ -314,15 +326,15 @@ mod tests {
     }
 
     /// Regression test for PR #84 review: a destination reporting more than
-    /// `MAX_CHANNELS` (a multichannel audio interface) must not make `render`
-    /// slice `output_scratch` — capacity `RENDER_QUANTUM_FRAMES * MAX_CHANNELS`
-    /// — out of bounds. At a full render quantum, `MAX_CHANNELS + 1` output
+    /// `MAX_DEVICE_CHANNELS` (a multichannel audio interface) must not make `render`
+    /// slice `output_scratch` — capacity `RENDER_QUANTUM_FRAMES * MAX_DEVICE_CHANNELS`
+    /// — out of bounds. At a full render quantum, `MAX_DEVICE_CHANNELS + 1` output
     /// channels is exactly the shape that panicked before `render` clamped
     /// `out_channels`.
     #[wasm_bindgen_test]
     fn render_clamps_out_channels_above_max_channels() {
         let frames = RENDER_QUANTUM_FRAMES;
-        let requested_out_channels = MAX_CHANNELS as usize + 1;
+        let requested_out_channels = MAX_DEVICE_CHANNELS as usize + 1;
         let seen_out_channels = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&seen_out_channels);
 
@@ -335,12 +347,12 @@ mod tests {
         let result = handle.render(1, requested_out_channels, frames);
         assert!(
             result,
-            "render must not panic when out_channels exceeds MAX_CHANNELS"
+            "render must not panic when out_channels exceeds MAX_DEVICE_CHANNELS"
         );
         assert_eq!(
             seen_out_channels.load(Ordering::Relaxed),
-            MAX_CHANNELS as usize,
-            "render must clamp out_channels to MAX_CHANNELS before invoking the callback"
+            MAX_DEVICE_CHANNELS as usize,
+            "render must clamp out_channels to MAX_DEVICE_CHANNELS before invoking the callback"
         );
     }
 
@@ -371,13 +383,13 @@ mod tests {
     }
 
     /// `in_channels` analog of `render_clamps_out_channels_above_max_channels`:
-    /// a capture device reporting more than `MAX_CHANNELS` input planes must
+    /// a capture device reporting more than `MAX_DEVICE_CHANNELS` input planes must
     /// not make `render` slice `input_scratch` — capacity
-    /// `RENDER_QUANTUM_FRAMES * MAX_CHANNELS` — out of bounds.
+    /// `RENDER_QUANTUM_FRAMES * MAX_DEVICE_CHANNELS` — out of bounds.
     #[wasm_bindgen_test]
     fn render_clamps_in_channels_above_max_channels() {
         let frames = RENDER_QUANTUM_FRAMES;
-        let requested_in_channels = MAX_CHANNELS as usize + 1;
+        let requested_in_channels = MAX_DEVICE_CHANNELS as usize + 1;
         let seen_in_channels = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&seen_in_channels);
 
@@ -390,12 +402,12 @@ mod tests {
         let result = handle.render(requested_in_channels, 1, frames);
         assert!(
             result,
-            "render must not panic when in_channels exceeds MAX_CHANNELS"
+            "render must not panic when in_channels exceeds MAX_DEVICE_CHANNELS"
         );
         assert_eq!(
             seen_in_channels.load(Ordering::Relaxed),
-            MAX_CHANNELS as usize,
-            "render must clamp in_channels to MAX_CHANNELS before invoking the callback"
+            MAX_DEVICE_CHANNELS as usize,
+            "render must clamp in_channels to MAX_DEVICE_CHANNELS before invoking the callback"
         );
     }
 

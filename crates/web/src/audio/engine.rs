@@ -4,11 +4,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::audio::devices::{
     clamp_channel_count, first_audio_track, get_media_devices, get_user_media_audio,
-    resolve_input_channels, settings_channels, stop_media_stream,
+    stop_media_stream, track_channels,
 };
 use webtrip_core::audio::params::AudioParams;
 use webtrip_core::audio::processor::AudioProcessor;
-use webtrip_core::network::protocol::MAX_CHANNELS;
+use webtrip_core::limits::MAX_DEVICE_CHANNELS;
 use crate::audio::worklet::{create_worklet_node_with_flag, register_audio_worklet};
 use webtrip_core::stream::regulator::Regulator;
 use webtrip_core::stream::ring_buffer::RingBuffer;
@@ -58,7 +58,7 @@ impl AudioConstraints {
     /// Build the `getUserMedia` audio-constraints JS object from the resolved
     /// constraints. Browser glue only — not exercised by native tests.
     ///
-    /// Always asks for `channelCount: { ideal: MAX_CHANNELS }` so the browser
+    /// Always asks for `channelCount: { ideal: MAX_DEVICE_CHANNELS }` so the browser
     /// opens the device at its native width instead of downmixing: "capture
     /// N input channels" then reliably means the device's first N.
     pub(crate) fn to_js(&self) -> Result<JsValue, JsValue> {
@@ -92,7 +92,7 @@ impl AudioConstraints {
         js_sys::Reflect::set(
             &channel_constraint,
             &"ideal".into(),
-            &JsValue::from_f64(MAX_CHANNELS as f64),
+            &JsValue::from_f64(MAX_DEVICE_CHANNELS as f64),
         )?;
         js_sys::Reflect::set(&constraints, &"channelCount".into(), &channel_constraint)?;
 
@@ -255,12 +255,20 @@ impl AudioEngine {
 
         // The constraints open the device at its native width; the worklet
         // node's Explicit/Discrete `channelCount` then keeps only its first
-        // `input_channels` (dropping the rest). When the browser granted
-        // fewer than requested (e.g. Chrome forcing mono under echo
-        // cancellation) the narrower width is used and the send path's
-        // conform fills the wire width.
-        let granted = first_audio_track(&stream)
-            .map_or(1, |track| resolve_input_channels(settings_channels(&track), None));
+        // `input_channels` (dropping the rest). The device's width is read the
+        // same way the probe reads it (capability max, then settings), not
+        // from `getSettings()` alone, which reports the narrower granted
+        // width and would silently narrow a multichannel interface to mono.
+        // A narrower width than requested is still honoured, and the send
+        // path's conform fills the wire width.
+        let granted = match first_audio_track(&stream).map(|t| track_channels(&t)) {
+            Some(Ok(channels)) => channels,
+            Some(Err(e)) => {
+                stop_media_stream(&stream);
+                return Err(e);
+            }
+            None => 1,
+        };
         let worklet_input_channels = clamp_channel_count(input_channels.min(granted));
 
         // Create source node from the stream
@@ -306,10 +314,10 @@ impl AudioEngine {
     /// the configured count.
     ///
     /// Clamped to the destination's `maxChannelCount` (a wider `channelCount`
-    /// throws) and to [`MAX_CHANNELS`]: the worklet ABI's scratch buffers
+    /// throws) and to [`MAX_DEVICE_CHANNELS`]: the worklet ABI's scratch buffers
     /// (`ProcessorHandle`) and `worklet.js`'s channel views are both fixed at
     /// that width, so a wider interface is addressed at its first
-    /// `MAX_CHANNELS` outputs.
+    /// `MAX_DEVICE_CHANNELS` outputs.
     fn configure_destination(&self, requested: u32) -> Result<u32, JsValue> {
         let destination = self.ctx.destination();
         let channels = clamp_channel_count(requested.min(destination.max_channel_count()));
@@ -506,7 +514,7 @@ impl AudioEngine {
 
     /// The number of channels the current playback output is configured
     /// for (the requested output channels clamped to the destination's
-    /// `maxChannelCount` and `MAX_CHANNELS` — see `configure_destination`).
+    /// `maxChannelCount` and `MAX_DEVICE_CHANNELS` — see `configure_destination`).
     /// `None` until capture has started AND the worklet node has actually
     /// been built; always `>= 1` once known.
     #[wasm_bindgen(js_name = outputChannels)]
@@ -1235,7 +1243,7 @@ mod tests {
 
     /// `AudioConstraints::to_js` must emit an `exact` device-id constraint when a
     /// specific device is requested, alongside the three processing toggles, and
-    /// always an `ideal: MAX_CHANNELS` channelCount constraint (so the device
+    /// always an `ideal: MAX_DEVICE_CHANNELS` channelCount constraint (so the device
     /// opens at its native width rather than downmixed).
     ///
     /// This is the optional-config branch of the constraints builder (the
@@ -1267,8 +1275,8 @@ mod tests {
             .as_f64();
         assert_eq!(
             ideal,
-            Some(MAX_CHANNELS as f64),
-            "channelCount.ideal must ask for MAX_CHANNELS"
+            Some(MAX_DEVICE_CHANNELS as f64),
+            "channelCount.ideal must ask for MAX_DEVICE_CHANNELS"
         );
 
         assert_toggle_fields(&js, true, false, true);

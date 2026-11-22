@@ -493,7 +493,7 @@ The test requires threading support. Either:
   `stop_media_stream` ends a live stream's tracks, `get_audio_devices`
   returns a populated `{ inputDevices, outputDevices }` object, and the
   pre-connect channel probes (`get_input_device_channels`,
-  `get_output_device_channels`) resolve a count in `[1, MAX_CHANNELS]` for the
+  `get_output_device_channels`) resolve a count in `[1, MAX_DEVICE_CHANNELS]` for the
   default devices and reject an unknown device id (requires the fake-device
   flags above)
 - `crates/web/src/test_support.rs`: shared browser-test scaffolding (`run_in_browser`
