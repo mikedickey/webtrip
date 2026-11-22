@@ -7,7 +7,7 @@ use web_sys::{
 };
 
 use crate::audio::engine::{route_output_sink, AudioConstraints};
-use webtrip_core::network::protocol::MAX_CHANNELS;
+use webtrip_core::limits::MAX_DEVICE_CHANNELS;
 
 /// Device information
 #[wasm_bindgen]
@@ -117,16 +117,29 @@ async fn request_audio_permission(media_devices: &MediaDevices) -> Result<(), Js
 }
 
 /// Clamp a device-reported channel count to the supported range
-/// `[1, MAX_CHANNELS]`.
+/// `[1, MAX_DEVICE_CHANNELS]`.
 pub(crate) fn clamp_channel_count(channels: u32) -> u32 {
-    channels.clamp(1, MAX_CHANNELS as u32)
+    channels.clamp(1, MAX_DEVICE_CHANNELS as u32)
 }
 
 /// Resolve an input device's channel count from what its capture track
 /// reports: the capability maximum when known, otherwise the granted
-/// settings value, otherwise 1 — clamped to `[1, MAX_CHANNELS]`.
+/// settings value, otherwise 1 — clamped to `[1, MAX_DEVICE_CHANNELS]`.
 pub(crate) fn resolve_input_channels(settings: Option<u32>, capability_max: Option<u32>) -> u32 {
     clamp_channel_count(capability_max.or(settings).unwrap_or(1))
+}
+
+/// Resolve the width a capture track actually *delivers*: the granted settings
+/// value when the browser reports one, otherwise the capability maximum,
+/// otherwise 1 — clamped to `[1, MAX_DEVICE_CHANNELS]`.
+///
+/// The reverse precedence of [`resolve_input_channels`]. The probe asks what
+/// the device *offers* (capability first); capture must open the worklet at
+/// what the track *delivers*, because Explicit/Discrete channels the track
+/// doesn't deliver arrive as silent planes that the send path's mono downmix
+/// then averages in (halving the level, e.g. Chrome's echo-cancellation mono).
+pub(crate) fn resolve_granted_channels(settings: Option<u32>, capability_max: Option<u32>) -> u32 {
+    clamp_channel_count(settings.or(capability_max).unwrap_or(1))
 }
 
 /// The first audio track of `stream`, if any.
@@ -142,7 +155,7 @@ pub(crate) fn settings_channels(track: &MediaStreamTrack) -> Option<u32> {
 
 /// The maximum channel count `track`'s device supports
 /// (`getCapabilities().channelCount.max`), if reported.
-fn capability_max_channels(track: &MediaStreamTrack) -> Result<Option<u32>, JsValue> {
+pub(crate) fn capability_max_channels(track: &MediaStreamTrack) -> Result<Option<u32>, JsValue> {
     // Some browsers (notably Safari) don't implement `getCapabilities()` on
     // `MediaStreamTrack` at all — calling the unguarded web-sys binding would
     // throw a JS TypeError, so probe for the method first, the same way
@@ -156,12 +169,23 @@ fn capability_max_channels(track: &MediaStreamTrack) -> Result<Option<u32>, JsVa
         .and_then(|range| range.get_max()))
 }
 
+/// A capture `track`'s channel count under `resolve` (one of
+/// [`resolve_input_channels`] for the probe or [`resolve_granted_channels`]
+/// for capture). The single place the two raw values are read, so the probe
+/// and capture bring-up cannot drift apart on how they query the track.
+pub(crate) fn track_channels(
+    track: &MediaStreamTrack,
+    resolve: fn(Option<u32>, Option<u32>) -> u32,
+) -> Result<u32, JsValue> {
+    capability_max_channels(track).map(|max| resolve(settings_channels(track), max))
+}
+
 /// Query how many channels an input device has, without connecting.
 ///
 /// Opens the device (the default input when `deviceId` is absent or empty)
 /// with processing off and the native-width channel request, reads the
 /// capture track's channel capability, and stops the stream. Resolves to a
-/// count in `[1, MAX_CHANNELS]`.
+/// count in `[1, MAX_DEVICE_CHANNELS]`.
 ///
 /// A module-level function rather than a session method: it probes hardware
 /// and needs nothing from a session.
@@ -172,8 +196,7 @@ pub async fn get_input_device_channels(device_id: Option<String>) -> Result<u32,
     let stream = get_user_media_audio(&media_devices, &constraints).await?;
 
     let channels = match first_audio_track(&stream) {
-        Some(track) => capability_max_channels(&track)
-            .map(|max| resolve_input_channels(settings_channels(&track), max)),
+        Some(track) => track_channels(&track, resolve_input_channels),
         None => Ok(1),
     };
 
@@ -187,7 +210,7 @@ pub async fn get_input_device_channels(device_id: Option<String>) -> Result<u32,
 /// given (a no-op without `setSinkId`, so Safari and Firefox report the
 /// default output — the device they play to anyway), reads the
 /// destination's `maxChannelCount`, and closes the context. Resolves to a
-/// count in `[1, MAX_CHANNELS]`.
+/// count in `[1, MAX_DEVICE_CHANNELS]`.
 ///
 /// Module-level for the same reason as [`get_input_device_channels`].
 #[wasm_bindgen(js_name = getOutputDeviceChannels)]
@@ -381,15 +404,39 @@ mod tests {
             (Some(2), None, 2),
             // The capability wins over a narrower granted setting.
             (Some(1), Some(2), 2),
-            // Clamped to [1, MAX_CHANNELS] on both sides.
+            // Clamped to [1, MAX_DEVICE_CHANNELS] on both sides.
             (Some(0), None, 1),
             (None, Some(0), 1),
-            (None, Some(9), 8),
-            (Some(9), None, 8),
+            (None, Some(MAX_DEVICE_CHANNELS as u32 + 1), MAX_DEVICE_CHANNELS as u32),
+            (Some(MAX_DEVICE_CHANNELS as u32 + 1), None, MAX_DEVICE_CHANNELS as u32),
+            // A wide interface is addressed past the wire ceiling.
+            (None, Some(18), 18),
         ];
         for &(settings, capability_max, expected) in cases {
             assert_eq!(
                 resolve_input_channels(settings, capability_max),
+                expected,
+                "settings={settings:?} capability_max={capability_max:?}"
+            );
+        }
+    }
+
+    /// Capture width is what the track delivers: settings win over a wider
+    /// capability (the Chrome echo-cancellation mono force), and the
+    /// capability only fills in when settings are unreported.
+    #[test]
+    fn test_resolve_granted_channels_prefers_settings() {
+        let cases: &[(Option<u32>, Option<u32>, u32)] = &[
+            (None, None, 1),
+            (Some(1), Some(2), 1),
+            (Some(2), Some(32), 2),
+            (None, Some(18), 18),
+            (Some(0), Some(4), 1),
+            (Some(MAX_DEVICE_CHANNELS as u32 + 1), None, MAX_DEVICE_CHANNELS as u32),
+        ];
+        for &(settings, capability_max, expected) in cases {
+            assert_eq!(
+                resolve_granted_channels(settings, capability_max),
                 expected,
                 "settings={settings:?} capability_max={capability_max:?}"
             );
@@ -531,7 +578,7 @@ mod tests {
     }
 
     /// `get_input_device_channels` must open the device, resolve a count in
-    /// `[1, MAX_CHANNELS]`, and surface a `getUserMedia` failure (an unknown
+    /// `[1, MAX_DEVICE_CHANNELS]`, and surface a `getUserMedia` failure (an unknown
     /// exact device id) as a rejection rather than a made-up count.
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
@@ -540,8 +587,8 @@ mod tests {
             .await
             .expect("probing the default fake input should resolve");
         assert!(
-            (1..=MAX_CHANNELS as u32).contains(&channels),
-            "input probe must resolve within [1, MAX_CHANNELS], got {channels}"
+            (1..=MAX_DEVICE_CHANNELS as u32).contains(&channels),
+            "input probe must resolve within [1, MAX_DEVICE_CHANNELS], got {channels}"
         );
 
         assert!(
@@ -553,7 +600,7 @@ mod tests {
     }
 
     /// `get_output_device_channels` must resolve the default output's count
-    /// in `[1, MAX_CHANNELS]`, and surface a failed `setSinkId` (an unknown
+    /// in `[1, MAX_DEVICE_CHANNELS]`, and surface a failed `setSinkId` (an unknown
     /// device id) as a rejection.
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
@@ -562,8 +609,8 @@ mod tests {
             .await
             .expect("probing the default output should resolve");
         assert!(
-            (1..=MAX_CHANNELS as u32).contains(&channels),
-            "output probe must resolve within [1, MAX_CHANNELS], got {channels}"
+            (1..=MAX_DEVICE_CHANNELS as u32).contains(&channels),
+            "output probe must resolve within [1, MAX_DEVICE_CHANNELS], got {channels}"
         );
 
         assert!(

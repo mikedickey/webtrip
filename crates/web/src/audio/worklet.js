@@ -1,7 +1,5 @@
-// Must match `RENDER_QUANTUM_FRAMES` in worklet.rs (fixed by the Web Audio spec)
-// and `protocol::MAX_CHANNELS` in protocol.rs (the wire's channel limit).
-const RENDER_QUANTUM_FRAMES = 128;
-const MAX_CHANNELS = 8;
+// Frame and channel capacities come from the ProcessorHandle itself
+// (`frames_per_quantum()` / `channel_capacity()`), never constants here.
 
 registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProcessor {
     constructor(options) {
@@ -10,6 +8,8 @@ registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProce
         bindgen.initSync({ module, memory });
         this.processor = bindgen.ProcessorHandle.from_raw_ptr(handle);
         this.stopped = false;
+        this.frames = this.processor.frames_per_quantum();
+        this.channelCapacity = this.processor.channel_capacity();
         this.memory = memory;
         this.hasFlagPtr = hasFlagPtr;
 
@@ -43,13 +43,13 @@ registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProce
         const outputPtr = this.processor.output_ptr();
         this.inputViews = [];
         this.outputViews = [];
-        for (let ch = 0; ch < MAX_CHANNELS; ch++) {
-            const byteOffset = ch * RENDER_QUANTUM_FRAMES * Float32Array.BYTES_PER_ELEMENT;
+        for (let ch = 0; ch < this.channelCapacity; ch++) {
+            const byteOffset = ch * this.frames * Float32Array.BYTES_PER_ELEMENT;
             this.inputViews.push(
-                new Float32Array(this.memory.buffer, inputPtr + byteOffset, RENDER_QUANTUM_FRAMES)
+                new Float32Array(this.memory.buffer, inputPtr + byteOffset, this.frames)
             );
             this.outputViews.push(
-                new Float32Array(this.memory.buffer, outputPtr + byteOffset, RENDER_QUANTUM_FRAMES)
+                new Float32Array(this.memory.buffer, outputPtr + byteOffset, this.frames)
             );
         }
     }
@@ -78,7 +78,7 @@ registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProce
         const outChannels = outputs[0]?.length || 1;
 
         // Process audio through the Wasm processor (even if no input for playback)
-        const result = this.processor.render(inChannels, outChannels, RENDER_QUANTUM_FRAMES);
+        const result = this.processor.render(inChannels, outChannels, this.frames);
 
         for (let ch = 0; ch < outChannels; ch++) {
             outputs[0][ch]?.set(this.outputViews[ch]);

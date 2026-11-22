@@ -48,7 +48,7 @@ use crate::audio::audio_callback_loop::AudioCallbackLoop;
 use crate::audio::{cancelled_error, named_error};
 use crate::audio::engine::{close_audio_context_now, resume_context, route_output_sink, AudioEngine};
 use webtrip_core::audio::params::AudioParams;
-use webtrip_core::network::protocol::MAX_CHANNELS;
+use webtrip_core::limits::{MAX_DEVICE_CHANNELS, MAX_WIRE_CHANNELS};
 use webtrip_core::stream::regulator::Regulator;
 use webtrip_core::session_stats::build_session_stats;
 use webtrip_core::stream::ring_buffer::RingBuffer;
@@ -72,9 +72,11 @@ pub const CONNECT_TIMEOUT_MS: i32 = 45_000;
 // Pure decision helpers (no browser APIs — fully testable with `cargo test`)
 // ============================================================================
 
-/// Returns `true` when `channels` is within the supported range [1, `MAX_CHANNELS`].
-pub(crate) fn is_valid_channel_count(channels: u8) -> bool {
-    channels >= 1 && channels <= MAX_CHANNELS
+/// Returns `true` when `channels` is within `[1, max]`. `max` is
+/// `MAX_WIRE_CHANNELS` for the wire settings (send/receive) and
+/// `MAX_DEVICE_CHANNELS` for the device settings (input/output).
+pub(crate) fn is_valid_channel_count(channels: u8, max: u8) -> bool {
+    channels >= 1 && channels <= max
 }
 
 // ============================================================================
@@ -421,7 +423,8 @@ impl WebTripSession {
     /// Set how many channels this client sends over the wire (default 1).
     ///
     /// Every channel-count setter is rejected outside `Idle` (and for counts
-    /// outside [1, `MAX_CHANNELS`]): the transports and the render thread
+    /// outside their ceiling: [1, `MAX_WIRE_CHANNELS`] for send/receive,
+    /// [1, `MAX_DEVICE_CHANNELS`] for input/output): the transports and the render thread
     /// snapshot these at connect time, so a mid-connection change would
     /// desync producer and consumer on the channel-agnostic `RingBuffer`.
     ///
@@ -431,7 +434,7 @@ impl WebTripSession {
     /// 1 sent.
     #[wasm_bindgen(js_name = setSendChannels)]
     pub fn set_send_channels(&self, channels: u8) {
-        if !self.can_set_channel_count("send", channels) {
+        if !self.can_set_channel_count("send", channels, MAX_WIRE_CHANNELS) {
             return;
         }
         self.send_channels.set(channels);
@@ -456,7 +459,7 @@ impl WebTripSession {
     /// `map_to_output` maps it onto the output device.
     #[wasm_bindgen(js_name = setReceiveChannels)]
     pub fn set_receive_channels(&self, channels: u8) {
-        if self.can_set_channel_count("receive", channels) {
+        if self.can_set_channel_count("receive", channels, MAX_WIRE_CHANNELS) {
             self.receive_channels.set(channels);
         }
     }
@@ -472,7 +475,7 @@ impl WebTripSession {
     /// Idle-only (see [`set_send_channels`](Self::set_send_channels)).
     #[wasm_bindgen(js_name = setInputChannels)]
     pub fn set_input_channels(&self, channels: u8) {
-        if self.can_set_channel_count("input", channels) {
+        if self.can_set_channel_count("input", channels, MAX_DEVICE_CHANNELS) {
             self.input_channels.set(channels);
         }
     }
@@ -489,7 +492,7 @@ impl WebTripSession {
     /// [`set_send_channels`](Self::set_send_channels)).
     #[wasm_bindgen(js_name = setOutputChannels)]
     pub fn set_output_channels(&self, channels: u8) {
-        if self.can_set_channel_count("output", channels) {
+        if self.can_set_channel_count("output", channels, MAX_DEVICE_CHANNELS) {
             self.output_channels.set(channels);
         }
     }
@@ -1153,16 +1156,17 @@ impl WebTripSession {
     }
 
     /// Shared guard for the channel-count setters: a count may change only
-    /// while `Idle` and only within [1, `MAX_CHANNELS`]. Logs the reason
+    /// while `Idle` and only within [1, `max`] (the wire ceiling for send/
+    /// receive, the device ceiling for input/output). Logs the reason
     /// (`which` names the setting) when it may not.
-    fn can_set_channel_count(&self, which: &str, channels: u8) -> bool {
+    fn can_set_channel_count(&self, which: &str, channels: u8, max: u8) -> bool {
         if self.state() != SessionState::Idle {
             web_sys::console::warn_1(
                 &format!("⚠️ Cannot change {which} channels while connected").into(),
             );
             return false;
         }
-        if !is_valid_channel_count(channels) {
+        if !is_valid_channel_count(channels, max) {
             web_sys::console::warn_1(
                 &format!("⚠️ Invalid {which} channel count: {channels}").into(),
             );
@@ -1222,10 +1226,17 @@ mod tests {
 
     #[test]
     fn channel_count_validation_boundaries() {
-        assert!(!is_valid_channel_count(0));
-        assert!(is_valid_channel_count(1));
-        assert!(is_valid_channel_count(8));
-        assert!(!is_valid_channel_count(9));
+        // Wire and device settings share the guard but not the ceiling: a
+        // count valid for a device (an 18-channel interface) is not valid on
+        // the wire.
+        for max in [MAX_WIRE_CHANNELS, MAX_DEVICE_CHANNELS] {
+            assert!(!is_valid_channel_count(0, max));
+            assert!(is_valid_channel_count(1, max));
+            assert!(is_valid_channel_count(max, max));
+            assert!(!is_valid_channel_count(max + 1, max));
+        }
+        assert!(is_valid_channel_count(18, MAX_DEVICE_CHANNELS));
+        assert!(!is_valid_channel_count(18, MAX_WIRE_CHANNELS));
     }
 
     // -----------------------------------------------------------------------

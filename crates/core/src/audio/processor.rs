@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::audio::params::{AudioParams, MAX_DB, MIN_DB, decode_db, decode_volume, encode_db};
-use crate::network::protocol::MAX_CHANNELS;
+use crate::limits::{MAX_DEVICE_CHANNELS, MAX_WIRE_CHANNELS};
 use crate::stream::regulator::Regulator;
 use crate::stream::ring_buffer::RingBuffer;
 use crate::stream::shared_ptr::SharedPtr;
@@ -257,22 +257,22 @@ pub struct AudioProcessor {
     network_to_local_buffer: SharedPtr<Regulator>,
     /// Temporary buffer for gained audio. Planar multi-channel, same layout
     /// as `process()`'s `input`: `in_channels * frames` samples, `gained[ch *
-    /// frames + frame]`. Preallocated at `128 * MAX_CHANNELS` so a widening
+    /// frames + frame]`. Preallocated at `DEVICE_SCRATCH_LEN` so a widening
     /// resize never allocates on the render thread.
     gained_buffer: Vec<f32>,
     /// The captured audio converted from the worklet's planar layout to
     /// interleaved (`[frame * channels + ch]`), shared by the network-send path
     /// and the local monitor mix so the planar→interleaved conversion happens
-    /// once per callback, not twice. Preallocated at `128 * MAX_CHANNELS` so a
+    /// once per callback, not twice. Preallocated at `DEVICE_SCRATCH_LEN` so a
     /// widening resize never allocates on the render thread.
     captured_interleaved: Vec<f32>,
     /// Buffer for the regulator's interleaved output, before mapping to the
-    /// output device's channel count. Preallocated at `128 * MAX_CHANNELS` so
+    /// output device's channel count. Preallocated at `WIRE_SCRATCH_LEN` so
     /// a widening `receive_from_network` resize never allocates on the render
     /// thread.
     remote_interleaved: Vec<f32>,
     /// The peer stream mapped onto the output device's channels (planar:
-    /// `[ch * frames + frame]`). Preallocated at `128 * MAX_CHANNELS`.
+    /// `[ch * frames + frame]`). Preallocated at `DEVICE_SCRATCH_LEN`.
     remote_mapped: Vec<f32>,
     /// The local monitor mapped onto the output device's channels, same
     /// planar layout as `remote_mapped`.
@@ -281,23 +281,21 @@ pub struct AudioProcessor {
     /// captured width → the session's fixed wire channel count). Kept
     /// separate from `captured_interleaved` because the monitor mix still
     /// needs the TRUE captured width, not the wire-conformed one.
-    /// Preallocated at `128 * MAX_CHANNELS`.
+    /// Preallocated at `WIRE_SCRATCH_LEN`.
     wire_conformed: Vec<f32>,
 }
 
+/// Frames per worklet render quantum the scratch buffers are sized for.
+const SCRATCH_FRAMES: usize = 128;
+/// Device-width scratch (indexed by device channel counts): sized from the
+/// device ceiling so a wide interface never `resize`s on the render thread.
+const DEVICE_SCRATCH_LEN: usize = SCRATCH_FRAMES * MAX_DEVICE_CHANNELS as usize;
+/// Wire-width scratch (indexed by wire channel counts).
+const WIRE_SCRATCH_LEN: usize = SCRATCH_FRAMES * MAX_WIRE_CHANNELS as usize;
+
 impl AudioProcessor {
     pub fn new(params: &'static AudioParams) -> Self {
-        Self {
-            params,
-            local_to_network_buffer: SharedPtr::null(),
-            network_to_local_buffer: SharedPtr::null(),
-            gained_buffer: vec![0.0; 128 * MAX_CHANNELS as usize],
-            captured_interleaved: vec![0.0; 128 * MAX_CHANNELS as usize],
-            remote_interleaved: vec![0.0; 128 * MAX_CHANNELS as usize],
-            remote_mapped: vec![0.0; 128 * MAX_CHANNELS as usize],
-            monitor_mapped: vec![0.0; 128 * MAX_CHANNELS as usize],
-            wire_conformed: vec![0.0; 128 * MAX_CHANNELS as usize],
-        }
+        Self::with_network(params, SharedPtr::null(), SharedPtr::null())
     }
 
     /// Create processor with network audio support
@@ -312,12 +310,12 @@ impl AudioProcessor {
             params,
             local_to_network_buffer,
             network_to_local_buffer,
-            gained_buffer: vec![0.0; 128 * MAX_CHANNELS as usize],
-            captured_interleaved: vec![0.0; 128 * MAX_CHANNELS as usize],
-            remote_interleaved: vec![0.0; 128 * MAX_CHANNELS as usize],
-            remote_mapped: vec![0.0; 128 * MAX_CHANNELS as usize],
-            monitor_mapped: vec![0.0; 128 * MAX_CHANNELS as usize],
-            wire_conformed: vec![0.0; 128 * MAX_CHANNELS as usize],
+            gained_buffer: vec![0.0; DEVICE_SCRATCH_LEN],
+            captured_interleaved: vec![0.0; DEVICE_SCRATCH_LEN],
+            remote_interleaved: vec![0.0; WIRE_SCRATCH_LEN],
+            remote_mapped: vec![0.0; DEVICE_SCRATCH_LEN],
+            monitor_mapped: vec![0.0; DEVICE_SCRATCH_LEN],
+            wire_conformed: vec![0.0; WIRE_SCRATCH_LEN],
         }
     }
 
@@ -502,7 +500,7 @@ impl AudioProcessor {
         // the Acquire inside it makes the subsequent `channels()` read coherent.
         let fpp = regulator.fpp();
         debug_assert_eq!(fpp, frames, "regulator fpp must match the worklet's frame count");
-        let interleaved_cap = fpp * MAX_CHANNELS as usize;
+        let interleaved_cap = fpp * MAX_WIRE_CHANNELS as usize;
 
         if self.remote_interleaved.len() < interleaved_cap {
             self.remote_interleaved.resize(interleaved_cap, 0.0);
@@ -1105,6 +1103,39 @@ mod tests {
                 "wire sample {i}: mono capture must be duplicated into both wire channels, got {sample}"
             );
         }
+    }
+
+    /// A full-width device (capture and playback at `MAX_DEVICE_CHANNELS`,
+    /// well past the wire ceiling) must not make any scratch buffer grow: a
+    /// `resize` on the render thread allocates. Pins the device-width buffers
+    /// to the device ceiling, not the wire ceiling.
+    #[test]
+    fn test_process_full_width_device_never_resizes_scratch() {
+        const FRAMES: usize = 128;
+        const WIDE: usize = MAX_DEVICE_CHANNELS as usize;
+
+        let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
+        params.set_send_channels(2);
+        let mut ring = RingBuffer::new();
+        let mut processor = networked_processor(params, &mut ring);
+        let lens = |p: &AudioProcessor| {
+            [
+                p.gained_buffer.len(),
+                p.captured_interleaved.len(),
+                p.remote_interleaved.len(),
+                p.remote_mapped.len(),
+                p.monitor_mapped.len(),
+                p.wire_conformed.len(),
+            ]
+        };
+        let before = lens(&processor);
+
+        let levels: Vec<f32> = (0..WIDE).map(|c| 0.01 * (c + 1) as f32).collect();
+        let input = planar_capture(&levels, FRAMES);
+        let mut output = vec![0.0f32; FRAMES * WIDE];
+        assert!(processor.process(&input, WIDE, &mut output, WIDE, 0.0));
+
+        assert_eq!(lens(&processor), before, "no scratch buffer may resize on the render thread");
     }
 
     #[test]

@@ -74,10 +74,10 @@ const HIST_FPP: usize = 128;
 /// the module header.
 const NUM_SLOTS: usize = 4096;
 /// Maximum channels a single stream may claim. A local mirror of
-/// `protocol::MAX_CHANNELS`, not an import of it: this module deliberately has
+/// `limits::MAX_WIRE_CHANNELS`, not an import of it: this module deliberately has
 /// no `crate::` imports (see the module header) so a native host can reuse it
 /// against a different wire format with its own limit.
-const MAX_CHANNELS: usize = 8;
+pub(crate) const MAX_CHANNELS: usize = 8;
 /// Maximum auto tolerance in milliseconds
 const AUTO_MAX_MS: f64 = 250.0;
 /// Duration before auto mode kicks in
