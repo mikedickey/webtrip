@@ -35,6 +35,7 @@ coverage:
 # calls, like `MockTransport::transport_type`) would count as uncovered and drag
 # the percentage down. They carry no production logic worth measuring.
 ignore:
-  - "src/test_support.rs"     # shared wasm-bindgen-test helpers + MockTransport
-  - "src/api/test_helpers.rs" # mockito HTTP-fixture builders
+  - "crates/webtrip-web/src/test_support.rs"     # shared wasm-bindgen-test helpers + MockTransport
+  - "crates/webtrip-api/src/api/test_helpers.rs" # mockito HTTP-fixture builders
   - "tests"                   # standalone integration/harness test binaries
+  - "crates/webtrip-web/tests"

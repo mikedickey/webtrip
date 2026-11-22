@@ -1,0 +1,134 @@
+[package]
+name = "webtrip"
+description = "Rust rewrite of JackTrip for audio in web browsers"
+authors.workspace = true
+edition.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# Enables the `__coverage_dump` export used by the integration harness to pull
+# LLVM profile data out of the live (browser) WASM build. Pair with the
+# instrument-coverage rustflags (see `build:wasm:coverage` in package.json);
+# never enable for a shipped build.
+coverage = ["dep:minicov"]
+
+[dependencies]
+console_error_panic_hook = "0.1.7"
+# Supplies the LLVM profiler runtime (we build with `-Zno-profiler-runtime`) and
+# a `capture_coverage` sink. Only compiled under the `coverage` feature.
+minicov = { version = "0.3.8", optional = true }
+log = "0.4"
+js-sys = "0.3.83"
+wasm-bindgen = "0.2.106"
+wasm-bindgen-futures = "0.4.56"
+
+webtrip-core = { path = "../webtrip-core", features = ["wasm"] }
+webtrip-api = { path = "../webtrip-api", features = ["wasm"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde-wasm-bindgen = "0.6"
+
+web-sys = { version = "0.3.83", features = [
+  # AudioContext and worklet
+  "AudioContext",
+  "AudioContextOptions",
+  "AudioDestinationNode",
+  "AudioNode",
+  "AudioWorklet",
+  "AudioWorkletNode",
+  "AudioWorkletNodeOptions",
+  "ChannelCountMode",
+  "ChannelInterpretation",
+  "MessagePort",
+  
+  # MediaDevices API
+  "MediaDeviceInfo",
+  "MediaDeviceKind",
+  "MediaDevices",
+  "MediaStream",
+  "MediaStreamAudioSourceNode",
+  "MediaStreamConstraints",
+  "MediaStreamTrack",
+  "MediaTrackSettings",
+  "MediaTrackCapabilities",
+  "ULongRange",
+  
+  # For dependent_module (worklet.js loading)
+  "Blob",
+  "BlobPropertyBag",
+  "Url",
+  
+  # Browser APIs
+  "Navigator",
+  "Window",
+  "console",
+  "CloseEvent",
+  "CloseEventInit",
+  "Event",
+  "EventTarget",
+  "ErrorEvent",
+  "ErrorEventInit",
+  
+  # WebRTC for JackTrip protocol
+  "RtcConfiguration",
+  "RtcDataChannel",
+  "RtcDataChannelEvent",
+  "RtcDataChannelEventInit",
+  "RtcDataChannelInit",
+  "RtcDataChannelState",
+  "RtcDataChannelType",
+  "RtcIceCandidate",
+  "RtcIceCandidateInit",
+  "RtcIceConnectionState",
+  "RtcIceGatheringState",
+  "RtcPeerConnection",
+  "RtcPeerConnectionIceEvent",
+  "RtcSdpType",
+  "RtcSessionDescription",
+  "RtcSessionDescriptionInit",
+  "RtcSignalingState",
+  "RtcIceServer",
+  
+  # For binary data handling
+  "Crypto",
+  "MessageEvent",
+  "MessageEventInit",
+  
+  # WebSocket for signaling
+  "WebSocket",
+  "BinaryType",
+  
+  # RTC events
+  "RtcTrackEvent",
+  
+  # Worker API for WebTransport dedicated thread
+  "Worker",
+  "WorkerOptions",
+  "WorkerType",
+  "DedicatedWorkerGlobalScope",
+  
+  # WebTransport API (Chrome 97+, Edge 97+)
+  "WebTransport",
+  "WebTransportBidirectionalStream",
+  "WebTransportCloseInfo",
+  "WebTransportCongestionControl",
+  "WebTransportDatagramDuplexStream",
+  "WebTransportError",
+  "WebTransportErrorOptions",
+  "WebTransportErrorSource",
+  "WebTransportHash",
+  "WebTransportOptions",
+  "WebTransportReceiveStream",
+  "WebTransportSendStream",
+  "ReadableStream",
+  "ReadableStreamDefaultReader",
+  "WritableStream",
+  "WritableStreamDefaultWriter",
+] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

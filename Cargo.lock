@@ -1298,6 +1298,21 @@ dependencies = [
  "js-sys",
  "log",
  "minicov",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-sys",
+ "webtrip-api",
+ "webtrip-core",
+]
+
+[[package]]
+name = "webtrip-api"
+version = "0.1.0"
+dependencies = [
  "mockito",
  "reqwest",
  "serde",
@@ -1309,8 +1324,15 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-bindgen-test",
- "web-sys",
+]
+
+[[package]]
+name = "webtrip-core"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]

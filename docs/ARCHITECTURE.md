@@ -38,7 +38,7 @@ WebTrip uses a multi-threaded architecture with WebAssembly for high-performance
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                 WASM Layer (Rust - Main Thread)                  │
-│              src/lib.rs, src/session.rs                          │
+│              webtrip-web: lib.rs, session.rs                    │
 │                                                                   │
 │  JackTripSession (High-level orchestrator)                       │
 │    • Manages WebRTC connections and data channels               │
@@ -61,8 +61,8 @@ WebTrip uses a multi-threaded architecture with WebAssembly for high-performance
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │            Audio Worklet Thread (JavaScript + WASM)              │
-│                  src/audio/worklet.js (bridge)                   │
-│                  src/audio/processor.rs (core)                   │
+│                  webtrip-web: audio/worklet.js (bridge)         │
+│                  webtrip-core: audio/processor.rs (core)        │
 │                                                                   │
 │  WasmAudioProcessor (JS bridge)                                  │
 │    • AudioWorkletProcessor implementation                        │
@@ -82,9 +82,9 @@ WebTrip uses a multi-threaded architecture with WebAssembly for high-performance
 ### Component Summary
 
 - **Frontend Layer** (`website/src/pages/demo/`): React demo UI that manages user interactions, device selection, and WebRTC signaling
-- **Session Layer** (`src/session.rs`): Orchestrates network and audio, owns shared buffers, bridges WebRTC and AudioWorklet
-- **Audio Engine** (`src/audio/engine.rs`): Manages Web Audio API, creates AudioContext and worklet nodes
-- **Audio Processor** (`src/audio/processor.rs`): Real-time DSP processing in dedicated audio thread
+- **Session Layer** (`crates/webtrip-web/src/session.rs`): Orchestrates network and audio, owns shared buffers, bridges WebRTC and AudioWorklet
+- **Audio Engine** (`crates/webtrip-web/src/audio/engine.rs`): Manages Web Audio API, creates AudioContext and worklet nodes
+- **Audio Processor** (`crates/webtrip-core/src/audio/processor.rs`): Real-time DSP processing in dedicated audio thread
 
 ### Key Data Structures
 
@@ -610,7 +610,7 @@ The WebTransport transport offloads network I/O to a dedicated Web Worker:
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ Worker Thread (minimal JS bootstrap)                        │
-│  src/audio/webtransport_worker.js (~40 lines, bundled)      │
+│  webtrip-web: network/webtransport_worker.js (~40 lines, bundled)│
 │    1. Loads WASM module via dependent_module! macro         │
 │    2. Initializes with shared memory from main thread       │
 │    3. Forwards all messages to Rust handler                 │
@@ -646,11 +646,11 @@ Web Workers must be created from a JavaScript file—browsers don't support load
 - Initializes it with SharedArrayBuffer memory from the main thread
 - Forwards all messages to Rust's `handleWorkerMessage()` function
 
-This follows the **same pattern as AudioWorklet** (`src/audio/worklet.js`):
+This follows the **same pattern as AudioWorklet** (`crates/webtrip-web/src/audio/worklet.js`):
 - Both use the `dependent_module!` macro to bundle JS into the WASM package as Blob URLs
 - Minimal JavaScript (~40-50 lines) acts as browser-mandated entry point
 - All actual logic executes in Rust for type safety and performance
-- Both files live in `src/audio/` for consistency
+- The worklet bridge lives in `crates/webtrip-web/src/audio/` and the worker bridge in `crates/webtrip-web/src/network/`
 
 **JavaScript (~40 lines):** Module loading, memory initialization, message forwarding  
 **Rust (400+ lines):** Protocol logic, packet processing, buffer management, state tracking, statistics

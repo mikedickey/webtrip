@@ -40,7 +40,7 @@ jobs:
       - name: Compute container fingerprint
         id: fingerprint
         run: |
-          tag=sha-$(cat containers/builder/Containerfile Cargo.toml Cargo.lock package.json \
+          tag=sha-$(cat containers/builder/Containerfile Cargo.toml crates/*/Cargo.toml Cargo.lock package.json \
                     website/package.json website/package-lock.json \
                     | sha256sum | cut -c1-16)
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
@@ -92,6 +92,8 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - run: npm ci
+      # Platform rule: webtrip-core/webtrip-api must build natively without web-sys/js-sys.
+      - run: npm run check:core
       - run: npm run build
       # The production-image job COPYs these; upload now, before the coverage
       # runs below rebuild pkg/ with instrumentation.
