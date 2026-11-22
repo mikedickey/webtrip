@@ -129,6 +129,19 @@ pub(crate) fn resolve_input_channels(settings: Option<u32>, capability_max: Opti
     clamp_channel_count(capability_max.or(settings).unwrap_or(1))
 }
 
+/// Resolve the width a capture track actually *delivers*: the granted settings
+/// value when the browser reports one, otherwise the capability maximum,
+/// otherwise 1 — clamped to `[1, MAX_DEVICE_CHANNELS]`.
+///
+/// The reverse precedence of [`resolve_input_channels`]. The probe asks what
+/// the device *offers* (capability first); capture must open the worklet at
+/// what the track *delivers*, because Explicit/Discrete channels the track
+/// doesn't deliver arrive as silent planes that the send path's mono downmix
+/// then averages in (halving the level, e.g. Chrome's echo-cancellation mono).
+pub(crate) fn resolve_granted_channels(settings: Option<u32>, capability_max: Option<u32>) -> u32 {
+    clamp_channel_count(settings.or(capability_max).unwrap_or(1))
+}
+
 /// The first audio track of `stream`, if any.
 pub(crate) fn first_audio_track(stream: &MediaStream) -> Option<MediaStreamTrack> {
     stream.get_audio_tracks().get(0).dyn_into::<MediaStreamTrack>().ok()
@@ -156,11 +169,15 @@ pub(crate) fn capability_max_channels(track: &MediaStreamTrack) -> Result<Option
         .and_then(|range| range.get_max()))
 }
 
-/// The channel count of a capture `track`: the one place that combines its
-/// capability maximum and granted settings, shared by the probe
-/// ([`get_input_device_channels`]) and capture bring-up so they cannot drift.
-pub(crate) fn track_channels(track: &MediaStreamTrack) -> Result<u32, JsValue> {
-    capability_max_channels(track).map(|max| resolve_input_channels(settings_channels(track), max))
+/// A capture `track`'s channel count under `resolve` (one of
+/// [`resolve_input_channels`] for the probe or [`resolve_granted_channels`]
+/// for capture). The single place the two raw values are read, so the probe
+/// and capture bring-up cannot drift apart on how they query the track.
+pub(crate) fn track_channels(
+    track: &MediaStreamTrack,
+    resolve: fn(Option<u32>, Option<u32>) -> u32,
+) -> Result<u32, JsValue> {
+    capability_max_channels(track).map(|max| resolve(settings_channels(track), max))
 }
 
 /// Query how many channels an input device has, without connecting.
@@ -179,7 +196,7 @@ pub async fn get_input_device_channels(device_id: Option<String>) -> Result<u32,
     let stream = get_user_media_audio(&media_devices, &constraints).await?;
 
     let channels = match first_audio_track(&stream) {
-        Some(track) => track_channels(&track),
+        Some(track) => track_channels(&track, resolve_input_channels),
         None => Ok(1),
     };
 
@@ -398,6 +415,28 @@ mod tests {
         for &(settings, capability_max, expected) in cases {
             assert_eq!(
                 resolve_input_channels(settings, capability_max),
+                expected,
+                "settings={settings:?} capability_max={capability_max:?}"
+            );
+        }
+    }
+
+    /// Capture width is what the track delivers: settings win over a wider
+    /// capability (the Chrome echo-cancellation mono force), and the
+    /// capability only fills in when settings are unreported.
+    #[test]
+    fn test_resolve_granted_channels_prefers_settings() {
+        let cases: &[(Option<u32>, Option<u32>, u32)] = &[
+            (None, None, 1),
+            (Some(1), Some(2), 1),
+            (Some(2), Some(32), 2),
+            (None, Some(18), 18),
+            (Some(0), Some(4), 1),
+            (Some(MAX_DEVICE_CHANNELS as u32 + 1), None, MAX_DEVICE_CHANNELS as u32),
+        ];
+        for &(settings, capability_max, expected) in cases {
+            assert_eq!(
+                resolve_granted_channels(settings, capability_max),
                 expected,
                 "settings={settings:?} capability_max={capability_max:?}"
             );

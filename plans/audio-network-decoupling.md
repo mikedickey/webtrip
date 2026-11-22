@@ -450,10 +450,20 @@ bug fixed. Independent of every later phase.*
   centralising it — a stale `worklet.js` is a `TypeError` inside the render
   callback that kills the AudioWorkletProcessor and stops all audio.
 - Capture fix: make `capability_max_channels` (`devices.rs:145`) `pub(crate)`
-  and extract the shared "resolve a track's width" step so `engine.rs:259-260`
-  (which passes `None` for the capability today) and
-  `get_input_device_channels` (`devices.rs:174-178`) cannot drift. Reuse
-  `resolve_input_channels` (`devices.rs:128`).
+  and extract one `track_channels(track, resolve)` that reads a track's two raw
+  values, so `engine.rs` capture and `get_input_device_channels` cannot drift
+  in *how they query*. They deliberately differ in *precedence*: the probe asks
+  what the device offers (`resolve_input_channels`, capability first); capture
+  opens the worklet at what the track delivers (`resolve_granted_channels`,
+  granted settings first, capability only when settings are unreported). The
+  node is Explicit/Discrete, so channels the track doesn't deliver arrive as
+  silent planes, and every later stage that narrows (`downmix_to_mono`, the
+  mixer's conform to wire width) averages them in — halving the send/monitor
+  level for Chrome's echo-cancellation mono force. No later phase corrects
+  this; the capture width must be right at its source.
+- `setInputChannels`/`setOutputChannels` validate against `MAX_DEVICE_CHANNELS`
+  (send/receive stay on `MAX_WIRE_CHANNELS`); otherwise a wide interface
+  cannot be selected. `is_valid_channel_count` takes the ceiling.
 
 ### Phase 2 — `dsp.rs` extraction + `MixEngine`/`SimpleMixer`
 *Pure refactor. Groundwork for everything else. `dsp.rs` and `mixer.rs` are

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::audio::devices::{
     clamp_channel_count, first_audio_track, get_media_devices, get_user_media_audio,
-    stop_media_stream, track_channels,
+    resolve_granted_channels, stop_media_stream, track_channels,
 };
 use webtrip_core::audio::params::AudioParams;
 use webtrip_core::audio::processor::AudioProcessor;
@@ -255,13 +255,13 @@ impl AudioEngine {
 
         // The constraints open the device at its native width; the worklet
         // node's Explicit/Discrete `channelCount` then keeps only its first
-        // `input_channels` (dropping the rest). The device's width is read the
-        // same way the probe reads it (capability max, then settings), not
-        // from `getSettings()` alone, which reports the narrower granted
-        // width and would silently narrow a multichannel interface to mono.
-        // A narrower width than requested is still honoured, and the send
-        // path's conform fills the wire width.
-        let granted = match first_audio_track(&stream).map(|t| track_channels(&t)) {
+        // `input_channels` (dropping the rest). The width is what the track
+        // *delivers* (granted settings, falling back to the capability max
+        // only when settings are unreported): opening the node wider than the
+        // track delivers yields silent planes that the mono downmix averages
+        // in, halving the send level. A narrower width than requested is
+        // honoured, and the send path's conform fills the wire width.
+        let granted = match first_audio_track(&stream).map(|t| track_channels(&t, resolve_granted_channels)) {
             Some(Ok(channels)) => channels,
             Some(Err(e)) => {
                 stop_media_stream(&stream);

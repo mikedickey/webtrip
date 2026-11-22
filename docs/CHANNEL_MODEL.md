@@ -174,11 +174,13 @@ output counts (`engine.rs`):
    (`AudioConstraints::to_js`). Asking for the maximum makes the browser open
    the device at its native width instead of downmixing, so "input channels =
    N" reliably means the device's first N.
-2. Read the device's width with `track_channels` — the same capability-max,
-   then settings, resolution `getInputDeviceChannels` uses — so the probe and
-   capture cannot disagree. (`getSettings().channelCount` alone reports the
-   narrower granted width and would narrow a multichannel interface to mono.)
-   A browser that reports neither is treated as 1 channel.
+2. Read the width the track **delivers** with `track_channels(…,
+   resolve_granted_channels)`: the granted `getSettings().channelCount`,
+   falling back to `getCapabilities().channelCount.max` only when settings
+   are unreported (so Safari-style gaps no longer force mono). This is the
+   reverse precedence of the probe (`resolve_input_channels`, capability
+   first), because a node opened wider than the track delivers receives
+   silent planes that the mono downmix averages in. Neither reported means 1.
 3. Build the `AudioWorkletNode` with an input width of
    `min(input_channels, granted)`. The node's `channelCount` is
    `Explicit`/`Discrete`, so per the Web Audio spec the extra source channels
@@ -419,10 +421,9 @@ stay live.
   the raw byte 15 misreads it. WebTrip itself sends symmetric packets whenever
   the send and receive counts are equal (e.g. the demo's Stereo mode).
 - **Chrome forces mono capture when echo cancellation is on.** This is a
-  browser policy, not a WebTrip bug. The track delivers one plane, so the
-  second channel of a 2-channel capture is silent (capture width is the
-  device's capability, not the granted setting). If stereo capture looks
-  unavailable during testing, check the AGC/Echo/Noise toggles first.
+  browser policy, not a WebTrip bug. The capture width drops to 1 and the
+  conform fills the send width. If stereo capture looks unavailable during
+  testing, check the AGC/Echo/Noise toggles first.
 - **A browser reporting 0 channels is floored to 1** (`clamp_channel_count`),
   not surfaced as an error. Current browsers fail `getUserMedia` outright for
   an input with no channels rather than resolve with a degenerate track.
