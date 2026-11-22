@@ -1294,19 +1294,9 @@ dependencies = [
 name = "webtrip"
 version = "0.1.0"
 dependencies = [
- "console_error_panic_hook",
- "js-sys",
- "log",
- "minicov",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-test",
- "web-sys",
  "webtrip-api",
  "webtrip-core",
+ "webtrip-web",
 ]
 
 [[package]]
@@ -1333,6 +1323,25 @@ dependencies = [
  "log",
  "serde_json",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webtrip-web"
+version = "0.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "js-sys",
+ "log",
+ "minicov",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-sys",
+ "webtrip-api",
+ "webtrip-core",
 ]
 
 [[package]]

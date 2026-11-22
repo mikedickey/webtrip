@@ -58,13 +58,13 @@ silently ship a build/test flag mismatch.
 
 ### Fake media-device flags (required for device/capture tests)
 
-`crates/webtrip-web/webdriver.json` launches headless Chrome with two extra flags beyond the usual
+`crates/web/webdriver.json` launches headless Chrome with two extra flags beyond the usual
 `--headless`/`--no-sandbox`/`--disable-dev-shm-usage`:
 
 - `--use-fake-device-for-media-stream` — gives Chrome a **synthetic** audio
   input (a generated tone) so `enumerateDevices()` reports a real input device.
   Without it, headless Chrome enumerates an **empty** device list and the
-  `crates/webtrip-web/src/audio/devices.rs` enumeration tests would have nothing to assert on.
+  `crates/web/src/audio/devices.rs` enumeration tests would have nothing to assert on.
 - `--use-fake-ui-for-media-stream` — **auto-grants** the microphone permission
   with no user gesture, so `getUserMedia()` resolves to a `MediaStream` instead
   of rejecting (headless Chrome has no permission UI and otherwise denies the
@@ -91,7 +91,7 @@ tests assert on the input list and only validate outputs when present.
 1. **Unit / module tests**: Place `#[wasm_bindgen_test]` tests **inline** in the
    module's `#[cfg(test)] mod tests` block, alongside the native `#[test]`
    tests, gated on `#[cfg(target_arch = "wasm32")]` (e.g.
-   `crates/webtrip-core/src/stream/ring_buffer.rs`, `crates/webtrip-web/src/network/webrtc.rs`). This keeps browser tests
+   `crates/core/src/stream/ring_buffer.rs`, `crates/web/src/network/webrtc.rs`). This keeps browser tests
    next to the code they cover and lets them reuse `pub(crate)` helpers and
    private fields without widening visibility.
 2. **Integration tests**: Place in `tests/*.rs` for standalone test files (e.g.
@@ -103,7 +103,7 @@ tests assert on the input list and only validate outputs when present.
 test binary**. To avoid duplicating it across modules (DRY, per AGENTS.md):
 
 - **Library unit-test binary** (everything under `src/`): the single invocation
-  lives in [`crates/webtrip-web/src/test_support.rs`](../crates/webtrip-web/src/test_support.rs). Individual modules
+  lives in [`crates/web/src/test_support.rs`](../crates/web/src/test_support.rs). Individual modules
   (`ring_buffer`, `webrtc`, future `engine`, …) only `use
   wasm_bindgen_test::wasm_bindgen_test;` and add `#[wasm_bindgen_test]`
   functions — they must **not** repeat the configure call. `test_support` also
@@ -166,7 +166,7 @@ the toolchain container (`containers/builder/Containerfile`). The browser setup
 
 The unit tests above stop at the real-network boundary: the session's connect
 lifecycle is driven over a test-only, server-free transport
-(`connect_with_test_transport` in `crates/webtrip-web/src/session.rs`, backed by
+(`connect_with_test_transport` in `crates/web/src/session.rs`, backed by
 `test_support::MockTransport`), which connects instantly and does no I/O. The
 **integration tests** drive the real WASM client against an actual
 `jacktrip/jacktrip:edge` hub server in Docker, for **both** the WebRTC and
@@ -183,7 +183,7 @@ npm run test:integration:run   # inner-loop: skip the build, reuse existing pkg/
 
 Unlike the unit tests, these do **not** use `wasm-bindgen-test`. The WebTransport
 worker loads the wasm module from `{origin}/pkg/webtrip.js`
-(`crates/webtrip-web/src/network/webtransport.rs::wasm_module_url`), which only resolves when the page
+(`crates/web/src/network/webtransport.rs::wasm_module_url`), which only resolves when the page
 is served at the site root with `pkg/` present — something the
 `wasm-bindgen-test` harness origin does not do. So `tests/integration/run.mjs`:
 
@@ -316,7 +316,7 @@ talks to a real JackTrip server. `coverage:integration` captures *that* run:
    web`) with the same instrument-coverage flags as `coverage:wasm` layered on,
    plus `--features coverage`. `--dev` keeps `wasm-opt` off so the
    `__llvm_covmap`/`__llvm_covfun` sections survive. The `coverage` feature pulls
-   in `minicov` and enables a `__coverageDump` export (`crates/webtrip-web/src/lib.rs`).
+   in `minicov` and enables a `__coverageDump` export (`crates/web/src/lib.rs`).
 2. The harness (`tests/integration/run.mjs`, with `INTEGRATION_COVERAGE` set)
    drives both transports against the live server, then calls `__coverageDump`
    and writes `coverage/integration.profraw`.
@@ -463,31 +463,31 @@ The test requires threading support. Either:
 ## Current Test Coverage
 
 - `tests/wasm_harness.rs`: Basic harness validation tests
-- `crates/webtrip-core/src/stream/ring_buffer.rs`: WASM test for RingBuffer basic operations
-- `crates/webtrip-web/src/network/webrtc.rs`: WebRTC glue against `web_sys` — `RtcPeerConnection`
+- `crates/core/src/stream/ring_buffer.rs`: WASM test for RingBuffer basic operations
+- `crates/web/src/network/webrtc.rs`: WebRTC glue against `web_sys` — `RtcPeerConnection`
   creation from a `TransportConfig`, `create_offer` SDP validity, data-channel
   initial state, and ICE-candidate JSON → `RtcIceCandidate` parsing
-- `crates/webtrip-web/src/audio/engine.rs`: AudioContext bootstrap — `AudioEngine::create` builds a
+- `crates/web/src/audio/engine.rs`: AudioContext bootstrap — `AudioEngine::create` builds a
   real `AudioContext` reporting a plausible (>0, in-range) sample rate
-- `crates/webtrip-web/src/audio/worklet.rs`: worklet module registration via the `dependent_module!`
+- `crates/web/src/audio/worklet.rs`: worklet module registration via the `dependent_module!`
   Blob/URL path (`register_audio_worklet` resolves against `audioWorklet.addModule`)
-- `crates/webtrip-web/src/network/webtransport.rs`: `is_webtransport_available` reports `true` in the
+- `crates/web/src/network/webtransport.rs`: `is_webtransport_available` reports `true` in the
   headless Chrome harness (inverse of the native check); `create_worker` builds
   a `web_sys::Worker` via the `dependent_module!` Blob-URL flow and registers the
   `onmessage`/`onerror` closures; `build_init_message` (the assembly behind
   `init_worker`) layers the browser-only `wasmMemory` (a `WebAssembly.Memory`)
   and `wasmUrl` (the bindgen glue URL) onto the plain-JSON buffer config (live
   `connect()` needs an HTTP/3 server — skipped)
-- `crates/webtrip-web/src/network/webtransport_worker.rs`: worker-side `#[wasm_bindgen]` entry points
+- `crates/web/src/network/webtransport_worker.rs`: worker-side `#[wasm_bindgen]` entry points
   called directly — `worker_init`+`worker_get_stats` (zeroed stats prove init
   ran) and `handle_worker_message` routing for `init`/`getStats`/`disconnect`
   (resolves) plus an unknown type (rejects). The server-dependent
   `worker_connect`/`send_loop`/`receive_loop` paths are intentionally not covered
-- `crates/webtrip-web/src/audio/audio_callback_loop.rs`: `has_atomics_wait_async` reports `true`
+- `crates/web/src/audio/audio_callback_loop.rs`: `has_atomics_wait_async` reports `true`
   under the shared-memory harness, plus an end-to-end smoke test of the
   `Atomics.waitAsync` wake-up path (set flag + `Atomics.notify` → tick fires),
   which exercises the imported shared `WebAssembly.Memory` / `SharedArrayBuffer`
-- `crates/webtrip-web/src/audio/devices.rs`: MediaDevices glue around the native categorization
+- `crates/web/src/audio/devices.rs`: MediaDevices glue around the native categorization
   core — `get_media_devices` reaches `navigator.mediaDevices`,
   `request_audio_permission`/`getUserMedia` resolves under the fake-device flags,
   `stop_media_stream` ends a live stream's tracks, `get_audio_devices`
@@ -496,9 +496,9 @@ The test requires threading support. Either:
   `get_output_device_channels`) resolve a count in `[1, MAX_CHANNELS]` for the
   default devices and reject an unknown device id (requires the fake-device
   flags above)
-- `crates/webtrip-web/src/test_support.rs`: shared browser-test scaffolding (`run_in_browser`
+- `crates/web/src/test_support.rs`: shared browser-test scaffolding (`run_in_browser`
   opt-in for the lib binary, `assert_valid_sdp`, `sleep_ms` async yield helper)
-- `crates/webtrip-web/src/session.rs`: the async connect state machine on its failure paths (with
+- `crates/web/src/session.rs`: the async connect state machine on its failure paths (with
   no server-free transport, the successful connect lifecycle needs a live hub
   and is covered by the integration tests). Asserts the invalid-host fast-fail
   path (an empty host yields an invalid signaling URL that fails without a

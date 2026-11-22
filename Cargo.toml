@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/webtrip-core", "crates/webtrip-api", "crates/webtrip-web"]
+members = ["crates/core", "crates/api", "crates/web", "crates/webtrip"]
 # `npm run test`/`check` name members explicitly; a bare `cargo` at the root
 # builds the browser host, which only compiles with the wasm flags in package.json.
 

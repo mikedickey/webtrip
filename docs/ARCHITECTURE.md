@@ -82,9 +82,9 @@ WebTrip uses a multi-threaded architecture with WebAssembly for high-performance
 ### Component Summary
 
 - **Frontend Layer** (`website/src/pages/demo/`): React demo UI that manages user interactions, device selection, and WebRTC signaling
-- **Session Layer** (`crates/webtrip-web/src/session.rs`): Orchestrates network and audio, owns shared buffers, bridges WebRTC and AudioWorklet
-- **Audio Engine** (`crates/webtrip-web/src/audio/engine.rs`): Manages Web Audio API, creates AudioContext and worklet nodes
-- **Audio Processor** (`crates/webtrip-core/src/audio/processor.rs`): Real-time DSP processing in dedicated audio thread
+- **Session Layer** (`crates/web/src/session.rs`): Orchestrates network and audio, owns shared buffers, bridges WebRTC and AudioWorklet
+- **Audio Engine** (`crates/web/src/audio/engine.rs`): Manages Web Audio API, creates AudioContext and worklet nodes
+- **Audio Processor** (`crates/core/src/audio/processor.rs`): Real-time DSP processing in dedicated audio thread
 
 ### Key Data Structures
 
@@ -646,11 +646,11 @@ Web Workers must be created from a JavaScript file—browsers don't support load
 - Initializes it with SharedArrayBuffer memory from the main thread
 - Forwards all messages to Rust's `handleWorkerMessage()` function
 
-This follows the **same pattern as AudioWorklet** (`crates/webtrip-web/src/audio/worklet.js`):
+This follows the **same pattern as AudioWorklet** (`crates/web/src/audio/worklet.js`):
 - Both use the `dependent_module!` macro to bundle JS into the WASM package as Blob URLs
 - Minimal JavaScript (~40-50 lines) acts as browser-mandated entry point
 - All actual logic executes in Rust for type safety and performance
-- The worklet bridge lives in `crates/webtrip-web/src/audio/` and the worker bridge in `crates/webtrip-web/src/network/`
+- The worklet bridge lives in `crates/web/src/audio/` and the worker bridge in `crates/web/src/network/`
 
 **JavaScript (~40 lines):** Module loading, memory initialization, message forwarding  
 **Rust (400+ lines):** Protocol logic, packet processing, buffer management, state tracking, statistics
