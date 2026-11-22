@@ -1,5 +1,5 @@
 [package]
-name = "webtrip"
+name = "webtrip-web"
 description = "Rust rewrite of JackTrip for audio in web browsers"
 authors.workspace = true
 edition.workspace = true
@@ -7,7 +7,7 @@ publish.workspace = true
 version.workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [features]
 # Enables the `__coverage_dump` export used by the integration harness to pull
@@ -26,8 +26,8 @@ js-sys = "0.3.83"
 wasm-bindgen = "0.2.106"
 wasm-bindgen-futures = "0.4.56"
 
-webtrip-core = { path = "../webtrip-core", features = ["wasm"] }
-webtrip-api = { path = "../webtrip-api", features = ["wasm"] }
+webtrip-core = { path = "../core", features = ["wasm"] }
+webtrip-api = { path = "../api", features = ["wasm"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde-wasm-bindgen = "0.6"

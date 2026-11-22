@@ -78,7 +78,10 @@ mixing-engine boundary; full fpp decoupling in both directions; **sample-rate co
 the device rate and the wire rate, in both directions**; automatic fpp
 fitting on **both** transports; device↔network separation; structural
 groundwork for N connections; **a core/web crate split enforced by Cargo**
-(`webtrip-core`, `webtrip-api`, `webtrip-web`).
+(`webtrip-core`, `webtrip-api`, `webtrip-web` in unprefixed `crates/core`,
+`crates/api`, `crates/web`), plus a **`webtrip` facade crate** (`crates/webtrip`)
+re-exporting them as `webtrip::core` / `webtrip::api` (and `webtrip::web` behind
+an opt-in feature).
 
 **Out:** `website/src/pages/demo/Demo.tsx` (stays at 1-2 channel capture
 modes); changing PLC/Burg concealment behaviour; actually supporting N>1
@@ -105,7 +108,9 @@ the stream primitives that bridge them) and **platform** (portable core /
 browser host) — and the platform axis is a Cargo workspace:
 
 ```
-crates/webtrip-core/src/          portable; no web-sys / js-sys, ever
+crates/webtrip/src/lib.rs         package `webtrip`: the facade; re-exports only
+                                  (`webtrip::core`, `webtrip::api`, `webtrip::web` under `web`)
+crates/core/src/                  package `webtrip-core`; portable; no web-sys / js-sys, ever
   limits.rs
   audio/    processor, params, dsp, mixer
   network/  protocol, transport (trait + deliver_received_packet + state mapping),
@@ -113,8 +118,9 @@ crates/webtrip-core/src/          portable; no web-sys / js-sys, ever
             parse_ice_candidate_json)
   stream/   shared_ptr, ring_buffer, regulator, frame_reader   (the bridge primitives)
   lifecycle.rs, session_stats.rs (SessionStats, build_session_stats, tick_decision)
-crates/webtrip-api/src/           portable; today's api/ + models/
-crates/webtrip-web/src/           the cdylib; the only crate that touches the browser
+crates/api/src/                   package `webtrip-api`; portable; today's api/ + models/
+crates/web/src/                   package `webtrip-web`; the cdylib (built as pkg/webtrip.js);
+                                  the only crate that touches the browser
   lib.rs, session.rs, dependent_module.rs, test_support.rs (browser-test harness)
   audio/    devices, engine, worklet(+js), audio_callback_loop
   network/  webrtc, webtransport, webtransport_worker(+js), signaling (WebSocket wiring)
@@ -151,6 +157,19 @@ Decisions behind the platform split, settled with the user:
   Project-defined `Logger`/`Clock` traits were rejected as reinventing `log`
   and threading a handle through every type.
 - **No native crate yet.** It would be empty.
+- **Unprefixed directories, one `webtrip` facade.** Crate directories drop the
+  project prefix (`crates/core` holds package `webtrip-core`). `crates/webtrip`
+  (package `webtrip`) re-exports the others so a consumer takes one dependency
+  and writes `webtrip::core::…` / `webtrip::api::…`. `webtrip::web` exists only
+  behind an off-by-default `web` feature, so a default `webtrip` dependency is
+  as portable as core. The facade also forwards `wasm`. It takes the package
+  name `webtrip`, so the browser package becomes `webtrip-web`, and its
+  wasm-pack artifact keeps the name `webtrip` through `--out-name webtrip`.
+- **The JS contract is one module.** The website and integration tests import
+  only `pkg/webtrip` (`website/src/lib/webtrip.ts`, `tests/integration/run.mjs`).
+  JS has no notion of Rust crates: core/api types reach JS because
+  `webtrip-web` links them into its one cdylib with their `wasm` feature on.
+  The crate layout is invisible from TypeScript and must stay so.
 
 ### New modules
 
@@ -211,7 +230,7 @@ Each phase compiles alone and keeps all three npm checks green.
 
 ### Phase 0 — Module and crate reorganization
 *First, so every later phase puts its new files in their final crate. Split
-into three steps so the pure renames stay reviewable apart from the real
+into four steps so the pure renames stay reviewable apart from the real
 refactor.*
 
 #### Phase 0a — Module moves inside the single crate (pure renames)
@@ -341,6 +360,67 @@ items `#[doc(hidden)]` when they are not public API. Update the npm scripts:
 Update the AGENTS.md *Build Commands* and *Key Modules* sections, and the
 `README.md` paths.
 
+(0d renames these `crates/webtrip-*` directories; the paths above describe
+0c as executed.)
+
+#### Phase 0d — Unprefixed crate directories + `webtrip` facade
+*Mechanical. No logic change, no `use` path change in core or api.*
+
+- **Moves (`git mv`):** `crates/webtrip-core` → `crates/core`,
+  `crates/webtrip-api` → `crates/api`, `crates/webtrip-web` → `crates/web`.
+  Package names `webtrip-core` / `webtrip-api` are unchanged, so no import
+  changes. Update the path dependencies (`../core`, `../api`) and the root
+  `members`.
+- **Rename the browser package** `webtrip` → `webtrip-web` (its library name
+  becomes `webtrip_web`). Make its `crate-type = ["cdylib", "rlib"]` so the
+  facade can depend on it. Pass `--out-name webtrip` in `build:wasm` and
+  `build:wasm:coverage`, so the output stays `pkg/webtrip.js` /
+  `pkg/webtrip_bg.wasm`. Those names are load-bearing:
+  `wasm_module_url` (`webtransport.rs`), `website/src/lib/webtrip.ts`,
+  `tests/integration/run.mjs`, `containers/webtrip/Containerfile`,
+  `scripts/integration-coverage-report.sh`. Retarget `-p webtrip` →
+  `-p webtrip-web` in `coverage:wasm` and in the builder Containerfile's
+  `cargo clean` lines.
+- **New `crates/webtrip`** (package `webtrip`, rlib, workspace-inherited
+  metadata; `publish` stays false, and publishing is a separate decision):
+  ```toml
+  [features]
+  wasm = ["webtrip-core/wasm", "webtrip-api/wasm"]
+  web  = ["dep:webtrip-web"]
+
+  [dependencies]
+  webtrip-core = { path = "../core" }
+  webtrip-api  = { path = "../api" }
+  webtrip-web  = { path = "../web", optional = true }
+  ```
+  ```rust
+  pub use webtrip_core as core;
+  pub use webtrip_api as api;
+  #[cfg(feature = "web")]
+  pub use webtrip_web as web;
+  ```
+  Re-exports only: no logic, so no tests. (Inside the facade, write `::core`
+  wherever the built-in crate is meant.) `webtrip-web` keeps depending on
+  `webtrip-core` / `webtrip-api` directly. Depending on the facade instead
+  would form a `webtrip-web → webtrip → webtrip-web` cycle once `web` is on.
+- **Platform rule covers the facade:** `check:core` becomes
+  `cargo check -p webtrip-core -p webtrip-api -p webtrip --no-default-features`.
+- **Path references** (`crates/webtrip-*` → `crates/*`): root `Cargo.toml`,
+  `package.json` (`build:wasm*`, `test:wasm`), `codecov.yml`, the builder
+  `containers/builder/Containerfile` (manifest COPYs and the prewarm stub loop,
+  which must also stub `crates/webtrip`, since every member's manifest must
+  exist), the `ci.yml` comment, `tests/integration/run.mjs` comments,
+  AGENTS.md (*Threading Model*'s `SharedPtr` path, *Workspace layout* now four
+  crates, *Key Modules*), `README.md`, `docs/ARCHITECTURE.md`,
+  `docs/CHANNEL_MODEL.md`, `docs/WASM_TESTING.md` (including
+  `crates/web/webdriver.json`). Doc comments that name the *package*
+  `webtrip-web` stay correct.
+- **Acceptance:** `pkg/webtrip.d.ts` is unchanged against the 0c build (same
+  comparison rule as 0b). `pkg/webtrip.js` and `pkg/webtrip_bg.wasm` exist
+  under those names. No TypeScript file changes. `git grep 'crates/webtrip-'`
+  is empty outside `plans/`. `cargo check -p webtrip --features web` builds
+  under the wasm flags.
+
 ### Phase 1 — Channel-ceiling split + capture-width fix
 *Delivers: an 18-channel interface addressed at 32; the mono-narrowing capture
 bug fixed. Independent of every later phase.*
@@ -377,7 +457,7 @@ bug fixed. Independent of every later phase.*
 
 ### Phase 2 — `dsp.rs` extraction + `MixEngine`/`SimpleMixer`
 *Pure refactor. Groundwork for everything else. `dsp.rs` and `mixer.rs` are
-created in `webtrip-core/src/audio/`.*
+created in `crates/core/src/audio/`.*
 
 `SimpleMixer::render` reproduces `processor.rs:330-423` exactly, composing the
 `dsp.rs` functions and never reimplementing them: gain → `max_channel_rms` →
@@ -661,13 +741,13 @@ session holds `Vec<Connection>` and `connect()` enforces `len <= 1` by
 - **Homes:** `Connection` is `webtrip-web` (it holds a transport);
   `ConnectionStats` and its builder are `webtrip-core`.
 
-**Non-negotiable sequencing:** 0a → 0b → 0c, all before Phase 1 (so later
+**Non-negotiable sequencing:** 0a → 0b → 0c → 0d, all before Phase 1 (so later
 phases create new files in their final crate); 2 before 3 (the reader feeds the mixer's `net_in`); 3 before 4
 (adopting a peer fpp without the frame adapter breaks playback immediately —
 `remote_interleaved` would be `fpp*channels` while the mixer expects
 `frames*channels`); 3b after 3 (it changes the frame↔packet arithmetic that
 phase establishes). Phase 3b is independent of 4 in either order. Phase 1 is
-otherwise independent and can ship at any point after 0c.
+otherwise independent and can ship at any point after 0d.
 
 ## Testing
 
@@ -701,16 +781,16 @@ No test should merely restate 32, 8 or 1200.
 The crate split itself adds no tests: renames and attribute moves have no
 logic that could fail. Its checks are the 0b grep acceptance, `check:core`,
 and a diff showing `pkg/webtrip.d.ts` from `npm run build:wasm` is
-byte-identical before 0a and after 0c (run in the phase, not committed).
+byte-identical before 0a and after 0d (run in the phase, not committed).
 Tests extracted in 0b move with their code.
 
 ## Verification
 
-0. `npm run check:core` (added in 0c) — native check of `webtrip-core` and
-   `webtrip-api` with no features; fails if either reaches `web-sys`/`js-sys`.
+0. `npm run check:core` (added in 0c) — native check of `webtrip-core`,
+   `webtrip-api` and the `webtrip` facade with no features; fails if any reaches `web-sys`/`js-sys`.
 1. `npm run check` — first gate; catches missed renames and any const
    assertions. Never bare `cargo check` (`web_sys` unstable gating).
-2. `npm run test` — native units across all three crates (`--workspace`): `session.rs`, `protocol.rs`, `params.rs`,
+2. `npm run test` — native units across the workspace (`--workspace`): `session.rs`, `protocol.rs`, `params.rs`,
    `devices.rs`, `regulator.rs`, `processor.rs`, plus the new `dsp`/`mixer`/
    `frame_reader` tests.
 3. `npm run test:wasm` — the **only** step exercising `worklet.js`, so the only
@@ -742,22 +822,23 @@ Tests extracted in 0b move with their code.
 
 ## Critical files
 
-Paths below are post-Phase-0c. Pre-move, all of `src/audio/` (plus
+Paths below are post-Phase-0d. Pre-move, all of `src/audio/` (plus
 `src/session.rs`, `src/lifecycle.rs`, `src/api/`, `src/models/`).
 
-`crates/webtrip-core/src/`: `audio/processor.rs`, `stream/regulator.rs`,
+`crates/core/src/`: `audio/processor.rs`, `stream/regulator.rs`,
 `stream/ring_buffer.rs`, `network/transport.rs`, `network/protocol.rs`.
 
-`crates/webtrip-web/src/`: `audio/engine.rs`, `audio/worklet.rs`,
+`crates/web/src/`: `audio/engine.rs`, `audio/worklet.rs`,
 `audio/worklet.js`, `network/webtransport_worker.rs`, `network/webrtc.rs`,
 `session.rs`.
 
-New in `crates/webtrip-core/src/`: `limits.rs` (both ceilings — shared by
+New in `crates/core/src/`: `limits.rs` (both ceilings — shared by
 `audio/` and `network/`, so it sits above both), `audio/dsp.rs`,
 `audio/mixer.rs`, `stream/frame_reader.rs`, `network/signaling_message.rs`,
 `session_stats.rs`.
 
-Config to update: root `Cargo.toml` (workspace) and the three crate manifests,
+Config to update: root `Cargo.toml` (workspace) and the four crate manifests (including the
+`crates/webtrip` facade),
 `package.json` scripts, the CI workflow (add `check:core`), `AGENTS.md`
 (*Build Commands*, *Key Modules*), `README.md`.
 

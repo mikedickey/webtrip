@@ -47,7 +47,7 @@ cache would silently miss. Key points:
   `/workspace`. **Do not override `CARGO_TARGET_DIR`** at run time or the warm
   cache is bypassed.
 - The stub's own `webtrip` artifacts are removed after prewarm (`cargo clean -p
-  webtrip`) so the local crate always rebuilds from real source. Without this,
+  webtrip-web`) so the local crates always rebuilds from real source. Without this,
   cargo's mtime-based freshness check could treat older-mtime mounted source as
   already-built and run stale stub code.
 - The cache depends on `Cargo.toml` + `Cargo.lock`. When dependencies change,

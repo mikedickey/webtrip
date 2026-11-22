@@ -1,0 +1,20 @@
+[package]
+name = "webtrip"
+description = "WebTrip facade: re-exports webtrip-core, webtrip-api and (behind `web`) webtrip-web"
+authors.workspace = true
+edition.workspace = true
+publish.workspace = true
+version.workspace = true
+
+# Platform rule: with default features this crate is as portable as core.
+# `npm run check:core` builds it natively with no features to enforce that.
+[features]
+# Forwards JS exports on core/api types. Does not pull in the browser host.
+wasm = ["webtrip-core/wasm", "webtrip-api/wasm"]
+# Re-exports the browser host as `webtrip::web`.
+web = ["dep:webtrip-web"]
+
+[dependencies]
+webtrip-core = { path = "../core" }
+webtrip-api = { path = "../api" }
+webtrip-web = { path = "../web", optional = true }

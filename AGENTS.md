@@ -68,7 +68,7 @@ Therefore:
   `Rc`/`RefCell` at the callback boundary rather than letting it leak inward. If a
   value can be reached from more than one agent or thread, it uses atomics regardless
   of which file it lives in.
-- **Cross-thread pointers go through `SharedPtr` (`crates/webtrip-core/src/stream/shared_ptr.rs`).** It
+- **Cross-thread pointers go through `SharedPtr` (`crates/core/src/stream/shared_ptr.rs`).** It
   carries the `Send`/`Sync` assertion once, in an audited place. Do not add a
   hand-rolled `unsafe impl Send`/`Sync` to a struct to silence the compiler — that
   asserts a guarantee the type may not have. If a type genuinely cannot be shared,
@@ -99,7 +99,7 @@ This applies equally to test helpers, serialization utilities, fixture builders,
 
 **Never run `cargo check` or `cargo test` directly** — they will fail because `web_sys` types like `WebTransport` are gated behind `web_sys_unstable_apis`. Use the npm scripts which pass the required flags:
 
-- `npm run check:core` — Native `cargo check` of `webtrip-core` and `webtrip-api` with no features; enforces that they never reach `web-sys`/`js-sys`
+- `npm run check:core` — Native `cargo check` of `webtrip-core`, `webtrip-api` and `webtrip` with no features; enforces that they never reach `web-sys`/`js-sys`
 - `npm run check` — Run `cargo check` with correct RUSTFLAGS and WASM target
 - `npm run test` — Run `cargo test` with correct RUSTFLAGS (runs native, not WASM)
 - `npm run test:wasm` — Run `wasm-bindgen-test` for browser-only modules (see [docs/WASM_TESTING.md](docs/WASM_TESTING.md) for details)
@@ -133,31 +133,32 @@ When deleting or refactoring production code, delete its tests rather than porti
 
 ### Workspace layout
 
-A Cargo workspace of three crates. The **platform rule** is compiler-enforced:
-`webtrip-core` and `webtrip-api` never depend on `web-sys`/`js-sys`; only
-`webtrip-web` does. `npm run check:core` (run in CI) builds the two portable crates
+A Cargo workspace of four crates. The **platform rule** is compiler-enforced:
+`webtrip-core`, `webtrip-api` and the `webtrip` facade never depend on `web-sys`/`js-sys`; only
+`webtrip-web` does. `npm run check:core` (run in CI) builds the portable crates
 natively with no features and fails if either reaches the browser. JS exports on
 portable types are `#[cfg_attr(feature = "wasm", wasm_bindgen)]` — `webtrip-web`
 enables that feature. Items `webtrip-web` needs from core that are not public API are
 `pub` + `#[doc(hidden)]`. Within a crate, `network` never imports `audio` and `audio`
 never imports `network` (both may use `stream`); `session.rs` composes them.
 
-- **`crates/webtrip-core/`** — portable: `audio/`, `network/` (protocol, transport trait), `stream/` (shared_ptr, ring_buffer, regulator), `lifecycle.rs`, `session_stats.rs`
-- **`crates/webtrip-api/`** — portable: `api/` (reqwest client) and `models/`
-- **`crates/webtrip-web/`** — the `webtrip` cdylib; browser hosts: `audio/` (devices, engine, worklet), `network/` (webrtc, webtransport, signaling), `session.rs`, `lib.rs`
+- **`crates/webtrip/`** — package `webtrip`: the facade; re-exports only (`webtrip::core`, `webtrip::api`, and `webtrip::web` behind the off-by-default `web` feature)
+- **`crates/core/`** — package `webtrip-core`; portable: `audio/`, `network/` (protocol, transport trait), `stream/` (shared_ptr, ring_buffer, regulator), `lifecycle.rs`, `session_stats.rs`
+- **`crates/api/`** — package `webtrip-api`; portable: `api/` (reqwest client) and `models/`
+- **`crates/web/`** — package `webtrip-web`, the cdylib built as `pkg/webtrip.js` (`--out-name webtrip`); browser hosts: `audio/` (devices, engine, worklet), `network/` (webrtc, webtransport, signaling), `session.rs`, `lib.rs`
 
 ### Key Modules
 
-- **`crates/webtrip-web/src/session.rs`** — `WebTripSession`: top-level orchestrator; owns the transport, audio engine, and shared buffers
-- **`crates/webtrip-core/src/lifecycle.rs`** — Portable connect/disconnect state machine (one atomic epoch+state word) that `WebTripSession` consults before acquiring, publishing, or releasing resources
-- **`crates/webtrip-core/src/stream/regulator.rs`** — Jitter buffer with Burg PLC (packet loss concealment), ported from JackTrip C++
-- **`crates/webtrip-core/src/network/protocol.rs`** — JackTrip 16-byte wire protocol (serialization, sample rate encoding)
-- **`crates/webtrip-web/src/network/signaling.rs`** — Hub server WebSocket signaling for WebRTC/WebTransport
-- **`crates/webtrip-core/src/stream/ring_buffer.rs`** — Lock-free SPSC queue with `Atomics.waitAsync` wake-up
-- **`crates/webtrip-core/src/audio/params.rs`** — Atomic shared state for volume, gain, peaks across threads
-- **`crates/webtrip-api/src/api/`** — HTTP API client (reqwest) for JackTrip Virtual Studio REST API
-- **`crates/webtrip-api/src/models/`** — Typed data models with auto-generated TypeScript types via `tsify-next`
-- **`crates/webtrip-web/src/lib.rs`** — WASM entry point, exports `init()` and public types to JavaScript
+- **`crates/web/src/session.rs`** — `WebTripSession`: top-level orchestrator; owns the transport, audio engine, and shared buffers
+- **`crates/core/src/lifecycle.rs`** — Portable connect/disconnect state machine (one atomic epoch+state word) that `WebTripSession` consults before acquiring, publishing, or releasing resources
+- **`crates/core/src/stream/regulator.rs`** — Jitter buffer with Burg PLC (packet loss concealment), ported from JackTrip C++
+- **`crates/core/src/network/protocol.rs`** — JackTrip 16-byte wire protocol (serialization, sample rate encoding)
+- **`crates/web/src/network/signaling.rs`** — Hub server WebSocket signaling for WebRTC/WebTransport
+- **`crates/core/src/stream/ring_buffer.rs`** — Lock-free SPSC queue with `Atomics.waitAsync` wake-up
+- **`crates/core/src/audio/params.rs`** — Atomic shared state for volume, gain, peaks across threads
+- **`crates/api/src/api/`** — HTTP API client (reqwest) for JackTrip Virtual Studio REST API
+- **`crates/api/src/models/`** — Typed data models with auto-generated TypeScript types via `tsify-next`
+- **`crates/web/src/lib.rs`** — WASM entry point, exports `init()` and public types to JavaScript
 - **`website/`** — React SPA for webtrip.dev (Vite, own package.json); the demo lives at the `/demo` route (`website/src/pages/demo/`) and loads the wasm-pack output at runtime from `/pkg/` (unbundled — the WebTransport worker re-imports `{origin}/pkg/webtrip.js`, see `wasm_module_url`). `website/server.js` serves the built site plus repo-root `pkg/` with the COOP/COEP headers SharedArrayBuffer needs
 - **`plans/`** — planning documents for work that is in progress, already completed, or superseded; see [plans/AGENTS.md](plans/AGENTS.md). Only read files in this directory when actively working on a specific plan, or when trying to understand the original implementation of a specific feature — do not read it otherwise
 
