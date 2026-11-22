@@ -49,7 +49,7 @@ pub mod tracks;
 pub mod users;
 
 // Re-export models from the existing models module
-pub use crate::models;
+pub use crate::webtrip_api::models;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) mod test_helpers;

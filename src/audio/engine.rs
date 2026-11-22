@@ -6,13 +6,13 @@ use crate::audio::devices::{
     clamp_channel_count, first_audio_track, get_media_devices, get_user_media_audio,
     resolve_input_channels, settings_channels, stop_media_stream,
 };
-use crate::audio::params::AudioParams;
-use crate::audio::processor::AudioProcessor;
-use crate::audio::protocol::MAX_CHANNELS;
+use crate::webtrip_core::audio::params::AudioParams;
+use crate::webtrip_core::audio::processor::AudioProcessor;
+use crate::webtrip_core::network::protocol::MAX_CHANNELS;
 use crate::audio::worklet::{create_worklet_node_with_flag, register_audio_worklet};
-use crate::audio::regulator::Regulator;
-use crate::audio::ring_buffer::RingBuffer;
-use crate::audio::shared_ptr::SharedPtr;
+use crate::webtrip_core::stream::regulator::Regulator;
+use crate::webtrip_core::stream::ring_buffer::RingBuffer;
+use crate::webtrip_core::stream::shared_ptr::SharedPtr;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -401,7 +401,7 @@ impl AudioEngine {
     /// processing" node: still popping the shared [`Regulator`] and writing
     /// the send ring buffer every callback alongside its replacement.
     ///
-    /// [`Regulator`]: crate::audio::regulator::Regulator
+    /// [`Regulator`]: crate::webtrip_core::stream::regulator::Regulator
     fn teardown_worklet_node(&self, node: &AudioWorkletNode) {
         if let Ok(port) = node.port() {
             let _ = port.post_message(&JsValue::from_str("stop"));
@@ -434,14 +434,14 @@ impl AudioEngine {
     /// becomes inert within one render quantum, then awaits
     /// [`AudioContext.close`](https://developer.mozilla.org/en-US/docs/Web/API/AudioContext/close)
     /// (with a timeout) so the worklet global scope is destroyed before the
-    /// caller may [`Regulator::reset`](crate::audio::regulator::Regulator::reset)
+    /// caller may [`Regulator::reset`](crate::webtrip_core::stream::regulator::Regulator::reset)
     /// (WEB-53 Bug 7 / WEB-66). Closing — not merely suspending — also
     /// prevents a leaked context from being resumed and racing a freed
     /// regulator as a second consumer.
     ///
     /// Returns `true` only when `close()`'s promise **fulfilled** (worklet
     /// quiescence established). A timeout or rejection returns `false`; the
-    /// caller must not [`Regulator::reset`](crate::audio::regulator::Regulator::reset)
+    /// caller must not [`Regulator::reset`](crate::webtrip_core::stream::regulator::Regulator::reset)
     /// in that case.
     ///
     /// This is terminal for the engine: a closed context cannot be restarted.
@@ -465,7 +465,7 @@ impl AudioEngine {
     /// and other sync paths that cannot await; prefer
     /// [`stop_capture`](Self::stop_capture) whenever async is available so
     /// close can finish (or time out) before
-    /// [`Regulator::reset`](crate::audio::regulator::Regulator::reset).
+    /// [`Regulator::reset`](crate::webtrip_core::stream::regulator::Regulator::reset).
     pub(crate) fn stop_capture_now(&mut self) {
         self.stop_nodes();
         close_audio_context_now(&self.ctx);
@@ -622,7 +622,7 @@ pub(crate) fn close_audio_context_now(ctx: &AudioContext) {
 /// Returns `true` only when the close promise **fulfilled** (or the context
 /// was already `"closed"`). A timeout or rejection returns `false` — the
 /// worklet is not proven quiescent, so callers must not
-/// [`Regulator::reset`](crate::audio::regulator::Regulator::reset).
+/// [`Regulator::reset`](crate::webtrip_core::stream::regulator::Regulator::reset).
 pub(crate) async fn close_audio_context(ctx: &AudioContext, timeout_ms: i32) -> bool {
     if audio_context_state(ctx).as_deref() == Some("closed") {
         return true;

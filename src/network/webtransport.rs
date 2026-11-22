@@ -31,7 +31,7 @@
 //! - Safari / Firefox: Not yet supported (use WebRTC fallback)
 
 use crate::dependent_module;
-use super::transport::{AudioBufferConfig, Transport, TransportState, TransportType, notify_transport_state};
+use crate::webtrip_core::network::transport::{AudioBufferConfig, Transport, TransportState, TransportType, notify_transport_state};
 use js_sys::{Object, Reflect};
 use serde::Serialize;
 use std::cell::RefCell;
@@ -564,7 +564,7 @@ impl Transport for WebTransportImpl {
 
     fn set_audio_buffers(&mut self, config: AudioBufferConfig) {
         self.audio_buffers = Some(config);
-        super::transport::log_audio_buffers_set("WebTransport", &config);
+        crate::webtrip_core::network::transport::log_audio_buffers_set("WebTransport", &config);
     }
 
     fn set_on_state_change(&mut self, callback: js_sys::Function) {
@@ -726,7 +726,7 @@ impl Drop for WebTransportImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::shared_ptr::SharedPtr;
+    use crate::webtrip_core::stream::shared_ptr::SharedPtr;
 
     // ── Browser feature detection (web_sys) ──────────────────────────────────
     //

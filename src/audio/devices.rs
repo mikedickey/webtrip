@@ -7,7 +7,7 @@ use web_sys::{
 };
 
 use crate::audio::engine::{route_output_sink, AudioConstraints};
-use crate::audio::protocol::MAX_CHANNELS;
+use crate::webtrip_core::network::protocol::MAX_CHANNELS;
 
 /// Device information
 #[wasm_bindgen]

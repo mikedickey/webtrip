@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use wasm_bindgen::prelude::*;
 
-use crate::audio::protocol::MAX_CHANNELS;
-use crate::audio::shared_ptr::SharedPtr;
+use crate::webtrip_core::network::protocol::MAX_CHANNELS;
+use crate::webtrip_core::stream::shared_ptr::SharedPtr;
 
 /// Minimum dB level (silence threshold)
 pub const MIN_DB: f32 = -60.0;
@@ -40,7 +40,7 @@ pub struct AudioParams {
     /// Number of channels sent over the wire, fixed for a connection. The
     /// render thread conforms captured audio to this width before writing
     /// the send ring buffer. Governs only the send path — playback width is
-    /// the peer's to declare (see [`crate::audio::regulator::Regulator::push`]).
+    /// the peer's to declare (see [`crate::webtrip_core::stream::regulator::Regulator::push`]).
     pub(crate) send_channels: AtomicU32,
 }
 

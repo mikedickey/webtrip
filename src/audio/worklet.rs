@@ -1,4 +1,4 @@
-use crate::audio::protocol::MAX_CHANNELS;
+use crate::webtrip_core::network::protocol::MAX_CHANNELS;
 use crate::dependent_module;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
@@ -142,7 +142,7 @@ pub fn create_worklet_node(
 /// `channelCount`/`outputChannelCount` are set `Explicit`/`Discrete` so
 /// channels are never speaker-folded or up-mixed by the graph itself — the
 /// mapping between capture/peer channels and output channels is `webtrip`'s
-/// own (`crate::audio::processor::map_to_output`), not the browser's.
+/// own (`crate::webtrip_core::audio::processor::map_to_output`), not the browser's.
 pub fn create_worklet_node_with_flag(
     ctx: &AudioContext,
     process: ProcessorCallback,

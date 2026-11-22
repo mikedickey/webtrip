@@ -17,9 +17,9 @@
 //! - No retransmissions (maxRetransmits = 0)
 //! - Binary mode (ArrayBuffer)
 
-use crate::audio::protocol::{AudioPacket, make_exit_packet};
-use crate::audio::signaling::HubSignaling;
-use crate::audio::transport::{Transport, TransportState, TransportType, AudioBufferConfig, notify_transport_state};
+use crate::webtrip_core::network::protocol::{AudioPacket, make_exit_packet};
+use crate::network::signaling::HubSignaling;
+use crate::webtrip_core::network::transport::{Transport, TransportState, TransportType, AudioBufferConfig, notify_transport_state};
 use js_sys::{Array, ArrayBuffer, Object, Reflect, Uint8Array};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -365,7 +365,7 @@ impl WebRtcTransport {
 
     /// Set callback for connection state changes (optional, for external monitoring)
     pub fn set_on_state_change(&mut self, callback: js_sys::Function) {
-        use crate::audio::transport::Transport;
+        use crate::webtrip_core::network::transport::Transport;
         Transport::set_on_state_change(self, callback);
     }
 
@@ -462,7 +462,7 @@ impl WebRtcTransport {
 
                             if do_receive {
                                 if let Some(data) = self.receive_queue.borrow_mut().pop_front() {
-                                    match crate::audio::transport::deliver_received_packet(
+                                    match crate::webtrip_core::network::transport::deliver_received_packet(
                                         jitter_buffer,
                                         &data,
                                         &mut self.received_samples,
@@ -965,7 +965,7 @@ impl WebRtcTransport {
 
     /// Check if connected and ready to send
     pub fn is_connected(&self) -> bool {
-        use crate::audio::transport::Transport;
+        use crate::webtrip_core::network::transport::Transport;
         Transport::is_connected(self)
     }
 
@@ -1140,7 +1140,7 @@ impl Transport for WebRtcTransport {
         let max_packet_bytes = 16 + (config.samples_per_packet() * 4);
         self.packet_serialize_buffer.resize(max_packet_bytes, 0);
 
-        super::transport::log_audio_buffers_set("WebRTC", &config);
+        crate::webtrip_core::network::transport::log_audio_buffers_set("WebRTC", &config);
     }
 
     fn set_on_state_change(&mut self, callback: js_sys::Function) {
@@ -1357,14 +1357,14 @@ mod tests {
     // the same way WEB-38 documented the session's server-bound connect arms.)
 
     #[cfg(target_arch = "wasm32")]
-    use crate::audio::protocol::HEADER_SIZE;
+    use crate::webtrip_core::network::protocol::HEADER_SIZE;
     #[cfg(target_arch = "wasm32")]
-    use crate::audio::regulator::Regulator;
+    use crate::webtrip_core::stream::regulator::Regulator;
     #[cfg(target_arch = "wasm32")]
-    use crate::audio::ring_buffer::RingBuffer;
+    use crate::webtrip_core::stream::ring_buffer::RingBuffer;
     // Only the wasm-only `buffer_config` helper builds an `AudioBufferConfig`.
     #[cfg(target_arch = "wasm32")]
-    use crate::audio::shared_ptr::SharedPtr;
+    use crate::webtrip_core::stream::shared_ptr::SharedPtr;
     #[cfg(target_arch = "wasm32")]
     use crate::test_support::{assert_valid_sdp, recording_state_callback};
     #[cfg(target_arch = "wasm32")]

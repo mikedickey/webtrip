@@ -1,17 +1,14 @@
-// Audio subsystem (contains all audio-related modules)
+// Portable core and API trees (become the `webtrip-core` / `webtrip-api`
+// crates in Phase 0c)
+pub mod webtrip_core;
+pub mod webtrip_api;
+
+// Browser hosts
 pub mod audio;
+pub mod network;
 
-// Clean API client module
-// Provides a friendly, ergonomic interface to the JackTrip Virtual Studio API
-pub mod api;
-
-// Clean, typed models for the JackTrip API
-// All models are exposed to JavaScript via wasm-bindgen and generate TypeScript types
-pub mod models;
-
-// Other core modules
+// Other web modules
 mod dependent_module;
-mod lifecycle;
 pub mod session;
 
 // Shared scaffolding for browser (`wasm-bindgen-test`) tests. Holds the single
@@ -20,19 +17,18 @@ pub mod session;
 #[cfg(all(test, target_arch = "wasm32"))]
 mod test_support;
 
-// Re-export all audio types for convenience
-pub use audio::{
-    // Core audio types
-    AudioProcessor, AudioParams, DeviceInfo, ProcessorHandle, AudioEngine,
-    // Buffer types
-    RingBuffer, Regulator, RegulatorStats,
+// Re-export public types for convenience
+pub use audio::{DeviceInfo, ProcessorHandle, AudioEngine};
+pub use webtrip_core::audio::{AudioProcessor, AudioParams};
+pub use webtrip_core::stream::{RingBuffer, Regulator, RegulatorStats};
+pub use webtrip_core::network::{
     // Protocol types
     AudioFormat, AudioPacket, PacketHeader, StreamStats,
     // Transport types
     Transport, TransportType, TransportState,
-    TransportConfig,
-    WebRtcTransport,
-    WebTransportImpl,
+};
+pub use network::{
+    TransportConfig, WebRtcTransport, WebTransportImpl,
     // Signaling types
     HubSignaling, HubConnectionState, SignalingMessage,
 };

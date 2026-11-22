@@ -3,7 +3,7 @@
 //! Virtual studio management, configuration, and related operations.
 
 use super::{to_js_value, ApiClient, ApiError, urlencode};
-use crate::models;
+use crate::webtrip_api::models;
 use wasm_bindgen::prelude::*;
 
 // =============================================================================
@@ -230,7 +230,7 @@ impl StudiosApi {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use crate::api::test_helpers::{assert_http_status, mock_api, mock_empty, mock_json};
+    use crate::webtrip_api::api::test_helpers::{assert_http_status, mock_api, mock_empty, mock_json};
 
     fn api(client: &ApiClient) -> StudiosApi {
         StudiosApi::from_client(client)

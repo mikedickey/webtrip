@@ -194,9 +194,9 @@ pub(crate) fn gate() -> (js_sys::Promise, js_sys::Function) {
 ///
 /// [`WebTripSession::connect_with_test_transport`]: crate::session::WebTripSession::connect_with_test_transport
 pub(crate) struct MockTransport {
-    state: crate::audio::transport::TransportState,
+    state: crate::webtrip_core::network::transport::TransportState,
     /// The session's buffers, from `set_audio_buffers`.
-    audio_buffers: Option<crate::audio::transport::AudioBufferConfig>,
+    audio_buffers: Option<crate::webtrip_core::network::transport::AudioBufferConfig>,
     /// One packet of scratch for draining the send ring buffer.
     drain_scratch: Vec<f32>,
     probe: std::rc::Rc<MockProbe>,
@@ -207,7 +207,7 @@ pub(crate) struct MockTransport {
 impl MockTransport {
     pub(crate) fn new() -> Self {
         Self {
-            state: crate::audio::transport::TransportState::Disconnected,
+            state: crate::webtrip_core::network::transport::TransportState::Disconnected,
             audio_buffers: None,
             drain_scratch: Vec::new(),
             probe: Default::default(),
@@ -240,14 +240,14 @@ async fn pass(gate: Option<js_sys::Promise>) {
     }
 }
 
-impl crate::audio::transport::Transport for MockTransport {
-    fn transport_type(&self) -> crate::audio::transport::TransportType {
+impl crate::webtrip_core::network::transport::Transport for MockTransport {
+    fn transport_type(&self) -> crate::webtrip_core::network::transport::TransportType {
         // The concrete type is irrelevant to the lifecycle under test; report
         // the default so no production `TransportType::Mock` variant is needed.
-        crate::audio::transport::TransportType::WebRTC
+        crate::webtrip_core::network::transport::TransportType::WebRTC
     }
 
-    fn set_audio_buffers(&mut self, config: crate::audio::transport::AudioBufferConfig) {
+    fn set_audio_buffers(&mut self, config: crate::webtrip_core::network::transport::AudioBufferConfig) {
         self.drain_scratch.resize(config.samples_per_packet(), 0.0);
         self.audio_buffers = Some(config);
     }
@@ -270,7 +270,7 @@ impl crate::audio::transport::Transport for MockTransport {
         }
     }
 
-    fn state(&self) -> crate::audio::transport::TransportState {
+    fn state(&self) -> crate::webtrip_core::network::transport::TransportState {
         self.state
     }
 
@@ -284,7 +284,7 @@ impl crate::audio::transport::Transport for MockTransport {
         let gate = self.connect_gate.take();
         Box::pin(async move {
             pass(gate).await;
-            self.state = crate::audio::transport::TransportState::Connected;
+            self.state = crate::webtrip_core::network::transport::TransportState::Connected;
             let hook = self.probe.on_connected.borrow_mut().take();
             if let Some(hook) = hook {
                 hook();
@@ -295,7 +295,7 @@ impl crate::audio::transport::Transport for MockTransport {
 
     fn close(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
         self.probe.closes.set(self.probe.closes.get() + 1);
-        self.state = crate::audio::transport::TransportState::Closed;
+        self.state = crate::webtrip_core::network::transport::TransportState::Closed;
         // Match WebRTC's `close_sync`: notify `"closed"` before the async
         // part returns. `MockTransport` reports `TransportType::WebRTC`, and
         // the session treats that string as a failure — so Drop must retire

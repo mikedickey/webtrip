@@ -1,38 +1,14 @@
-//! Audio subsystem modules
+//! Browser audio host: device enumeration, the audio engine, and the
+//! AudioWorklet integration. The portable processor and parameters live in
+//! `webtrip_core::audio`.
 //!
-//! This module contains all audio-related functionality including:
-//! - Audio device enumeration and management
-//! - Audio engine for capture and playback
-//! - Audio processing and effects
-//! - Audio parameters and configuration
-//! - JackTrip protocol implementation
-//! - AudioWorklet integration
-//! - Ring and jitter buffers
-//! - WebRTC transport
-//! - Hub server signaling
+//! Dependency rule: `audio` never imports `network` (and vice versa);
+//! `session.rs` composes them.
 
-// Core audio modules
-pub mod processor;
-pub mod params;
 pub mod devices;
 pub mod worklet;
 pub mod engine;
 pub mod audio_callback_loop;
-
-// Buffer modules
-pub mod ring_buffer;
-pub mod regulator;
-pub mod shared_ptr;
-
-// JackTrip protocol modules
-pub mod protocol;
-
-// Transport and signaling modules
-pub mod transport;
-pub mod webrtc;
-pub mod webtransport;
-pub mod webtransport_worker;
-pub mod signaling;
 
 /// An `Error` with the given `name`. A connect rejects with the DOM's
 /// conventional names for an aborted (`"AbortError"`) or timed-out
@@ -59,26 +35,7 @@ pub(crate) fn make_promise() -> (js_sys::Promise, js_sys::Function, js_sys::Func
     (promise, resolve_fn.unwrap(), reject_fn.unwrap())
 }
 
-// Re-export core audio types
-pub use processor::AudioProcessor;
-pub use params::AudioParams;
 pub use devices::DeviceInfo;
 pub use worklet::ProcessorHandle;
 pub use engine::AudioEngine;
 pub use audio_callback_loop::{AudioCallbackLoop, has_atomics_wait_async};
-
-// Re-export buffer types
-pub use ring_buffer::RingBuffer;
-pub use regulator::{Regulator, RegulatorStats};
-
-// Re-export JackTrip types
-pub use protocol::{AudioFormat, AudioPacket, PacketHeader, StreamStats};
-
-// Re-export transport types
-pub use transport::{Transport, TransportType, TransportState};
-pub use webrtc::{TransportConfig, WebRtcTransport};
-pub use webtransport::WebTransportImpl;
-
-// Re-export signaling types
-pub use signaling::{HubSignaling, HubConnectionState, SignalingMessage};
-

@@ -1,10 +1,10 @@
 use std::sync::atomic::Ordering;
 
-use crate::audio::params::{AudioParams, MAX_DB, MIN_DB, decode_db, decode_volume, encode_db};
-use crate::audio::protocol::MAX_CHANNELS;
-use crate::audio::regulator::Regulator;
-use crate::audio::ring_buffer::RingBuffer;
-use crate::audio::shared_ptr::SharedPtr;
+use crate::webtrip_core::audio::params::{AudioParams, MAX_DB, MIN_DB, decode_db, decode_volume, encode_db};
+use crate::webtrip_core::network::protocol::MAX_CHANNELS;
+use crate::webtrip_core::stream::regulator::Regulator;
+use crate::webtrip_core::stream::ring_buffer::RingBuffer;
+use crate::webtrip_core::stream::shared_ptr::SharedPtr;
 
 /// Peak hold time in process calls (~48kHz / 128 samples = ~375 calls/sec)
 /// Hold peak for about 1.5 seconds
@@ -941,7 +941,7 @@ mod tests {
     /// per frame due to f32 rounding (e.g. 4321/100*100 → 4320.999 → 4320).
     #[test]
     fn test_peak_db_level_stable_during_hold() {
-        use crate::audio::params::{AudioParams, encode_db};
+        use crate::webtrip_core::audio::params::{AudioParams, encode_db};
 
         let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
         let mut processor = AudioProcessor::new(params);

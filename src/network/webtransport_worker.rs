@@ -36,13 +36,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
-use crate::audio::ring_buffer::RingBuffer;
-use crate::audio::regulator::Regulator;
-use crate::audio::shared_ptr::SharedPtr;
-use crate::audio::protocol::{AudioPacket, make_exit_packet, HEADER_SIZE};
+use crate::webtrip_core::stream::ring_buffer::RingBuffer;
+use crate::webtrip_core::stream::regulator::Regulator;
+use crate::webtrip_core::stream::shared_ptr::SharedPtr;
+use crate::webtrip_core::network::protocol::{AudioPacket, make_exit_packet, HEADER_SIZE};
 #[cfg(target_arch = "wasm32")]
-use crate::audio::transport::HIGH_RATE_WARN_INTERVAL;
-use crate::audio::transport::deliver_received_packet;
+use crate::webtrip_core::network::transport::HIGH_RATE_WARN_INTERVAL;
+use crate::webtrip_core::network::transport::deliver_received_packet;
 
 /// Number of interleaved samples in one outgoing audio packet for the given
 /// buffer size (samples per channel) and channel count.
@@ -124,7 +124,7 @@ fn classify_receive_error(receive_errors: u64, packets_received: u64) -> Receive
 /// WebTransport connection. The `unsafe` raw-pointer deref of the regulator
 /// stays at the [`receive_loop`] call site; here it is an ordinary `&`.
 /// Deserialize-and-push itself lives in
-/// [`deliver_received_packet`](crate::audio::transport::deliver_received_packet),
+/// [`deliver_received_packet`](crate::webtrip_core::network::transport::deliver_received_packet),
 /// shared with the WebRTC transport's receive path; a rejected push outcome is
 /// already warned on there, so only the deserialize `Err` case needs handling
 /// here.
