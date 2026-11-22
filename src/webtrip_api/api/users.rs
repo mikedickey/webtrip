@@ -2,9 +2,12 @@
 //!
 //! User profile management, preferences, and related operations.
 
-use super::{to_js_value, PaginationQuery, ApiClient, ApiError, urlencode};
+#[cfg(feature = "wasm")]
+use super::to_js_value;
+use super::{PaginationQuery, ApiClient, ApiError, urlencode};
 use crate::webtrip_api::models;
 use std::collections::HashMap;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 // =============================================================================
@@ -134,6 +137,7 @@ impl UsersApi {
 // JavaScript API (wasm_bindgen wrappers)
 // =============================================================================
 
+#[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl UsersApi {
     #[wasm_bindgen(js_name = getCurrentUser)]

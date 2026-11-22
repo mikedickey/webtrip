@@ -48,6 +48,7 @@
 //!   - **Value = 1-254**: explicit channel count (asymmetric configuration)
 //!   - **Value = 255 (0xFF)**: the sender transmits no audio
 
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 /// JackTrip native header size (16 bytes)
@@ -269,8 +270,7 @@ impl PacketHeader {
     /// Deserialize header from bytes (little-endian byte order)
     pub fn deserialize(buffer: &[u8]) -> Result<Self, ProtocolError> {
         if buffer.len() < HEADER_SIZE {
-            #[cfg(target_arch = "wasm32")]
-            web_sys::console::error_1(&format!("❌ Buffer too small: {} bytes (need {})", buffer.len(), HEADER_SIZE).into());
+            log::error!("❌ Buffer too small: {} bytes (need {})", buffer.len(), HEADER_SIZE);
             return Err(ProtocolError::BufferTooSmall);
         }
 
@@ -296,28 +296,25 @@ impl PacketHeader {
         // Validate decoded outgoing channels — this packet's payload width.
         // After decoding, it can be 0 (no audio) or 1-MAX_CHANNELS (normal range)
         if num_outgoing_channels > MAX_CHANNELS {
-            #[cfg(target_arch = "wasm32")]
-            web_sys::console::error_1(&format!(
+            log::error!(
                 "❌ Invalid outgoing channel count: {} (too high, max is {})",
                 num_outgoing_channels, MAX_CHANNELS
-            ).into());
+            );
             return Err(ProtocolError::InvalidChannelCount);
         }
         
         if ![8, 16, 24, 32].contains(&bit_depth) {
-            #[cfg(target_arch = "wasm32")]
-            web_sys::console::error_1(&format!(
+            log::error!(
                 "❌ Invalid bit depth: {} (expected 8, 16, 24, or 32)", 
                 bit_depth
-            ).into());
+            );
             return Err(ProtocolError::InvalidBitDepth);
         }
         if buffer_size == 0 || buffer_size > 4096 {
-            #[cfg(target_arch = "wasm32")]
-            web_sys::console::error_1(&format!(
+            log::error!(
                 "❌ Invalid buffer size: {} (expected 1-4096)", 
                 buffer_size
-            ).into());
+            );
             return Err(ProtocolError::InvalidBufferSize);
         }
 
@@ -515,11 +512,10 @@ impl AudioPacket {
         let audio_data_size = num_samples * bytes_per_sample;
 
         if buffer.len() < HEADER_SIZE + audio_data_size {
-            #[cfg(target_arch = "wasm32")]
-            web_sys::console::error_1(&format!(
+            log::error!(
                 "❌ Buffer too small for audio data: got {} bytes, need {} (header) + {} (audio) = {} total",
                 buffer.len(), HEADER_SIZE, audio_data_size, HEADER_SIZE + audio_data_size
-            ).into());
+            );
             return Err(ProtocolError::BufferTooSmall);
         }
 
@@ -611,7 +607,7 @@ impl std::fmt::Display for ProtocolError {
 }
 
 /// Stream statistics for monitoring connection quality
-#[wasm_bindgen]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(Debug, Clone, Default)]
 pub struct StreamStats {
     /// Total packets sent
@@ -628,9 +624,9 @@ pub struct StreamStats {
     pub rtt_ms: f32,
 }
 
-#[wasm_bindgen]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 impl StreamStats {
-    #[wasm_bindgen(constructor)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(constructor))]
     pub fn new() -> Self {
         Self::default()
     }
@@ -646,7 +642,7 @@ impl StreamStats {
 }
 
 /// Audio format configuration
-#[wasm_bindgen]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(Debug, Clone, Copy)]
 pub struct AudioFormat {
     pub sample_rate: u32,
@@ -655,10 +651,10 @@ pub struct AudioFormat {
     pub bit_depth: u8,
 }
 
-#[wasm_bindgen]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 impl AudioFormat {
     /// Create a mono format (most common for JackTrip)
-    #[wasm_bindgen(constructor)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(constructor))]
     pub fn new() -> Self {
         Self::mono()
     }

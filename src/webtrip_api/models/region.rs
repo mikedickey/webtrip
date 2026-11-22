@@ -1,15 +1,18 @@
 //! Cloud region models
 
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "wasm")]
 use tsify_next::Tsify;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 /// Cloud region details
 ///
 /// Represents a cloud region where JackTrip servers can be deployed.
 /// The API returns a map of region IDs (strings) to Region objects.
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 pub struct Region {
     /// Geographic group (e.g., "Americas", "Europe", "Asia", "Oceania", "Africa")
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,8 +88,9 @@ pub struct Region {
 }
 
 /// Instance type available in a region
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 pub struct InstanceType {
     /// Instance type identifier (e.g., "Standard_B1s", "t2d-standard-1")
     #[serde(default)]

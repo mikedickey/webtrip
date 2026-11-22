@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 use crate::webtrip_core::network::protocol::MAX_CHANNELS;
@@ -20,7 +21,7 @@ fn db_to_percent(db: f32) -> f32 {
 }
 
 /// Parameters shared between main thread and audio processing thread
-#[wasm_bindgen]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct AudioParams {
     /// Current dB level (stored as (db - MIN_DB) * 100 for fixed-point)
     pub(crate) db_level: AtomicI32,
@@ -71,72 +72,72 @@ impl AudioParams {
     }
 }
 
-#[wasm_bindgen]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 impl AudioParams {
     /// Get the current dB level (-60.0 to 0.0)
-    #[wasm_bindgen(js_name = getDbLevel)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getDbLevel))]
     pub fn get_db_level(&self) -> f32 {
         decode_db(self.db_level.load(Ordering::Relaxed))
     }
 
     /// Get the peak dB level (-60.0 to 0.0)
-    #[wasm_bindgen(js_name = getPeakDbLevel)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getPeakDbLevel))]
     pub fn get_peak_db_level(&self) -> f32 {
         decode_db(self.peak_db_level.load(Ordering::Relaxed))
     }
 
     /// Get the current volume level as a percentage (0.0 to 100.0)
     /// Maps -60dB to 0% and 0dB to 100%
-    #[wasm_bindgen(js_name = getVolumeLevel)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getVolumeLevel))]
     pub fn get_volume_level(&self) -> f32 {
         db_to_percent(self.get_db_level())
     }
 
     /// Get the peak level as a percentage (0.0 to 100.0)
-    #[wasm_bindgen(js_name = getPeakLevel)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getPeakLevel))]
     pub fn get_peak_level(&self) -> f32 {
         db_to_percent(self.get_peak_db_level())
     }
 
     /// Set monitor volume (0.0 to 1.0)
-    #[wasm_bindgen(js_name = setMonitorVolume)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setMonitorVolume))]
     pub fn set_monitor_volume(&self, volume: f32) {
         self.monitor_volume.store(encode_volume(volume.clamp(0.0, 1.0)), Ordering::Relaxed);
     }
 
     /// Get monitor volume (0.0 to 1.0)
-    #[wasm_bindgen(js_name = getMonitorVolume)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getMonitorVolume))]
     pub fn get_monitor_volume(&self) -> f32 {
         decode_volume(self.monitor_volume.load(Ordering::Relaxed))
     }
 
     /// Get the total number of audio callbacks (process() calls)
-    #[wasm_bindgen(js_name = getCallbackCount)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getCallbackCount))]
     pub fn get_callback_count(&self) -> u64 {
         self.callback_count.load(Ordering::Relaxed)
     }
 
     /// Set input gain in dB (-20.0 to +20.0)
-    #[wasm_bindgen(js_name = setInputGain)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setInputGain))]
     pub fn set_input_gain(&self, gain_db: f32) {
         let clamped = gain_db.clamp(-20.0, 20.0);
         self.input_gain_db.store((clamped * 100.0) as i32, Ordering::Relaxed);
     }
 
     /// Get input gain in dB
-    #[wasm_bindgen(js_name = getInputGain)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getInputGain))]
     pub fn get_input_gain(&self) -> f32 {
         self.input_gain_db.load(Ordering::Relaxed) as f32 / 100.0
     }
 
     /// Set output volume (0.0 to 1.0)
-    #[wasm_bindgen(js_name = setOutputVolume)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setOutputVolume))]
     pub fn set_output_volume(&self, volume: f32) {
         self.output_volume.store(encode_volume(volume.clamp(0.0, 1.0)), Ordering::Relaxed);
     }
 
     /// Get output volume (0.0 to 1.0)
-    #[wasm_bindgen(js_name = getOutputVolume)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getOutputVolume))]
     pub fn get_output_volume(&self) -> f32 {
         decode_volume(self.output_volume.load(Ordering::Relaxed))
     }
@@ -152,7 +153,7 @@ impl AudioParams {
 /// [`SharedPtr`] from it with [`SharedPtr::from_addr`] (unsafe — see the
 /// `// SAFETY:` comment in [`with_params`]). The allocation is leaked so it
 /// outlives every agent that holds the address.
-#[wasm_bindgen(js_name = createAudioParams)]
+#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = createAudioParams))]
 pub fn create_audio_params() -> usize {
     SharedPtr::from_ref(Box::leak(Box::<AudioParams>::default())).addr()
 }
@@ -175,67 +176,67 @@ fn with_params<R>(addr: usize, fallback: R, f: impl FnOnce(&AudioParams) -> R) -
 }
 
 /// Get volume level from params pointer (0.0 to 100.0)
-#[wasm_bindgen(js_name = getVolumeLevelFromPtr)]
+#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getVolumeLevelFromPtr))]
 pub fn get_volume_level_from_ptr(ptr: usize) -> f32 {
     with_params(ptr, 0.0, |p| p.get_volume_level())
 }
 
 /// Get dB level from params pointer (-60.0 to 0.0)
-#[wasm_bindgen(js_name = getDbLevelFromPtr)]
+#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getDbLevelFromPtr))]
 pub fn get_db_level_from_ptr(ptr: usize) -> f32 {
     with_params(ptr, -60.0, |p| p.get_db_level())
 }
 
 /// Get peak level from params pointer (0.0 to 100.0)
-#[wasm_bindgen(js_name = getPeakLevelFromPtr)]
+#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getPeakLevelFromPtr))]
 pub fn get_peak_level_from_ptr(ptr: usize) -> f32 {
     with_params(ptr, 0.0, |p| p.get_peak_level())
 }
 
 /// Get peak dB level from params pointer (-60.0 to 0.0)
-#[wasm_bindgen(js_name = getPeakDbLevelFromPtr)]
+#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getPeakDbLevelFromPtr))]
 pub fn get_peak_db_level_from_ptr(ptr: usize) -> f32 {
     with_params(ptr, -60.0, |p| p.get_peak_db_level())
 }
 
 /// Set monitor volume from params pointer (0.0 to 1.0)
-#[wasm_bindgen(js_name = setMonitorVolumeFromPtr)]
+#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setMonitorVolumeFromPtr))]
 pub fn set_monitor_volume_from_ptr(ptr: usize, volume: f32) {
     with_params(ptr, (), |p| p.set_monitor_volume(volume));
 }
 
 /// Get monitor volume from params pointer (0.0 to 1.0)
-#[wasm_bindgen(js_name = getMonitorVolumeFromPtr)]
+#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getMonitorVolumeFromPtr))]
 pub fn get_monitor_volume_from_ptr(ptr: usize) -> f32 {
     with_params(ptr, 0.0, |p| p.get_monitor_volume())
 }
 
 /// Set input gain from params pointer (-20.0 to +20.0 dB)
-#[wasm_bindgen(js_name = setInputGainFromPtr)]
+#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setInputGainFromPtr))]
 pub fn set_input_gain_from_ptr(ptr: usize, gain_db: f32) {
     with_params(ptr, (), |p| p.set_input_gain(gain_db));
 }
 
 /// Get input gain from params pointer (dB)
-#[wasm_bindgen(js_name = getInputGainFromPtr)]
+#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getInputGainFromPtr))]
 pub fn get_input_gain_from_ptr(ptr: usize) -> f32 {
     with_params(ptr, 0.0, |p| p.get_input_gain())
 }
 
 /// Set output volume from params pointer (0.0 to 1.0)
-#[wasm_bindgen(js_name = setOutputVolumeFromPtr)]
+#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setOutputVolumeFromPtr))]
 pub fn set_output_volume_from_ptr(ptr: usize, volume: f32) {
     with_params(ptr, (), |p| p.set_output_volume(volume));
 }
 
 /// Get output volume from params pointer (0.0 to 1.0)
-#[wasm_bindgen(js_name = getOutputVolumeFromPtr)]
+#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getOutputVolumeFromPtr))]
 pub fn get_output_volume_from_ptr(ptr: usize) -> f32 {
     with_params(ptr, 1.0, |p| p.get_output_volume())
 }
 
 /// Get callback count from params pointer
-#[wasm_bindgen(js_name = getCallbackCountFromPtr)]
+#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getCallbackCountFromPtr))]
 pub fn get_callback_count_from_ptr(ptr: usize) -> u64 {
     with_params(ptr, 0, |p| p.get_callback_count())
 }

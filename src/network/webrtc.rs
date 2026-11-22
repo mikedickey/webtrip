@@ -19,7 +19,10 @@
 
 use crate::webtrip_core::network::protocol::{AudioPacket, make_exit_packet};
 use crate::network::signaling::HubSignaling;
-use crate::webtrip_core::network::transport::{Transport, TransportState, TransportType, AudioBufferConfig, notify_transport_state};
+use crate::network::{SharedStateCallback, notify_transport_state, transport_error_from_js};
+use crate::webtrip_core::network::signaling_message::parse_ice_candidate_json;
+use crate::webtrip_core::session_stats::{tick_decision, TickDecision};
+use crate::webtrip_core::network::transport::{transport_state_str, Transport, TransportState, TransportType, AudioBufferConfig, StateCallback, TransportError};
 use js_sys::{Array, ArrayBuffer, Object, Reflect, Uint8Array};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -36,76 +39,6 @@ use web_sys::{
 };
 
 // ─── Pure logic helpers (no browser APIs) ────────────────────────────────────
-
-/// Fields extracted from an ICE-candidate JSON string.
-///
-/// The JSON format used by the JackTrip hub server is:
-/// `{"candidate":"...","sdpMid":"audio","sdpMLineIndex":0}`
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ParsedIceCandidate {
-    pub candidate: String,
-    pub sdp_mid: Option<String>,
-    pub sdp_m_line_index: Option<u16>,
-}
-
-/// Parse an ICE-candidate JSON string into its component fields.
-///
-/// Returns `None` for empty input, invalid JSON, or when the required
-/// `"candidate"` key is absent or not a string.  The `sdpMid` and
-/// `sdpMLineIndex` keys are optional and map to `None` when missing.
-///
-/// This is the single source of truth for ICE-candidate JSON parsing.
-/// The browser callback wraps this and forwards the result to `web_sys`.
-pub(crate) fn parse_ice_candidate_json(json: &str) -> Option<ParsedIceCandidate> {
-    if json.is_empty() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let candidate = v.get("candidate")?.as_str()?.to_string();
-    let sdp_mid = v.get("sdpMid").and_then(|s| s.as_str()).map(String::from);
-    let sdp_m_line_index = v
-        .get("sdpMLineIndex")
-        .and_then(|n| n.as_u64())
-        .map(|n| n as u16);
-    Some(ParsedIceCandidate { candidate, sdp_mid, sdp_m_line_index })
-}
-
-/// What the tick loop should do in a single iteration.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TickDecision {
-    /// Not connected: drain the ring buffer so `Atomics.waitAsync` can sleep.
-    Drain,
-    /// No work to do this iteration: exit the loop.
-    Idle,
-    /// At least one direction has data — attempt send and/or receive.
-    Process {
-        /// Ring buffer has enough samples to form one outgoing packet.
-        should_send: bool,
-        /// Receive queue has at least one incoming packet.
-        have_receive: bool,
-    },
-}
-
-/// Compute what the tick loop should do given the current transport state.
-///
-/// This is the pure decision kernel of `do_tick`; it takes plain integers and
-/// booleans so it can be called from native unit tests without any browser API.
-pub(crate) fn tick_decision(
-    is_connected: bool,
-    available: u32,
-    samples_needed: u32,
-    have_receive: bool,
-) -> TickDecision {
-    if !is_connected {
-        return TickDecision::Drain;
-    }
-    let should_send = available >= samples_needed;
-    if should_send || have_receive {
-        TickDecision::Process { should_send, have_receive }
-    } else {
-        TickDecision::Idle
-    }
-}
 
 /// Whether a `HubSignaling` state string represents a closed/error condition.
 ///
@@ -306,7 +239,7 @@ pub struct WebRtcTransport {
     on_ice_candidate_closure: Option<Closure<dyn FnMut(web_sys::RtcPeerConnectionIceEvent)>>,
     on_data_channel_closure: Option<Closure<dyn FnMut(RtcDataChannelEvent)>>,
     /// JavaScript callbacks for external integration (optional)
-    on_state_change: Option<js_sys::Function>,
+    on_state_change: Option<SharedStateCallback>,
     /// Callback for ICE candidates (enables external ICE handling)
     js_on_ice_candidate: Option<js_sys::Function>,
     
@@ -365,8 +298,12 @@ impl WebRtcTransport {
 
     /// Set callback for connection state changes (optional, for external monitoring)
     pub fn set_on_state_change(&mut self, callback: js_sys::Function) {
-        use crate::webtrip_core::network::transport::Transport;
-        Transport::set_on_state_change(self, callback);
+        Transport::set_on_state_change(
+            self,
+            Box::new(move |state| {
+                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(transport_state_str(state)));
+            }),
+        );
     }
 
     /// Set callback for ICE candidates (optional, for external signaling)
@@ -466,6 +403,7 @@ impl WebRtcTransport {
                                         jitter_buffer,
                                         &data,
                                         &mut self.received_samples,
+                                        crate::now_ms(),
                                     ) {
                                         Ok(_outcome) => {
                                             processed_receive = true;
@@ -555,7 +493,7 @@ impl WebRtcTransport {
                     let _ = reject_fn.call1(&JsValue::NULL, &JsValue::from_str(&err_msg));
                 } else if let Some(ref callback) = state_callback_for_close {
                     // Promise already resolved — connection was established and is now closing.
-                    let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("disconnected"));
+                    callback(TransportState::Disconnected);
                 }
             }
         }) as Box<dyn FnMut(String)>);
@@ -626,7 +564,7 @@ impl WebRtcTransport {
                             
                             // Notify state change
                             if let Some(ref callback) = state_cb {
-                                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("connected"));
+                                callback(TransportState::Connected);
                             }
                             
                             // Resolve the promise to signal connection is complete.
@@ -646,7 +584,7 @@ impl WebRtcTransport {
                             
                             // Notify state change
                             if let Some(ref callback) = state_cb {
-                                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("failed"));
+                                callback(TransportState::Failed);
                             }
                             
                             // Reject the promise
@@ -1032,7 +970,7 @@ impl WebRtcTransport {
 
             // Notify state change
             if let Some(ref callback) = on_state_change {
-                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("connected"));
+                callback(TransportState::Connected);
             }
         }) as Box<dyn FnMut(_)>);
 
@@ -1074,7 +1012,7 @@ impl WebRtcTransport {
         let on_open = Closure::wrap(Box::new(move || {
             web_sys::console::debug_1(&format!("Data channel '{}' opened!", channel_label).into());
             if let Some(ref callback) = on_state_change {
-                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("connected"));
+                callback(TransportState::Connected);
             }
         }) as Box<dyn FnMut()>);
         channel.set_onopen(Some(on_open.as_ref().unchecked_ref()));
@@ -1084,7 +1022,7 @@ impl WebRtcTransport {
         let js_on_state_change2 = self.on_state_change.clone();
         let on_close = Closure::wrap(Box::new(move || {
             if let Some(ref callback) = js_on_state_change2 {
-                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("disconnected"));
+                callback(TransportState::Disconnected);
             }
         }) as Box<dyn FnMut()>);
         channel.set_onclose(Some(on_close.as_ref().unchecked_ref()));
@@ -1143,8 +1081,8 @@ impl Transport for WebRtcTransport {
         crate::webtrip_core::network::transport::log_audio_buffers_set("WebRTC", &config);
     }
 
-    fn set_on_state_change(&mut self, callback: js_sys::Function) {
-        self.on_state_change = Some(callback);
+    fn set_on_state_change(&mut self, callback: StateCallback) {
+        self.on_state_change = Some(Rc::from(callback));
     }
 
     fn connect(
@@ -1152,14 +1090,16 @@ impl Transport for WebRtcTransport {
         server: &str,
         port: u16,
         client_name: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), JsValue>> + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + '_>> {
         // Convert to owned strings for the async block
         let server = server.to_string();
         let client_name = client_name.to_string();
 
         // Call the existing connect_to_hub implementation
         Box::pin(async move {
-            self.connect_to_hub(&server, port, &client_name).await
+            self.connect_to_hub(&server, port, &client_name)
+                .await
+                .map_err(|e| transport_error_from_js(&e))
         })
     }
 
@@ -1192,86 +1132,6 @@ impl Drop for WebRtcTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── ICE candidate JSON parsing ────────────────────────────────────────────
-
-    #[test]
-    fn parse_ice_candidate_json_full_object() {
-        let json = r#"{"candidate":"candidate:1 1 UDP 2122252543 192.168.1.1 56789 typ host","sdpMid":"audio","sdpMLineIndex":0}"#;
-        let parsed = parse_ice_candidate_json(json).unwrap();
-        assert!(parsed.candidate.starts_with("candidate:"));
-        assert_eq!(parsed.sdp_mid.as_deref(), Some("audio"));
-        assert_eq!(parsed.sdp_m_line_index, Some(0));
-    }
-
-    #[test]
-    fn parse_ice_candidate_json_optional_fields_absent() {
-        let json = r#"{"candidate":"candidate:1 1 UDP 2122252543 10.0.0.1 12345 typ host"}"#;
-        let parsed = parse_ice_candidate_json(json).unwrap();
-        assert!(parsed.candidate.contains("typ host"));
-        assert_eq!(parsed.sdp_mid, None);
-        assert_eq!(parsed.sdp_m_line_index, None);
-    }
-
-    #[test]
-    fn parse_ice_candidate_json_empty_string_returns_none() {
-        assert_eq!(parse_ice_candidate_json(""), None);
-    }
-
-    #[test]
-    fn parse_ice_candidate_json_malformed_returns_none() {
-        assert_eq!(parse_ice_candidate_json("{not valid json"), None);
-        assert_eq!(parse_ice_candidate_json("null"), None);
-        assert_eq!(parse_ice_candidate_json("[]"), None);
-    }
-
-    #[test]
-    fn parse_ice_candidate_json_missing_candidate_key_returns_none() {
-        // JSON object but no "candidate" field → must return None.
-        let json = r#"{"sdpMid":"audio","sdpMLineIndex":0}"#;
-        assert_eq!(parse_ice_candidate_json(json), None);
-    }
-
-    #[test]
-    fn parse_ice_candidate_json_non_string_candidate_returns_none() {
-        // "candidate" present but not a string → must return None.
-        let json = r#"{"candidate":42}"#;
-        assert_eq!(parse_ice_candidate_json(json), None);
-    }
-
-    // ── Tick decision logic ───────────────────────────────────────────────────
-
-    #[test]
-    fn tick_decision_drains_when_not_connected() {
-        // Regardless of how much data is available, not-connected → Drain.
-        assert_eq!(tick_decision(false, 128, 128, false), TickDecision::Drain);
-        assert_eq!(tick_decision(false, 1024, 128, true),  TickDecision::Drain);
-        assert_eq!(tick_decision(false, 0,    128, false), TickDecision::Drain);
-    }
-
-    #[test]
-    fn tick_decision_process_receive_only_when_queue_has_data() {
-        // Not enough samples to send, but receive queue has data → Process (receive only).
-        let decision = tick_decision(true, 0, 128, true);
-        assert_eq!(
-            decision,
-            TickDecision::Process { should_send: false, have_receive: true },
-        );
-    }
-
-    #[test]
-    fn tick_decision_send_at_exact_sample_threshold() {
-        // available == samples_needed → should_send is true (not strictly greater than).
-        assert_eq!(
-            tick_decision(true, 128, 128, false),
-            TickDecision::Process { should_send: true, have_receive: false },
-        );
-        // One sample short → should_send is false.
-        assert_eq!(
-            tick_decision(true, 127, 128, false),
-            TickDecision::Idle,
-        );
-    }
 
     // ── Signaling-close connect-failure decision (pure) ──────────────────────
     //
@@ -1333,7 +1193,7 @@ mod tests {
     // headless Chrome via `npm run test:wasm`. The per-binary browser opt-in
     // (`wasm_bindgen_test_configure!(run_in_browser)`) lives once in
     // `crate::test_support`; here we only import the attribute and the shared
-    // `assert_valid_sdp` / `recording_state_callback` helpers. No signaling
+    // `assert_valid_sdp` / `recording_transport_callback` helpers. No signaling
     // server is required — construction, the `Transport` state surface, and the
     // tick loop's `Drain` path are all reachable without a live peer.
     //
@@ -1366,7 +1226,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     use crate::webtrip_core::stream::shared_ptr::SharedPtr;
     #[cfg(target_arch = "wasm32")]
-    use crate::test_support::{assert_valid_sdp, recording_state_callback};
+    use crate::test_support::{assert_valid_sdp, recording_transport_callback};
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;
 
@@ -1440,10 +1300,10 @@ mod tests {
         let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
             .expect("transport construction should succeed");
 
-        let (log, cb) = recording_state_callback();
+        let (log, cb) = recording_transport_callback();
         Transport::set_on_state_change(
             &mut transport,
-            cb.as_ref().unchecked_ref::<js_sys::Function>().clone(),
+            cb,
         );
 
         transport.set_connected();
@@ -1623,9 +1483,8 @@ mod tests {
         let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
             .expect("transport construction should succeed");
 
-        let (log, cb) = recording_state_callback();
-        transport.on_state_change =
-            Some(cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        let (log, cb) = recording_transport_callback();
+        transport.on_state_change = Some(Rc::from(cb));
 
         transport
             .create_peer_connection()
@@ -1677,7 +1536,6 @@ mod tests {
             "messages on the server-created channel must land on the transport's receive queue"
         );
 
-        drop(cb);
     }
 
     // ── SDP answer / ICE-candidate / send-bytes guard & success paths ────────
@@ -1904,10 +1762,10 @@ mod tests {
             .expect("transport construction should succeed");
 
         // The signaling close→reject wiring only arms when a state callback is set.
-        let (log, cb) = recording_state_callback();
+        let (log, cb) = recording_transport_callback();
         Transport::set_on_state_change(
             &mut transport,
-            cb.as_ref().unchecked_ref::<js_sys::Function>().clone(),
+            cb,
         );
 
         let result = transport
@@ -1922,6 +1780,5 @@ mod tests {
             "a failed connect must never report \"connected\", got: {:?}",
             log.borrow()
         );
-        drop(cb);
     }
 }

@@ -5,8 +5,8 @@
 
 use std::pin::Pin;
 use std::future::Future;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
-use web_sys;
 
 use crate::webtrip_core::network::protocol::{AudioPacket, PacketHeader, ProtocolError};
 use crate::webtrip_core::stream::regulator::{PushOutcome, Regulator};
@@ -14,11 +14,9 @@ use crate::webtrip_core::stream::shared_ptr::SharedPtr;
 
 /// In the high-error/reject-rate regime, emit at most one warning per this
 /// many occurrences, so a degraded link or a persistently mismatched peer
-/// can't flood the console from a realtime receive loop. Only the browser
-/// build logs, so the constant is wasm-only (dead code in the native test
-/// build otherwise). Shared by [`deliver_received_packet`]'s rejection
-/// warnings and the WebTransport worker's deserialize-error accounting.
-#[cfg(target_arch = "wasm32")]
+/// can't flood the log from a realtime receive loop. Shared by
+/// [`deliver_received_packet`]'s rejection warnings and the WebTransport
+/// worker's deserialize-error accounting.
 pub(crate) const HIGH_RATE_WARN_INTERVAL: u64 = 50;
 
 /// Deserialize one received wire packet and deliver it to the regulator.
@@ -27,27 +25,33 @@ pub(crate) const HIGH_RATE_WARN_INTERVAL: u64 = 50;
 /// main-thread tick loop and the WebTransport worker's datagram receive loop
 /// both reuse this instead of duplicating deserialize-then-push. Deserializes
 /// `data` via [`AudioPacket::deserialize_into`] into `samples`, then pushes it
-/// with the header's declared incoming channel count. On any non-`Stored`
+/// with the header's declared incoming channel count at `now_ms` (the caller's
+/// clock; core reads none). On any non-`Stored`
 /// [`PushOutcome`] (bad channel count, a channel count that changed
-/// mid-stream, or a size mismatch — see `Regulator::push`), emits a throttled
-/// `console::warn` so a persistently silent stream is diagnosable instead of
+/// mid-stream, or a size mismatch — see `Regulator::push_at`), emits a
+/// throttled `log::warn!` so a persistently silent stream is diagnosable instead of
 /// failing with no stat and no log.
 pub(crate) fn deliver_received_packet(
     regulator: &Regulator,
     data: &[u8],
     samples: &mut Vec<f32>,
+    now_ms: f64,
 ) -> Result<PushOutcome, ProtocolError> {
     let header: PacketHeader = AudioPacket::deserialize_into(data, samples)?;
-    let outcome = regulator.push(header.sequence_number, header.num_outgoing_channels as usize, samples);
+    let outcome = regulator.push_at(
+        header.sequence_number,
+        header.num_outgoing_channels as usize,
+        samples,
+        now_ms,
+    );
 
-    #[cfg(target_arch = "wasm32")]
     if outcome != PushOutcome::Stored {
         let rejected = regulator.stats().packets_rejected;
         if rejected % HIGH_RATE_WARN_INTERVAL == 0 {
-            web_sys::console::warn_1(&format!(
+            log::warn!(
                 "⚠️ Regulator rejected a received packet: {:?} ({} rejected so far)",
                 outcome, rejected
-            ).into());
+            );
         }
     }
 
@@ -55,7 +59,7 @@ pub(crate) fn deliver_received_packet(
 }
 
 /// Transport type selection
-#[wasm_bindgen]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportType {
     /// WebRTC Data Channels (current, universal support)
@@ -92,7 +96,7 @@ impl TransportType {
 }
 
 /// Connection state shared across all transports
-#[wasm_bindgen]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportState {
     Disconnected,
@@ -144,12 +148,9 @@ impl AudioBufferConfig {
 
 /// Log that audio buffers have been configured on a transport
 pub(crate) fn log_audio_buffers_set(transport_name: &str, config: &AudioBufferConfig) {
-    web_sys::console::debug_1(
-        &format!(
-            "✅ {}: Audio buffers configured (send {}ch, receive {}ch, {} samples)",
-            transport_name, config.send_channels, config.receive_channels, config.buffer_size
-        )
-        .into(),
+    log::debug!(
+        "✅ {}: Audio buffers configured (send {}ch, receive {}ch, {} samples)",
+        transport_name, config.send_channels, config.receive_channels, config.buffer_size
     );
 }
 
@@ -168,13 +169,57 @@ pub(crate) fn transport_state_str(state: TransportState) -> &'static str {
     }
 }
 
-/// Notify a JS state-change callback with the string representation of `state`.
-/// Shared by all three transport implementations.
-pub(crate) fn notify_transport_state(state: TransportState, callback: &Option<js_sys::Function>) {
-    if let Some(ref cb) = callback {
-        let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(transport_state_str(state)));
+/// Whether a transport-level state string reports that the connection failed.
+///
+/// Only failures cross from the transport into the session: the session
+/// drives `connecting`/`connected` itself, so a transport's own (possibly
+/// late) reports of those are dropped.
+///
+/// The two transports deliberately differ on `"disconnected"`:
+///
+/// * **WebRTC** reports `"disconnected"`/`"closed"` only when the peer
+///   connection or data channel drops, which from the session's point of view
+///   is a failure.
+/// * **WebTransport** posts `"disconnected"` from the worker after a
+///   *graceful*, user-initiated close (once the JackTrip exit packets have been
+///   flushed); genuine failures arrive separately as `"failed"`. Treating
+///   `"disconnected"` as a failure there flips the UI from "Not Connected" to
+///   "Connection Error" ~20 ms after the user clicks Disconnect.
+pub fn transport_state_is_failure(transport_type: TransportType, transport_state: &str) -> bool {
+    match (transport_type, transport_state) {
+        (_, "failed") => true,
+        (TransportType::WebRTC, "disconnected" | "closed") => true,
+        _ => false,
     }
 }
+
+/// Callback a host installs to hear about transport state changes.
+pub type StateCallback = Box<dyn Fn(TransportState)>;
+
+/// Why a transport could not connect. Portable: carries only a message, so a
+/// host maps it to its own error type (the browser host makes a JS `Error`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportError {
+    message: String,
+}
+
+impl TransportError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self { message: message.into() }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TransportError {}
 
 /// Transport trait that all implementations must implement
 /// 
@@ -211,8 +256,8 @@ pub trait Transport {
     /// 
     /// This allows the session layer to be notified when the transport's
     /// connection state changes (e.g., connected, failed, disconnected).
-    /// The callback receives a state string: "connected", "failed", "disconnected"
-    fn set_on_state_change(&mut self, _callback: js_sys::Function) {
+    /// The callback receives the new [`TransportState`]
+    fn set_on_state_change(&mut self, _callback: StateCallback) {
         // Default: no-op (not all transports need state callbacks)
     }
 
@@ -232,7 +277,7 @@ pub trait Transport {
         server: &str,
         port: u16,
         client_name: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), JsValue>> + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + '_>>;
 
     /// Process one audio callback tick
     /// 
@@ -301,5 +346,48 @@ mod tests {
         assert_eq!(transport_state_str(TransportState::Connected),    "connected");
         assert_eq!(transport_state_str(TransportState::Failed),       "failed");
         assert_eq!(transport_state_str(TransportState::Closed),       "closed");
+    }
+
+    // Transport-state → session failure mapping
+
+    /// Full matrix over both transports and every state string either of them
+    /// can emit. The rows that matter most:
+    ///
+    /// * WebTransport `"disconnected"` must not be a failure (regression: a
+    ///   graceful user-initiated disconnect flipped the UI to "Connection
+    ///   Error" ~20 ms after the exit packets were flushed).
+    /// * WebRTC `"disconnected"`/`"closed"` must be a failure (the peer
+    ///   connection really did drop).
+    /// * `"connected"`/`"connecting"` are never forwarded: the session drives
+    ///   those itself, and a late transport report must not regress the UI.
+    #[test]
+    fn transport_failure_reports_per_transport() {
+        use TransportType::{WebRTC, WebTransport};
+
+        let cases: &[(TransportType, &str, bool)] = &[
+            (WebRTC, "failed", true),
+            (WebTransport, "failed", true),
+            // Divergent: a dropped peer connection vs. a graceful worker close.
+            (WebRTC, "disconnected", true),
+            (WebRTC, "closed", true),
+            (WebTransport, "disconnected", false),
+            (WebTransport, "closed", false),
+            // Progress reports belong to the session, not the transport.
+            (WebRTC, "connected", false),
+            (WebTransport, "connected", false),
+            (WebRTC, "connecting", false),
+            (WebTransport, "connecting", false),
+            // Anything unrecognized is dropped rather than guessed at.
+            (WebRTC, "", false),
+            (WebTransport, "", false),
+        ];
+
+        for &(transport, state, expected) in cases {
+            assert_eq!(
+                transport_state_is_failure(transport, state),
+                expected,
+                "{transport:?} transport state {state:?} mapped incorrectly"
+            );
+        }
     }
 }

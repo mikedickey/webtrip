@@ -354,7 +354,7 @@ impl AudioEngine {
         };
 
         let process = Box::new(move |input: &[f32], in_channels: usize, output: &mut [f32], out_channels: usize| {
-            processor.process(input, in_channels, output, out_channels)
+            processor.process(input, in_channels, output, out_channels, crate::now_ms())
         });
 
         // Get ring buffer flag pointer for event-driven wake-up

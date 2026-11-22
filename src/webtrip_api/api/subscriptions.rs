@@ -5,8 +5,11 @@
 //! roots (`/users/{userId}/subscriptions` and `/studios/{studioId}/subscriptions*`)
 //! but model the single membership concept, so they live together here.
 
-use super::{to_js_value, ApiClient, ApiError, urlencode};
+#[cfg(feature = "wasm")]
+use super::to_js_value;
+use super::{ApiClient, ApiError, urlencode};
 use crate::webtrip_api::models;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 // =============================================================================
@@ -97,6 +100,7 @@ impl SubscriptionsApi {
 // JavaScript API (wasm_bindgen wrappers)
 // =============================================================================
 
+#[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl SubscriptionsApi {
     #[wasm_bindgen(js_name = listUserSubscriptions)]

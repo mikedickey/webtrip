@@ -11,6 +11,7 @@
 
 use super::{ApiClient, ApiError, PaginationQuery, urlencode};
 use crate::webtrip_api::models;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 // =============================================================================
@@ -85,6 +86,7 @@ impl TracksApi {
 // JavaScript API (wasm_bindgen wrappers)
 // =============================================================================
 
+#[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl TracksApi {
     #[wasm_bindgen(js_name = listTracks)]

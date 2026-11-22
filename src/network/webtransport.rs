@@ -31,7 +31,8 @@
 //! - Safari / Firefox: Not yet supported (use WebRTC fallback)
 
 use crate::dependent_module;
-use crate::webtrip_core::network::transport::{AudioBufferConfig, Transport, TransportState, TransportType, notify_transport_state};
+use crate::network::{SharedStateCallback, notify_transport_state, transport_error_from_js};
+use crate::webtrip_core::network::transport::{AudioBufferConfig, StateCallback, Transport, TransportError, TransportState, TransportType};
 use js_sys::{Object, Reflect};
 use serde::Serialize;
 use std::cell::RefCell;
@@ -217,7 +218,7 @@ pub struct WebTransportImpl {
     audio_buffers: Option<AudioBufferConfig>,
 
     // Callbacks
-    on_state_change: Option<js_sys::Function>,
+    on_state_change: Option<SharedStateCallback>,
 
     // State synchronization
     connection_promise_resolve: Rc<RefCell<Option<js_sys::Function>>>,
@@ -252,11 +253,6 @@ impl WebTransportImpl {
             worker_ready_reject: Rc::new(RefCell::new(None)),
             close_promise_resolve: Rc::new(RefCell::new(None)),
         })
-    }
-
-    /// Set callback for state changes
-    pub fn set_on_state_change(&mut self, callback: js_sys::Function) {
-        self.on_state_change = Some(callback);
     }
 
     /// Create and initialize the worker
@@ -298,7 +294,7 @@ impl WebTransportImpl {
                     "connected" => {
                         web_sys::console::log_1(&"[WebTransport] ✅ Worker reports: CONNECTED".into());
                         if let Some(ref callback) = state_change_cb {
-                            let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("connected"));
+                            callback(TransportState::Connected);
                         }
                         // Resolve the connection promise
                         if let Some(resolve) = connection_resolve.borrow_mut().take() {
@@ -334,7 +330,7 @@ impl WebTransportImpl {
                             let _ = resolve.call0(&JsValue::NULL);
                         }
                         if let Some(ref callback) = state_change_cb {
-                            let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("disconnected"));
+                            callback(TransportState::Disconnected);
                         }
                     }
                     _ => {
@@ -359,7 +355,7 @@ impl WebTransportImpl {
                                 &format!("[WebTransport] ❌ Worker error: {}", error).into(),
                             );
                             if let Some(ref callback) = state_change_cb {
-                                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("failed"));
+                                callback(TransportState::Failed);
                             }
                             // Reject startup promises if still pending
                             if let Some(reject) = worker_ready_reject.borrow_mut().take() {
@@ -406,7 +402,7 @@ impl WebTransportImpl {
             web_sys::console::error_1(&msg.clone().into());
 
             if let Some(ref callback) = state_change_cb2 {
-                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("failed"));
+                callback(TransportState::Failed);
             }
             // Reject startup promises if still pending so callers don't hang
             if let Some(reject) = onerror_ready_reject.borrow_mut().take() {
@@ -567,8 +563,8 @@ impl Transport for WebTransportImpl {
         crate::webtrip_core::network::transport::log_audio_buffers_set("WebTransport", &config);
     }
 
-    fn set_on_state_change(&mut self, callback: js_sys::Function) {
-        self.on_state_change = Some(callback);
+    fn set_on_state_change(&mut self, callback: StateCallback) {
+        self.on_state_change = Some(Rc::from(callback));
     }
 
     fn connect(
@@ -576,11 +572,13 @@ impl Transport for WebTransportImpl {
         server: &str,
         port: u16,
         client_name: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), JsValue>> + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + '_>> {
         // Build WebTransport URL (HTTPS + /webtransport path)
         let url = build_connection_url(server, port, client_name);
 
-        Box::pin(async move { self.connect_to_server(url).await })
+        Box::pin(async move {
+            self.connect_to_server(url).await.map_err(|e| transport_error_from_js(&e))
+        })
     }
 
     fn tick(&mut self) {
@@ -736,7 +734,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;
     #[cfg(target_arch = "wasm32")]
-    use crate::test_support::{dispatch_message_event, recording_state_callback};
+    use crate::test_support::{dispatch_message_event, recording_transport_callback};
 
     /// Chrome (the headless test browser, v97+) exposes the `WebTransport`
     /// global, so detection must report availability — the inverse of the
@@ -944,8 +942,8 @@ mod tests {
     async fn worker_error_message_rejects_pending_promises_and_fails() {
         let mut transport = WebTransportImpl::new().expect("construction in browser");
 
-        let (log, cb) = recording_state_callback();
-        transport.set_on_state_change(cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        let (log, cb) = recording_transport_callback();
+        transport.set_on_state_change(cb);
 
         transport.create_worker().expect("create_worker should build the worker");
 
@@ -978,7 +976,6 @@ mod tests {
             ["failed"],
             "a worker error must emit exactly one \"failed\" state change"
         );
-        drop(cb);
     }
 
     /// A worker `ErrorEvent` must reject the pending startup promises and emit
@@ -989,8 +986,8 @@ mod tests {
     async fn worker_error_event_rejects_pending_promises_and_fails() {
         let mut transport = WebTransportImpl::new().expect("construction in browser");
 
-        let (log, cb) = recording_state_callback();
-        transport.set_on_state_change(cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        let (log, cb) = recording_transport_callback();
+        transport.set_on_state_change(cb);
 
         transport.create_worker().expect("create_worker should build the worker");
 
@@ -1024,7 +1021,6 @@ mod tests {
         assert!(conn_err.as_string().unwrap_or_default().contains("kaboom"));
 
         assert_eq!(log.borrow().as_slice(), ["failed"]);
-        drop(cb);
     }
 
     /// `assemble_error_event_message` must read `filename`/`lineno`/`message`
@@ -1074,8 +1070,8 @@ mod tests {
     async fn disconnected_message_terminates_worker_and_resolves_close() {
         let mut transport = WebTransportImpl::new().expect("construction in browser");
 
-        let (log, cb) = recording_state_callback();
-        transport.set_on_state_change(cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        let (log, cb) = recording_transport_callback();
+        transport.set_on_state_change(cb);
 
         transport.create_worker().expect("create_worker should build the worker");
 
@@ -1100,7 +1096,6 @@ mod tests {
             ["disconnected"],
             "graceful teardown must emit \"disconnected\", never \"failed\""
         );
-        drop(cb);
     }
 
     /// The `"ready"` worker message gates `connect_to_server`'s first await: it
@@ -1113,8 +1108,8 @@ mod tests {
     async fn ready_message_resolves_only_the_worker_ready_gate() {
         let mut transport = WebTransportImpl::new().expect("construction in browser");
 
-        let (log, cb) = recording_state_callback();
-        transport.set_on_state_change(cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        let (log, cb) = recording_transport_callback();
+        transport.set_on_state_change(cb);
         transport.create_worker().expect("create_worker should build the worker");
 
         // Stash both startup promises exactly as `connect_to_server` would.
@@ -1140,7 +1135,6 @@ mod tests {
             "\"ready\" is an internal gate and must not emit a state change, got {:?}",
             log.borrow()
         );
-        drop(cb);
     }
 
     /// The `"connected"` worker message must resolve the pending connection
@@ -1151,8 +1145,8 @@ mod tests {
     async fn connected_message_resolves_connection_promise_and_emits_connected() {
         let mut transport = WebTransportImpl::new().expect("construction in browser");
 
-        let (log, cb) = recording_state_callback();
-        transport.set_on_state_change(cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        let (log, cb) = recording_transport_callback();
+        transport.set_on_state_change(cb);
         transport.create_worker().expect("create_worker should build the worker");
 
         let (conn_promise, conn_resolve, _conn_reject) = crate::audio::make_promise();
@@ -1167,7 +1161,6 @@ mod tests {
             .await
             .expect("connection promise must resolve on \"connected\"");
         assert_eq!(log.borrow().as_slice(), ["connected"]);
-        drop(cb);
     }
 
     /// Messages the handler doesn't recognize — an unknown string, an object
@@ -1180,8 +1173,8 @@ mod tests {
     async fn unrecognized_worker_messages_are_inert() {
         let mut transport = WebTransportImpl::new().expect("construction in browser");
 
-        let (log, cb) = recording_state_callback();
-        transport.set_on_state_change(cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        let (log, cb) = recording_transport_callback();
+        transport.set_on_state_change(cb);
         transport.create_worker().expect("create_worker should build the worker");
 
         let (_ready_promise, ready_resolve, ready_reject) = crate::audio::make_promise();
@@ -1227,7 +1220,6 @@ mod tests {
             "unrecognized messages must not emit state changes, got {:?}",
             log.borrow()
         );
-        drop(cb);
     }
 
     // --- encode_uri_component ---

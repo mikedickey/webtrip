@@ -8,6 +8,7 @@ pub mod audio;
 pub mod network;
 
 // Other web modules
+mod console_log;
 mod dependent_module;
 pub mod session;
 
@@ -38,10 +39,18 @@ pub use session::{WebTripSession, SessionState, SessionStats};
 
 use wasm_bindgen::prelude::*;
 
+/// Wall-clock milliseconds, the one clock every host call into the portable
+/// core is stamped with (`Regulator::push_at`/`pop_at` must share an epoch
+/// across the main thread, the worker and the worklet, so all use `Date.now()`).
+pub(crate) fn now_ms() -> f64 {
+    js_sys::Date::now()
+}
+
 /// Initialize the WASM module (call once at startup)
 #[wasm_bindgen]
 pub fn init() {
     console_error_panic_hook::set_once();
+    console_log::install();
 }
 
 /// Get the WASM memory for use with Atomics.waitAsync

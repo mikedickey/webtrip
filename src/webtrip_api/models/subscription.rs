@@ -5,15 +5,18 @@
 
 use super::ModifiedAtTime;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "wasm")]
 use tsify_next::Tsify;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 /// A studio membership ("subscription") linking a user to a studio.
 ///
 /// Note the mixed wire casing: `user_id` and `updated_at` are snake_case while
 /// `serverId` is camelCase, so every field uses an explicit serde rename.
-#[derive(Tsify, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 pub struct Subscription {
     /// Shared creation/update timestamps (`createdAt`, `updatedAt`)
     #[serde(flatten)]

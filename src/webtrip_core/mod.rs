@@ -12,3 +12,4 @@ pub mod audio;
 pub mod network;
 pub mod stream;
 pub(crate) mod lifecycle;
+pub mod session_stats;

@@ -2,9 +2,12 @@
 //!
 //! Health checks, region information, analytics, and other system-level operations.
 
-use super::{to_js_value, ApiClient, ApiError, urlencode};
+#[cfg(feature = "wasm")]
+use super::to_js_value;
+use super::{ApiClient, ApiError, urlencode};
 use crate::webtrip_api::models;
 use std::collections::HashMap;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 // =============================================================================
@@ -69,6 +72,7 @@ impl SystemApi {
 // JavaScript API (wasm_bindgen wrappers)
 // =============================================================================
 
+#[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl SystemApi {
     /// Check system health

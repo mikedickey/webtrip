@@ -2,9 +2,12 @@
 //!
 //! JackTrip Radio recordings management.
 
-use super::{to_js_value, PaginationQuery, ApiClient, ApiError, urlencode};
+#[cfg(feature = "wasm")]
+use super::to_js_value;
+use super::{PaginationQuery, ApiClient, ApiError, urlencode};
 use crate::webtrip_api::models;
 use serde::Serialize;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 // =============================================================================
@@ -206,6 +209,7 @@ impl RecordingsApi {
 // JavaScript API (wasm_bindgen wrappers)
 // =============================================================================
 
+#[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl RecordingsApi {
     #[wasm_bindgen(js_name = listRecordings)]

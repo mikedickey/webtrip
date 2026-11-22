@@ -9,6 +9,7 @@
 use std::cell::UnsafeCell;
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 /// Size of the ring buffer in samples
@@ -26,7 +27,7 @@ const RING_BUFFER_SIZE: usize = 4096;
 /// and one (other) thread calls [`read`](Self::read). Calling `write` from two
 /// threads at once, or `read` from two threads at once, is undefined behavior.
 /// Everything else is atomic and may be called from any thread.
-#[wasm_bindgen]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct RingBuffer {
     /// Ring buffer for audio going TO the network (local mic -> network).
     ///
@@ -68,10 +69,10 @@ pub struct RingBuffer {
     has_data_flag: AtomicU32,
 }
 
-#[wasm_bindgen]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 impl RingBuffer {
     /// Create a new ring buffer
-    #[wasm_bindgen(constructor)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(constructor))]
     pub fn new() -> Self {
         Self {
             buffer: (0..RING_BUFFER_SIZE).map(|_| UnsafeCell::new(0.0)).collect(),
@@ -130,7 +131,7 @@ impl RingBuffer {
     /// - AudioWorklet sets flag to 1 and calls Atomics.notify()
     /// - Main thread waits with Atomics.waitAsync()
     /// - Zero CPU usage when idle!
-    #[wasm_bindgen(js_name = getHasDataFlagPtr)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getHasDataFlagPtr))]
     pub fn get_has_data_flag_ptr(&self) -> usize {
         &self.has_data_flag as *const AtomicU32 as usize
     }

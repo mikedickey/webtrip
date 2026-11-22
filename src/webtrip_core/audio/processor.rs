@@ -327,7 +327,10 @@ impl AudioProcessor {
     /// frames + frame]`, `frames == input.len() / in_channels`. `output` is
     /// planar across `out_channels` output channels: `output[ch * frames +
     /// frame]`.
-    pub fn process(&mut self, input: &[f32], in_channels: usize, output: &mut [f32], out_channels: usize) -> bool {
+    ///
+    /// `now_ms` is the host's wall-clock time for this callback, handed to the
+    /// regulator's `pop_at`; the processor itself never reads a clock.
+    pub fn process(&mut self, input: &[f32], in_channels: usize, output: &mut [f32], out_channels: usize, now_ms: f64) -> bool {
         let in_channels = in_channels.max(1);
         let out_channels = out_channels.max(1);
         let frames = input.len() / in_channels;
@@ -381,7 +384,7 @@ impl AudioProcessor {
         // it onto `out_channels` output channels. `receive_from_network`
         // returns 0 when no network buffer is attached, in which case the
         // peer stream is silence.
-        let remote_channels = self.receive_from_network(frames);
+        let remote_channels = self.receive_from_network(frames, now_ms);
         if remote_channels == 0 {
             self.remote_mapped[..mapped_len].fill(0.0);
         } else {
@@ -483,13 +486,13 @@ impl AudioProcessor {
 
     /// Receive remote audio from network via jitter buffer into
     /// `remote_interleaved`. Returns the regulator's channel count **after**
-    /// `pop` (so it is ordered by that call's Acquire — WEB-53 Bug 3), or `0`
+    /// `pop_at` (so it is ordered by that call's Acquire — WEB-53 Bug 3), or `0`
     /// when no network buffer is attached (the caller treats that as silence).
     ///
     /// `Regulator::pop()`'s return value is informational metadata (real vs.
     /// concealed) and must NOT gate playback — concealed audio is the entire
     /// point of jitter buffering and must be played to avoid clicks.
-    fn receive_from_network(&mut self, frames: usize) -> usize {
+    fn receive_from_network(&mut self, frames: usize, now_ms: f64) -> usize {
         let Some(regulator) = self.network_to_local_buffer.as_ref() else {
             return 0;
         };
@@ -507,7 +510,7 @@ impl AudioProcessor {
 
         // Read the regulator's output (always populates the buffer; pop()'s
         // bool distinguishes real vs concealed but is irrelevant for mixing).
-        regulator.pop(&mut self.remote_interleaved[..interleaved_cap]);
+        regulator.pop_at(&mut self.remote_interleaved[..interleaved_cap], now_ms);
 
         regulator.channels()
     }
@@ -949,7 +952,7 @@ mod tests {
         // Drive a loud signal through process() to establish a peak.
         let loud: Vec<f32> = vec![1.0; 128];
         let mut out = vec![0.0f32; 128];
-        processor.process(&loud, 1, &mut out, 1);
+        processor.process(&loud, 1, &mut out, 1, 0.0);
 
         let stored_after_peak = params.peak_db_level.load(std::sync::atomic::Ordering::Relaxed);
         assert!(stored_after_peak > encode_db(-60.0), "a loud signal must raise the peak");
@@ -958,7 +961,7 @@ mod tests {
         // The stored fixed-point value must remain bit-for-bit identical throughout.
         let silence: Vec<f32> = vec![0.0; 128];
         for frame in 0..PEAK_HOLD_FRAMES {
-            processor.process(&silence, 1, &mut out, 1);
+            processor.process(&silence, 1, &mut out, 1, 0.0);
             let stored = params.peak_db_level.load(std::sync::atomic::Ordering::Relaxed);
             assert_eq!(
                 stored,
@@ -968,7 +971,7 @@ mod tests {
         }
 
         // After hold expires, decay must have begun (stored value decreases).
-        processor.process(&silence, 1, &mut out, 1);
+        processor.process(&silence, 1, &mut out, 1, 0.0);
         let stored_after_decay = params.peak_db_level.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             stored_after_decay < stored_after_peak,
@@ -1023,7 +1026,7 @@ mod tests {
 
         let input = planar_capture(&[LEFT, RIGHT], FRAMES);
         let mut output = vec![-99.0f32; FRAMES * 2];
-        assert!(processor.process(&input, 2, &mut output, 2));
+        assert!(processor.process(&input, 2, &mut output, 2, 0.0));
 
         // The network path must see interleaved stereo: L,R per frame — not
         // planar, not one channel, not an average.
@@ -1087,7 +1090,7 @@ mod tests {
         // … but the browser granted mono.
         let input = planar_capture(&[LEVEL], FRAMES);
         let mut output = vec![0.0f32; FRAMES * 2];
-        assert!(processor.process(&input, 1, &mut output, 2));
+        assert!(processor.process(&input, 1, &mut output, 2, 0.0));
 
         assert_eq!(
             ring.available(),

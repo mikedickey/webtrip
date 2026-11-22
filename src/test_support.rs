@@ -125,6 +125,23 @@ pub(crate) fn recording_state_callback() -> (
     (log, closure)
 }
 
+/// Like [`recording_state_callback`], for a [`Transport`]'s typed state
+/// callback: records each reported state's string form (the contract the
+/// transport tests assert on).
+pub(crate) fn recording_transport_callback() -> (
+    std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    crate::webtrip_core::network::transport::StateCallback,
+) {
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let log_for_cb = log.clone();
+    let callback = Box::new(move |state| {
+        log_for_cb
+            .borrow_mut()
+            .push(crate::webtrip_core::network::transport::transport_state_str(state).to_string());
+    });
+    (log, callback)
+}
+
 /// Assert that an SDP blob is well-formed.
 ///
 /// A minimally valid session description is non-empty and contains the
@@ -154,18 +171,18 @@ pub(crate) struct MockProbe {
     /// Calls to `tick` (the audio-callback network loop)
     pub(crate) ticks: std::cell::Cell<u32>,
     /// The state-change callback the session installed
-    on_state_change: std::cell::RefCell<Option<js_sys::Function>>,
+    on_state_change: std::cell::RefCell<Option<crate::network::SharedStateCallback>>,
     /// Run once, just before a `connect` resolves (after any gate opens)
     on_connected: std::cell::RefCell<Option<Box<dyn FnOnce()>>>,
 }
 
 impl MockProbe {
-    /// Report a transport-level state string to the session, as a real
-    /// transport's event handlers would.
-    pub(crate) fn report(&self, state: &str) {
+    /// Report a transport-level state to the session, as a real transport's
+    /// event handlers would.
+    pub(crate) fn report(&self, state: crate::webtrip_core::network::transport::TransportState) {
         let callback = self.on_state_change.borrow().clone();
         let callback = callback.expect("the session installs a state callback before connecting");
-        let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(state));
+        callback(state);
     }
 
     /// Run `hook` just before the next `connect` resolves.
@@ -252,8 +269,8 @@ impl crate::webtrip_core::network::transport::Transport for MockTransport {
         self.audio_buffers = Some(config);
     }
 
-    fn set_on_state_change(&mut self, callback: js_sys::Function) {
-        *self.probe.on_state_change.borrow_mut() = Some(callback);
+    fn set_on_state_change(&mut self, callback: crate::webtrip_core::network::transport::StateCallback) {
+        *self.probe.on_state_change.borrow_mut() = Some(std::rc::Rc::from(callback));
     }
 
     /// Drain the send ring buffer, as `WebRtcTransport` does before its data
@@ -279,7 +296,7 @@ impl crate::webtrip_core::network::transport::Transport for MockTransport {
         _server: &str,
         _port: u16,
         _client_name: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), JsValue>> + '_>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::webtrip_core::network::transport::TransportError>> + '_>> {
         self.probe.connects.set(self.probe.connects.get() + 1);
         let gate = self.connect_gate.take();
         Box::pin(async move {
@@ -301,7 +318,7 @@ impl crate::webtrip_core::network::transport::Transport for MockTransport {
         // the session treats that string as a failure — so Drop must retire
         // the lifecycle epoch or this report would emit `"error"` (WEB-68).
         if let Some(callback) = self.probe.on_state_change.borrow().clone() {
-            let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("closed"));
+            callback(crate::webtrip_core::network::transport::TransportState::Closed);
         }
         Box::pin(pass(self.close_gate.take()))
     }
