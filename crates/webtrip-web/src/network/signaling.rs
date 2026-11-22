@@ -1,0 +1,768 @@
+//! JackTrip Hub Server Signaling Protocol
+//!
+//! This module implements the WebRTC signaling protocol for connecting to
+//! JackTrip hub servers. The signaling happens over WebSocket on the same
+//! port as traditional TCP signaling (default 4464).
+//!
+//! ## Protocol Flow
+//!
+//! ```text
+//! Client                                    Hub Server
+//!   │                                           │
+//!   │  1. WebSocket Connect (wss://host:4464/webrtc?name=ClientName)
+//!   │───────────────────────────────────────────▶
+//!   │                                           │
+//!   │  2. {"protocol":"webrtc", "version":1}    │
+//!   │───────────────────────────────────────────▶
+//!   │                                           │
+//!   │  3. {"type":"offer", "sdp":"..."}         │
+//!   │───────────────────────────────────────────▶
+//!   │                                           │  Create PeerConnection
+//!   │  4. {"type":"answer", "sdp":"..."}        │  Allocate mixer slot
+//!   │◀───────────────────────────────────────────
+//!   │                                           │
+//!   │  5. Exchange ICE candidates               │
+//!   │◀──────────────────────────────────────────▶
+//!   │                                           │
+//!   │  6. Data Channel Open                     │
+//!   │═══════════════════════════════════════════│
+//!   │                                           │
+//!   │  7. Audio packets over Data Channel       │
+//!   │◀═════════════════════════════════════════▶│
+//! ```
+//!
+//! ## Message Types
+//!
+//! All messages are JSON-encoded:
+//!
+//! - **Protocol Detection**: `{"protocol": "webrtc", "version": 1}` (client name is in WebSocket URL)
+//! - **SDP Offer**: `{"type": "offer", "sdp": "v=0\r\n..."}`
+//! - **SDP Answer**: `{"type": "answer", "sdp": "v=0\r\n..."}`
+//! - **ICE Candidate**: `{"type": "ice", "candidate": "...", "sdpMid": "...", "sdpMLineIndex": 0}`
+//! - **Hangup**: `{"type": "hangup"}`
+//! - **Error**: `{"type": "error", "message": "..."}`
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
+use web_sys::{CloseEvent, Event, MessageEvent, WebSocket};
+
+use webtrip_core::network::signaling_message::{HubConnectionState, SignalingMessage, SignalingMessageType};
+
+/// Hub server signaling client
+///
+/// Handles WebSocket connection and signaling with a JackTrip hub server.
+#[wasm_bindgen]
+pub struct HubSignaling {
+    /// Server URL (always `wss://` for hub WebRTC signaling)
+    server_url: String,
+    /// WebSocket connection
+    socket: Option<WebSocket>,
+    /// Connection state
+    state: HubConnectionState,
+    /// Whether the WebSocket is ready to send messages
+    is_ready: Rc<RefCell<bool>>,
+    /// Queue for outgoing messages (sent when WebSocket is ready)
+    outgoing_queue: Rc<RefCell<Vec<String>>>,
+    /// Callbacks stored as closures
+    on_message_closure: Option<Closure<dyn FnMut(MessageEvent)>>,
+    on_open_closure: Option<Closure<dyn FnMut()>>,
+    on_close_closure: Option<Closure<dyn FnMut(CloseEvent)>>,
+    on_error_closure: Option<Closure<dyn FnMut(Event)>>,
+    /// Message queue for received messages
+    message_queue: Rc<RefCell<Vec<SignalingMessage>>>,
+    /// JavaScript callbacks
+    js_on_answer: Option<js_sys::Function>,
+    js_on_ice: Option<js_sys::Function>,
+    js_on_error: Option<js_sys::Function>,
+    js_on_state_change: Option<js_sys::Function>,
+}
+
+impl HubSignaling {
+    fn build(server_url: String) -> Self {
+        Self {
+            server_url,
+            socket: None,
+            state: HubConnectionState::Disconnected,
+            is_ready: Rc::new(RefCell::new(false)),
+            outgoing_queue: Rc::new(RefCell::new(Vec::new())),
+            on_message_closure: None,
+            on_open_closure: None,
+            on_close_closure: None,
+            on_error_closure: None,
+            message_queue: Rc::new(RefCell::new(Vec::new())),
+            js_on_answer: None,
+            js_on_ice: None,
+            js_on_error: None,
+            js_on_state_change: None,
+        }
+    }
+
+    fn send_or_queue(&self, json: String) -> Result<(), JsValue> {
+        if *self.is_ready.borrow() {
+            self.socket.as_ref().ok_or("Not connected")?.send_with_str(&json)?;
+        } else {
+            self.outgoing_queue.borrow_mut().push(json);
+        }
+        Ok(())
+    }
+}
+
+#[wasm_bindgen]
+impl HubSignaling {
+    /// Create a new hub signaling client
+    ///
+    /// WebRTC hub signaling always uses a TLS WebSocket (`wss://`) on the `/webrtc` path.
+    ///
+    /// # Arguments
+    /// * `server_host` - The hub server hostname (from studio.server_host)
+    /// * `port` - The signaling port (default 4464)
+    /// * `client_name` - Client identifier (sent as URL query parameter), empty string for anonymous
+    #[wasm_bindgen(constructor)]
+    pub fn new(server_host: &str, port: u16, client_name: &str) -> Self {
+        // Only include name parameter if client_name is not empty
+        let server_url = if client_name.is_empty() {
+            format!("wss://{}:{}/webrtc", server_host, port)
+        } else {
+            let encoded_name = js_sys::encode_uri_component(client_name);
+            format!("wss://{}:{}/webrtc?name={}", server_host, port, encoded_name)
+        };
+
+        Self::build(server_url)
+    }
+
+    /// Create from a full WebSocket URL (`ws://` is upgraded to `wss://` for hub signaling)
+    pub fn from_url(url: &str, _client_name: &str) -> Self {
+        let server_url = if url.starts_with("ws://") {
+            format!("wss://{}", &url[5..])
+        } else {
+            url.to_string()
+        };
+        Self::build(server_url)
+    }
+
+    /// Set callback for SDP answer received
+    pub fn set_on_answer(&mut self, callback: js_sys::Function) {
+        self.js_on_answer = Some(callback);
+    }
+
+    /// Set callback for ICE candidate received
+    pub fn set_on_ice(&mut self, callback: js_sys::Function) {
+        self.js_on_ice = Some(callback);
+    }
+
+    /// Set callback for errors
+    pub fn set_on_error(&mut self, callback: js_sys::Function) {
+        self.js_on_error = Some(callback);
+    }
+
+    /// Set callback for state changes
+    pub fn set_on_state_change(&mut self, callback: js_sys::Function) {
+        self.js_on_state_change = Some(callback);
+    }
+
+    /// Stop reporting state changes, e.g. before a deliberate `disconnect`
+    /// that the callback would otherwise mistake for the hub hanging up.
+    pub(crate) fn clear_on_state_change(&mut self) {
+        self.js_on_state_change = None;
+    }
+
+    /// Get current connection state
+    pub fn state(&self) -> HubConnectionState {
+        self.state
+    }
+
+    /// Connect to the hub server
+    pub fn connect(&mut self) -> Result<(), JsValue> {
+        if self.socket.is_some() {
+            return Err("Already connected".into());
+        }
+
+        self.set_state(HubConnectionState::Connecting);
+        let ws = WebSocket::new(&self.server_url)?;
+
+        // Set up event handlers
+        let message_queue = self.message_queue.clone();
+        let js_on_answer = self.js_on_answer.clone();
+        let js_on_ice = self.js_on_ice.clone();
+        let js_on_error = self.js_on_error.clone();
+
+        let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
+            if let Ok(text) = event.data().dyn_into::<js_sys::JsString>() {
+                let text: String = text.into();
+                web_sys::console::debug_1(&format!("📨 Signaling received message: {}", text).into());
+                
+                if let Ok(msg) = SignalingMessage::from_json(&text) {
+                    web_sys::console::debug_1(&format!("✅ Parsed message type: {:?}", msg.msg_type).into());
+                    match msg.msg_type {
+                        SignalingMessageType::Answer => {
+                            web_sys::console::debug_1(&"📥 Signaling: Answer message detected".into());
+                            if let Some(ref callback) = js_on_answer {
+                                if let Some(ref sdp) = msg.sdp {
+                                    web_sys::console::debug_1(&"✅ Signaling: Calling answer callback".into());
+                                    let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(sdp));
+                                }
+                            } else {
+                                web_sys::console::warn_1(&"⚠️ Answer callback not set".into());
+                            }
+                        }
+                        SignalingMessageType::Ice => {
+                            if let Some(ref callback) = js_on_ice {
+                                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&text));
+                            } else {
+                                web_sys::console::warn_1(&"⚠️ ICE callback not set".into());
+                            }
+                        }
+                        SignalingMessageType::Error => {
+                            let error = msg.error.as_deref().unwrap_or("Unknown error");
+                            web_sys::console::error_1(&format!("❌ Signaling error: {}", error).into());
+                            if let Some(ref callback) = js_on_error {
+                                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(error));
+                            }
+                        }
+                        _ => {
+                            message_queue.borrow_mut().push(msg);
+                        }
+                    }
+                } else {
+                    web_sys::console::warn_1(&"⚠️ Failed to parse signaling message".into());
+                }
+            }
+        }) as Box<dyn FnMut(_)>);
+
+        ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+        self.on_message_closure = Some(on_message);
+
+        // On open - send protocol handshake and flush queued messages
+        let socket_clone = ws.clone();
+        let is_ready = self.is_ready.clone();
+        let outgoing_queue = self.outgoing_queue.clone();
+        let on_open = Closure::wrap(Box::new(move || {
+            web_sys::console::debug_1(&"✅ Signaling: WebSocket connected!".into());
+
+            // Send protocol handshake first (client name already in URL)
+            let msg = SignalingMessage::protocol();
+            let json = msg.to_json();
+            web_sys::console::debug_1(&format!("📤 Signaling: Sending protocol handshake: {}", json).into());
+            let _ = socket_clone.send_with_str(&json);
+
+            // Mark as ready
+            *is_ready.borrow_mut() = true;
+
+            // Flush any queued outgoing messages
+            let queued: Vec<String> = outgoing_queue.borrow_mut().drain(..).collect();
+            web_sys::console::debug_1(&format!("📤 Signaling: Flushing {} queued messages", queued.len()).into());
+            for msg in queued {
+                web_sys::console::debug_1(&format!("📤 Signaling: Sending queued: {}", msg).into());
+                let _ = socket_clone.send_with_str(&msg);
+            }
+        }) as Box<dyn FnMut()>);
+
+        ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+        self.on_open_closure = Some(on_open);
+
+        // On close
+        let js_on_state_change = self.js_on_state_change.clone();
+        let on_close = Closure::wrap(Box::new(move |event: CloseEvent| {
+            let code = event.code();
+            let reason = event.reason();
+            let was_clean = event.was_clean();
+            web_sys::console::warn_1(&format!("⚠️ Signaling: WebSocket closed (code={}, reason='{}', clean={})", code, reason, was_clean).into());
+            // Include the close code in the state string so callers can give specific error messages.
+            // Format: "closed:CODE" (e.g. "closed:1006")
+            if let Some(ref callback) = js_on_state_change {
+                let state_with_code = format!("closed:{}", code);
+                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&state_with_code));
+            }
+        }) as Box<dyn FnMut(_)>);
+
+        ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+        self.on_close_closure = Some(on_close);
+
+        // On error
+        let js_on_error_clone = self.js_on_error.clone();
+        let on_error = Closure::wrap(Box::new(move |event: Event| {
+            web_sys::console::error_1(&format!("❌ Signaling: WebSocket error: {:?}", event).into());
+            if let Some(ref callback) = js_on_error_clone {
+                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str("WebSocket error"));
+            }
+        }) as Box<dyn FnMut(_)>);
+
+        ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+        self.on_error_closure = Some(on_error);
+
+        self.socket = Some(ws);
+        self.set_state(HubConnectionState::Handshaking);
+
+        Ok(())
+    }
+
+    /// Send an SDP offer to the server
+    /// If the WebSocket isn't ready yet, the message is queued
+    pub fn send_offer(&self, sdp: &str) -> Result<(), JsValue> {
+        self.send_or_queue(SignalingMessage::offer(sdp).to_json())
+    }
+
+    /// Send an ICE candidate to the server
+    /// If the WebSocket isn't ready yet, the message is queued
+    pub fn send_ice_candidate(&self, candidate: &str, sdp_mid: &str, sdp_m_line_index: u16) -> Result<(), JsValue> {
+        self.send_or_queue(SignalingMessage::ice(candidate, sdp_mid, sdp_m_line_index).to_json())
+    }
+
+    /// Send a hangup message and disconnect
+    pub fn disconnect(&mut self) {
+        if let Some(ref socket) = self.socket {
+            let msg = SignalingMessage::hangup();
+            let _ = socket.send_with_str(&msg.to_json());
+            let _ = socket.close();
+        }
+        self.cleanup();
+        self.set_state(HubConnectionState::Closed);
+    }
+
+    /// Check if connected
+    pub fn is_connected(&self) -> bool {
+        matches!(
+            self.state,
+            HubConnectionState::Handshaking | HubConnectionState::Negotiating | HubConnectionState::Connected
+        )
+    }
+
+    // Private methods
+
+    fn set_state(&mut self, state: HubConnectionState) {
+        if self.state != state {
+            self.state = state;
+            if let Some(ref callback) = self.js_on_state_change {
+                let state_str = match state {
+                    HubConnectionState::Disconnected => "disconnected",
+                    HubConnectionState::Connecting => "connecting",
+                    HubConnectionState::Handshaking => "handshaking",
+                    HubConnectionState::Negotiating => "negotiating",
+                    HubConnectionState::Connected => "connected",
+                    HubConnectionState::Failed => "failed",
+                    HubConnectionState::Closed => "closed",
+                };
+                let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(state_str));
+            }
+        }
+    }
+
+    fn cleanup(&mut self) {
+        // Remove event handlers BEFORE dropping closures to prevent "closure invoked after being dropped" errors
+        if let Some(ref socket) = self.socket {
+            socket.set_onmessage(None);
+            socket.set_onopen(None);
+            socket.set_onclose(None);
+            socket.set_onerror(None);
+        }
+        
+        // Now safe to drop closures
+        self.on_message_closure = None;
+        self.on_open_closure = None;
+        self.on_close_closure = None;
+        self.on_error_closure = None;
+        
+        // Finally drop the socket
+        self.socket = None;
+        *self.is_ready.borrow_mut() = false;
+        self.outgoing_queue.borrow_mut().clear();
+        self.message_queue.borrow_mut().clear();
+    }
+}
+
+impl Drop for HubSignaling {
+    fn drop(&mut self) {
+        self.disconnect();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- from_url scheme upgrade ---
+
+    #[test]
+    fn test_from_url_upgrades_ws_to_wss() {
+        let sig = HubSignaling::from_url("ws://hub.example.com:4464/webrtc", "");
+        assert_eq!(sig.server_url, "wss://hub.example.com:4464/webrtc");
+    }
+
+    #[test]
+    fn test_from_url_passes_through_wss() {
+        let sig = HubSignaling::from_url("wss://hub.example.com:4464/webrtc", "");
+        assert_eq!(sig.server_url, "wss://hub.example.com:4464/webrtc");
+    }
+
+    // --- is_connected across states ---
+
+    #[test]
+    fn test_is_connected_true_for_active_states() {
+        for state in [
+            HubConnectionState::Handshaking,
+            HubConnectionState::Negotiating,
+            HubConnectionState::Connected,
+        ] {
+            let mut sig = HubSignaling::from_url("wss://hub.example.com/webrtc", "");
+            sig.state = state;
+            assert!(sig.is_connected(), "{:?} should count as connected", state);
+        }
+    }
+
+    #[test]
+    fn test_is_connected_false_for_inactive_states() {
+        for state in [
+            HubConnectionState::Disconnected,
+            HubConnectionState::Connecting,
+            HubConnectionState::Failed,
+            HubConnectionState::Closed,
+        ] {
+            let mut sig = HubSignaling::from_url("wss://hub.example.com/webrtc", "");
+            sig.state = state;
+            assert!(!sig.is_connected(), "{:?} should not count as connected", state);
+        }
+    }
+
+    // ── Browser tests (web_sys WebSocket glue) ────────────────────────────────
+    //
+    // These exercise the genuinely browser-only surface of `HubSignaling` —
+    // everything touching `web_sys::WebSocket`/`MessageEvent`/`CloseEvent`,
+    // `js_sys::Function`, and `wasm_bindgen::Closure`. The pure JSON layer above
+    // is already exhaustively native-tested and is NOT re-covered here.
+    //
+    // They run in headless Chrome via `npm run test:wasm`. The per-binary browser
+    // opt-in (`wasm_bindgen_test_configure!(run_in_browser)`) lives once in
+    // `crate::test_support`; here we only import the attribute.
+    //
+    // Headless caveat: without a live hub the WebSocket never reaches the OPEN
+    // state — `onopen` never fires and the socket sits in `CONNECTING`. So we do
+    // NOT assert on a real handshake or server echo; instead we test wiring,
+    // queueing, state transitions, teardown, and synthetic-event handling. The
+    // one path that depends on an OPEN socket (`send_with_str` succeeding) is
+    // documented inline where it is approximated with a CONNECTING socket.
+
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// Build a `js_sys::Function` that records the string form of its first
+    /// argument into a shared `Vec`. Returns the recording buffer and the
+    /// function. The backing `Closure` is leaked (`forget`) so it stays valid
+    /// for the whole test — the standard pattern for browser-test callbacks.
+    #[cfg(target_arch = "wasm32")]
+    fn recording_callback() -> (Rc<RefCell<Vec<String>>>, js_sys::Function) {
+        let calls = Rc::new(RefCell::new(Vec::<String>::new()));
+        let calls_for_closure = calls.clone();
+        let closure = Closure::wrap(Box::new(move |arg: JsValue| {
+            calls_for_closure
+                .borrow_mut()
+                .push(arg.as_string().unwrap_or_default());
+        }) as Box<dyn FnMut(JsValue)>);
+        let func = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
+        closure.forget();
+        (calls, func)
+    }
+
+    /// Construct a synthetic text `MessageEvent` and dispatch it to the socket,
+    /// which invokes the registered `onmessage` handler synchronously. Thin
+    /// wrapper over the shared [`crate::test_support::dispatch_message_event`]
+    /// so the event construction isn't duplicated.
+    #[cfg(target_arch = "wasm32")]
+    fn dispatch_text_message(ws: &WebSocket, data: &str) {
+        crate::test_support::dispatch_message_event(ws.as_ref(), &JsValue::from_str(data));
+    }
+
+    /// `new()` with a non-ASCII client name must percent-encode the name via the
+    /// `js_sys::encode_uri_component` path; no socket is constructed yet.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn signaling_new_percent_encodes_non_ascii_client_name() {
+        let sig = HubSignaling::new("hub.example.com", 4464, "Café Müller");
+
+        assert!(
+            sig.server_url
+                .starts_with("wss://hub.example.com:4464/webrtc?name="),
+            "URL must be wss:// on /webrtc with a name query param, got: {}",
+            sig.server_url
+        );
+        // 'é' (U+00E9) encodes to its UTF-8 bytes %C3%A9; the space to %20.
+        assert!(
+            sig.server_url.contains("%C3%A9"),
+            "non-ASCII 'é' must be percent-encoded, got: {}",
+            sig.server_url
+        );
+        assert!(
+            !sig.server_url.contains('é') && !sig.server_url.contains('ü'),
+            "raw non-ASCII characters must not appear, got: {}",
+            sig.server_url
+        );
+        // The WebSocket is only created by connect(), not by the constructor.
+        assert!(sig.socket.is_none(), "no socket until connect()");
+    }
+
+    /// An empty client name omits the query param entirely (no `?name=`).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn signaling_new_omits_name_when_empty() {
+        let sig = HubSignaling::new("hub.example.com", 4464, "");
+        assert_eq!(sig.server_url, "wss://hub.example.com:4464/webrtc");
+    }
+
+    /// `connect()` constructs the `WebSocket` (carrying the encoded name), wires
+    /// all four event handlers onto it, retains the backing closures, and
+    /// advances the state machine to `Handshaking`. A second `connect()` errors.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn signaling_connect_constructs_socket_and_wires_handlers() {
+        let mut sig = HubSignaling::new("nonexistent.invalid", 4464, "Café");
+        sig.connect()
+            .expect("connect to a bogus wss:// URL succeeds headless (socket stays CONNECTING)");
+
+        let ws = sig.socket.clone().expect("connect() must construct a WebSocket");
+        assert!(
+            ws.url().contains("%C3%A9"),
+            "constructed socket URL must keep the encoded name, got: {}",
+            ws.url()
+        );
+
+        // All four handlers are wired on the underlying socket...
+        assert!(ws.onmessage().is_some(), "onmessage must be wired");
+        assert!(ws.onopen().is_some(), "onopen must be wired");
+        assert!(ws.onclose().is_some(), "onclose must be wired");
+        assert!(ws.onerror().is_some(), "onerror must be wired");
+
+        // ...and the owning closures are retained so they outlive the socket.
+        assert!(sig.on_message_closure.is_some());
+        assert!(sig.on_open_closure.is_some());
+        assert!(sig.on_close_closure.is_some());
+        assert!(sig.on_error_closure.is_some());
+
+        // connect() drove Disconnected -> Connecting -> Handshaking.
+        assert_eq!(sig.state(), HubConnectionState::Handshaking);
+
+        // Connecting again while a socket exists must be rejected.
+        assert!(sig.connect().is_err(), "second connect() must error");
+    }
+
+    /// `set_state()` fires the registered state-change callback exactly once per
+    /// distinct transition, with the documented lowercase string for each state.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn signaling_set_state_fires_callback_with_state_strings() {
+        let mut sig = HubSignaling::new("hub.example.com", 4464, "");
+        let (states, func) = recording_callback();
+        sig.set_on_state_change(func);
+
+        sig.set_state(HubConnectionState::Connecting);
+        // Re-entering the same state must NOT fire the callback again.
+        sig.set_state(HubConnectionState::Connecting);
+        sig.set_state(HubConnectionState::Handshaking);
+        sig.set_state(HubConnectionState::Negotiating);
+        sig.set_state(HubConnectionState::Connected);
+        sig.set_state(HubConnectionState::Failed);
+        sig.set_state(HubConnectionState::Closed);
+        sig.set_state(HubConnectionState::Disconnected);
+
+        assert_eq!(
+            *states.borrow(),
+            vec![
+                "connecting",
+                "handshaking",
+                "negotiating",
+                "connected",
+                "failed",
+                "closed",
+                "disconnected",
+            ],
+            "each distinct transition fires once with the mapped string"
+        );
+    }
+
+    /// `send_or_queue` while not ready (the default) buffers messages on the
+    /// outgoing queue instead of touching the socket.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn signaling_send_or_queue_queues_when_not_ready() {
+        let sig = HubSignaling::new("hub.example.com", 4464, "");
+        assert!(!*sig.is_ready.borrow(), "fresh signaling is not ready");
+
+        sig.send_offer("v=0\r\n").expect("queueing an offer must succeed");
+        sig.send_ice_candidate("candidate:1 1 UDP 1 1.1.1.1 1 typ host", "data", 0)
+            .expect("queueing an ICE candidate must succeed");
+
+        let queue = sig.outgoing_queue.borrow();
+        assert_eq!(queue.len(), 2, "both messages buffered while not ready");
+        assert!(queue[0].contains(r#""type":"offer""#));
+        assert!(queue[1].contains(r#""type":"ice""#));
+    }
+
+    /// When ready, `send_or_queue` takes the `WebSocket.send_with_str` branch
+    /// rather than the queue. Headless, the socket never opens, so `send_with_str`
+    /// throws `InvalidStateError` on the CONNECTING socket — but the key
+    /// behavioral contract (the message is NOT enqueued) still holds, proving the
+    /// send branch was taken. A real OPEN socket would send successfully; that
+    /// success path can't be reached headless without a live hub (documented).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn signaling_send_or_queue_uses_send_branch_when_ready() {
+        let mut sig = HubSignaling::new("nonexistent.invalid", 4464, "");
+        sig.connect().expect("connect");
+        *sig.is_ready.borrow_mut() = true;
+
+        let _ = sig.send_offer("v=0\r\n");
+        assert!(
+            sig.outgoing_queue.borrow().is_empty(),
+            "ready path must hit the socket, never the queue"
+        );
+
+        // The other half of the branch: ready but no socket → the `?`-propagated
+        // "Not connected" error, still without enqueueing.
+        let orphan = HubSignaling::new("hub.example.com", 4464, "");
+        *orphan.is_ready.borrow_mut() = true;
+        assert!(
+            orphan.send_offer("v=0\r\n").is_err(),
+            "ready + no socket must error rather than queue"
+        );
+        assert!(orphan.outgoing_queue.borrow().is_empty());
+    }
+
+    /// `disconnect()` detaches every handler from the underlying socket, drops
+    /// the closures and socket, clears the queues, and transitions to `Closed`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn signaling_disconnect_detaches_handlers_and_resets_state() {
+        let mut sig = HubSignaling::new("nonexistent.invalid", 4464, "");
+        sig.connect().expect("connect");
+
+        // Keep a clone of the underlying socket so we can inspect it post-teardown.
+        let ws = sig.socket.clone().expect("socket present after connect");
+        assert!(ws.onmessage().is_some(), "handler wired before disconnect");
+
+        // Buffer a message so we can prove cleanup clears the outgoing queue.
+        sig.send_offer("v=0\r\n").expect("queue offer (not ready yet)");
+        assert!(!sig.outgoing_queue.borrow().is_empty());
+
+        sig.disconnect();
+
+        // Underlying socket: all four handlers detached.
+        assert!(ws.onmessage().is_none(), "onmessage detached");
+        assert!(ws.onopen().is_none(), "onopen detached");
+        assert!(ws.onclose().is_none(), "onclose detached");
+        assert!(ws.onerror().is_none(), "onerror detached");
+
+        // Signaling object: socket + closures gone, queues cleared, state Closed.
+        assert!(sig.socket.is_none(), "socket dropped");
+        assert!(sig.on_message_closure.is_none());
+        assert!(sig.on_open_closure.is_none());
+        assert!(sig.on_close_closure.is_none());
+        assert!(sig.on_error_closure.is_none());
+        assert!(!*sig.is_ready.borrow(), "ready flag reset");
+        assert!(sig.outgoing_queue.borrow().is_empty(), "outgoing queue cleared");
+        assert!(sig.message_queue.borrow().is_empty(), "received queue cleared");
+        assert_eq!(sig.state(), HubConnectionState::Closed);
+    }
+
+    /// An incoming `answer` message is parsed and its SDP forwarded to the
+    /// `on_answer` callback. Dispatched via a synthetic `MessageEvent`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn signaling_onmessage_forwards_answer_sdp() {
+        let mut sig = HubSignaling::new("nonexistent.invalid", 4464, "");
+        let (answers, func) = recording_callback();
+        sig.set_on_answer(func);
+        sig.connect().expect("connect");
+        let ws = sig.socket.clone().unwrap();
+
+        let sdp = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
+        dispatch_text_message(&ws, &SignalingMessage::answer(sdp).to_json());
+
+        assert_eq!(
+            *answers.borrow(),
+            vec![sdp.to_string()],
+            "on_answer must receive the extracted SDP"
+        );
+    }
+
+    /// An incoming `ice` message forwards the raw JSON text to the `on_ice`
+    /// callback (the WebRTC layer re-parses it).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn signaling_onmessage_forwards_ice_json() {
+        let mut sig = HubSignaling::new("nonexistent.invalid", 4464, "");
+        let (ices, func) = recording_callback();
+        sig.set_on_ice(func);
+        sig.connect().expect("connect");
+        let ws = sig.socket.clone().unwrap();
+
+        let ice_json =
+            SignalingMessage::ice("candidate:1 1 UDP 1 1.1.1.1 1 typ host", "data", 0).to_json();
+        dispatch_text_message(&ws, &ice_json);
+
+        let ices = ices.borrow();
+        assert_eq!(ices.len(), 1, "on_ice fired exactly once");
+        assert!(ices[0].contains(r#""type":"ice""#));
+        assert!(ices[0].contains("candidate:1 1 UDP"));
+    }
+
+    /// An incoming `error` message forwards the error text to the `on_error`
+    /// callback.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn signaling_onmessage_forwards_error_message() {
+        let mut sig = HubSignaling::new("nonexistent.invalid", 4464, "");
+        let (errors, func) = recording_callback();
+        sig.set_on_error(func);
+        sig.connect().expect("connect");
+        let ws = sig.socket.clone().unwrap();
+
+        // Build the payload via to_json() so this test exercises the same wire
+        // format as the rest of the module rather than a hand-written literal.
+        let error_json = SignalingMessage {
+            msg_type: SignalingMessageType::Error,
+            sdp: None,
+            candidate: None,
+            sdp_mid: None,
+            sdp_m_line_index: None,
+            error: Some("Room is full".to_string()),
+        }
+        .to_json();
+        dispatch_text_message(&ws, &error_json);
+
+        assert_eq!(*errors.borrow(), vec!["Room is full".to_string()]);
+    }
+
+    /// The `onclose` handler extracts the close code and forwards it to the
+    /// state-change callback as `"closed:<code>"`. Dispatched via a synthetic
+    /// `CloseEvent`.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn signaling_onclose_reports_close_code() {
+        let mut sig = HubSignaling::new("nonexistent.invalid", 4464, "");
+        let (states, func) = recording_callback();
+        sig.set_on_state_change(func);
+        sig.connect().expect("connect");
+        let ws = sig.socket.clone().unwrap();
+
+        // connect() already drove connecting + handshaking through set_state.
+        assert_eq!(
+            *states.borrow(),
+            vec!["connecting".to_string(), "handshaking".to_string()],
+        );
+
+        let init = web_sys::CloseEventInit::new();
+        init.set_code(4001);
+        init.set_reason("server full");
+        let event = web_sys::CloseEvent::new_with_event_init_dict("close", &init)
+            .expect("CloseEvent construction should succeed");
+        ws.dispatch_event(&event)
+            .expect("dispatching the close event should succeed");
+
+        assert_eq!(
+            states.borrow().last().map(String::as_str),
+            Some("closed:4001"),
+            "onclose forwards the numeric close code"
+        );
+    }
+}
+

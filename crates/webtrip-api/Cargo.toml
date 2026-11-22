@@ -1,0 +1,28 @@
+[package]
+name = "webtrip-api"
+description = "JackTrip Virtual Studio REST API client and models"
+authors.workspace = true
+edition.workspace = true
+publish.workspace = true
+version.workspace = true
+
+# Platform rule: this crate never depends on web-sys or js-sys (see webtrip-core).
+[features]
+# JS exports and generated TypeScript types for the API surface. Only
+# `webtrip-web` turns this on.
+wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:tsify-next", "dep:serde-wasm-bindgen"]
+
+[dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "query"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_repr = "0.1"  # For numeric enum serialization
+url = "2.5"
+serde-wasm-bindgen = { version = "0.6", optional = true }
+tsify-next = { version = "0.5", features = ["js"], optional = true }  # TypeScript type generation
+wasm-bindgen = { version = "0.2.106", optional = true }
+wasm-bindgen-futures = { version = "0.4.56", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+mockito = "1.7.2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

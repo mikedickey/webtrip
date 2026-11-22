@@ -3,7 +3,7 @@
 //
 // Why a served-app + browser-driver harness (not `wasm-bindgen-test`): the
 // WebTransport worker loads the wasm module from `{origin}/pkg/webtrip.js`
-// (see `src/audio/webtransport.rs::wasm_module_url`), which only resolves when
+// (see `crates/webtrip-web/src/network/webtransport.rs::wasm_module_url`), which only resolves when
 // the page is served at the site root with `pkg/` present. So we serve the real
 // app via `website/server.js`, point a headless browser at it, and run each transport
 // through the actual exported session API
@@ -221,8 +221,8 @@ async function inPageDrive({ transportName, host, port, connectTimeoutMs, sendPo
   // error-rate / connection-lost branches) and the WebRTC data-channel receive
   // body (`enqueue_channel_message`, both channel-creation directions, incl. the
   // non-ArrayBuffer rejection) — is covered by targeted browser unit tests
-  // (`#[wasm_bindgen_test]` in src/audio/webtransport_worker.rs and
-  // src/audio/webrtc.rs; see WEB-45). Those feed synthetic inbound data straight
+  // (`#[wasm_bindgen_test]` in crates/webtrip-web/src/network/webtransport_worker.rs and
+  // crates/webtrip-web/src/network/webrtc.rs; see WEB-45). Those feed synthetic inbound data straight
   // into the receive handlers and assert on Regulator state + the stats counters.
   const s = session.get_stats();
   const result = {

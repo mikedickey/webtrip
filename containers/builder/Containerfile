@@ -55,7 +55,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # so it doesn't try to download a driver that mismatches the installed
     # browser. Headless-Chrome flags (--no-sandbox for running as root in a
     # container, --disable-dev-shm-usage for the small /dev/shm) come from the
-    # webdriver.json at the repo root.
+    # crates/webtrip-web/webdriver.json.
     CHROMEDRIVER=/usr/bin/chromedriver
 
 # 1. OS packages: dev essentials + native build toolchain.
@@ -153,12 +153,15 @@ RUN umask 000 \
 #    so it copies every touched file into a new layer — that one `chmod` was the
 #    single largest layer in the image (~2.8 GB of duplicated cache trees).
 COPY Cargo.toml Cargo.lock package.json /opt/prewarm/
+COPY crates/webtrip-core/Cargo.toml /opt/prewarm/crates/webtrip-core/
+COPY crates/webtrip-api/Cargo.toml /opt/prewarm/crates/webtrip-api/
+COPY crates/webtrip-web/Cargo.toml /opt/prewarm/crates/webtrip-web/
 RUN set -eux; \
     umask 000; \
     mkdir -p "${XDG_CACHE_HOME}"; \
     cd /opt/prewarm; \
-    mkdir -p src; \
-    printf 'use wasm_bindgen::prelude::*;\n#[wasm_bindgen]\npub fn __prewarm() {}\n' > src/lib.rs; \
+    for c in webtrip-core webtrip-api webtrip-web; do mkdir -p crates/$c/src; : > crates/$c/src/lib.rs; done; \
+    printf 'use wasm_bindgen::prelude::*;\n#[wasm_bindgen]\npub fn __prewarm() {}\n' > crates/webtrip-web/src/lib.rs; \
     npm run build:wasm; \
     npm run test; \
     # Warm the wasm *test*-profile dep graph (what `npm run test:wasm` builds).
@@ -181,9 +184,9 @@ RUN set -eux; \
     # older-mtime mounted source as already-built and silently run stub code.
     # One clean per profile/target the warm-up produced webtrip artifacts in:
     # wasm release (build:wasm), wasm test (test --no-run), native (test).
-    cargo clean -p webtrip --release --target wasm32-unknown-unknown; \
-    cargo clean -p webtrip --target wasm32-unknown-unknown; \
-    cargo clean -p webtrip; \
+    cargo clean -p webtrip -p webtrip-core -p webtrip-api --release --target wasm32-unknown-unknown; \
+    cargo clean -p webtrip -p webtrip-core -p webtrip-api --target wasm32-unknown-unknown; \
+    cargo clean -p webtrip -p webtrip-core -p webtrip-api; \
     cd /; \
     rm -rf /opt/prewarm
 

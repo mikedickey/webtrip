@@ -71,6 +71,8 @@ the fallback path, not a replacement — see [Browser Compatibility](#browser-co
 
 Because both of the above are passed as flags rather than committed to `.cargo/config.toml`,
 bare `cargo check` / `cargo test` invocations will fail. Always go through the npm scripts.
+(`npm run check:core` is the one native, flag-free check: it builds the portable `webtrip-core` and
+`webtrip-api` crates with no browser dependencies, which is how the core/web split is enforced.)
 
 ## Building
 

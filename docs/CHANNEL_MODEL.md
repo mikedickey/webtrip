@@ -445,15 +445,15 @@ stay live.
 
 | Concern | File |
 |---|---|
-| Session channel configuration (send/receive/input/output setters, Idle-only guard), `AudioBufferConfig` construction | `src/session.rs` |
-| `AudioBufferConfig` (send/receive counts handed to transports) | `src/audio/transport.rs` |
-| Atomic shared `send_channels` field | `src/audio/params.rs` |
-| Pre-connect device probes (`getInputDeviceChannels`, `getOutputDeviceChannels`), `resolve_input_channels` | `src/audio/devices.rs` |
-| `getUserMedia` constraints, capture-width clamping, destination configuration, worklet node (re)building | `src/audio/engine.rs` |
-| Worklet ABI (planar scratch buffers, `ProcessorCallback`/`ProcessorHandle::render`) | `src/audio/worklet.rs` |
-| Worklet JS bridge (copies each channel plane in/out of WASM memory) | `src/audio/worklet.js` |
-| Gain, metering, planar↔interleaved conversion, channel-mapping policy, send/receive wiring | `src/audio/processor.rs` |
-| Wire protocol header (bytes 14/15, payload sizing, `MAX_CHANNELS`) | `src/audio/protocol.rs` |
-| Peer channel-count adoption (jitter buffer) | `src/audio/regulator.rs` |
-| Per-transport packet framing at the send/receive counts | `src/audio/webrtc.rs`, `src/audio/webtransport.rs`, `src/audio/webtransport_worker.rs` |
+| Session channel configuration (send/receive/input/output setters, Idle-only guard), `AudioBufferConfig` construction | `crates/webtrip-web/src/session.rs` |
+| `AudioBufferConfig` (send/receive counts handed to transports) | `crates/webtrip-core/src/network/transport.rs` |
+| Atomic shared `send_channels` field | `crates/webtrip-core/src/audio/params.rs` |
+| Pre-connect device probes (`getInputDeviceChannels`, `getOutputDeviceChannels`), `resolve_input_channels` | `crates/webtrip-web/src/audio/devices.rs` |
+| `getUserMedia` constraints, capture-width clamping, destination configuration, worklet node (re)building | `crates/webtrip-web/src/audio/engine.rs` |
+| Worklet ABI (planar scratch buffers, `ProcessorCallback`/`ProcessorHandle::render`) | `crates/webtrip-web/src/audio/worklet.rs` |
+| Worklet JS bridge (copies each channel plane in/out of WASM memory) | `crates/webtrip-web/src/audio/worklet.js` |
+| Gain, metering, planar↔interleaved conversion, channel-mapping policy, send/receive wiring | `crates/webtrip-core/src/audio/processor.rs` |
+| Wire protocol header (bytes 14/15, payload sizing, `MAX_CHANNELS`) | `crates/webtrip-core/src/network/protocol.rs` |
+| Peer channel-count adoption (jitter buffer) | `crates/webtrip-core/src/stream/regulator.rs` |
+| Per-transport packet framing at the send/receive counts | `crates/webtrip-web/src/network/webrtc.rs`, `crates/webtrip-web/src/network/webtransport.rs`, `crates/webtrip-web/src/network/webtransport_worker.rs` |
 | Demo UI: probing, `devicechange`, capture modes, config locking | `website/src/pages/demo/Demo.tsx` |

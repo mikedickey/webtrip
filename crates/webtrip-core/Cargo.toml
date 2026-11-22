@@ -1,0 +1,19 @@
+[package]
+name = "webtrip-core"
+description = "Portable WebTrip core: audio processing, wire protocol, jitter buffer"
+authors.workspace = true
+edition.workspace = true
+publish.workspace = true
+version.workspace = true
+
+# Platform rule: this crate never depends on web-sys or js-sys. `npm run
+# check:core` builds it natively with no features to enforce that.
+[features]
+# JS exports for core types (`#[cfg_attr(feature = "wasm", wasm_bindgen)]`).
+# Only `webtrip-web` turns this on.
+wasm = ["dep:wasm-bindgen"]
+
+[dependencies]
+log = "0.4"
+serde_json = "1.0"
+wasm-bindgen = { version = "0.2.106", optional = true }
