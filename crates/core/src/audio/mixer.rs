@@ -24,6 +24,12 @@ pub enum MixError {
     /// or the device rate is outside the supported range. Names both so the
     /// failure is diagnosable, never a stream silently played at the wrong speed.
     UnsupportedRates { device_rate: u32, wire_rate: u32 },
+    /// The regulator cannot serve the callbacks it is attached to: it would
+    /// return 0 from every pop (a silent peer, nothing logged).
+    RegulatorCapacity { capacity: usize, needed: usize },
+    /// The regulator runs at a different rate than the wire stream; it never
+    /// sees the device rate, so every conversion would be wrong.
+    RegulatorRate { regulator_rate: u32, wire_rate: u32 },
 }
 
 impl std::fmt::Display for MixError {
@@ -34,6 +40,14 @@ impl std::fmt::Display for MixError {
                 f,
                 "cannot convert between the audio device rate ({device_rate} Hz) and the wire rate ({wire_rate} Hz): \
                  device rates must be {MIN_DEVICE_SAMPLE_RATE}..={MAX_DEVICE_SAMPLE_RATE} Hz"
+            ),
+            MixError::RegulatorCapacity { capacity, needed } => write!(
+                f,
+                "regulator callback capacity ({capacity} frames) is below the {needed} wire frames one callback can need"
+            ),
+            MixError::RegulatorRate { regulator_rate, wire_rate } => write!(
+                f,
+                "the regulator runs at {regulator_rate} Hz but the wire rate is {wire_rate} Hz"
             ),
         }
     }
@@ -279,6 +293,13 @@ impl MixEngine for SimpleMixer {
                 }
                 net.frames = match self.send_resampler.as_mut() {
                     None => frames,
+                    // A width change would reset the resampler and move the
+                    // frame counts this callback was sized with: drop the
+                    // history and skip this one callback.
+                    Some(resampler) if !resampler.continues(wire_channels) => {
+                        resampler.idle();
+                        0
+                    }
                     // A callback of any other size than the prepared chunk
                     // cannot be converted; the host guarantees a fixed
                     // quantum, so this is a contract break, not a state.
@@ -290,7 +311,12 @@ impl MixEngine for SimpleMixer {
                         0
                     }
                 };
+            } else if let Some(resampler) = self.send_resampler.as_mut() {
+                resampler.idle();
             }
+        } else if let Some(resampler) = self.send_resampler.as_mut() {
+            // No streaming ring: nothing is sent, so the history goes stale.
+            resampler.idle();
         }
 
         match io.net_in.first().filter(|net| net.channels > 0) {
@@ -298,11 +324,18 @@ impl MixEngine for SimpleMixer {
                 let wire_frames = net.interleaved.len() / net.channels;
                 let peer: Option<&[f32]> = match self.recv_resampler.as_mut() {
                     None => net.interleaved.get(..frames * net.channels),
+                    Some(resampler) if !resampler.continues(net.channels) => {
+                        resampler.idle();
+                        None
+                    }
                     Some(resampler) => {
                         let converted = frames * net.channels;
                         if frames == resampler.output_frames_next() && wire_frames == resampler.input_frames_next() {
-                            resampler.process(net.interleaved, net.channels, &mut self.recv_native);
-                            self.recv_native.get(..converted)
+                            // A failed conversion returns 0 and leaves `recv_native`
+                            // holding the previous callback's audio; play silence
+                            // rather than replaying it.
+                            let produced = resampler.process(net.interleaved, net.channels, &mut self.recv_native);
+                            if produced == frames { self.recv_native.get(..converted) } else { None }
                         } else {
                             debug_assert!(false, "net_in carries {wire_frames} frames, not the {} the engine asked for", resampler.input_frames_next());
                             None
@@ -314,7 +347,13 @@ impl MixEngine for SimpleMixer {
                     None => self.remote_mapped[..mapped_len].fill(0.0),
                 }
             }
-            None => self.remote_mapped[..mapped_len].fill(0.0),
+            None => {
+                // No peer stream yet: the history goes stale.
+                if let Some(resampler) = self.recv_resampler.as_mut() {
+                    resampler.idle();
+                }
+                self.remote_mapped[..mapped_len].fill(0.0);
+            }
         }
 
         map_to_output(
@@ -355,23 +394,21 @@ mod tests {
         levels.iter().flat_map(|&l| std::iter::repeat(l).take(FRAMES)).collect()
     }
 
-    fn prepared(max_device_channels: usize) -> SimpleMixer {
+    /// A mixer prepared for the given layout, or the `prepare` error.
+    fn try_prepared(max_frames: usize, max_device_channels: usize, device_rate: u32, wire_rate: u32) -> Result<SimpleMixer, MixError> {
         let mut mixer = SimpleMixer::new();
-        mixer.prepare(&MixLayout { max_frames: FRAMES, max_device_channels, device_rate: RATE, wire_rate: RATE }).unwrap();
-        mixer
+        mixer.prepare(&MixLayout { max_frames, max_device_channels, device_rate, wire_rate })?;
+        Ok(mixer)
+    }
+
+    fn prepared(max_device_channels: usize) -> SimpleMixer {
+        try_prepared(FRAMES, max_device_channels, RATE, RATE).unwrap()
     }
 
     #[test]
     fn prepare_rejects_empty_layouts() {
-        let mut mixer = SimpleMixer::new();
-        assert_eq!(
-            mixer.prepare(&MixLayout { max_frames: 0, max_device_channels: 2, device_rate: RATE, wire_rate: RATE }),
-            Err(MixError::EmptyLayout("frames"))
-        );
-        assert_eq!(
-            mixer.prepare(&MixLayout { max_frames: 8, max_device_channels: 0, device_rate: RATE, wire_rate: RATE }),
-            Err(MixError::EmptyLayout("device channels"))
-        );
+        assert_eq!(try_prepared(0, 2, RATE, RATE).err(), Some(MixError::EmptyLayout("frames")));
+        assert_eq!(try_prepared(8, 0, RATE, RATE).err(), Some(MixError::EmptyLayout("device channels")));
     }
 
     /// A layout sized at the maxima must absorb a render at those maxima with
@@ -461,11 +498,7 @@ mod tests {
     const CHUNK: usize = 128;
 
     fn converting(device_rate: u32, wire_rate: u32) -> SimpleMixer {
-        let mut mixer = SimpleMixer::new();
-        mixer
-            .prepare(&MixLayout { max_frames: CHUNK, max_device_channels: 2, device_rate, wire_rate })
-            .unwrap();
-        mixer
+        try_prepared(CHUNK, 2, device_rate, wire_rate).unwrap()
     }
 
     /// A rate the engine cannot convert is refused at `prepare` with both rates
@@ -473,9 +506,7 @@ mod tests {
     #[test]
     fn prepare_rejects_unconvertible_rates_naming_both() {
         for (device_rate, wire_rate) in [(0, 48_000), (4_000, 48_000), (MAX_DEVICE_SAMPLE_RATE + 1, 48_000), (48_000, 0)] {
-            let err = SimpleMixer::new()
-                .prepare(&MixLayout { max_frames: CHUNK, max_device_channels: 2, device_rate, wire_rate })
-                .unwrap_err();
+            let err = try_prepared(CHUNK, 2, device_rate, wire_rate).err().expect("unconvertible rates must be refused");
             assert_eq!(err, MixError::UnsupportedRates { device_rate, wire_rate });
             let message = err.to_string();
             assert!(message.contains(&device_rate.to_string()) && message.contains(&wire_rate.to_string()), "{message}");
@@ -531,5 +562,54 @@ mod tests {
             let at_device = measured_hz(&played, 1, 0, device_rate, played.len() / 5);
             assert!((at_device - TONE).abs() < 10.0, "{device_rate}: peer played as {at_device} Hz");
         }
+    }
+
+    /// Review of #116: callbacks that skip a resampler (ring not streaming, no
+    /// peer yet) must not leave its filter history behind, or the audio from
+    /// before the gap rings out into the silence after it.
+    #[test]
+    fn resamplers_drop_history_across_skipped_callbacks() {
+        let mut mixer = converting(96_000, 48_000);
+        let controls = MixControls { input_gain: 1.0, monitor_volume: 0.0, output_volume: 1.0 };
+        let loud = vec![0.9; CHUNK];
+        let quiet = vec![0.0; CHUNK];
+        let wire_loud = vec![0.9; mixer.net_in_frames_needed(CHUNK)];
+        let mut output = vec![0.0; CHUNK];
+        let mut staging = vec![0.0; wire_frames_per_callback(CHUNK, 96_000, 48_000)];
+        let mut net_out = [NetOut { interleaved: &mut staging, channels: 1, frames: 0 }];
+        mixer.render(
+            &controls,
+            &mut MixIo {
+                device_in: &[DeviceIn { planar: &loud, channels: 1 }],
+                device_out: &mut [DeviceOut { planar: &mut output, channels: 1 }],
+                net_in: &[NetIn { interleaved: &wire_loud, channels: 1 }],
+                net_out: &mut net_out,
+            },
+        );
+        // A callback with neither a send ring nor a peer.
+        mixer.render(
+            &controls,
+            &mut MixIo {
+                device_in: &[DeviceIn { planar: &quiet, channels: 1 }],
+                device_out: &mut [DeviceOut { planar: &mut output, channels: 1 }],
+                net_in: &[],
+                net_out: &mut [],
+            },
+        );
+        // Both streams resume with silence: nothing of the loud audio may remain.
+        let wire_quiet = vec![0.0; mixer.net_in_frames_needed(CHUNK)];
+        let mut net_out = [NetOut { interleaved: &mut staging, channels: 1, frames: 0 }];
+        mixer.render(
+            &controls,
+            &mut MixIo {
+                device_in: &[DeviceIn { planar: &quiet, channels: 1 }],
+                device_out: &mut [DeviceOut { planar: &mut output, channels: 1 }],
+                net_in: &[NetIn { interleaved: &wire_quiet, channels: 1 }],
+                net_out: &mut net_out,
+            },
+        );
+        let sent = net_out[0].frames;
+        assert!(staging[..sent].iter().all(|&s| s == 0.0), "send resampler replayed stale history");
+        assert!(output.iter().all(|&s| s == 0.0), "recv resampler replayed stale history");
     }
 }

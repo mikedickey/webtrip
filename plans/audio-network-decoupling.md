@@ -562,8 +562,8 @@ every place that converts between "frames the device needs" and "packets the
 wire supplies" accounts for the ratio.
 
 - **Make the rates explicit.** `limits::WIRE_SAMPLE_RATE = 48_000` is the one
-  named wire rate (`protocol::DEFAULT_SAMPLE_RATE` re-exports it, and the session
-  builds its regulator with it). The device rate is read back from
+  named wire rate (`AudioFormat` and the packet header's rate code derive from it, and the
+  session builds its regulator with it). The device rate is read back from
   `AudioContext.sampleRate` when the worklet node is built and passed, with the
   wire rate, to `AudioProcessor::with_network` and on into `MixLayout`
   (`device_rate`, `wire_rate`). The regulator's `sample_rate` stays the **wire**

@@ -116,23 +116,9 @@ impl AudioProcessor {
         device_rate: u32,
         wire_rate: u32,
     ) -> Result<Self, MixError> {
-        let max_wire_frames = wire_frames_per_callback(max_callback_frames, device_rate, wire_rate);
-        // The regulator's FIFO capacity and this callback ceiling are set
-        // independently; a regulator smaller than the callbacks it serves
-        // returns 0 from every pop (silent peer, nothing logged). Setup is off
-        // the render thread, so fail loudly here instead.
-        if let Some(regulator) = network_to_local_buffer.as_ref() {
-            assert!(
-                regulator.callback_capacity() >= max_wire_frames,
-                "regulator callback capacity ({}) is below the {max_wire_frames} wire frames one {max_callback_frames}-frame callback can need",
-                regulator.callback_capacity(),
-            );
-            assert_eq!(
-                regulator.sample_rate(),
-                wire_rate,
-                "the regulator must run at the wire rate: it never sees the device rate"
-            );
-        }
+        // Validate the rates first: everything below divides by or sizes from
+        // them (a 0 Hz device would divide by zero), so an unsupported rate must
+        // surface as `Err`, not a panic.
         // Device-width scratch is sized from the device ceiling so a wide
         // interface never `resize`s on the render thread.
         let mut mixer = SimpleMixer::new();
@@ -142,6 +128,19 @@ impl AudioProcessor {
             device_rate,
             wire_rate,
         })?;
+        let max_wire_frames = wire_frames_per_callback(max_callback_frames, device_rate, wire_rate);
+        // The regulator's FIFO capacity and this callback ceiling are set
+        // independently; a regulator smaller than the callbacks it serves
+        // returns 0 from every pop (silent peer, nothing logged). Setup is off
+        // the render thread, so fail loudly here instead.
+        if let Some(regulator) = network_to_local_buffer.as_ref() {
+            if regulator.callback_capacity() < max_wire_frames {
+                return Err(MixError::RegulatorCapacity { capacity: regulator.callback_capacity(), needed: max_wire_frames });
+            }
+            if regulator.sample_rate() != wire_rate {
+                return Err(MixError::RegulatorRate { regulator_rate: regulator.sample_rate(), wire_rate });
+            }
+        }
         let wire_scratch_len = max_wire_frames * MAX_WIRE_CHANNELS as usize;
         Ok(Self {
             params,
@@ -278,6 +277,7 @@ impl AudioProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits::{MAX_DEVICE_SAMPLE_RATE, MIN_DEVICE_SAMPLE_RATE};
 
     /// Tolerance for floating-point comparisons.
     const EPS: f32 = 1e-4;
@@ -376,8 +376,18 @@ mod tests {
         // SAFETY: `ring` is borrowed for the processor's lifetime in these
         // tests; the processor never outlives the stack local.
         let ring_ptr = unsafe { SharedPtr::new(ring as *mut RingBuffer) };
-        AudioProcessor::with_network(params, ring_ptr, SharedPtr::null(), RENDER_QUANTUM_FRAMES, WIRE_SAMPLE_RATE, WIRE_SAMPLE_RATE)
-            .expect("matched rates build")
+        matched_rate_processor(params, ring_ptr, SharedPtr::null(), RENDER_QUANTUM_FRAMES).expect("matched rates build")
+    }
+
+    /// `with_network` at the wire rate on both sides: only the ring,
+    /// regulator and callback size vary between these tests.
+    fn matched_rate_processor(
+        params: &'static AudioParams,
+        ring: SharedPtr<RingBuffer>,
+        regulator: SharedPtr<crate::stream::regulator::Regulator>,
+        frames: usize,
+    ) -> Result<AudioProcessor, MixError> {
+        AudioProcessor::with_network(params, ring, regulator, frames, WIRE_SAMPLE_RATE, WIRE_SAMPLE_RATE)
     }
 
     /// `frames` of planar capture (`[ch * frames + frame]`) where channel `ch`
@@ -579,13 +589,32 @@ mod tests {
     /// carry would silence the peer on every pop; the mismatch must be caught
     /// at construction, not discovered as silence.
     #[test]
-    #[should_panic(expected = "wire frames one")]
-    fn test_with_network_rejects_undersized_regulator() {
+    fn test_with_network_rejects_mismatched_regulator() {
         use crate::stream::regulator::Regulator;
         let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
         // Default capacity is one packet (64 frames); callbacks are 128.
         let reg = Regulator::with_params(1, 64, 48_000, 5.0);
-        let _ = AudioProcessor::with_network(params, SharedPtr::null(), SharedPtr::from_ref(&reg), RENDER_QUANTUM_FRAMES, WIRE_SAMPLE_RATE, WIRE_SAMPLE_RATE);
+        let result = matched_rate_processor(params, SharedPtr::null(), SharedPtr::from_ref(&reg), RENDER_QUANTUM_FRAMES);
+        assert!(matches!(result, Err(MixError::RegulatorCapacity { capacity: 64, .. })));
+
+        // Capacity is fine but the regulator runs at a rate other than the wire's.
+        let reg = Regulator::with_params(1, 64, 44_100, 5.0).with_callback_capacity(RENDER_QUANTUM_FRAMES);
+        let result = matched_rate_processor(params, SharedPtr::null(), SharedPtr::from_ref(&reg), RENDER_QUANTUM_FRAMES);
+        assert!(matches!(result, Err(MixError::RegulatorRate { regulator_rate: 44_100, .. })));
+    }
+
+    /// An unsupported rate is an `Err` even with a regulator attached: the
+    /// rate check runs before the sizing math (0 Hz would divide by zero) and
+    /// the regulator asserts (a sub-minimum rate would trip the capacity one).
+    #[test]
+    fn test_with_network_returns_err_for_unsupported_device_rate() {
+        use crate::stream::regulator::Regulator;
+        let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
+        let reg = Regulator::with_params(1, 64, WIRE_SAMPLE_RATE, 5.0);
+        for device_rate in [0, MIN_DEVICE_SAMPLE_RATE - 1, MAX_DEVICE_SAMPLE_RATE + 1] {
+            let result = AudioProcessor::with_network(params, SharedPtr::null(), SharedPtr::from_ref(&reg), RENDER_QUANTUM_FRAMES, device_rate, WIRE_SAMPLE_RATE);
+            assert!(matches!(result, Err(MixError::UnsupportedRates { .. })), "device rate {device_rate}");
+        }
     }
 
     /// The processor must hand the peer stream to the mixer at the width and
@@ -602,8 +631,7 @@ mod tests {
 
         let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
         let reg = Regulator::with_params(1, FPP, 48_000, 5.0).with_callback_capacity(FRAMES);
-        let mut processor = AudioProcessor::with_network(params, SharedPtr::null(), SharedPtr::from_ref(&reg), FRAMES, WIRE_SAMPLE_RATE, WIRE_SAMPLE_RATE)
-            .expect("matched rates build");
+        let mut processor = matched_rate_processor(params, SharedPtr::null(), SharedPtr::from_ref(&reg), FRAMES).expect("matched rates build");
         let input = vec![0.0f32; FRAMES];
         let mut output = vec![0.0f32; FRAMES];
         let mut checked = 0;

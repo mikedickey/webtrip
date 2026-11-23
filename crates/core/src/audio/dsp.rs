@@ -232,6 +232,9 @@ pub(crate) struct StreamResampler {
     out_planes: Vec<Vec<f32>>,
     /// Holds the active-channel mask, rewritten in place per call.
     indexing: Indexing,
+    /// Channel width of the stream the filter history belongs to; `0` when the
+    /// history is clear (fresh, or after [`idle`](Self::idle)).
+    history_channels: usize,
 }
 
 impl StreamResampler {
@@ -271,7 +274,26 @@ impl StreamResampler {
             in_planes,
             out_planes,
             indexing: Indexing { active_channels_mask: Some(vec![true; max_channels]), ..Indexing::new() },
+            history_channels: 0,
         })
+    }
+
+    /// Whether `channels` can continue the stream the filter history holds.
+    /// `false` after a width change: the caller must [`idle`](Self::idle) and
+    /// skip that callback, since the reset moves the frame counts the callback
+    /// was sized with.
+    pub(crate) fn continues(&self, channels: usize) -> bool {
+        self.history_channels == 0 || self.history_channels == channels
+    }
+
+    /// Mark the stream as interrupted (callback skipped, or channel width
+    /// changed): drop the filter history so audio from before the gap is not
+    /// blended into what follows. Allocation-free.
+    pub(crate) fn idle(&mut self) {
+        if self.history_channels != 0 {
+            self.inner.reset();
+            self.history_channels = 0;
+        }
     }
 
     /// Frames the next [`process`](Self::process) call consumes.
@@ -302,6 +324,7 @@ impl StreamResampler {
             return 0;
         }
 
+        self.history_channels = channels;
         for (ch, plane) in self.in_planes.iter_mut().take(channels).enumerate() {
             for (frame, sample) in plane[..in_frames].iter_mut().enumerate() {
                 *sample = input[frame * channels + ch];

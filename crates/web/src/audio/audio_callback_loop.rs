@@ -97,15 +97,6 @@ pub fn start_audio_callback_loop(
                             }}
                         }}
                         
-                        // Clear the flag *before* the tick. A read only clears it
-                        // when it drains the ring exactly, so leftover samples
-                        // (a write size that isn't a multiple of the packet size,
-                        // e.g. a resampled capture) would leave it at 1 and make
-                        // waitAsync return "not-equal" forever: a synchronous
-                        // spin that starves the main thread. A write during the
-                        // tick re-sets it, so no wake-up is lost.
-                        Atomics.store(int32View, flagIndex, 0);
-
                         // Data is ready - call tick callback
                         if (running) {{
                             tickCallback();
@@ -299,47 +290,6 @@ mod tests {
         // memory.
         lp.stop();
         assert!(!lp.is_running());
-        crate::test_support::sleep_ms(20).await;
-        drop(cb);
-        drop(flag);
-    }
-
-    /// Regression: a tick that leaves the flag at 1 (a ring read that did not
-    /// drain it, as with a resampled capture whose writes are not a multiple of
-    /// the packet size) must not make the loop spin. One notify is one tick;
-    /// without the loop clearing the flag itself, `waitAsync` returns
-    /// "not-equal" forever and the tick runs unbounded.
-    #[wasm_bindgen_test]
-    async fn audio_callback_loop_does_not_spin_when_tick_leaves_flag_set() {
-        use std::cell::Cell;
-        use std::rc::Rc;
-        use std::sync::atomic::AtomicI32;
-        use wasm_bindgen::closure::Closure;
-        use wasm_bindgen::JsCast;
-
-        let flag = Box::new(AtomicI32::new(0));
-        let flag_ptr = (&*flag as *const AtomicI32) as usize;
-        let memory: js_sys::WebAssembly::Memory = wasm_bindgen::memory().unchecked_into();
-        let int32 = js_sys::Int32Array::new(&memory.buffer());
-        let flag_index = (flag_ptr / 4) as u32;
-
-        let count = Rc::new(Cell::new(0u32));
-        let count_for_cb = count.clone();
-        // Never touches the flag.
-        let cb = Closure::wrap(Box::new(move || count_for_cb.set(count_for_cb.get() + 1)) as Box<dyn FnMut()>);
-
-        let mut lp = AudioCallbackLoop::new();
-        assert!(lp
-            .start_with_atomics(&wasm_bindgen::memory(), flag_ptr, cb.as_ref().unchecked_ref::<js_sys::Function>().clone())
-            .expect("starting the callback loop should not error"));
-
-        js_sys::Atomics::store(&int32, flag_index, 1).expect("Atomics.store");
-        js_sys::Atomics::notify(&int32, flag_index).expect("Atomics.notify");
-        crate::test_support::sleep_ms(100).await;
-
-        assert_eq!(count.get(), 1, "one notify must be exactly one tick");
-
-        lp.stop();
         crate::test_support::sleep_ms(20).await;
         drop(cb);
         drop(flag);

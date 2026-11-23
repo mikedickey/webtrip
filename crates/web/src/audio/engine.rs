@@ -126,6 +126,18 @@ pub struct AudioEngine {
     requested_output_channels: u32,
 }
 
+/// The one place the engine's `AudioContext` options are built: minimal
+/// latency, plus a requested sample rate when given (`None` takes the
+/// device's own rate).
+fn context_options(sample_rate: Option<f32>) -> AudioContextOptions {
+    let options = AudioContextOptions::new();
+    options.set_latency_hint(&JsValue::from(0));
+    if let Some(rate) = sample_rate {
+        options.set_sample_rate(rate);
+    }
+    options
+}
+
 #[wasm_bindgen]
 impl AudioEngine {
     /// Create a new audio engine (without network support)
@@ -149,18 +161,20 @@ impl AudioEngine {
         // browser may refuse it or give another rate, and the rate the context
         // actually runs at is read back when the worklet is built, where the
         // core mixer converts if it differs from the wire rate.
-        let options = AudioContextOptions::new();
-        options.set_latency_hint(&JsValue::from(0));
-        options.set_sample_rate(WIRE_SAMPLE_RATE as f32);
-
-        let ctx = match AudioContext::new_with_context_options(&options) {
+        let ctx = match AudioContext::new_with_context_options(&context_options(Some(
+            WIRE_SAMPLE_RATE as f32,
+        ))) {
             Ok(ctx) => ctx,
-            Err(_) => {
+            Err(e) => {
                 // Some browsers throw for a rate the device cannot be driven
                 // at; take the device's own rate instead of failing to start.
-                let options = AudioContextOptions::new();
-                options.set_latency_hint(&JsValue::from(0));
-                AudioContext::new_with_context_options(&options)?
+                // Keep the original error visible: if the retry fails too, it
+                // is the only hint at why the first attempt was refused.
+                web_sys::console::warn_2(
+                    &"AudioContext rejected the requested wire sample rate; retrying at the device rate:".into(),
+                    &e,
+                );
+                AudioContext::new_with_context_options(&context_options(None))?
             }
         };
         register_audio_worklet(&ctx).await?;
