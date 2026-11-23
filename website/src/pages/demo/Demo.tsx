@@ -4,17 +4,24 @@ import {
   isIOS,
   type AudioDevices,
   type DemoEngine,
-  type DeviceInfo,
   type SessionState,
 } from "../../lib/webtrip";
 import LevelMeter from "./LevelMeter";
 import Slider from "./Slider";
 import StatsPanel from "./StatsPanel";
+import {
+  defaultSettings,
+  loadSavedSettings,
+  pickDevice,
+  resolveSettings,
+  saveSettings,
+  type CaptureMode,
+  type Settings,
+  type TransportChoice,
+} from "./settings";
 import "./demo.css";
 
 type Phase = "loading" | "ready" | "mic-error" | "engine-error";
-type TransportChoice = "auto" | "webrtc" | "webtransport";
-type CaptureMode = "mixToMono" | "stereo" | "mono";
 
 const SESSION_STATE_LABELS: Record<SessionState, string> = {
   idle: "Not Connected",
@@ -43,14 +50,6 @@ const RECEIVE_CHANNELS = 2;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-// Keep the current selection if the device is still present, otherwise fall
-// back to the first listed device.
-function pickDevice(devices: DeviceInfo[], currentId: string): string {
-  return devices.some((d) => d.deviceId === currentId)
-    ? currentId
-    : (devices[0]?.deviceId ?? "");
 }
 
 // The channel count of a selected device, probed before connecting and again
@@ -160,6 +159,42 @@ export default function Demo() {
   // "already in progress" rejection would show as an error on a live connect.
   const connectingRef = useRef(false);
 
+  // Puts every persisted setting into the UI and pushes the levels to the
+  // engine, whose shared params otherwise keep whatever a previous mount set.
+  const applySettings = (eng: DemoEngine, s: Settings) => {
+    setServerHost(s.serverHost);
+    setServerPort(s.serverPort);
+    setClientName(s.clientName);
+    setTransportChoice(s.transportChoice);
+    setInputDeviceId(s.inputDeviceId);
+    setOutputDeviceId(s.outputDeviceId);
+    setAgc(s.agc);
+    setEcho(s.echo);
+    setNoise(s.noise);
+    setCaptureMode(s.captureMode);
+    setInputGain(s.inputGain);
+    setOutputVolume(s.outputVolume);
+    setMonitorVolume(s.monitorVolume);
+    eng.m.setInputGainFromPtr(eng.paramsPtr, s.inputGain);
+    eng.m.setOutputVolumeFromPtr(eng.paramsPtr, s.outputVolume / 100);
+    eng.m.setMonitorVolumeFromPtr(eng.paramsPtr, s.monitorVolume / 100);
+  };
+
+  // Persist on every change, but only once the saved settings have been
+  // applied: before that the state is still the pre-load defaults.
+  useEffect(() => {
+    if (phase !== "ready") return;
+    saveSettings({
+      serverHost, serverPort, clientName, transportChoice,
+      inputDeviceId, outputDeviceId, agc, echo, noise, captureMode,
+      inputGain, outputVolume, monitorVolume,
+    });
+  }, [
+    phase, serverHost, serverPort, clientName, transportChoice,
+    inputDeviceId, outputDeviceId, agc, echo, noise, captureMode,
+    inputGain, outputVolume, monitorVolume,
+  ]);
+
   // Bumped by the retry button on the engine-error screen; getDemoEngine()
   // clears its cache on failure, so re-running the effect starts a fresh load.
   const [loadAttempt, setLoadAttempt] = useState(0);
@@ -191,8 +226,7 @@ export default function Demo() {
         if (cancelled) return;
         setEngine(eng);
         setDevices(devs);
-        setInputDeviceId(pickDevice(devs.inputDevices, ""));
-        setOutputDeviceId(pickDevice(devs.outputDevices, ""));
+        applySettings(eng, resolveSettings(loadSavedSettings(), devs));
         setPhase("ready");
       } catch (error) {
         console.error(error);
@@ -632,6 +666,14 @@ export default function Demo() {
         </div>
 
         <LevelMeter engine={engine} active={connected} />
+
+        <button
+          className="action-btn secondary reset-btn"
+          disabled={configLocked}
+          onClick={() => applySettings(engine, defaultSettings(devices))}
+        >
+          Restore Defaults
+        </button>
       </div>
     </div>
   );
