@@ -191,6 +191,182 @@ pub(crate) fn interleave_planar(planar: &[f32], channels: usize, frames: usize, 
     }
 }
 
+// ==============================================================================
+// Sample-rate conversion
+// ==============================================================================
+
+use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
+use rubato::{
+    Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction,
+};
+
+/// Which side of a [`StreamResampler`] has a fixed frame count per call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FixedSide {
+    /// Every call consumes exactly the chunk size (e.g. the capture callback);
+    /// the number of frames produced varies.
+    Input,
+    /// Every call produces exactly the chunk size (e.g. the playback callback);
+    /// the number of frames consumed varies.
+    Output,
+}
+
+/// Why a [`StreamResampler`] could not be built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResamplerSetupError(pub String);
+
+/// Fixed-ratio, allocation-free converter between two sample rates for
+/// interleaved audio, built on rubato's asynchronous sinc resampler.
+///
+/// Every buffer is sized at construction; [`process`](Self::process) never
+/// allocates, so it is safe on the render thread. The clock drift between the
+/// device and the peer is deliberately *not* tracked here (the regulator's
+/// adaptive tolerance absorbs it), so the ratio never changes.
+pub(crate) struct StreamResampler {
+    inner: Async<f32>,
+    max_channels: usize,
+    /// One plane per channel, so rubato sees a channel-major layout while the
+    /// callers keep interleaved audio.
+    in_planes: Vec<Vec<f32>>,
+    out_planes: Vec<Vec<f32>>,
+    /// Holds the active-channel mask, rewritten in place per call.
+    indexing: Indexing,
+}
+
+impl StreamResampler {
+    /// Convert `from_rate` → `to_rate` for up to `max_channels` channels,
+    /// `chunk_frames` frames on the `fixed` side per call.
+    pub(crate) fn new(
+        from_rate: u32,
+        to_rate: u32,
+        chunk_frames: usize,
+        max_channels: usize,
+        fixed: FixedSide,
+    ) -> Result<Self, ResamplerSetupError> {
+        let params = SincInterpolationParameters {
+            sinc_len: 128,
+            f_cutoff: None,
+            oversampling_factor: 256,
+            interpolation: SincInterpolationType::Linear,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        let inner = Async::<f32>::new_sinc(
+            to_rate as f64 / from_rate as f64,
+            1.0,
+            &params,
+            chunk_frames,
+            max_channels,
+            match fixed {
+                FixedSide::Input => FixedAsync::Input,
+                FixedSide::Output => FixedAsync::Output,
+            },
+        )
+        .map_err(|e| ResamplerSetupError(e.to_string()))?;
+        let in_planes = vec![vec![0.0; inner.input_frames_max()]; max_channels];
+        let out_planes = vec![vec![0.0; inner.output_frames_max()]; max_channels];
+        Ok(Self {
+            inner,
+            max_channels,
+            in_planes,
+            out_planes,
+            indexing: Indexing { active_channels_mask: Some(vec![true; max_channels]), ..Indexing::new() },
+        })
+    }
+
+    /// Frames the next [`process`](Self::process) call consumes.
+    pub(crate) fn input_frames_next(&self) -> usize {
+        self.inner.input_frames_next()
+    }
+
+    /// Frames the next [`process`](Self::process) call produces.
+    pub(crate) fn output_frames_next(&self) -> usize {
+        self.inner.output_frames_next()
+    }
+
+    /// Convert `input` (interleaved, `channels` wide, exactly
+    /// [`input_frames_next`](Self::input_frames_next) frames) into `output`
+    /// (interleaved, room for [`output_frames_next`](Self::output_frames_next)
+    /// frames). Returns the frames produced, `0` if a buffer is too short.
+    ///
+    /// Channels past `channels` are skipped, so a narrow stream pays only for
+    /// the channels it has.
+    pub(crate) fn process(&mut self, input: &[f32], channels: usize, output: &mut [f32]) -> usize {
+        debug_assert!(channels >= 1 && channels <= self.max_channels);
+        let channels = channels.clamp(1, self.max_channels);
+        let in_frames = self.inner.input_frames_next();
+        let out_frames = self.inner.output_frames_next();
+        debug_assert!(input.len() >= in_frames * channels, "resampler input is short");
+        debug_assert!(output.len() >= out_frames * channels, "resampler output is short");
+        if input.len() < in_frames * channels || output.len() < out_frames * channels {
+            return 0;
+        }
+
+        for (ch, plane) in self.in_planes.iter_mut().take(channels).enumerate() {
+            for (frame, sample) in plane[..in_frames].iter_mut().enumerate() {
+                *sample = input[frame * channels + ch];
+            }
+        }
+        if let Some(mask) = self.indexing.active_channels_mask.as_mut() {
+            for (ch, active) in mask.iter_mut().enumerate() {
+                *active = ch < channels;
+            }
+        }
+        let produced = {
+            let (Ok(src), Ok(mut dst)) = (
+                SequentialSliceOfVecs::new(&self.in_planes, self.max_channels, in_frames),
+                SequentialSliceOfVecs::new_mut(&mut self.out_planes, self.max_channels, out_frames),
+            ) else {
+                return 0;
+            };
+            match self.inner.process_into_buffer(&src, &mut dst, Some(&self.indexing)) {
+                Ok((_, produced)) => produced,
+                Err(_) => return 0,
+            }
+        };
+        for (ch, plane) in self.out_planes.iter().take(channels).enumerate() {
+            for (frame, &sample) in plane[..produced].iter().enumerate() {
+                output[frame * channels + ch] = sample;
+            }
+        }
+        produced
+    }
+}
+
+/// Tone generation and measurement shared by the rate-conversion tests of
+/// `dsp`, `mixer` and `processor`.
+#[cfg(test)]
+pub(crate) mod test_signals {
+    /// `frames` interleaved frames of `channels` sine tones: channel `ch`
+    /// runs at `freqs[ch]` Hz and amplitude `amp`, sampled at `rate`,
+    /// starting at absolute frame `start`.
+    pub fn tones(freqs: &[f32], amp: f32, rate: u32, start: usize, frames: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(frames * freqs.len());
+        for n in start..start + frames {
+            for &f in freqs {
+                out.push(amp * (2.0 * std::f32::consts::PI * f * n as f32 / rate as f32).sin());
+            }
+        }
+        out
+    }
+
+    /// Frequency of channel `ch` of an interleaved signal, from its rising
+    /// zero crossings, ignoring the first `skip` frames (resampler warm-up).
+    pub fn measured_hz(signal: &[f32], channels: usize, ch: usize, rate: u32, skip: usize) -> f32 {
+        let samples: Vec<f32> = signal.chunks(channels).skip(skip).map(|f| f[ch]).collect();
+        let rising: Vec<usize> = (1..samples.len()).filter(|&i| samples[i - 1] < 0.0 && samples[i] >= 0.0).collect();
+        assert!(rising.len() >= 3, "too few cycles to measure ({})", rising.len());
+        let span = (rising[rising.len() - 1] - rising[0]) as f32;
+        (rising.len() - 1) as f32 * rate as f32 / span
+    }
+
+    /// RMS of channel `ch`, ignoring the first `skip` frames.
+    pub fn rms(signal: &[f32], channels: usize, ch: usize, skip: usize) -> f32 {
+        let samples: Vec<f32> = signal.chunks(channels).skip(skip).map(|f| f[ch]).collect();
+        (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,5 +738,93 @@ mod tests {
             (actual - expected).abs() < EPS,
             "single-channel max_channel_rms must equal compute_rms: expected {expected}, got {actual}"
         );
+    }
+
+    // --- StreamResampler -----------------------------------------------------
+
+    use super::test_signals::{measured_hz, rms, tones};
+    use crate::limits::{wire_frames_per_callback, MAX_DEVICE_SAMPLE_RATE, MIN_DEVICE_SAMPLE_RATE};
+
+    const CHUNK: usize = 128;
+    const TONES: [f32; 2] = [1000.0, 2000.0];
+    const AMP: f32 = 0.5;
+
+    /// Stream `calls` chunks of a stereo two-tone signal through a resampler
+    /// (the tones' frequencies are absolute, so they must come out unchanged
+    /// at the new rate) and return everything it produced.
+    fn convert_tones(from: u32, to: u32, fixed: FixedSide, calls: usize) -> Vec<f32> {
+        let mut resampler = StreamResampler::new(from, to, CHUNK, 2, fixed).unwrap();
+        let mut consumed = 0;
+        let mut produced = Vec::new();
+        for _ in 0..calls {
+            let in_frames = resampler.input_frames_next();
+            let input = tones(&TONES, AMP, from, consumed, in_frames);
+            consumed += in_frames;
+            let mut out = vec![0.0; resampler.output_frames_next() * 2];
+            let n = resampler.process(&input, 2, &mut out);
+            produced.extend_from_slice(&out[..n * 2]);
+        }
+        produced
+    }
+
+    /// The rate pairs a real session meets, both converter shapes: whichever
+    /// way the ratio is applied, a tone must keep its pitch and level, and
+    /// each channel its own pitch (a planar/interleaved mix-up swaps or blends
+    /// them). An inverted ratio doubles or halves the pitch.
+    #[test]
+    fn resampler_preserves_pitch_level_and_channel_identity() {
+        for (from, to) in [(48_000, 96_000), (96_000, 48_000), (44_100, 48_000), (48_000, 44_100), (48_000, 16_000)] {
+            for fixed in [FixedSide::Input, FixedSide::Output] {
+                let out = convert_tones(from, to, fixed, 200);
+                let skip = out.len() / 2 / 5; // drop the filter's warm-up
+                for (ch, &hz) in TONES.iter().enumerate() {
+                    let got = measured_hz(&out, 2, ch, to, skip);
+                    assert!((got - hz).abs() < hz * 0.01, "{from}->{to} {fixed:?} ch{ch}: {hz} Hz came out as {got}");
+                    let level = rms(&out, 2, ch, skip);
+                    assert!((level - AMP / 2f32.sqrt()).abs() < 0.02, "{from}->{to} {fixed:?} ch{ch}: level {level}");
+                }
+            }
+        }
+    }
+
+    /// Mono through a stereo-capable resampler: channels the stream does not
+    /// have are skipped, not read as garbage or mixed in.
+    #[test]
+    fn resampler_serves_fewer_channels_than_it_was_built_for() {
+        let mut resampler = StreamResampler::new(48_000, 96_000, CHUNK, 8, FixedSide::Input).unwrap();
+        let mut consumed = 0;
+        let mut produced = Vec::new();
+        for _ in 0..100 {
+            let input = tones(&[1000.0], AMP, 48_000, consumed, CHUNK);
+            consumed += CHUNK;
+            let mut out = vec![0.0; resampler.output_frames_next()];
+            let n = resampler.process(&input, 1, &mut out);
+            produced.extend_from_slice(&out[..n]);
+        }
+        let got = measured_hz(&produced, 1, 0, 96_000, produced.len() / 5);
+        assert!((got - 1000.0).abs() < 10.0, "mono tone came out as {got} Hz");
+    }
+
+    /// Every wire-side scratch buffer is sized by `wire_frames_per_callback`
+    /// before the device rate is known; a rate where a call needs or yields
+    /// more would make the render thread allocate (or the regulator, whose
+    /// FIFO is sized the same way, return silence). The per-call counts walk
+    /// through the fractional-ratio phases, so run long enough to see them all. Equal rates never build a resampler (the mixer bypasses it), so 48 kHz is absent.
+    #[test]
+    fn wire_frames_per_callback_bounds_every_call_at_every_supported_rate() {
+        const WIRE: u32 = 48_000;
+        for device in [MIN_DEVICE_SAMPLE_RATE, 11_025, 16_000, 22_050, 32_000, 44_100, 88_200, 96_000, 192_000, MAX_DEVICE_SAMPLE_RATE] {
+            let bound = wire_frames_per_callback(CHUNK, device, WIRE);
+            let mut recv = StreamResampler::new(WIRE, device, CHUNK, 1, FixedSide::Output).unwrap();
+            let mut send = StreamResampler::new(device, WIRE, CHUNK, 1, FixedSide::Input).unwrap();
+            for call in 0..500 {
+                let needed = recv.input_frames_next();
+                assert!(needed <= bound, "device {device} call {call}: receive needs {needed} > {bound}");
+                recv.process(&vec![0.0; needed], 1, &mut vec![0.0; CHUNK]);
+                let yielded = send.output_frames_next();
+                assert!(yielded <= bound, "device {device} call {call}: send yields {yielded} > {bound}");
+                send.process(&vec![0.0; CHUNK], 1, &mut vec![0.0; yielded]);
+            }
+        }
     }
 }

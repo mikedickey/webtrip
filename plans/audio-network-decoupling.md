@@ -561,38 +561,64 @@ Requirement: the device rate and the wire rate are independent values, and
 every place that converts between "frames the device needs" and "packets the
 wire supplies" accounts for the ratio.
 
-- **Make the rates explicit.** Read the actual `AudioContext` rate after
-  creation and carry it, with the wire rate, in `MixLayout` (the mixer's
-  `prepare`). Replace the hardcoded 48000 at `session.rs:439` with the wire
-  rate as a named value. The regulator's `sample_rate` stays the **wire** rate
-  (it derives packet duration and tolerance windows from it); it must never
-  see the device rate.
-- **Receive direction:** convert the regulator's wire-rate output to the
-  device rate before the mixer's `net_in`. The processor asks `pop_frames_at`
-  for `frames_needed` converted into wire-rate frames
-  (`ceil(frames_needed * wire_rate / device_rate)`), so the pull clock still
-  ticks exactly once per device callback.
-- **Send direction:** convert captured device-rate frames to the wire rate
-  before they reach the ring buffer, so packets carry wire-rate audio and the
-  header's rate field (`protocol.rs`) is truthful.
-- **Where the conversion lives: both (decided).** Request the wire rate when
-  creating the `AudioContext` (`sampleRate: 48000`), and fall back to our own
-  conversion when the browser does not give it. The converter is a resampler in
-  `webtrip-core`'s `dsp.rs`, used by the mixer, so it is testable natively and
-  reusable by a future native host, which has no browser to resample at the
-  device edge for it. The rate is only a *request* the browser may not
-  honour, so the context's actual rate is read back after creation and the
-  core resampler is engaged whenever it differs from the wire rate. Where the
-  browser does honour the request, no conversion runs and no quality or
-  latency is spent on it.
-- **Fail loudly in every case.** If the final device rate and wire rate
-  differ and no conversion is active, `connect` must return an error naming
-  both rates — never run silently at the wrong speed. This is the same
-  "diagnosable rail" rule as the channel and packet-size limits.
+- **Make the rates explicit.** `limits::WIRE_SAMPLE_RATE = 48_000` is the one
+  named wire rate (`protocol::DEFAULT_SAMPLE_RATE` re-exports it, and the session
+  builds its regulator with it). The device rate is read back from
+  `AudioContext.sampleRate` when the worklet node is built and passed, with the
+  wire rate, to `AudioProcessor::with_network` and on into `MixLayout`
+  (`device_rate`, `wire_rate`). The regulator's `sample_rate` stays the **wire**
+  rate and never sees the device rate; `with_network` asserts this
+  (`Regulator::sample_rate()`).
+- **Where the conversion lives: both (decided).** The `AudioContext` is created
+  with `sampleRate: 48000` (retried without it if the browser throws), and our
+  own conversion engages whenever the actual rate differs. Where the browser
+  honours the request nothing runs. `dsp::StreamResampler` wraps rubato's
+  asynchronous sinc `Async` resampler (`default-features = false`: no FFT; sinc
+  length 128, linear interpolation over a 256× table, ratio fixed). It
+  preallocates everything, so `process` never allocates on the render thread,
+  and uses rubato's active-channel mask so a narrow stream pays only for its
+  channels. It is built for `MAX_WIRE_CHANNELS`, so adoption of the peer's
+  channel count needs no rebuild.
+- **The mixer owns both conversions.** `SimpleMixer::prepare` builds a send
+  resampler (fixed input: one render quantum in, a varying number of wire
+  frames out) and a receive resampler (fixed output: one render quantum out, a
+  varying number of wire frames in) only when the rates differ. Equal rates
+  build nothing and the mixer behaves as before.
+  - **Receive:** `net_in` carries wire-rate frames. A new trait method,
+    `MixEngine::net_in_frames_needed(device_frames)`, returns exactly how many
+    the resampler consumes this call (the default is `device_frames`). The
+    processor pops that many from `pop_frames_at`, so the pull clock still ticks
+    once per device callback. The count is exact, not the
+    `ceil(frames * wire / device)` approximation, because a fractional ratio
+    (44.1 kHz) varies call to call.
+  - **Send:** the capture is conformed to wire width at the device rate, then
+    resampled; `NetOut.frames` reports the wire frames written, and the
+    processor writes exactly that many to the ring, so packets carry wire-rate
+    audio and the header's rate field is truthful.
+  - A callback whose size differs from the prepared chunk cannot be converted
+    (the worklet's quantum is fixed at 128): `debug_assert`, and that call sends
+    nothing / plays silence.
+- **Sizing.** `limits::wire_frames_per_callback(frames, device, wire)` (exact
+  ratio rounded up, plus one frame of slack, or `frames` when the rates match)
+  sizes the processor's `remote_interleaved` and `wire_staging`.
+  `MIN_DEVICE_SAMPLE_RATE = 8_000` and `MAX_DEVICE_SAMPLE_RATE = 768_000` bound
+  the supported device rates. The regulator is built before the context exists,
+  so the session sizes its callback capacity for the slowest device:
+  `limits::MAX_WIRE_FRAMES_PER_CALLBACK` (769).
+- **Fail loudly.** `MixLayout` is refused with `MixError::UnsupportedRates`
+  (naming both rates) when either rate is zero, the device rate is outside the
+  supported range, or the resampler cannot be built. `AudioProcessor::with_network`
+  returns it, `build_and_connect_worklet_node` turns it into a JS error, and
+  `connect` fails with it. Conversion is always available, so a mismatch itself
+  is never an error, only a rate that cannot be converted.
 - **Clock drift needs no special handling.** The device clock and the peer's
   clock are separate oscillators, so even at identical nominal rates they
   drift. A fixed-ratio converter is sufficient: the regulator's adaptive
   tolerance absorbs the slow drift, as it does today.
+- **Cost.** Two sinc resamplers at ~130 KB of tables each, allocated on the main
+  thread at worklet build, only when the rates differ. Measured delay
+  per direction while converting is 0.7–1.4 ms (rubato's `output_delay`: 32–128
+  output frames across 48↔96 kHz and 44.1→48 kHz).
 
 ### Phase 5 — fpp fitting + peer-fpp adoption
 *Delivers: 5-channel links stop silently failing; a 256-fpp peer works instead

@@ -10,20 +10,31 @@
 //! `net_out: &mut []` means nothing is sent.
 
 use crate::audio::dsp::{
-    apply_gain, conform_interleaved_channels, interleave_planar, map_to_output, max_channel_rms,
+    apply_gain, conform_interleaved_channels, interleave_planar, map_to_output, max_channel_rms, FixedSide,
+    StreamResampler,
 };
+use crate::limits::{MAX_DEVICE_SAMPLE_RATE, MAX_WIRE_CHANNELS, MIN_DEVICE_SAMPLE_RATE};
 
 /// Why a layout was refused by [`MixEngine::prepare`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MixError {
     /// A dimension of the layout was zero, which could never hold a stream.
     EmptyLayout(&'static str),
+    /// The device and wire rates cannot be converted between: a rate is zero
+    /// or the device rate is outside the supported range. Names both so the
+    /// failure is diagnosable, never a stream silently played at the wrong speed.
+    UnsupportedRates { device_rate: u32, wire_rate: u32 },
 }
 
 impl std::fmt::Display for MixError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MixError::EmptyLayout(what) => write!(f, "mix layout has zero {what}"),
+            MixError::UnsupportedRates { device_rate, wire_rate } => write!(
+                f,
+                "cannot convert between the audio device rate ({device_rate} Hz) and the wire rate ({wire_rate} Hz): \
+                 device rates must be {MIN_DEVICE_SAMPLE_RATE}..={MAX_DEVICE_SAMPLE_RATE} Hz"
+            ),
         }
     }
 }
@@ -38,6 +49,12 @@ pub struct MixLayout {
     pub max_frames: usize,
     /// Widest device stream (capture or playback), in channels.
     pub max_device_channels: usize,
+    /// The device's actual sample rate (`AudioContext.sampleRate`), which may
+    /// differ from the rate it was asked for.
+    pub device_rate: u32,
+    /// The rate network streams run at. The mixer converts between the two
+    /// when they differ, and does nothing when they match.
+    pub wire_rate: u32,
 }
 
 /// Per-callback control values, already decoded from the shared atomics.
@@ -70,18 +87,24 @@ pub struct DeviceOut<'a> {
     pub channels: usize,
 }
 
-/// A received network stream, interleaved: `interleaved[frame * channels + ch]`.
-/// `channels == 0` means no audio has arrived yet and counts as silence.
+/// A received network stream at the **wire** rate, interleaved:
+/// `interleaved[frame * channels + ch]`, exactly
+/// [`MixEngine::net_in_frames_needed`] frames. `channels == 0` means no audio
+/// has arrived yet and counts as silence.
 pub struct NetIn<'a> {
     pub interleaved: &'a [f32],
     pub channels: usize,
 }
 
-/// A network stream to send, interleaved. The caller sizes `interleaved` to
-/// at least `frames * channels`; `render` fills exactly that prefix.
+/// A network stream to send, interleaved at the **wire** rate. The caller
+/// sizes `interleaved` for the most wire frames one callback can yield
+/// ([`wire_frames_per_callback`]); `render` fills a prefix and reports its
+/// length in `frames`. With a rate conversion the count varies per call.
 pub struct NetOut<'a> {
     pub interleaved: &'a mut [f32],
     pub channels: usize,
+    /// Set by `render`: wire frames written to `interleaved`.
+    pub frames: usize,
 }
 
 /// Every stream one `render` call reads or writes.
@@ -97,6 +120,13 @@ pub trait MixEngine: Send {
     fn prepare(&mut self, layout: &MixLayout) -> Result<(), MixError>;
     /// On the RT thread. No allocation, no locking, no unbounded work.
     fn render(&mut self, controls: &MixControls, io: &mut MixIo<'_, '_>) -> MixMeters;
+    /// Wire-rate frames the next `render` of `device_frames` device frames
+    /// reads from each `net_in`. Equal to `device_frames` unless the engine
+    /// converts between the device and wire rates, in which case it varies per
+    /// call and the caller must supply exactly this many.
+    fn net_in_frames_needed(&self, device_frames: usize) -> usize {
+        device_frames
+    }
 }
 
 /// One device in, one device out, at most one network stream each way.
@@ -111,6 +141,14 @@ pub struct SimpleMixer {
     remote_mapped: Vec<f32>,
     /// The local monitor mapped onto the output device's channels (planar).
     monitor_mapped: Vec<f32>,
+    /// Capture → wire rate. `None` when the rates match (no conversion runs).
+    send_resampler: Option<StreamResampler>,
+    /// The capture at wire width but still at the device rate, the resampler's input.
+    send_native: Vec<f32>,
+    /// Wire rate → device rate for the peer stream. `None` when the rates match.
+    recv_resampler: Option<StreamResampler>,
+    /// The peer stream converted to the device rate, at wire width.
+    recv_native: Vec<f32>,
 }
 
 impl SimpleMixer {
@@ -139,6 +177,13 @@ pub(crate) fn ensure_len(buf: &mut Vec<f32>, len: usize) {
 }
 
 impl MixEngine for SimpleMixer {
+    fn net_in_frames_needed(&self, device_frames: usize) -> usize {
+        match &self.recv_resampler {
+            Some(resampler) if device_frames == resampler.output_frames_next() => resampler.input_frames_next(),
+            _ => device_frames,
+        }
+    }
+
     fn prepare(&mut self, layout: &MixLayout) -> Result<(), MixError> {
         if layout.max_frames == 0 {
             return Err(MixError::EmptyLayout("frames"));
@@ -146,6 +191,24 @@ impl MixEngine for SimpleMixer {
         if layout.max_device_channels == 0 {
             return Err(MixError::EmptyLayout("device channels"));
         }
+        let rates = MixError::UnsupportedRates { device_rate: layout.device_rate, wire_rate: layout.wire_rate };
+        if layout.wire_rate == 0 || !(MIN_DEVICE_SAMPLE_RATE..=MAX_DEVICE_SAMPLE_RATE).contains(&layout.device_rate) {
+            return Err(rates);
+        }
+        let wire_channels = MAX_WIRE_CHANNELS as usize;
+        (self.send_resampler, self.recv_resampler) = if layout.device_rate == layout.wire_rate {
+            (None, None)
+        } else {
+            let send = StreamResampler::new(layout.device_rate, layout.wire_rate, layout.max_frames, wire_channels, FixedSide::Input);
+            let recv = StreamResampler::new(layout.wire_rate, layout.device_rate, layout.max_frames, wire_channels, FixedSide::Output);
+            match (send, recv) {
+                (Ok(send), Ok(recv)) => (Some(send), Some(recv)),
+                _ => return Err(rates),
+            }
+        };
+        let device_frames = layout.max_frames;
+        self.send_native = vec![0.0; device_frames * wire_channels];
+        self.recv_native = vec![0.0; device_frames * wire_channels];
         let len = layout.max_frames * layout.max_device_channels;
         for buf in [
             &mut self.gained,
@@ -184,10 +247,19 @@ impl MixEngine for SimpleMixer {
         interleave_planar(&self.gained, in_channels, frames, &mut self.captured_interleaved[..captured_len]);
 
         if let Some(net) = io.net_out.first_mut() {
+            net.frames = 0;
             let wire_channels = net.channels.max(1);
             let wire_len = frames * wire_channels;
-            debug_assert!(net.interleaved.len() >= wire_len, "net_out is smaller than one render");
-            if let Some(wire) = net.interleaved.get_mut(..wire_len) {
+            // Conform straight into the output when no conversion follows,
+            // otherwise into the resampler's input.
+            let converting = self.send_resampler.is_some();
+            let conformed = if converting {
+                self.send_native.get_mut(..wire_len)
+            } else {
+                debug_assert!(net.interleaved.len() >= wire_len, "net_out is smaller than one render");
+                net.interleaved.get_mut(..wire_len)
+            };
+            if let Some(wire) = conformed {
                 if in_channels == wire_channels {
                     wire.copy_from_slice(&self.captured_interleaved[..captured_len]);
                 } else {
@@ -198,16 +270,43 @@ impl MixEngine for SimpleMixer {
                         wire_channels,
                     );
                 }
+                net.frames = match self.send_resampler.as_mut() {
+                    None => frames,
+                    // A callback of any other size than the prepared chunk
+                    // cannot be converted; the host guarantees a fixed
+                    // quantum, so this is a contract break, not a state.
+                    Some(resampler) if frames == resampler.input_frames_next() => {
+                        resampler.process(&self.send_native[..wire_len], wire_channels, net.interleaved)
+                    }
+                    Some(_) => {
+                        debug_assert!(false, "callback of {frames} frames differs from the prepared chunk");
+                        0
+                    }
+                };
             }
         }
 
         match io.net_in.first().filter(|net| net.channels > 0) {
-            Some(net) => map_to_output(
-                &net.interleaved[..frames * net.channels],
-                net.channels,
-                &mut self.remote_mapped[..mapped_len],
-                out_channels,
-            ),
+            Some(net) => {
+                let wire_frames = net.interleaved.len() / net.channels;
+                let peer: Option<&[f32]> = match self.recv_resampler.as_mut() {
+                    None => net.interleaved.get(..frames * net.channels),
+                    Some(resampler) => {
+                        let converted = frames * net.channels;
+                        if frames == resampler.output_frames_next() && wire_frames == resampler.input_frames_next() {
+                            resampler.process(net.interleaved, net.channels, &mut self.recv_native);
+                            self.recv_native.get(..converted)
+                        } else {
+                            debug_assert!(false, "net_in carries {wire_frames} frames, not the {} the engine asked for", resampler.input_frames_next());
+                            None
+                        }
+                    }
+                };
+                match peer {
+                    Some(peer) => map_to_output(peer, net.channels, &mut self.remote_mapped[..mapped_len], out_channels),
+                    None => self.remote_mapped[..mapped_len].fill(0.0),
+                }
+            }
             None => self.remote_mapped[..mapped_len].fill(0.0),
         }
 
@@ -234,9 +333,11 @@ impl MixEngine for SimpleMixer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits::wire_frames_per_callback;
 
     const EPS: f32 = 1e-4;
     const FRAMES: usize = 8;
+    const RATE: u32 = 48_000;
 
     fn controls(monitor_volume: f32) -> MixControls {
         MixControls { input_gain: 1.0, monitor_volume, output_volume: 1.0 }
@@ -249,7 +350,7 @@ mod tests {
 
     fn prepared(max_device_channels: usize) -> SimpleMixer {
         let mut mixer = SimpleMixer::new();
-        mixer.prepare(&MixLayout { max_frames: FRAMES, max_device_channels }).unwrap();
+        mixer.prepare(&MixLayout { max_frames: FRAMES, max_device_channels, device_rate: RATE, wire_rate: RATE }).unwrap();
         mixer
     }
 
@@ -257,11 +358,11 @@ mod tests {
     fn prepare_rejects_empty_layouts() {
         let mut mixer = SimpleMixer::new();
         assert_eq!(
-            mixer.prepare(&MixLayout { max_frames: 0, max_device_channels: 2 }),
+            mixer.prepare(&MixLayout { max_frames: 0, max_device_channels: 2, device_rate: RATE, wire_rate: RATE }),
             Err(MixError::EmptyLayout("frames"))
         );
         assert_eq!(
-            mixer.prepare(&MixLayout { max_frames: 8, max_device_channels: 0 }),
+            mixer.prepare(&MixLayout { max_frames: 8, max_device_channels: 0, device_rate: RATE, wire_rate: RATE }),
             Err(MixError::EmptyLayout("device channels"))
         );
     }
@@ -285,7 +386,7 @@ mod tests {
                 device_in: &[DeviceIn { planar: &input, channels: WIDE }],
                 device_out: &mut [DeviceOut { planar: &mut output, channels: WIDE }],
                 net_in: &[NetIn { interleaved: &remote, channels: 2 }],
-                net_out: &mut [NetOut { interleaved: &mut wire, channels: 2 }],
+                net_out: &mut [NetOut { interleaved: &mut wire, channels: 2, frames: 0 }],
             },
         );
 
@@ -313,7 +414,7 @@ mod tests {
                 device_in: &[DeviceIn { planar: &input, channels: 2 }],
                 device_out: &mut [DeviceOut { planar: &mut output, channels: 2 }],
                 net_in: &[NetIn { interleaved: &remote, channels: 2 }],
-                net_out: &mut [NetOut { interleaved: &mut wire, channels: 2 }],
+                net_out: &mut [NetOut { interleaved: &mut wire, channels: 2, frames: 0 }],
             },
         );
 
@@ -345,6 +446,83 @@ mod tests {
                 },
             );
             assert!(output.iter().all(|&s| (s - LEVEL).abs() < EPS), "monitor only: {output:?}");
+        }
+    }
+
+    // --- rate conversion -----------------------------------------------------
+
+    const CHUNK: usize = 128;
+
+    fn converting(device_rate: u32, wire_rate: u32) -> SimpleMixer {
+        let mut mixer = SimpleMixer::new();
+        mixer
+            .prepare(&MixLayout { max_frames: CHUNK, max_device_channels: 2, device_rate, wire_rate })
+            .unwrap();
+        mixer
+    }
+
+    /// A rate the engine cannot convert is refused at `prepare` with both rates
+    /// in the message, rather than a stream silently running at the wrong speed.
+    #[test]
+    fn prepare_rejects_unconvertible_rates_naming_both() {
+        for (device_rate, wire_rate) in [(0, 48_000), (4_000, 48_000), (MAX_DEVICE_SAMPLE_RATE + 1, 48_000), (48_000, 0)] {
+            let err = SimpleMixer::new()
+                .prepare(&MixLayout { max_frames: CHUNK, max_device_channels: 2, device_rate, wire_rate })
+                .unwrap_err();
+            assert_eq!(err, MixError::UnsupportedRates { device_rate, wire_rate });
+            let message = err.to_string();
+            assert!(message.contains(&device_rate.to_string()) && message.contains(&wire_rate.to_string()), "{message}");
+        }
+    }
+
+    /// The motivating failure: a 96 kHz device on a 48 kHz link. Sent audio
+    /// must be packetised as 48 kHz (a 1 kHz capture still reads 1 kHz on the
+    /// wire, at half the frames), and received 48 kHz audio must play at the
+    /// device's rate with the callback consuming half as many wire frames.
+    /// Run at a fractional ratio too (44.1 kHz), where the per-call frame
+    /// counts vary and only the long-run average is exact.
+    #[test]
+    fn render_converts_both_directions_between_device_and_wire_rate() {
+        use crate::audio::dsp::test_signals::{measured_hz, tones};
+        const TONE: f32 = 1000.0;
+        const CALLS: usize = 300;
+        for device_rate in [96_000u32, 44_100] {
+            let wire_rate = 48_000u32;
+            let mut mixer = converting(device_rate, wire_rate);
+            let mut sent = Vec::new();
+            let mut played = Vec::new();
+            let (mut device_clock, mut wire_clock) = (0usize, 0usize);
+            for _ in 0..CALLS {
+                let needed = mixer.net_in_frames_needed(CHUNK);
+                let peer = tones(&[TONE], 0.5, wire_rate, wire_clock, needed);
+                wire_clock += needed;
+                let capture = tones(&[TONE], 0.5, device_rate, device_clock, CHUNK);
+                device_clock += CHUNK;
+                let mut output = vec![0.0; CHUNK];
+                let mut staging = vec![0.0; wire_frames_per_callback(CHUNK, device_rate, wire_rate)];
+                let mut net_out = [NetOut { interleaved: &mut staging, channels: 1, frames: 0 }];
+                mixer.render(
+                    &MixControls { input_gain: 1.0, monitor_volume: 0.0, output_volume: 1.0 },
+                    &mut MixIo {
+                        device_in: &[DeviceIn { planar: &capture, channels: 1 }],
+                        device_out: &mut [DeviceOut { planar: &mut output, channels: 1 }],
+                        net_in: &[NetIn { interleaved: &peer, channels: 1 }],
+                        net_out: &mut net_out,
+                    },
+                );
+                let frames = net_out[0].frames;
+                sent.extend_from_slice(&staging[..frames]);
+                played.extend_from_slice(&output);
+            }
+            // Wire frames per device frame is wire/device, to within the
+            // filter's start-up, which is why this is a rate and not a count.
+            let expected_sent = CALLS * CHUNK * wire_rate as usize / device_rate as usize;
+            assert!(sent.len().abs_diff(expected_sent) <= 2, "{device_rate}: sent {} wire frames, expected {expected_sent}", sent.len());
+            assert!(wire_clock.abs_diff(expected_sent) <= 2, "{device_rate}: consumed {wire_clock} wire frames, expected {expected_sent}");
+            let on_wire = measured_hz(&sent, 1, 0, wire_rate, sent.len() / 5);
+            assert!((on_wire - TONE).abs() < 10.0, "{device_rate}: capture reached the wire as {on_wire} Hz");
+            let at_device = measured_hz(&played, 1, 0, device_rate, played.len() / 5);
+            assert!((at_device - TONE).abs() < 10.0, "{device_rate}: peer played as {at_device} Hz");
         }
     }
 }

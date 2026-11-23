@@ -56,8 +56,8 @@ use crate::limits::MAX_WIRE_CHANNELS;
 /// JackTrip native header size (16 bytes)
 pub const HEADER_SIZE: usize = 16;
 
-/// Default sample rate (48kHz = code 3)
-pub const DEFAULT_SAMPLE_RATE: u32 = 48000;
+/// Default sample rate (48kHz = code 3); the wire rate the session runs at.
+pub use crate::limits::WIRE_SAMPLE_RATE as DEFAULT_SAMPLE_RATE;
 pub const DEFAULT_SAMPLE_RATE_CODE: u8 = 3;
 
 /// Default buffer size (samples per channel per packet)
