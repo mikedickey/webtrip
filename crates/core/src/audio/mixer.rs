@@ -202,7 +202,14 @@ impl MixEngine for SimpleMixer {
             let send = StreamResampler::new(layout.device_rate, layout.wire_rate, layout.max_frames, wire_channels, FixedSide::Input);
             let recv = StreamResampler::new(layout.wire_rate, layout.device_rate, layout.max_frames, wire_channels, FixedSide::Output);
             match (send, recv) {
-                (Ok(send), Ok(recv)) => (Some(send), Some(recv)),
+                (Ok(send), Ok(recv)) => {
+                    log::info!(
+                        "Resampling active: audio device runs at {} Hz, wire at {} Hz; converting both directions",
+                        layout.device_rate,
+                        layout.wire_rate
+                    );
+                    (Some(send), Some(recv))
+                }
                 _ => return Err(rates),
             }
         };

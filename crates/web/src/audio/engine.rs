@@ -1217,7 +1217,8 @@ mod tests {
         // pointers into them — declare them before the engine so they drop last.
         let params = AudioParams::default();
         let mut ring = RingBuffer::new();
-        let mut regulator = Regulator::new();
+        // Sized like the session's: the context may not run at the wire rate.
+        let mut regulator = Regulator::new().with_callback_capacity(webtrip_core::limits::MAX_WIRE_FRAMES_PER_CALLBACK);
         let mut engine = create_engine(&params).await;
 
         engine.set_local_to_network_buffer(&mut ring as *mut RingBuffer);
