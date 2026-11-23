@@ -355,6 +355,10 @@ impl WebRtcTransport {
                 // Distinct object from `ring_buffer` above, so no aliasing
                 // between the two borrows. Regulator is `&self` (SPSC).
                 let Some(jitter_buffer) = buffers.network_to_local.as_ref() else {
+                    // No jitter buffer to deliver into: drain like the
+                    // not-connected case, or the flag stays set and `waitAsync`
+                    // spins.
+                    while ring_buffer.read(&mut self.audio_to_send_buffer) {}
                     return;
                 };
 
@@ -425,6 +429,11 @@ impl WebRtcTransport {
                 }
             }
         }
+
+        // Whatever stopped us (`Idle`, or the loop running out of full
+        // packets), a partial packet may remain with the flag still set; clear
+        // it or `waitAsync` spins. See `RingBuffer::arm_wakeup`.
+        ring_buffer.arm_wakeup(samples_needed);
     }
 
 

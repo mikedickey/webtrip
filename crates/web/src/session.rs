@@ -48,7 +48,7 @@ use crate::audio::audio_callback_loop::AudioCallbackLoop;
 use crate::audio::{cancelled_error, named_error};
 use crate::audio::engine::{close_audio_context_now, resume_context, route_output_sink, AudioEngine};
 use webtrip_core::audio::params::AudioParams;
-use webtrip_core::limits::{MAX_DEVICE_CHANNELS, MAX_WIRE_CHANNELS, RENDER_QUANTUM_FRAMES};
+use webtrip_core::limits::{MAX_DEVICE_CHANNELS, MAX_WIRE_CHANNELS, MAX_WIRE_FRAMES_PER_CALLBACK, WIRE_SAMPLE_RATE};
 use webtrip_core::stream::regulator::Regulator;
 use webtrip_core::session_stats::build_session_stats;
 use webtrip_core::stream::ring_buffer::RingBuffer;
@@ -336,7 +336,7 @@ impl WebTripSession {
         // `AudioParams` that outlives the session and every agent holding it).
         let audio_params = unsafe { SharedPtr::<AudioParams>::from_addr(audio_params_addr) };
         let buffer_size = 128;
-        let sample_rate = 48000;
+        let sample_rate = WIRE_SAMPLE_RATE;
         let send_channels = 1;
         let receive_channels = 2;
 
@@ -352,7 +352,7 @@ impl WebTripSession {
         // The peer's actual count is still adopted from its first packet.
         let network_to_local_buffer = Box::new(
             Regulator::with_params(receive_channels as usize, buffer_size, sample_rate, -500.0)
-                .with_callback_capacity(RENDER_QUANTUM_FRAMES),
+                .with_callback_capacity(MAX_WIRE_FRAMES_PER_CALLBACK),
         );
 
         Ok(WebTripSession {

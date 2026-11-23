@@ -228,6 +228,26 @@ impl RingBuffer {
 
         true
     }
+
+    /// Re-arm the wake-up flag for a consumer that reads in `needed`-sample
+    /// units and has just stopped because fewer than `needed` remain.
+    ///
+    /// `read` clears the flag only on an exact drain or a failed read, so a
+    /// consumer that stops at a partial unit (a write size that is not a
+    /// multiple of the packet size, e.g. a resampled capture) would leave it at
+    /// 1, and `Atomics.waitAsync` would return "not-equal" forever: a
+    /// synchronous spin. Call this when the consumer decides to wait.
+    ///
+    /// The flag is cleared *first* and `available` re-checked after, so a write
+    /// landing in between (it stores `write_pos`, then sets the flag) is never
+    /// lost: either the recheck sees it and re-sets the flag, or the flag store
+    /// came after our clear.
+    pub fn arm_wakeup(&self, needed: u32) {
+        self.has_data_flag.store(0, Ordering::SeqCst);
+        if self.available() >= needed {
+            self.has_data_flag.store(1, Ordering::SeqCst);
+        }
+    }
 }
 
 impl RingBuffer {
@@ -388,6 +408,25 @@ mod tests {
         assert!(rb.read(&mut out));
         assert_eq!(rb.available(), 0);
         assert_eq!(rb.has_data_flag(), 0, "flag cleared when empty");
+    }
+
+    /// Regression: a consumer that stops at a partial packet left the flag at 1
+    /// and `waitAsync` spun. `arm_wakeup` clears it for a partial remainder but
+    /// keeps it set when a full unit is already waiting (no lost wake-up).
+    #[test]
+    fn arm_wakeup_clears_flag_only_when_less_than_a_unit_remains() {
+        let rb = streaming_buffer();
+        assert!(rb.write(&[0.0; 6]));
+        let mut out = [0.0; 4];
+        assert!(rb.read(&mut out));
+        assert_eq!(rb.has_data_flag(), 1, "partial remainder leaves the flag set");
+
+        rb.arm_wakeup(4);
+        assert_eq!(rb.has_data_flag(), 0, "2 < 4 remaining: nothing to wake for");
+
+        assert!(rb.write(&[0.0; 2]));
+        rb.arm_wakeup(4);
+        assert_eq!(rb.has_data_flag(), 1, "a full unit is waiting: stay armed");
     }
 
     #[test]

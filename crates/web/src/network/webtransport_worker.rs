@@ -612,6 +612,9 @@ fn build_next_packet(state: &WorkerState) -> Option<(Uint8Array, usize)> {
 
     let samples_needed = samples_per_packet(state.buffer_size, state.send_channels);
     if send_decision(ring_buffer.available(), samples_needed) == SendDecision::Wait {
+        // A partial packet may remain with the flag still set; clear it or the
+        // caller's `waitAsync` returns "not-equal" and spins.
+        ring_buffer.arm_wakeup(samples_needed);
         return None;
     }
 
@@ -1485,6 +1488,9 @@ mod tests {
             0,
             "withheld packets must not consume a sequence number"
         );
+        // Regression: waiting on a partial frame must clear the has-data flag,
+        // or the send loop's `waitAsync` returns "not-equal" and spins.
+        assert_eq!(ring.has_data_flag(), 0, "a withheld partial frame must leave the flag clear");
 
         // Top the buffer up to two full frames and drain both.
         let rest: Vec<f32> = (0..frame + 1).map(|i| i as f32 / 1000.0).collect();

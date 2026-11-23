@@ -51,14 +51,10 @@
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-use crate::limits::MAX_WIRE_CHANNELS;
+use crate::limits::{MAX_WIRE_CHANNELS, WIRE_SAMPLE_RATE};
 
 /// JackTrip native header size (16 bytes)
 pub const HEADER_SIZE: usize = 16;
-
-/// Default sample rate (48kHz = code 3)
-pub const DEFAULT_SAMPLE_RATE: u32 = 48000;
-pub const DEFAULT_SAMPLE_RATE_CODE: u8 = 3;
 
 /// Default buffer size (samples per channel per packet)
 pub const DEFAULT_BUFFER_SIZE: u16 = 128;
@@ -170,13 +166,13 @@ pub struct PacketHeader {
 }
 
 impl PacketHeader {
-    /// Create a new packet header with default settings (mono, 48kHz, 128 samples, 16-bit)
+    /// Create a new packet header with default settings (mono, wire rate, 128 samples, 16-bit)
     pub fn new(sequence_number: u16, timestamp: u64) -> Self {
         Self {
             timestamp,
             sequence_number,
             buffer_size: DEFAULT_BUFFER_SIZE,
-            sample_rate: SampleRateCode::Sr48000,
+            sample_rate: SampleRateCode::from_hz(WIRE_SAMPLE_RATE),
             bit_depth: DEFAULT_BIT_DEPTH,
             num_incoming_channels: 1,
             num_outgoing_channels: 1,
@@ -189,7 +185,7 @@ impl PacketHeader {
             timestamp,
             sequence_number,
             buffer_size: DEFAULT_BUFFER_SIZE,
-            sample_rate: SampleRateCode::Sr48000,
+            sample_rate: SampleRateCode::from_hz(WIRE_SAMPLE_RATE),
             bit_depth: DEFAULT_BIT_DEPTH,
             num_incoming_channels: 2,
             num_outgoing_channels: 2,
@@ -657,7 +653,7 @@ impl AudioFormat {
 
     pub fn mono() -> Self {
         Self {
-            sample_rate: DEFAULT_SAMPLE_RATE,
+            sample_rate: WIRE_SAMPLE_RATE,
             channels: 1,
             buffer_size: DEFAULT_BUFFER_SIZE,
             bit_depth: DEFAULT_BIT_DEPTH,
@@ -666,7 +662,7 @@ impl AudioFormat {
 
     pub fn stereo() -> Self {
         Self {
-            sample_rate: DEFAULT_SAMPLE_RATE,
+            sample_rate: WIRE_SAMPLE_RATE,
             channels: 2,
             buffer_size: DEFAULT_BUFFER_SIZE,
             bit_depth: DEFAULT_BIT_DEPTH,

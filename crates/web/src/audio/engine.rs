@@ -8,7 +8,7 @@ use crate::audio::devices::{
 };
 use webtrip_core::audio::params::AudioParams;
 use webtrip_core::audio::processor::AudioProcessor;
-use webtrip_core::limits::{MAX_DEVICE_CHANNELS, RENDER_QUANTUM_FRAMES};
+use webtrip_core::limits::{MAX_DEVICE_CHANNELS, RENDER_QUANTUM_FRAMES, WIRE_SAMPLE_RATE};
 use crate::audio::worklet::{create_worklet_node_with_flag, register_audio_worklet};
 use webtrip_core::stream::regulator::Regulator;
 use webtrip_core::stream::ring_buffer::RingBuffer;
@@ -126,6 +126,18 @@ pub struct AudioEngine {
     requested_output_channels: u32,
 }
 
+/// The one place the engine's `AudioContext` options are built: minimal
+/// latency, plus a requested sample rate when given (`None` takes the
+/// device's own rate).
+fn context_options(sample_rate: Option<f32>) -> AudioContextOptions {
+    let options = AudioContextOptions::new();
+    options.set_latency_hint(&JsValue::from(0));
+    if let Some(rate) = sample_rate {
+        options.set_sample_rate(rate);
+    }
+    options
+}
+
 #[wasm_bindgen]
 impl AudioEngine {
     /// Create a new audio engine (without network support)
@@ -143,11 +155,28 @@ impl AudioEngine {
         local_to_network_buffer_ptr: *mut RingBuffer,
         network_to_local_buffer_ptr: *mut Regulator,
     ) -> Result<AudioEngine, JsValue> {
-        // Configure AudioContext with minimal latency
-        let options = AudioContextOptions::new();
-        options.set_latency_hint(&JsValue::from(0));
-
-        let ctx = AudioContext::new_with_context_options(&options)?;
+        // Configure AudioContext with minimal latency, asking for the wire
+        // rate so the browser resamples at the device edge when it can (no
+        // conversion of ours, no added latency). It is only a request: a
+        // browser may refuse it or give another rate, and the rate the context
+        // actually runs at is read back when the worklet is built, where the
+        // core mixer converts if it differs from the wire rate.
+        let ctx = match AudioContext::new_with_context_options(&context_options(Some(
+            WIRE_SAMPLE_RATE as f32,
+        ))) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                // Some browsers throw for a rate the device cannot be driven
+                // at; take the device's own rate instead of failing to start.
+                // Keep the original error visible: if the retry fails too, it
+                // is the only hint at why the first attempt was refused.
+                web_sys::console::warn_2(
+                    &"AudioContext rejected the requested wire sample rate; retrying at the device rate:".into(),
+                    &e,
+                );
+                AudioContext::new_with_context_options(&context_options(None))?
+            }
+        };
         register_audio_worklet(&ctx).await?;
 
         Ok(Self {
@@ -358,7 +387,19 @@ impl AudioEngine {
         let mut processor = if local_to_network.is_null() && network_to_local.is_null() {
             AudioProcessor::new(params)
         } else {
-            AudioProcessor::with_network(params, local_to_network, network_to_local, RENDER_QUANTUM_FRAMES)
+            // The context's rate is whatever the browser gave, not what was
+            // asked for; the processor converts to the wire rate when they
+            // differ and refuses (naming both) when it cannot.
+            let device_rate = self.ctx.sample_rate().round() as u32;
+            AudioProcessor::with_network(
+                params,
+                local_to_network,
+                network_to_local,
+                RENDER_QUANTUM_FRAMES,
+                device_rate,
+                WIRE_SAMPLE_RATE,
+            )
+            .map_err(|e| JsValue::from_str(&e.to_string()))?
         };
 
         let process = Box::new(move |input: &[f32], in_channels: usize, output: &mut [f32], out_channels: usize| {
@@ -1190,7 +1231,8 @@ mod tests {
         // pointers into them — declare them before the engine so they drop last.
         let params = AudioParams::default();
         let mut ring = RingBuffer::new();
-        let mut regulator = Regulator::new();
+        // Sized like the session's: the context may not run at the wire rate.
+        let mut regulator = Regulator::new().with_callback_capacity(webtrip_core::limits::MAX_WIRE_FRAMES_PER_CALLBACK);
         let mut engine = create_engine(&params).await;
 
         engine.set_local_to_network_buffer(&mut ring as *mut RingBuffer);

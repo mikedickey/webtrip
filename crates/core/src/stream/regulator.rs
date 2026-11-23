@@ -1053,6 +1053,12 @@ impl Regulator {
         self
     }
 
+    /// The rate this regulator's packets are at: the wire rate, never the
+    /// audio device's.
+    pub fn sample_rate(&self) -> u32 {
+        self.shared.sample_rate
+    }
+
     /// The most frames one [`pop_frames_at`](Self::pop_frames_at) call may ask
     /// for, as set by [`with_callback_capacity`](Self::with_callback_capacity).
     /// A host that owns a callback size checks it against this at setup.
