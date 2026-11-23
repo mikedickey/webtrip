@@ -18,6 +18,10 @@ pub const MAX_WIRE_CHANNELS: u8 = 8;
 /// so a wide interface never allocates on the render thread.
 pub const MAX_DEVICE_CHANNELS: u8 = 32;
 
+/// Frames in one Web Audio render quantum — the callback size the worklet
+/// hands the processor. Sizes every render-thread scratch buffer.
+pub const RENDER_QUANTUM_FRAMES: usize = 128;
+
 #[cfg(test)]
 mod tests {
     use super::*;

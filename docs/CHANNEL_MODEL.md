@@ -288,9 +288,9 @@ Key points:
       │                                │ <────────────────────────────────│                        │
       │                                │                                  │                        │
       │                                │                        ⑩ AudioProcessor::process:          │
-      │                                │                           regulator.channels()/fpp()       │
-      │                                │                           → regulator.pop()                │
-      │                                │                           into remote_interleaved           │
+      │                                │                           regulator.pop_frames_at(          │
+      │                                │                           remote_interleaved, 128 frames)  │
+      │                                │                           → peer channel count (0 = silence)│
       │                                │                                  │                        │
       │                                │                        ⑪ map_to_output(remote_interleaved,  │
       │                                │                           remote_channels, remote_mapped,   │

@@ -1,13 +1,9 @@
-use webtrip_core::limits::MAX_DEVICE_CHANNELS;
+use webtrip_core::limits::{MAX_DEVICE_CHANNELS, RENDER_QUANTUM_FRAMES};
 use crate::dependent_module;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{AudioContext, AudioWorkletNode, AudioWorkletNodeOptions, ChannelInterpretation};
-
-/// Frames per AudioWorklet render quantum. Fixed by the Web Audio spec, and
-/// the per-channel capacity of [`ProcessorHandle`]'s scratch buffers.
-pub const RENDER_QUANTUM_FRAMES: usize = 128;
 
 /// Type alias for the audio processing callback.
 ///

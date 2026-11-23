@@ -8,7 +8,7 @@ use crate::audio::devices::{
 };
 use webtrip_core::audio::params::AudioParams;
 use webtrip_core::audio::processor::AudioProcessor;
-use webtrip_core::limits::MAX_DEVICE_CHANNELS;
+use webtrip_core::limits::{MAX_DEVICE_CHANNELS, RENDER_QUANTUM_FRAMES};
 use crate::audio::worklet::{create_worklet_node_with_flag, register_audio_worklet};
 use webtrip_core::stream::regulator::Regulator;
 use webtrip_core::stream::ring_buffer::RingBuffer;
@@ -358,7 +358,7 @@ impl AudioEngine {
         let mut processor = if local_to_network.is_null() && network_to_local.is_null() {
             AudioProcessor::new(params)
         } else {
-            AudioProcessor::with_network(params, local_to_network, network_to_local)
+            AudioProcessor::with_network(params, local_to_network, network_to_local, RENDER_QUANTUM_FRAMES)
         };
 
         let process = Box::new(move |input: &[f32], in_channels: usize, output: &mut [f32], out_channels: usize| {

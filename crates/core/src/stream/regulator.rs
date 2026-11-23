@@ -781,6 +781,11 @@ struct Shared {
     // Configuration, fixed at construction
     fpp: usize,
     sample_rate: u32,
+    /// The most frames one `pop_frames_at` call may ask for. Written only by
+    /// `with_callback_capacity`, before the regulator is shared; read-only
+    /// after, so any thread (e.g. a host sizing a new processor while the old
+    /// one is still popping) may read it through `&Shared`.
+    max_callback_frames: usize,
 
     /// Packet storage (circular buffer by sequence number)
     slots: Box<[PacketSlot]>,
@@ -818,6 +823,8 @@ struct Shared {
     pub_max_latency_bits: AtomicU64,
     pub_glitches: AtomicU64,
     pub_packets: AtomicU64,
+    /// Frames pulled from the slots into the frame FIFO but not yet served.
+    pub_queued_frames: AtomicU64,
 }
 
 /// State owned by the consumer (`pop`). Reached only through
@@ -844,6 +851,16 @@ struct ConsumerState {
     num_channels: usize,
 
     last_stashed: Option<(u16, usize)>,
+
+    // Frame-granular output. Packets are pulled whole into `fifo`, and
+    // `pop_frames_at` serves exact frame counts from it. Preallocated
+    // (`with_callback_capacity`), so the render thread never allocates.
+    /// Pulled, not-yet-served samples live at `fifo[fifo_head..fifo_head + fifo_len]`.
+    fifo: Vec<f32>,
+    fifo_head: usize,
+    fifo_len: usize,
+    /// Stride of the FIFO's contents.
+    fifo_channels: usize,
 
     // Timing
     last_pop_time_ms: f64,
@@ -957,6 +974,7 @@ impl Regulator {
         let shared = Shared {
             fpp,
             sample_rate,
+            max_callback_frames: fpp,
             slots,
             last_seq_in: AtomicI32::new(SEQ_NONE),
             last_seq_out: AtomicI32::new(SEQ_NONE),
@@ -968,6 +986,7 @@ impl Regulator {
             pub_max_latency_bits: AtomicU64::new(0),
             pub_glitches: AtomicU64::new(0),
             pub_packets: AtomicU64::new(0),
+            pub_queued_frames: AtomicU64::new(0),
         };
         let consumer = ConsumerState {
             packets_in_past,
@@ -981,6 +1000,10 @@ impl Regulator {
             channels: channel_states,
             num_channels: channels,
             last_stashed: None,
+            fifo: vec![0.0; 2 * fpp * MAX_CHANNELS],
+            fifo_head: 0,
+            fifo_len: 0,
+            fifo_channels: channels,
             last_pop_time_ms: 0.0,
             push_stats: TimingStats::new(sample_rate, fpp),
             pull_stats: TimingStats::new(sample_rate, fpp),
@@ -1019,7 +1042,45 @@ impl Regulator {
         self.shared.push_internal(sequence, channels, samples, now_ms)
     }
 
-    /// Pop samples for playback.
+    /// Size the frame FIFO for callbacks of up to `frames` frames (default:
+    /// one packet). Call before the regulator is shared; this is the only
+    /// place the FIFO allocates.
+    pub fn with_callback_capacity(mut self, frames: usize) -> Self {
+        let fpp = self.shared.fpp;
+        self.shared.max_callback_frames = frames;
+        let consumer = self.consumer.get_mut();
+        consumer.fifo = vec![0.0; (frames + fpp) * MAX_CHANNELS];
+        self
+    }
+
+    /// The most frames one [`pop_frames_at`](Self::pop_frames_at) call may ask
+    /// for, as set by [`with_callback_capacity`](Self::with_callback_capacity).
+    /// A host that owns a callback size checks it against this at setup.
+    pub fn callback_capacity(&self) -> usize {
+        self.shared.max_callback_frames
+    }
+
+    /// Pop exactly `frames` frames for one audio callback, whatever the packet
+    /// size. Writes `frames * channels` interleaved samples to `output` and
+    /// returns `channels` — the peer's width, synchronized by this call's
+    /// Acquire (WEB-53 Bug 3) — or `0` (output untouched) if `frames` exceeds
+    /// the [`with_callback_capacity`](Self::with_callback_capacity) or the
+    /// stream has no channels.
+    ///
+    /// One call is one tick of the pull clock: the jitter statistics see the
+    /// true interval between callbacks, however many packets this call pulls
+    /// from the slots (none, when the FIFO already holds enough). Packets are
+    /// pulled as of `now_ms`, which is the same instant for all of them.
+    ///
+    /// Use either this or [`pop_at`](Self::pop_at) on a given regulator, not both.
+    pub fn pop_frames_at(&self, output: &mut [f32], frames: usize, now_ms: f64) -> usize {
+        // SAFETY: single consumer thread (struct docs); borrow ends on return.
+        let consumer = unsafe { self.consumer_mut() };
+        consumer.pop_frames(&self.shared, output, frames, now_ms)
+    }
+
+    /// Pop exactly one packet (`fpp * channels` samples), for a host whose
+    /// callback is one packet long. Prefer [`pop_frames_at`](Self::pop_frames_at).
     ///
     /// Returns `true` if real packet data was output, `false` if concealment
     /// was used. After returning, [`channels`](Self::channels) reflects the
@@ -1065,6 +1126,11 @@ impl Regulator {
         self.shared.fpp
     }
 
+    /// Wall-clock duration of `frames` frames at the wire sample rate.
+    pub fn frames_to_ms(&self, frames: usize) -> f64 {
+        frames_to_ms(frames, self.shared.sample_rate)
+    }
+
     /// Get the number of channels (peer-adopted).
     ///
     /// After a [`pop`](Self::pop) that rendered a started stream, this matches
@@ -1096,6 +1162,11 @@ impl Default for Regulator {
 }
 
 
+/// Wall-clock duration of `frames` frames at `sample_rate`.
+fn frames_to_ms(frames: usize, sample_rate: u32) -> f64 {
+    1000.0 * frames as f64 / sample_rate as f64
+}
+
 impl Shared {
     fn channels(&self) -> usize {
         self.num_channels.load(Ordering::Relaxed)
@@ -1106,7 +1177,7 @@ impl Shared {
     }
 
     fn fpp_duration_ms(&self) -> f64 {
-        1000.0 * self.fpp as f64 / self.sample_rate as f64
+        frames_to_ms(self.fpp, self.sample_rate)
     }
 
     fn reject(&self) {
@@ -1284,8 +1355,9 @@ impl Shared {
         // `depth` counts packets (sequence numbers), each `fpp` frames long —
         // not `fpp * channels`, which also carries the channel count and
         // would double-count latency for anything wider than mono.
-        let total_frames = depth * self.fpp as u32;
-        (total_frames as f32 / self.sample_rate as f32) * 1000.0
+        let queued = self.pub_queued_frames.load(Ordering::Relaxed) as f32;
+        let total_frames = (depth * self.fpp as u32) as f32 + queued;
+        (total_frames / self.sample_rate as f32) * 1000.0
     }
 }
 
@@ -1299,21 +1371,40 @@ impl ConsumerState {
     /// # Returns
     /// `true` if real packet data was output, `false` if concealment was used
     fn pop_internal(&mut self, sh: &Shared, output: &mut [f32], now_ms: f64) -> bool {
+        self.tick_pull(sh, now_ms);
+        self.pull_packet(sh, output, now_ms)
+    }
+
+    /// Advance the pull clock: record the interval since the previous tick.
+    /// Intervals of zero or less are discarded by `TimingStats::tick`.
+    fn tick_pull(&mut self, sh: &Shared, now_ms: f64) {
+        // Acquire first so `relative_now` is coherent with the stream's start.
+        sh.last_seq_in.load(Ordering::Acquire);
+        let relative_now = now_ms - sh.start_time_ms();
+        if self.last_pop_time_ms > 0.0 {
+            let elapsed = now_ms - self.last_pop_time_ms;
+            self.pull_stats.tick(elapsed, relative_now);
+        }
+        self.last_pop_time_ms = now_ms;
+    }
+
+    /// Whether the stream is still in its startup silence: nothing has
+    /// arrived, or the opening tolerance window has not yet elapsed.
+    fn in_startup(&self, last_seq_in_raw: i32, relative_now: f64) -> bool {
+        last_seq_in_raw == SEQ_NONE || relative_now < self.tolerance_ms
+    }
+
+    /// Pull one packet's worth of output (no pull-clock tick). `output` must
+    /// be exactly `fpp * channels` long.
+    fn pull_packet(&mut self, sh: &Shared, output: &mut [f32], now_ms: f64) -> bool {
         // Acquire FIRST so the stream shape and slots written before the
         // matching Release are visible (WEB-53 Bug 2).
         let last_seq_in_raw = sh.last_seq_in.load(Ordering::Acquire);
         let last_seq_in = last_seq_in_raw as u16;
         let relative_now = now_ms - sh.start_time_ms();
 
-        // Track inter-pop timing after the acquire so relative_now is coherent.
-        if self.last_pop_time_ms > 0.0 {
-            let elapsed = now_ms - self.last_pop_time_ms;
-            self.pull_stats.tick(elapsed, relative_now);
-        }
-        self.last_pop_time_ms = now_ms;
-
         // Return silence during startup
-        if last_seq_in_raw == SEQ_NONE || relative_now < self.tolerance_ms {
+        if self.in_startup(last_seq_in_raw, relative_now) {
             output.fill(0.0);
             self.publish_stats(sh);
             return false;
@@ -1380,6 +1471,78 @@ impl ConsumerState {
         }
     }
 
+    /// See [`Regulator::pop_frames_at`].
+    fn pop_frames(&mut self, sh: &Shared, output: &mut [f32], frames: usize, now_ms: f64) -> usize {
+        debug_assert!(frames <= sh.max_callback_frames, "callback of {frames} frames exceeds the FIFO capacity");
+        if frames > sh.max_callback_frames {
+            return 0;
+        }
+        self.tick_pull(sh, now_ms);
+
+        // One Acquire for the whole call: whether the stream has started, and
+        // therefore its width, is fixed for every packet pulled below.
+        let last_seq_in_raw = sh.last_seq_in.load(Ordering::Acquire);
+        let in_startup = self.in_startup(last_seq_in_raw, now_ms - sh.start_time_ms());
+        let channels = sh.channels();
+        if channels != self.fifo_channels {
+            // The FIFO is at the old stride (the stream just adopted its width).
+            self.fifo_head = 0;
+            self.fifo_len = 0;
+            self.fifo_channels = channels;
+        }
+        if channels == 0 {
+            return 0;
+        }
+
+        let fpp = sh.fpp;
+        while self.fifo_len < frames * channels {
+            if in_startup {
+                // Startup silence is queued only as far as this callback needs:
+                // a whole packet would leave a silent tail ahead of the first
+                // real audio, delaying it for the rest of the stream.
+                let shortfall = frames * channels - self.fifo_len;
+                self.fifo_append(shortfall).fill(0.0);
+                continue;
+            }
+            // Pull straight into the FIFO tail. The FIFO is moved out so the
+            // pull can borrow `self` (nothing on the pull path reads it); no
+            // allocation, no staging copy.
+            let len = fpp * channels;
+            self.fifo_reserve(len);
+            let mut fifo = std::mem::take(&mut self.fifo);
+            let end = self.fifo_head + self.fifo_len;
+            self.pull_packet(sh, &mut fifo[end..end + len], now_ms);
+            self.fifo = fifo;
+            self.fifo_len += len;
+        }
+
+        let want = frames * channels;
+        output[..want].copy_from_slice(&self.fifo[self.fifo_head..self.fifo_head + want]);
+        self.fifo_head += want;
+        self.fifo_len -= want;
+        if self.fifo_len == 0 {
+            self.fifo_head = 0;
+        }
+        self.publish_stats(sh);
+        channels
+    }
+
+    /// Compact the FIFO if needed so `len` more samples fit after the queued ones.
+    fn fifo_reserve(&mut self, len: usize) {
+        if self.fifo_head + self.fifo_len + len > self.fifo.len() {
+            self.fifo.copy_within(self.fifo_head..self.fifo_head + self.fifo_len, 0);
+            self.fifo_head = 0;
+        }
+    }
+
+    /// Extend the FIFO by `len` samples and return them for the caller to fill.
+    fn fifo_append(&mut self, len: usize) -> &mut [f32] {
+        self.fifo_reserve(len);
+        let end = self.fifo_head + self.fifo_len;
+        self.fifo_len += len;
+        &mut self.fifo[end..end + len]
+    }
+
     /// Handle an underrun (missing packet).
     fn handle_underrun(&mut self, sh: &Shared, output: &mut [f32], now: f64) -> bool {
         self.pull_stats.underruns += 1;
@@ -1415,6 +1578,14 @@ impl ConsumerState {
 
     fn interleave_output(&self, output: &mut [f32]) {
         let n = self.num_channels;
+        // Exactly one packet: a shorter buffer would silently drop the tail
+        // (`interleave_channel` zips), a longer one would keep stale audio in
+        // it. Every caller hands over an exactly-sized buffer.
+        debug_assert_eq!(
+            output.len(),
+            self.channels.first().map_or(0, |c| c.output_now_packet.len()) * n,
+            "pop output must be exactly one packet"
+        );
         for (ch, channel) in self.channels[..n].iter().enumerate() {
             interleave_channel(&channel.output_now_packet, n, ch, output);
         }
@@ -1709,6 +1880,10 @@ impl ConsumerState {
         self.skip_auto_headroom = true;
         self.auto_headroom_start_time = 6000.0;
 
+        // Frames pulled for the previous stream must not play in the next.
+        self.fifo_head = 0;
+        self.fifo_len = 0;
+
         // Reset timing
         self.last_pop_time_ms = 0.0;
 
@@ -1738,6 +1913,8 @@ impl ConsumerState {
             Ordering::Relaxed,
         );
         sh.pub_packets.store(self.packet_count, Ordering::Relaxed);
+        sh.pub_queued_frames
+            .store((self.fifo_len / self.fifo_channels.max(1)) as u64, Ordering::Relaxed);
     }
 }
 
@@ -1745,8 +1922,69 @@ impl ConsumerState {
 // Tests
 // ============================================================================
 
+/// Test drivers shared with other modules' tests (the processor's), so a
+/// "peer streams, host pulls in callbacks" loop is written once.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Push a packet a test expects the regulator to store, asserting the
+    /// outcome. Tests that drive `push_internal` for setup would otherwise
+    /// discard the `#[must_use]` result, so a push that starts getting
+    /// rejected (wrong size, unadopted channel count) would leave the
+    /// regulator empty and surface as a confusing failure further down —
+    /// or as no failure at all.
+    pub fn push_stored(reg: &Regulator, seq: u16, channels: usize, samples: &[f32], now_ms: f64) {
+        assert_eq!(
+            reg.push_at(seq, channels, samples, now_ms),
+            PushOutcome::Stored,
+            "setup push of seq {seq} ({channels}ch) must be stored"
+        );
+    }
+
+    /// Sample for `frame`/`ch` of the test stream: distinct per frame and
+    /// channel, never 0 (0 is startup silence).
+    pub fn ramp(frame: usize, ch: usize) -> f32 {
+        (frame * 16 + ch + 1) as f32
+    }
+
+    pub fn ramp_packet(seq: usize, fpp: usize, channels: usize) -> Vec<f32> {
+        (0..fpp * channels).map(|i| ramp(seq * fpp + i / channels, i % channels)).collect()
+    }
+
+    /// Callbacks allowed to hold the startup transient: a stream starts on
+    /// the *newest* packet, so the rest of that callback's pulls find nothing
+    /// newer and conceal. Exactness is asserted once the stream has settled.
+    pub const SETTLE_CALLBACKS: usize = 40;
+
+    /// Drive `callbacks` callbacks of `frames` frames against a peer sending
+    /// one `fpp` packet (`packet(seq)`) per packet period (everything that has arrived by
+    /// a callback is pushed before it). `pull(k, now_ms)` performs callback
+    /// `k`'s pop — directly on the regulator, or through whatever wraps it.
+    pub fn drive_callbacks(
+        reg: &Regulator,
+        (fpp, frames, channels): (usize, usize, usize),
+        callbacks: usize,
+        packet: impl Fn(usize) -> Vec<f32>,
+        mut pull: impl FnMut(usize, f64),
+    ) {
+        let period = reg.frames_to_ms(fpp);
+        let cb_period = reg.frames_to_ms(frames);
+        let mut pushed = 0usize;
+        for k in 0..callbacks {
+            let now = 21.0 + k as f64 * cb_period;
+            while 1.0 + pushed as f64 * period <= now {
+                push_stored(reg, pushed as u16, channels, &packet(pushed), 1.0 + pushed as f64 * period);
+                pushed += 1;
+            }
+            pull(k, now);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
     use super::*;
 
     /// Plant a packet directly in the ring, bypassing `push`, so a test can
@@ -1757,19 +1995,6 @@ mod tests {
         reg.shared.slots[slot_index(seq)].store(seq, timestamp, samples);
     }
 
-    /// Push a packet a test expects the regulator to store, asserting the
-    /// outcome. Tests that drive `push_internal` for setup would otherwise
-    /// discard the `#[must_use]` result, so a push that starts getting
-    /// rejected (wrong size, unadopted channel count) would leave the
-    /// regulator empty and surface as a confusing failure further down —
-    /// or as no failure at all.
-    fn push_stored(reg: &Regulator, seq: u16, channels: usize, samples: &[f32], now_ms: f64) {
-        assert_eq!(
-            reg.push_at(seq, channels, samples, now_ms),
-            PushOutcome::Stored,
-            "setup push of seq {seq} ({channels}ch) must be stored"
-        );
-    }
 
     fn last_seq_out_opt(reg: &Regulator) -> Option<u16> {
         let v = reg.shared.last_seq_out.load(Ordering::Acquire);
@@ -2900,7 +3125,8 @@ mod tests {
                 }
             });
             scope.spawn(|| {
-                let mut out = vec![0.0f32; fpp * MAX_CHANNELS];
+                // `pop_at` takes exactly one packet: `fpp` samples per channel, mono here.
+                let mut out = vec![0.0f32; fpp];
                 for i in 0..40 {
                     reg.pop_at(&mut out, 2.0 + i as f64);
                     let _ = reg.channels();
@@ -2912,5 +3138,177 @@ mod tests {
                 }
             });
         });
+    }
+
+    // ------------------------------------------------------------------
+    // Frame-granular pop (`pop_frames_at`)
+    // ------------------------------------------------------------------
+
+    struct CallbackRun {
+        /// Output served after the settling window, interleaved.
+        served: Vec<f32>,
+        /// Glitches and packets played after the settling window.
+        glitches: u64,
+        played: u64,
+        reg: Regulator,
+    }
+
+    /// Sample rate shared by `run_callbacks` and `callbacks_for_ms`, which is
+    /// called before any `Regulator` exists to ask it.
+    const CALLBACK_RUN_RATE: u32 = 48_000;
+
+    fn run_callbacks(fpp: usize, frames: usize, channels: usize, callbacks: usize, tolerance_ms: f64) -> CallbackRun {
+        let reg = Regulator::with_params(channels, fpp, CALLBACK_RUN_RATE, tolerance_ms).with_callback_capacity(frames);
+        let mut served = Vec::new();
+        let mut settled = (0, 0);
+        let mut out = vec![0.0f32; frames * MAX_CHANNELS];
+        drive_callbacks(&reg, (fpp, frames, channels), callbacks, |seq| ramp_packet(seq, fpp, channels), |k, now| {
+            if k == SETTLE_CALLBACKS {
+                let stats = reg.stats();
+                settled = (stats.glitches, stats.packets_played);
+            }
+            let c = reg.pop_frames_at(&mut out, frames, now);
+            assert_eq!(c, channels);
+            if k >= SETTLE_CALLBACKS {
+                served.extend_from_slice(&out[..frames * c]);
+            }
+        });
+        let stats = reg.stats();
+        CallbackRun { served, glitches: stats.glitches - settled.0, played: stats.packets_played - settled.1, reg }
+    }
+
+    /// `callbacks` covering `ms` of wall clock at `frames` per callback.
+    fn callbacks_for_ms(ms: f64, frames: usize) -> usize {
+        (ms / frames_to_ms(frames, CALLBACK_RUN_RATE)) as usize
+    }
+
+    /// Callback size and packet size are independent: whatever the ratio, the
+    /// peer's stream arrives sample-exact — no gap, repeat or drop at a
+    /// packet/callback seam — with no concealment, and exactly one packet is
+    /// consumed per packet of output.
+    #[test]
+    fn frame_pop_is_sample_exact_across_fpp_and_callback_ratios() {
+        // (fpp, callback frames): callback < packet, ==, >, and a non-divisor.
+        for &(fpp, frames) in &[(32, 128), (64, 128), (128, 128), (256, 128), (128, 64), (512, 128), (128, 100)] {
+            for channels in [1usize, 2, 5] {
+                let ctx = format!("fpp={fpp} frames={frames} ch={channels}");
+                let run = run_callbacks(fpp, frames, channels, 400, 5.0);
+                let total = run.served.len() / channels;
+                let start_frame = (run.served[0] as usize - 1) / 16;
+                for i in 0..total {
+                    for ch in 0..channels {
+                        assert_eq!(run.served[i * channels + ch], ramp(start_frame + i, ch), "{ctx}: frame {i} ch {ch}");
+                    }
+                }
+                assert_eq!(run.glitches, 0, "{ctx}: spurious concealment");
+                // At most one packet is in flight at each end of the window.
+                let consumed = (total / fpp) as u64;
+                assert!(
+                    (consumed..=consumed + 2).contains(&run.played),
+                    "{ctx}: {} packets played for {consumed} packets of output",
+                    run.played
+                );
+            }
+        }
+    }
+
+    /// The pull clock is the audio callback: one tick per call at the true
+    /// callback interval, however many packets that call consumes — including
+    /// none (callback smaller than the packet). Spreading a callback's packets
+    /// over artificial intervals would erase real callback jitter from the
+    /// statistics that set the auto tolerance's floor; zero-length intervals
+    /// between same-callback packets must not tick at all.
+    #[test]
+    fn pull_clock_ticks_once_per_callback_at_the_callback_interval() {
+        for &(fpp, frames) in &[(32, 128), (64, 128), (128, 128), (256, 128), (128, 64), (512, 128), (256, 64), (128, 100)] {
+            // Past AUTO_INIT_DURATION_MS and the headroom warmup.
+            let mut run = run_callbacks(fpp, frames, 2, callbacks_for_ms(12_000.0, frames), -1.0);
+            let cb_period = run.reg.frames_to_ms(frames);
+            let packet_period = run.reg.frames_to_ms(fpp);
+            let pull = &consumer(&mut run.reg).pull_stats;
+            assert!(
+                (pull.last_mean - cb_period).abs() < 0.01 && pull.last_std_dev < 0.01,
+                "fpp={fpp} frames={frames}: pull interval {:.3}±{:.3} ms, expected the {cb_period:.3} ms callback interval",
+                pull.last_mean,
+                pull.last_std_dev
+            );
+            // A steady peer settles tolerance near the slower of the two clocks.
+            let tolerance = run.reg.stats().tolerance_ms;
+            assert!(
+                tolerance <= 1.6 * cb_period.max(packet_period),
+                "fpp={fpp} frames={frames}: tolerance {tolerance:.2} ms for a steady peer"
+            );
+            assert_eq!(run.glitches, 0, "fpp={fpp} frames={frames}");
+        }
+    }
+
+    /// Frames already pulled from the jitter buffer but not yet played are
+    /// latency too, and a reset must not carry them into the next stream.
+    #[test]
+    fn latency_includes_pulled_unplayed_frames_and_reset_discards_them() {
+        const FPP: usize = 256;
+        const FRAMES: usize = 128;
+        let run = run_callbacks(FPP, FRAMES, 1, 100, 5.0);
+        let reg = &run.reg;
+        // A packet is twice the callback, so every other callback leaves one
+        // callback's worth of the packet queued. Find that callback.
+        let mut out = vec![0.0f32; FRAMES];
+        let mut now = 1000.0;
+        let mut queued_ms = 0.0;
+        for _ in 0..2 {
+            now += reg.frames_to_ms(FRAMES);
+            reg.pop_frames_at(&mut out, FRAMES, now);
+            queued_ms = reg.latency_ms() as f64 - reg.frames_to_ms(reg.depth() as usize * FPP);
+            if queued_ms > 0.0 {
+                break;
+            }
+        }
+        assert!(
+            (queued_ms - reg.frames_to_ms(FRAMES)).abs() < 1e-3,
+            "queued frames must reach latency_ms: {queued_ms} ms"
+        );
+
+        // SAFETY: single-threaded test; nothing else touches `reg`.
+        unsafe { reg.reset() };
+        assert_eq!(reg.latency_ms(), 0.0, "reset must discard frames queued from the previous stream");
+    }
+
+    /// Pops before the peer starts must not delay the first real audio: startup
+    /// silence is queued per callback, not per packet, so no silent packet tail
+    /// is left ahead of the stream (PR #113 review).
+    #[test]
+    fn prestart_pops_do_not_delay_first_real_audio() {
+        for &(fpp, frames) in &[(512usize, 100usize), (512, 128), (256, 128), (128, 100)] {
+            // Frames from the peer's first packet to the first real sample.
+            let first_real_frame = |prestart: usize| {
+                let reg = Regulator::with_params(2, fpp, CALLBACK_RUN_RATE, 5.0).with_callback_capacity(frames);
+                let mut out = vec![0.0f32; frames * MAX_CHANNELS];
+                let mut now = 21.0;
+                for _ in 0..prestart {
+                    reg.pop_frames_at(&mut out, frames, now);
+                    // Queued startup silence would be reported as jitter-buffer latency.
+                    assert_eq!(reg.latency_ms(), 0.0, "fpp={fpp} frames={frames}: pre-start silence counted as latency");
+                    now += reg.frames_to_ms(frames);
+                }
+                let (start, period) = (now, reg.frames_to_ms(fpp));
+                let mut pushed = 0usize;
+                for k in prestart.. {
+                    while start + pushed as f64 * period <= now {
+                        push_stored(&reg, pushed as u16, 2, &ramp_packet(pushed, fpp, 2), start + pushed as f64 * period);
+                        pushed += 1;
+                    }
+                    let c = reg.pop_frames_at(&mut out, frames, now);
+                    if let Some(f) = (0..frames).find(|f| out[f * c] != 0.0) {
+                        return (k - prestart) * frames + f;
+                    }
+                    now += reg.frames_to_ms(frames);
+                }
+                unreachable!()
+            };
+            let baseline = first_real_frame(0);
+            for prestart in 1..5 {
+                assert_eq!(first_real_frame(prestart), baseline, "fpp={fpp} frames={frames} prestart={prestart}");
+            }
+        }
     }
 }
