@@ -540,7 +540,7 @@ sizes `MixLayout` and `remote_interleaved` / `wire_staging` at
 `max_callback_frames * MAX_WIRE_CHANNELS`. A callback never exceeds the
 maximum; if one ever did, `ensure_len` degrades to a single allocation rather
 than a panic on the render thread. `fpp` is fixed at
-construction until Phase 4 (see there).
+construction until Phase 5 (see there).
 
 **Latency.** The frames sitting in the FIFO are published with the regulator's
 other snapshot atomics (`pub_queued_frames`) and counted by `latency_ms()`
@@ -550,7 +550,7 @@ rate.
 
 Delete `processor.rs:501`'s `debug_assert_eq!(fpp, frames)`.
 
-### Phase 3b — Sample-rate conversion (device rate ↔ wire rate)
+### Phase 4 — Sample-rate conversion (device rate ↔ wire rate)
 *Delivers: a 48 kHz link works regardless of the device's native rate (e.g.
 48 kHz mic + 96 kHz speakers) with no spurious PLC. Builds on Phase 3:
 `pop_frames_at` and the processor's frames-needed arithmetic both assume device
@@ -594,7 +594,7 @@ wire supplies" accounts for the ratio.
   drift. A fixed-ratio converter is sufficient: the regulator's adaptive
   tolerance absorbs the slow drift, as it does today.
 
-### Phase 4 — fpp fitting + peer-fpp adoption
+### Phase 5 — fpp fitting + peer-fpp adoption
 *Delivers: 5-channel links stop silently failing; a 256-fpp peer works instead
 of having every packet rejected.*
 
@@ -604,13 +604,22 @@ packet geometry has one definition:
 packet_bytes, limited_by }`. Largest power-of-two fpp ≤ preferred that fits
 (power-of-two because `packets_in_past = HIST*(HIST_FPP/fpp)` truncates for
 non-divisors, `regulator.rs:940-946`), clamped to `[MIN_FPP, MAX_FPP]`.
-`MIN_FPP = 32` recorded with its reason (below that the 16-byte header exceeds
-25% overhead); `FppLimit::Floor` surfaces as an **error**, not a silently
-oversized packet.
+
+**One fpp range for both directions, in `limits.rs`: `MIN_FPP = 16`,
+`MAX_FPP = 1024`.** 1024 is JackTrip's largest common buffer size; 16 is its
+low-latency setting. Header overhead at small fpp is a cost, not a correctness
+limit, so it sets no floor. In practice `fit_fpp` cannot reach the floor at the
+8-channel wire ceiling (1200 B still fits 64 fpp). The deserializer's
+`buffer_size` bound (`protocol.rs:309`, an unexplained `1..=4096` today) becomes
+`[MIN_FPP, MAX_FPP]` and keeps its `InvalidBufferSize` error, so the send-side
+fit, the wire check and the regulator share one definition.
+`FppLimit::Floor` surfaces as an **error**, not a silently oversized packet.
 
 `session.rs:412`'s single `buffer_size` splits into `send_fpp` and
 `receive_fpp` — genuinely different things (`:449-454` configures receive via
-`Regulator::with_params`, `:1061` send via `audio_buffer_config`). **No serializer change is needed**: `serialize_samples_into` derives
+`Regulator::with_params`, `:1061` send via `audio_buffer_config`). Because the regulator adopts the
+peer's fpp (below), `receive_fpp` is only the regulator's pre-adoption geometry:
+its initial tolerance and its startup silence. **No serializer change is needed**: `serialize_samples_into` derives
 `header.buffer_size = samples.len()/send_channels` (`protocol.rs:401`), so send
 fpp is implicit in how many samples a transport reads per packet, and both
 transports already use `AudioBufferConfig.buffer_size` as their chunk size
@@ -641,26 +650,102 @@ trait (`transport.rs`, near `connect` at `:230`).
   the browser's limit is below our chosen packet. Because fitting no longer
   depends on it, arriving late is harmless.
 
-**Peer-fpp adoption:** `deliver_received_packet` (`transport.rs:40-41`) already
-has `header.buffer_size` and simply doesn't pass it — add it. Today
-`adopt_channel_count` (`regulator.rs:1236`) runs on the producer, before the
-`Release` store of `last_seq_in` (`:1195`), and is sound because it touches
-only producer-side state (slot payloads, `num_channels`); its doc comment
-(`:1211-1233`) carries that argument.
+**Peer-fpp adoption: first packet only, exactly like channel adoption.**
+The regulator is split into `Shared` (borrowed only through `&`) and the
+consumer-owned `ConsumerState`. `Shared::fpp` is a plain field fixed at
+construction, and everything derived from fpp (`packets_in_past`, `up_to_now`,
+`beyond_now`, fade ramps, `burg`, both `TimingStats` windows, per-channel
+`ChannelState`) lives in `ConsumerState`, which the producer cannot write
+soundly. Channel adoption (`Shared::adopt_channel_count`) already solves the
+same problem: it runs on the producer only while `last_seq_in == SEQ_NONE`,
+writes slot payloads and the relaxed `num_channels` before the Release of
+`last_seq_in`, and the consumer picks the width up after its Acquire, against
+state that is clean because it is fresh or was cleared by a quiesced
+`reset()`. fpp follows the same path:
 
-**Open — the adoption mechanism must be redesigned before this phase starts.**
-The regulator is now split into a producer-owned `Shared` and a
-consumer-owned `ConsumerState` (`regulator.rs:766-851`). `fpp` and
-`sample_rate` are plain fields of `Shared`, fixed at construction (`:782-783`),
-and everything fpp-derived — `packets_in_past`, `up_to_now`, `beyond_now`,
-fade ramps, `burg`, both `TimingStats`, per-channel states — lives in
-`ConsumerState` (`:825-851`), which the producer cannot write soundly. So
-"extend `adopt_channel_count` to recompute the fpp-derived fields on the
-producer" is no longer possible as written. A replacement has to publish the
-peer fpp through the same `last_seq_in` Release/Acquire and let the consumer
-rebuild its own derived state on observing it, with that state preallocated
-at the `MAX_FPP` ceiling so the consumer never allocates. Settle the shape
-with the user first.
+- **Where the value comes from.** `deliver_received_packet` (`transport.rs`)
+  passes `header.buffer_size`. `Regulator::push_at` gains an `fpp` parameter.
+- **Producer, first packet** (`last_seq_in == SEQ_NONE`):
+  - If fpp is outside `[MIN_FPP, MAX_FPP]`, reject it as
+    `PushOutcome::UnsupportedFpp { got }`.
+  - `adopt_channel_count` becomes `adopt_stream_shape(channels, fpp)`. When
+    the shape changes, it stores `fpp` and `num_slots` (below) in new relaxed
+    atomics next to `num_channels`, resizes and zeroes the first `num_slots`
+    slot payloads, and truncates the rest. All of this happens before the
+    Release, so the existing soundness argument and doc comment carry over.
+- **Producer, later packets.**
+  - A packet whose fpp differs from the adopted one is rejected as
+    `PushOutcome::FppChanged { adopted, got }`, counted in `packets_rejected`,
+    and gets a throttled warning, like `ChannelCountChanged`.
+  - `WrongPacketSize` stays as a defensive check
+    (`samples.len() != channels * fpp`).
+- **Consumer.**
+  - `ConsumerState::observe_stream(sh)` runs right after the Acquire that
+    shows a started stream, in both `pop_frames` and `pull_packet`, before
+    the `in_startup` check.
+  - If `sh.fpp()` differs from the consumer's current fpp, it calls
+    `configure_fpp(fpp)`. That recomputes `packets_in_past`, `up_to_now` and
+    `beyond_now`, refills the fade prefixes, sets the Burg size and both
+    `TimingStats` windows, reconfigures every `ChannelState`, resets the
+    auto-mode initial tolerance (`fpp × AUTO_INIT_VAL_FACTOR`, as `reset()`
+    computes it), and flushes the FIFO (which is at the old packet size).
+  - All of that stays inside capacity preallocated at construction, so the
+    consumer never allocates.
+  - The check is idempotent, so two call sites are harmless. Nothing has run
+    `process_burg` before a stream starts, so there is no data to migrate.
+- **Readers switch to the adopted value.** `fpp_duration_ms`, `latency_ms`,
+  `update_headroom` and `Regulator::fpp()` read the adopted fpp, so `fpp()`
+  also works as a diagnostic.
+
+No new concurrency argument is needed: adoption only happens at a stream's
+start, and `reset()`'s quiescence contract (below) already governs getting back
+there.
+
+**Preallocation, independent of fpp.**
+
+- **`ChannelState`:** `packet_ring` and `predicted_past` become flat
+  `Vec<f32>`s of `UP_TO_NOW_MAX` samples, used as `packets_in_past` chunks of
+  `fpp`. Since `packets_in_past × fpp == up_to_now`, their memory is bounded
+  by history length, not packet count.
+  - `ring_buffer_push` writes chunk `wptr`.
+  - `real_past_into_prediction` copies two slices.
+  - `predicted_past.rotate_left(1)` becomes `[..up_to_now].rotate_left(fpp)`.
+  - Per-packet buffers are `MAX_FPP` long and used as `[..fpp]`.
+  - `prediction` is `UP_TO_NOW_MAX + 2·MAX_FPP`.
+  - `UP_TO_NOW_MAX = max(2·2·HIST_FPP, MAX_FPP) = 1024`. The
+    `packets_in_past` rule gives 256 for fpp ≤ 128, 2·fpp up to 256, and fpp
+    above that.
+- **`BurgAlgorithm`:** gains `set_size(size)`, which stays within its
+  construction capacity. It sets `order` and `input_size` and re-initializes
+  the `ak_reset` prefix.
+- **`TimingStats`:** `data` is preallocated for the `MIN_FPP` window
+  (`sample_rate / MIN_FPP / WINDOW_DIVISOR`). `set_window` resets it within
+  that capacity.
+- **Cost:** about 50 KB per channel, about 400 KB at 8 channels. State this in
+  the commit.
+
+**Constant-horizon slot ring.** With a fixed 4096 slots, memory is
+`4096 × fpp × channels × 4 B`: 16 MiB at 128 × 8 ch, but 128 MiB at 1024 × 8 ch.
+
+- `NUM_SLOTS` is replaced by a budget of `4096 × HIST_FPP` frames.
+- `num_slots(fpp)` is the largest power of two with `num_slots × fpp ≤ budget`,
+  capped at `MAX_SLOTS = 16384`:
+  - **Power of two** so `seq % num_slots` stays continuous across the `u16`
+    wrap.
+  - **The cap** keeps the ring at or under a quarter of sequence space, inside
+    `seq_is_newer`'s half-space window.
+- The horizon is about 10.9 s at any fpp ≥ 32 (5.5 s at 16, set by the cap),
+  and memory stays ≤ 16 MiB.
+- The slot array is preallocated at `MAX_SLOTS` entries with empty payloads
+  (about 640 KB of headers). Only the first `num_slots` are ever sized.
+- `slot_index` and `find_best_packet`'s `new_pkts > NUM_SLOTS` resync check
+  take the adopted `num_slots`, read after the Acquire.
+- Rewrite the module header's "Sequence space vs. slot space" section (it cites
+  4096 slots / ~10.9 s at fpp=128) in terms of the budget.
+
+**Mirrors.** The regulator keeps its "no `crate::` imports" rule. `MIN_FPP` and
+`MAX_FPP` are local `pub(crate)` mirrors, pinned against `limits.rs` by the same
+native test that pins `MAX_CHANNELS == MAX_WIRE_CHANNELS`.
 
 `reset()` (`regulator.rs:1068`) is sound only because the session quiesces
 both halves first: `release` awaits `AudioContext.close` and skips the reset
@@ -681,101 +766,180 @@ oversized writes (`:155-158`) while both send paths wait for
 Raise it to hold ≥2 packets at the wire ceiling and add a `debug_assert!` in
 `set_audio_buffers`.
 
-### Phase 5 — Device↔network separation
+### Phase 6 — Per-connection stream buffers; retirement replaces reset
+*Delivers: every connection gets its own `Regulator` and `RingBuffer`, and
+`Regulator::reset` is deleted. Ships with connect and the engine still
+coupled. It exists so Phase 7's split needs no regulator quiescence.*
+
+**The problem this solves.** `Regulator::reset` is `unsafe` and requires both
+halves quiesced. Today the only consumer-side proof is the `AudioContext`
+close inside `release` (`session.rs:926`). Once audio outlives a connection
+(Phase 7), a network-only `disconnect()` leaves the worklet popping, so
+nothing can prove quiescence and the regulator cannot be reset.
+
+**Decision (settled with the user): retire, never reset.** Each connection
+allocates fresh stream buffers. A disconnected connection's buffers are
+*retired*. They are freed only after the render thread confirms it has let go
+of them. The regulator's concurrency model is untouched: it stays strictly
+SPSC with its existing single-atomic publication. Rejected alternatives:
+
+- *An in-band reset request run by the consumer.* This adds a new protocol
+  inside the regulator. `Shared::reset` zeroes up to ~16 MiB of slot payload,
+  which is not real-time safe. A suspended context never pops, so the next
+  connect would wait forever.
+- *Closing and recreating the `AudioContext` per disconnect.* It causes an
+  audible gap and loses output-device routing. iOS needs a new user gesture
+  per context.
+
+**The quiescence proof: a worklet `'stopped'` acknowledgement.** A worklet's
+`port.onmessage` and `process()` both run on the render thread and never
+overlap. `worklet.js`'s `'stop'` handler sets `this.stopped`. `process()`
+checks that flag before calling `this.processor.render(...)`. So once the
+handler has run, that processor never touches its pointers again. The handler
+now also posts `'stopped'` back on the port. Receiving it on the main thread
+is the proof, with no context close. `teardown_worklet_node`
+(`engine.rs:413`) returns a future (or registers a callback) that settles on
+that acknowledgement.
+
+- **`Connection { id, transport, regulator: Box<Regulator>, ring:
+  Box<RingBuffer>, wire, state }`** is in `webtrip-web`, because it holds a
+  transport. The session holds `Vec<Connection>`. `connect()` enforces
+  `len <= 1` by **returning an error naming the limit**, never by silently
+  ignoring the call.
+  - The session's `local_to_network_buffer` / `network_to_local_buffer`
+    fields (`session.rs:283-284`) and their `ManuallyDrop` go away.
+  - `audio_buffer_config` and `buffer_ptrs` read from the connection.
+- **The processor's stream list is immutable for the life of a worklet node.**
+  The node is built pointing at one connection's buffers, or at none
+  (`AudioProcessor::new`, the empty `net_in`/`net_out` case). Adding or
+  removing a connection while an engine runs rebuilds the node through
+  `build_and_connect_worklet_node` (`engine.rs:343`). The output-device change
+  already uses and exercises that path.
+  - In this phase connect still brings the engine up after the dial, so the
+    first node is simply built against the new connection. The rebuild path
+    is wired and tested here, and becomes the hot path in Phase 7.
+- **Retirement.**
+  - On disconnect, the transport is closed first, so the producer is
+    quiesced.
+  - The connection's buffers then move into a session-owned retired list,
+    keyed by the node they were attached to.
+  - That entry is freed when the node's `'stopped'` arrives.
+  - If the context closes first (`stopAudio`, or the session `Drop` path),
+    the successful close frees every retired entry.
+  - If the close times out, the entries stay in the list, as `release`
+    already keeps the regulator un-reset on timeout today.
+  - If no acknowledgement ever arrives (for example, a suspended context
+    might not deliver port messages), the entry waits for the context close.
+    That is sound and bounded to one buffer pair per missing
+    acknowledgement.
+  - The session `Drop` path (`session.rs:1177`) uses the same retirement
+    rule in place of its hand-built buffer tuple.
+- **Delete `Regulator::reset`** with its `Shared::reset` / `ConsumerState::reset`
+  helpers and its `unsafe` contract.
+  - Re-adoption after a reconnect is now construction, since a fresh
+    regulator starts at `SEQ_NONE`.
+  - Delete the reset-specific tests (scrubbing, re-adoption after `reset()`,
+    the Phase 3 FIFO-flush-on-reset case, the Phase 5 "re-adoption of a
+    different fpp after `reset()`" case). Don't port them.
+  - Update the doc comments and module header that cite the reset/quiescence
+    contract (WEB-53 Bug 7 / WEB-66) to describe retirement.
+  - `release` no longer resets anything. Its `AudioContext.close` timeout
+    handling stays, because it still governs freeing.
+- **`AudioParams::send_channels` is removed from `AudioParams` entirely.** It
+  is per-connection wire state, read every callback (`processor.rs:172`) from
+  a leaked `'static`. The wire format moves into `RingBuffer`
+  (`set_wire_format`/`wire_channels`). The ring is already the
+  per-connection send-side object, the render thread already reaches it
+  through `SharedPtr`, and the stride of its contents is its own property.
+  `AudioParams` is then purely device and metering state.
+- **Stats.** `SessionStats` splits into `ConnectionStats` plus an aggregate.
+  `build_session_stats` (`session_stats.rs:59`) splits into a pure
+  `build_connection_stats` plus a trivial aggregate. The existing
+  `build_session_stats_maps_all_fields` test ports onto the former.
+- **Cost, stated in the commit.** Each connect allocates a regulator on the
+  main thread, off the audio thread. Connecting or disconnecting while an
+  engine runs swaps the worklet node, which is the same brief glitch an
+  output-device change already causes.
+- **Homes.** `Connection`, the retired list and the acknowledgement plumbing
+  are `webtrip-web`. `ConnectionStats` and its builder are `webtrip-core`.
+
+### Phase 7 — Device↔network separation
 *Delivers: audio-without-network, and network-without-audio on **both**
-transports. Independent of 2-4; easier after 2.*
+transports. Last, because it depends on Phase 6's retirement. A network-only
+`disconnect()` retires the connection's buffers while the worklet keeps
+running.*
 
-Today engine bring-up is a step inside connect. `bring_up`
-(`session.rs:920`) dials the transport, then runs
-`start_engine_unless_aborted` (`:1079`), which spawns `bring_up_engine`
-(`:304`) and races it against the connect's abort promise so `disconnect()`
-is never blocked on `getUserMedia` (WEB-69). On success it publishes the
-transport and engine and starts the network loop with no await in between
-(`:977-982`). Teardown is `disconnect` (`:733`) → `stop_network_loop` →
-`release` (`:1017`), which closes the transport, awaits
-`AudioEngine::stop_capture`, and resets the regulator only if the
-`AudioContext` close proved the worklet quiescent.
+Today engine bring-up is a step inside connect. `bring_up` (`session.rs:829`)
+dials the transport, then runs `start_engine_unless_aborted` (`:998`). That
+spawns `bring_up_engine` (`:201`) and races it against the connect's abort
+promise, so `disconnect()` is never blocked on `getUserMedia` (WEB-69). On
+success it publishes the transport and engine and starts the network loop
+with no await in between. Teardown is `disconnect` (`:635`) →
+`stop_network_loop` → `release` (`:926`).
 
-- **Split the engine half out of `bring_up`/`release`.** Public `startAudio`
-  runs the engine bring-up (`start_engine_unless_aborted`), keeping the
-  abort race and the cancel flag so a `stopAudio()`/`disconnect()` during a
-  pending permission prompt still settles promptly. `stopAudio` runs the
-  engine half of `release`. `connect` keeps the dial, the failure bridge,
-  and publishing the transport. `connect_to_studio` keeps its exact
-  signature (Demo.tsx is out of scope) and becomes `start_audio(...)` then
-  `connect(...)` — note that this reverses today's order (dial first, then
-  engine).
-- **Open — regulator reset without engine teardown.** `Regulator::reset`
-  requires the consumer to be quiescent, and today the only proof is the
-  `AudioContext` close inside `release`. Once audio outlives a connection,
-  a network-only `disconnect()` leaves the worklet popping, so `release`
-  can no longer reset the regulator the way it does now. Phase 6's
-  per-connection regulator plus worklet-node rebuild is one way to provide
-  quiescence; deciding how Phase 5 handles it before Phase 6 is a question
-  for the user.
+- **Split the engine half out of `bring_up`/`release`.**
+  - Public `startAudio` runs the engine bring-up
+    (`start_engine_unless_aborted`). It keeps the abort race and the cancel
+    flag, so a `stopAudio()`/`disconnect()` during a pending permission
+    prompt still settles promptly.
+  - `stopAudio` runs the engine half of `release`: `AudioContext.close`,
+    which also frees the retired entries.
+  - `connect` keeps the dial, the failure bridge and publishing the
+    transport. When an engine is running, it then rebuilds the node against
+    the new connection (Phase 6).
+  - `disconnect` closes the transport, then rebuilds the node with no
+    network stream if an engine is running, and retires the buffers.
+  - `connect_to_studio` keeps its exact signature (Demo.tsx is out of scope)
+    and becomes `start_audio(...)` then `connect(...)`. This reverses today's
+    order, which dials first and then starts the engine.
 - **Tick wiring stays as is.** The tick closure already ticks the shared
-  `TransportSlot` (`Rc<RefCell<Option<Box<dyn Transport>>>>`,
-  `session.rs:190`, closure at `:1212-1220`): no self-pointer, no `unsafe`,
-  `Rc`/`RefCell` only at the `web_sys` callback boundary. The `TickClock`
-  below must drive this same slot. It becomes a `Vec` only when N>1 actually
-  ships.
-- **State split:** `SessionState` becomes the *network* state; add
-  `AudioState { Stopped, Running }`. Session-level state becomes a pure
-  `aggregate_network_state(&[NetworkState]) -> SessionState` — natively
-  testable, and the seam where 1→N generalises. `SessionState` and the
-  connect/disconnect gate live in `Lifecycle` (`src/lifecycle.rs`, one atomic
-  epoch+state word); the network state and `AudioState` must be expressed in
-  that state machine (or a sibling with the same epoch discipline), not as a
-  separate flag alongside it.
-- **The WebRTC tick-clock asymmetry, addressed not papered over.** Its tick is
-  driven by `Atomics.waitAsync` on the ring's has-data flag, set only by
-  `RingBuffer::write` from the worklet — so no worklet means no ticks and
-  WebRTC cannot *receive* either; packets pile up in `receive_queue`
-  (`webrtc.rs:294`, drained only inside `tick` at `:464`). Introduce a
-  session-owned
-  `TickClock { None, Atomics(AudioCallbackLoop), Interval(IntervalTickLoop) }`
-  with `ensure_running_for(audio_running, any_connection_live)`.
-  `IntervalTickLoop` is a small sibling of `AudioCallbackLoop`
-  (`audio_callback_loop.rs:142`) with the same stop-on-Drop discipline.
-- **Homes:** `TickClock`, `IntervalTickLoop` and the `TransportSlot` wiring are
-  `webtrip-web`; `AudioState` and `aggregate_network_state` are
-  `webtrip-core`.
+  `TransportSlot` (`Rc<RefCell<Option<Box<dyn Transport>>>>`, `session.rs:87`,
+  set up in `start_network_loop` at `:1093`). There is no self-pointer and no
+  `unsafe`, and `Rc`/`RefCell` stay at the `web_sys` callback boundary. The
+  `TickClock` below must drive this same slot, which becomes the
+  connection's transport.
+- **State split.**
+  - `SessionState` becomes the *network* state.
+  - Add `AudioState { Stopped, Running }`.
+  - Session-level state becomes a pure
+    `aggregate_network_state(&[NetworkState]) -> SessionState`. It is
+    natively testable, and it is the seam where 1→N generalises.
+  - `SessionState` and the connect/disconnect gate live in `Lifecycle`
+    (`lifecycle.rs`, one atomic epoch+state word). The network state and
+    `AudioState` must be expressed in that state machine, or in a sibling
+    with the same epoch discipline, not as a separate flag alongside it.
+- **The WebRTC tick-clock asymmetry, addressed not papered over.**
+  - WebRTC's tick is driven by `Atomics.waitAsync` on the ring's has-data
+    flag. Only `RingBuffer::write` from the worklet sets that flag, so with
+    no worklet there are no ticks and WebRTC cannot *receive* either.
+    Packets pile up in `receive_queue` (`webrtc.rs:227`), which is drained
+    only inside `tick`.
+  - Introduce a session-owned
+    `TickClock { None, Atomics(AudioCallbackLoop), Interval(IntervalTickLoop) }`
+    with `ensure_running_for(audio_running, any_connection_live)`.
+  - `IntervalTickLoop` is a small sibling of `AudioCallbackLoop`
+    (`audio_callback_loop.rs:142`) with the same stop-on-Drop discipline.
+  - A network-only connection's regulator has no consumer. It fills, and its
+    slot ring overwrites, exactly as when a worklet stalls today. When audio
+    starts later, the node is built against it and `find_best_packet`'s
+    resync handles the backlog.
+- **Homes.** `TickClock` and `IntervalTickLoop` are `webtrip-web`.
+  `AudioState` and `aggregate_network_state` are `webtrip-core`.
 
-### Phase 6 — Per-connection restructuring
-*Groundwork only. Last, because it touches everything.*
+**Non-negotiable sequencing:** 0a → 0b → 0c → 0d, all before Phase 1, so
+later phases create new files in their final crate.
 
-Introduce `Connection { id, transport, regulator, ring, wire, state }`;
-session holds `Vec<Connection>` and `connect()` enforces `len <= 1` by
-**returning an error naming the limit**, not silently ignoring.
-
-- **`AudioParams::send_channels` is removed from `AudioParams` entirely** — it is
-  per-connection wire state in a leaked `'static` read every callback
-  (`processor.rs:465`). The wire format moves into `RingBuffer`
-  (`set_wire_format`/`wire_channels`): already the per-connection send-side
-  object, already reached by the render thread via `SharedPtr`, and the stride
-  of its contents is genuinely its own property. `AudioParams` is then purely
-  device/metering state.
-- One `Regulator` and one `RingBuffer` **per connection** — the single-consumer
-  problem dissolves rather than being solved, each ring staying strictly SPSC.
-- Concurrency rule, stated rather than hand-waved: **the processor's stream list
-  is immutable for the life of a worklet node.** Adding/removing a connection
-  rebuilds the node — machinery `engine.rs:332-398` and `teardown_worklet_node`
-  (`:399`) already provide and exercise for output-device changes.
-- `SessionStats` splits into `ConnectionStats` + aggregate;
-  `build_session_stats` (`session.rs:153`) splits into a pure
-  `build_connection_stats` plus a trivial aggregate, and the existing
-  `build_session_stats_maps_all_fields` test (`session.rs:1364` today, in
-  core's `session_stats.rs` after 0b) ports onto the former.
-- **Homes:** `Connection` is `webtrip-web` (it holds a transport);
-  `ConnectionStats` and its builder are `webtrip-core`.
-
-**Non-negotiable sequencing:** 0a → 0b → 0c → 0d, all before Phase 1 (so later
-phases create new files in their final crate); 2 before 3 (the regulator's frame output feeds the mixer's `net_in`); 3 before 4
-(adopting a peer fpp without the frame FIFO breaks playback immediately —
-`remote_interleaved` would be `fpp*channels` while the mixer expects
-`frames*channels`); 3b after 3 (it changes the frame↔packet arithmetic that
-phase establishes). Phase 3b is independent of 4 in either order. Phase 1 is
-otherwise independent and can ship at any point after 0d.
+- 2 before 3: the regulator's frame output feeds the mixer's `net_in`.
+- 3 before 5: adopting a peer fpp without the frame FIFO breaks playback
+  immediately, because `remote_interleaved` would be `fpp*channels` while the
+  mixer expects `frames*channels`.
+- 4 after 3: it changes the frame↔packet arithmetic that phase establishes.
+  Phase 4 is independent of 5 in either order.
+- 6 before 7: a network-only disconnect needs retirement, because nothing can
+  prove the consumer quiescent while the worklet keeps running.
+- 6 after 5: it deletes `reset()`, so Phase 5's reset-based re-adoption test
+  never needs porting.
+- Phase 1 is otherwise independent and can ship at any point after 0d.
 
 ## Testing
 
@@ -797,8 +961,28 @@ Genuinely new tests, each able to fail on a plausible bug:
   callback interval, and a steady peer's auto tolerance stays near the slower
   of the two clocks.
 - Latency and reset: frames queued in the FIFO reach `latency_ms()`, and
-  `reset()` discards them.
+  `reset()` discards them. (The reset half is deleted with `reset()` in
+  Phase 6.)
 - `fit_fpp` boundary matrix including its `limited_by` reason.
+- Peer-fpp adoption, extending the regulator's adoption/rejection test:
+  - first-packet adoption across `{MIN_FPP, 64, 128, 256, MAX_FPP}` ×
+    channels, with `fpp()` and `latency_ms()` reflecting the adopted value;
+  - both sides of `MIN_FPP` and `MAX_FPP` (`UnsupportedFpp`);
+  - a mid-stream `FppChanged`;
+  - re-adoption of a different fpp after `reset()` (deleted with `reset()` in
+    Phase 6; the reconnect test there replaces it).
+
+  The `pop_frames_at` continuity matrix gains an adopted fpp that differs from
+  the construction fpp, including 1024 against a 128-frame callback.
+- A loss burst at an adopted fpp ≠ 128 conceals with the reconfigured Burg
+  size. This catches a stale `up_to_now` or `beyond_now` slicing the wrong
+  prefix.
+- `test_loss_burst_wider_than_ring_resyncs_read_pointer` is parameterized over
+  adopted fpp, so the resync fires at `num_slots(fpp)`, plus one sequence
+  wraparound case at a non-default `num_slots`.
+- `test_deserialize_buffer_size_boundaries` retargets to `MIN_FPP - 1`,
+  `MIN_FPP`, `MAX_FPP` and `MAX_FPP + 1`. Protocol tests that use
+  out-of-range sizes (e.g. `buffer_size = 4`) move into range.
 - Rate-mismatch matrix (device rate × wire rate, e.g. 48/48, 96/48, 44.1/48):
   per callback the pop count and the converted frame count are right, a known
   tone survives conversion at the right pitch in both directions, and — the
@@ -808,6 +992,16 @@ Genuinely new tests, each able to fail on a plausible bug:
   named.
 - A browser test that a connect-only session with no worklet still ticks a
   `MockTransport` — the exact bug the WebRTC clock asymmetry causes.
+- Retirement (browser): a connection's buffers are not freed until the
+  replaced node's `'stopped'` acknowledgement arrives. The test holds the
+  acknowledgement back and asserts the buffers are still live, then delivers
+  it and asserts they are freed. When no acknowledgement arrives, retired
+  buffers are freed by a fulfilled `AudioContext.close` and kept on a close
+  timeout.
+- A disconnect-then-reconnect with audio running adopts the second peer's
+  channel count and fpp. This catches a stale regulator carried across
+  connections, which is the bug `reset()` used to prevent.
+- `connect()` with one connection live returns an error naming the limit.
 
 No test should merely restate 32, 8 or 1200.
 
@@ -876,6 +1070,6 @@ Config to update: root `Cargo.toml` (workspace) and the four crate manifests (in
 (*Build Commands*, *Key Modules*), `README.md`.
 
 Docs to update: `docs/ARCHITECTURE.md` (final crate/module layout, in Phase
-6's wrap-up), `docs/CHANNEL_MODEL.md` (asserts the 8-channel limit at
+7's wrap-up), `docs/CHANNEL_MODEL.md` (asserts the 8-channel limit at
 `:432-441`; `:179-182` and `:428-431` describe the settings-only capture
 behaviour that Phase 1 fixes), `docs/WASM_TESTING.md:491`.

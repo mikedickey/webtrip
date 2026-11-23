@@ -846,3 +846,8 @@
     grid-template-columns: repeat(2, 1fr);
   }
 }
+
+.reset-btn {
+  width: 100%;
+  margin-top: 16px;
+}
