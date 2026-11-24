@@ -250,8 +250,8 @@ For real-time audio (~2.7ms intervals at 128 samples/48kHz), we need **synchrono
 `WebTripSession` runs the audio engine and the network connection independently:
 
 - `startAudio()` / `stopAudio()` bring the engine up and down (`getAudioState()`: `"stopped"` / `"running"`). With no connection the worklet monitors the input and plays nothing back.
-- `connect()` / `disconnect()` dial and end a hub connection (`getState()`). With no engine, the connection still receives and sends nothing.
-- `connectToStudio()` is `startAudio` then `connect`, and owns the audio it started: `disconnect()` (or a failed connect) stops it. Audio already running when it is called is left alone.
+- `connectNetwork()` / `disconnectNetwork()` dial and end a hub connection (`getState()`). With no engine, the connection still receives and sends nothing.
+- `connect()` is `startAudio` then `connectNetwork`, and owns the audio it started: `disconnect()` (or a failed connect) stops it. Audio already running when it is called is left alone. `disconnectNetwork()` ends the connection but leaves audio running, and hands it to the caller.
 
 Each connection has its own `RingBuffer` and `Regulator`. A worklet node's stream list is fixed for its life, so attaching or detaching a connection while audio runs rebuilds the node (the brief glitch an output-device change causes), and the ended connection's buffers are *retired*: freed once the replaced node posts `"stopped"`, or once its engine's `AudioContext.close` fulfils.
 

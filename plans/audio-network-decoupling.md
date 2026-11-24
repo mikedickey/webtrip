@@ -930,15 +930,17 @@ transports. Last, because it depends on Phase 6's retirement. A network-only
 running.*
 
 - **Public API.** `startAudio(deviceId, agc, echo, ns)` and `stopAudio()` bring
-  the engine up and down; `connect(host, port, clientName)` dials with no audio;
-  `getAudioState()` reports `"stopped"`/`"running"`. `connectToStudio` keeps its
-  exact signature (Demo.tsx is out of scope).
-  - **`connectToStudio` owns the audio it started** (decided with the user): it
+  the engine up and down; `connectNetwork(host, port, clientName)` and
+  `disconnectNetwork()` dial and end a connection with no audio;
+  `getAudioState()` reports `"stopped"`/`"running"`. The whole-session pair
+  keeps the short names: `connect(host, port, deviceId, agc, echo, ns,
+  clientName)` (Demo.tsx's call) and `disconnect()`.
+  - **`connect` owns the audio it started** (decided with the user): it
     starts audio first (unless audio is already running), then dials, and
     `disconnect()` or a failed connect stops that audio again. Audio the caller
     already had running survives `disconnect()`, and an explicit `stopAudio()`
-    takes audio out of a connect's hands. This keeps the demo, which only knows
-    `connectToStudio`/`disconnect`, releasing the mic as before.
+    or `disconnectNetwork()` takes audio out of a connect's hands. This keeps
+    the demo, which only knows `connect`/`disconnect`, releasing the mic.
   - The audio start runs *inside* the connect (after `Connecting` is entered,
     under the connect's abort), not as a separate call before it, so
     `disconnect()` during a permission prompt still settles promptly (WEB-69).

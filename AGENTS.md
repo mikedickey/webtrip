@@ -149,7 +149,7 @@ never imports `network` (both may use `stream`); `session.rs` composes them.
 
 ### Key Modules
 
-- **`crates/web/src/session.rs`** — `WebTripSession`: top-level orchestrator; audio (`startAudio`/`stopAudio`) and network (`connect`/`disconnect`) are independent, `connectToStudio` is both; owns the audio engine and its connections; each connection owns its transport and its own `Regulator` + `RingBuffer`, retired (never reset) when it ends
+- **`crates/web/src/session.rs`** — `WebTripSession`: top-level orchestrator; audio (`startAudio`/`stopAudio`) and network (`connectNetwork`/`disconnectNetwork`) are independent, `connect`/`disconnect` do both; owns the audio engine and its connections; each connection owns its transport and its own `Regulator` + `RingBuffer`, retired (never reset) when it ends
 - **`crates/core/src/lifecycle.rs`** — Portable connect/disconnect (`Lifecycle`) and audio start/stop (`AudioLifecycle`) state machines (each one atomic epoch+state word) that `WebTripSession` consults before acquiring, publishing, or releasing resources
 - **`crates/web/src/tick_clock.rs`** — `TickClock`: ticks a published WebRTC transport from the audio callback while audio runs, on an interval otherwise
 - **`crates/core/src/stream/regulator.rs`** — Jitter buffer with Burg PLC (packet loss concealment), ported from JackTrip C++

@@ -8,15 +8,16 @@
 //!
 //! Audio and network are independent. `startAudio()` brings the engine up with
 //! no network (the worklet monitors the input and plays nothing back);
-//! `connect()` dials a hub with no audio (WebRTC is ticked on an interval, since
+//! `connectNetwork()` dials a hub with no audio (WebRTC is ticked on an interval, since
 //! no audio callback exists to wake it). Whichever comes second attaches the
-//! engine's worklet node to the connection's stream buffers. `connectToStudio()`
-//! is both, and owns the audio it started: `disconnect()` stops it again.
+//! engine's worklet node to the connection's stream buffers. `connect()`
+//! is both, and owns the audio it started: `disconnect()` stops it again, while
+//! `disconnectNetwork()` ends the connection and leaves audio running.
 //!
 //! ## Connection Flow
 //!
 //! ```text
-//! 1. connect_to_studio(server_host, port, ...)
+//! 1. connect(server_host, port, ...)
 //!    └─> Waits out any disconnect still tearing down
 //!    └─> Admitted only from Idle (see `webtrip_core::lifecycle`)
 //!    └─> Starts audio (unless it is already running), then dials the hub over
@@ -80,7 +81,7 @@ pub use webtrip_core::session_stats::SessionStats;
 /// Default signaling port (same as JackTrip TCP port)
 pub const DEFAULT_SIGNALING_PORT: u16 = 4464;
 
-/// How long `connect_to_studio` waits for the transport to connect before
+/// How long `connect` waits for the transport to connect before
 /// giving up and rejecting.
 pub const CONNECT_TIMEOUT_MS: i32 = 45_000;
 
@@ -292,7 +293,7 @@ enum Detached {
 /// WebTrip Session - coordinates all audio and network components
 ///
 /// Every method takes `&self`, so JavaScript may call any of them (notably
-/// `disconnect()` and `getState()`) while a `connectToStudio()` promise is
+/// `disconnect()` and `getState()`) while a `connect()` promise is
 /// pending: wasm-bindgen holds an async method's borrow until its promise
 /// settles, and an `&mut self` borrow would make every such call throw.
 ///
@@ -322,7 +323,7 @@ pub struct WebTripSession {
     abort_audio_in_flight: RefCell<Option<js_sys::Function>>,
     /// Settles when the audio stop in flight has returned audio to `Stopped`
     audio_teardown_in_flight: RefCell<Option<js_sys::Promise>>,
-    /// Whether the audio running was started by `connect_to_studio`, and so
+    /// Whether the audio running was started by `connect`, and so
     /// stops with its connection
     audio_owned_by_connect: Cell<bool>,
 
@@ -648,26 +649,26 @@ impl WebTripSession {
     /// connection stays up (its transport keeps running, with nothing to send
     /// and nothing playing what it receives). Safe to call at any time and any
     /// number of times; it also cancels a start in flight, and takes audio
-    /// that `connectToStudio()` started out of that connection's hands.
+    /// that `connect()` started out of that connection's hands.
     #[wasm_bindgen(js_name = stopAudio)]
     pub async fn stop_audio(&self) {
         self.audio_owned_by_connect.set(false);
         self.stop_audio_inner().await;
     }
 
-    // ========== Studio Connection Methods ==========
+    // ========== Network ==========
 
     /// Connect to a JackTrip hub server over the network only: audio is
     /// neither started nor required. A running engine is attached to the
     /// connection; one started later attaches itself. Admission, timeout and
-    /// cancellation are those of [`connect_to_studio`](Self::connect_to_studio).
+    /// cancellation are those of [`connect`](Self::connect).
     ///
     /// # Arguments
     /// * `server_host` - The hub server hostname (from studio.server_host)
     /// * `port` - The signaling port (default 4464)
     /// * `client_name` - Optional client name to send in connection request
-    #[wasm_bindgen(js_name = connect)]
-    pub async fn connect(
+    #[wasm_bindgen(js_name = connectNetwork)]
+    pub async fn connect_network(
         &self,
         server_host: String,
         port: Option<u16>,
@@ -712,8 +713,8 @@ impl WebTripSession {
     /// * `echo_cancellation` - Enable echo cancellation
     /// * `noise_suppression` - Enable noise suppression
     /// * `client_name` - Optional client name to send in connection request
-    #[wasm_bindgen(js_name = connectToStudio)]
-    pub async fn connect_to_studio(
+    #[wasm_bindgen(js_name = connect)]
+    pub async fn connect(
         &self,
         server_host: String,
         port: Option<u16>,
@@ -740,8 +741,10 @@ impl WebTripSession {
         .await
     }
 
-    /// Disconnect from the hub server, resolving once the session is `Idle`.
-    /// Audio keeps running unless `connectToStudio()` started it.
+    /// Disconnect from the hub server, resolving once the session is `Idle`,
+    /// and stop the audio `connect()` started (audio you started yourself with
+    /// `startAudio()` keeps running; so does everything after
+    /// [`disconnect_network`](Self::disconnect_network)).
     ///
     /// Safe to call at any time and any number of times: from `Idle` it is a
     /// no-op, and a call while another disconnect is running waits for that
@@ -763,6 +766,23 @@ impl WebTripSession {
     /// audio side is quiescent too (see [`crate::connection`]). A connect
     /// issued meanwhile waits for this to finish.
     pub async fn disconnect(&self) {
+        self.disconnect_with(true).await;
+    }
+
+    /// Disconnect from the hub server over the network only, with the same
+    /// guarantees as [`disconnect`](Self::disconnect), but audio is left running
+    /// even when `connect()` started it. That audio is then yours to stop with
+    /// `stopAudio()`: a later `disconnect()` does not touch it.
+    #[wasm_bindgen(js_name = disconnectNetwork)]
+    pub async fn disconnect_network(&self) {
+        self.disconnect_with(false).await;
+    }
+}
+
+impl WebTripSession {
+    /// The body of `disconnect` and `disconnectNetwork`: `stop_owned_audio`
+    /// says whether audio that `connect()` started goes with the connection.
+    async fn disconnect_with(&self, stop_owned_audio: bool) {
         match self.lifecycle.begin_disconnect() {
             DisconnectStart::AlreadyIdle => return,
             DisconnectStart::AlreadyDisconnecting => {
@@ -790,7 +810,7 @@ impl WebTripSession {
         if let Some(connection) = connection {
             self.end_connection(connection, transport).await;
         }
-        if self.audio_owned_by_connect.replace(false) {
+        if self.audio_owned_by_connect.replace(false) && stop_owned_audio {
             self.stop_audio_inner().await;
         }
 
@@ -798,10 +818,14 @@ impl WebTripSession {
         drop(teardown);
         emit_state(&self.on_state_change, SessionState::Idle);
     }
+}
+
+#[wasm_bindgen]
+impl WebTripSession {
 
     /// Return true when the underlying AudioContext is still suspended.
     ///
-    /// On iOS Safari the context may stay suspended after `connectToStudio` completes
+    /// On iOS Safari the context may stay suspended after `connect` completes
     /// because `resume()` requires a direct user-gesture activation.  The TypeScript
     /// layer can call this after a successful connect to decide whether to show a
     /// "Tap to enable audio" prompt.
@@ -844,10 +868,10 @@ impl WebTripSession {
     }
 
     /// Connect the session over a caller-supplied, already-constructed transport,
-    /// bypassing the real per-type transport construction in `connect_to_studio`.
+    /// bypassing the real per-type transport construction in `connect`.
     ///
     /// Unit-test only. Runs the same [`connect_with`] path as
-    /// `connect_to_studio` (admission, audio bring-up, dial, `Connected`)
+    /// `connect` (admission, audio bring-up, dial, `Connected`)
     /// against a mock transport with no live hub. Pair with [`disconnect`] for
     /// the teardown half.
     ///
@@ -1152,7 +1176,7 @@ impl WebTripSession {
 
     /// Admit and dial a connection (starting audio first when `audio` is given
     /// and none is running), and publish it; the transport-agnostic body of
-    /// `connect` and `connect_to_studio`. On failure (including cancellation)
+    /// `connectNetwork` and `connect`. On failure (including cancellation)
     /// everything the attempt created is released before this returns.
     async fn connect_with(
         &self,
@@ -1791,7 +1815,7 @@ mod tests {
     // state-change callback reports it in order.
     //
     // Connects run over `test_support::MockTransport` via
-    // `connect_with_test_transport`, which reuses `connect_to_studio`'s whole
+    // `connect_with_test_transport`, which reuses `connect`'s whole
     // `connect_with` path without a live hub. The real WebRTC/WebTransport
     // arms' network handshakes (SDP/ICE, QUIC) still require a live JackTrip
     // hub and are covered by the integration tests; here they are only
@@ -1997,7 +2021,7 @@ mod tests {
 
         session.disconnect().await;
         assert_eq!(session.get_state(), "idle");
-        assert_eq!(session.get_audio_state(), "stopped", "connectToStudio's audio stops with its connection");
+        assert_eq!(session.get_audio_state(), "stopped", "connect's audio stops with its connection");
         assert!(!session.has_transport());
         assert_eq!(probe.closes.get(), 1, "teardown must close the transport once");
         assert_log(&log, &["connecting", "connected", "disconnecting", "idle"], "after disconnect");
@@ -2581,7 +2605,7 @@ mod tests {
         // Default transport is WebRTC; an empty host yields an invalid
         // signaling URL that fails fast, with no live hub involved.
         let result = session
-            .connect_to_studio(
+            .connect(
                 String::new(),
                 None,
                 None,
@@ -2866,12 +2890,12 @@ mod tests {
         session.stop_audio().await;
     }
 
-    /// `connectToStudio()` owns the audio it started and `disconnect()` stops
+    /// `connect()` owns the audio it started and `disconnect()` stops
     /// it, so the demo (which only knows those two calls) releases the mic. Audio
     /// the caller already had running is not the connect's to stop.
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
-    async fn session_connect_to_studio_owns_only_the_audio_it_started() {
+    async fn session_connect_owns_only_the_audio_it_started() {
         let params = AudioParams::default();
         let session = new_session(&params);
 
@@ -2891,6 +2915,20 @@ mod tests {
             .expect("connect with audio already running should succeed");
         session.disconnect().await;
         assert_eq!(session.get_audio_state(), "running", "audio the caller started is not the connect's to stop");
+
+        // `disconnectNetwork()` ends the connection but leaves even a connect's
+        // audio running, and hands it to the caller: a later `disconnect()` is
+        // a no-op for audio.
+        session
+            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .await
+            .expect("connect should succeed");
+        session.disconnect_network().await;
+        assert_eq!(session.get_state(), "idle");
+        assert_eq!(session.get_audio_state(), "running", "disconnectNetwork must leave audio running");
+        session.disconnect().await;
+        assert_eq!(session.get_audio_state(), "running", "the audio is the caller's after disconnectNetwork");
+        session.stop_audio().await;
 
         // An explicit stop takes audio out of a connect's hands: the
         // connection stays up and a later disconnect leaves audio alone.

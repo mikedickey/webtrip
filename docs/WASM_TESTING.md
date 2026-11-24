@@ -193,7 +193,7 @@ is served at the site root with `pkg/` present — something the
 2. drives it with a headless browser (`puppeteer-core`), and
 3. for each transport, runs the actual exported session API
    (`createAudioParams` → `WebTripSession` → `setTransportType` →
-   `connectToStudio`), then asserts the transport reports **connected** and that
+   `connect`), then asserts the transport reports **connected** and that
    captured (fake-device) audio reaches the **send** ring buffer
    (`ring_buffer_samples_written > 0`). The receive/loopback counters are logged
    but not asserted (a lone hub client may get no echo).

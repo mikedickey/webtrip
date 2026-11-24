@@ -154,9 +154,9 @@ of the device-wide `AudioParams`.
 
 ## Connecting: Capture and Playback Setup
 
-### `connectToStudio()`
+### `connect()`
 
-`WebTripSession::connect_to_studio` builds `AudioBufferConfig { send_channels,
+`WebTripSession::connect` builds `AudioBufferConfig { send_channels,
 receive_channels, .. }` and hands it to the transport:
 
 - **WebRTC** (`webrtc.rs`) sizes its send buffers from `send_channels` and
@@ -398,7 +398,7 @@ restores it (Mix to Mono by default).
 | Mono | 1 | 1 | identity; the worklet node keeps only channel 0 |
 
 The demo applies all four counts in `handleConnect`, right before
-`connectToStudio`; Connect is only enabled while the session is `Idle`, so the
+`connect`; Connect is only enabled while the session is `Idle`, so the
 setters always take effect. So a remount never needs to re-sync the
 module-singleton session. Connection and device settings are locked from
 connect start until the session is back to idle; gain, volume, and monitor

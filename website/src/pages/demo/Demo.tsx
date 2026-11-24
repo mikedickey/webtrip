@@ -344,7 +344,7 @@ export default function Demo() {
       // Store the sink before connecting so start_capture routes playback to
       // it during engine bring-up, instead of starting on the default output.
       await engine.session.setOutputDevice(outputDeviceId || undefined);
-      await engine.session.connectToStudio(
+      await engine.session.connect(
         host,
         port,
         inputDeviceId || undefined,
