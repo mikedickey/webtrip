@@ -53,7 +53,8 @@ use webtrip_core::stream::regulator::Regulator;
 use webtrip_core::session_stats::build_session_stats;
 use webtrip_core::stream::ring_buffer::RingBuffer;
 use webtrip_core::stream::shared_ptr::SharedPtr;
-use webtrip_core::network::transport::{transport_state_is_failure, transport_state_str, AudioBufferConfig, StateCallback, Transport, TransportState, TransportType};
+use webtrip_core::network::protocol::DEFAULT_BUFFER_SIZE;
+use webtrip_core::network::transport::{fit_send_fpp, transport_state_is_failure, transport_state_str, AudioBufferConfig, StateCallback, Transport, TransportState, TransportType};
 use crate::network::webrtc::{TransportConfig as WebRtcConfig, WebRtcTransport};
 use crate::network::webtransport::{is_webtransport_available, WebTransportImpl};
 use webtrip_core::lifecycle::{ConnectRejected, DisconnectStart, Lifecycle};
@@ -306,7 +307,10 @@ pub struct WebTripSession {
 
     // Configuration. The four channel counts are independent, set only
     // while Idle, and fixed for the life of a connection.
-    buffer_size: usize,
+    /// Frames per packet this client prefers to send. A transport with a
+    /// packet-size limit sends fewer (`fit_send_fpp`); the peer is told by the
+    /// packet header, so nothing else needs to agree.
+    send_fpp: usize,
     /// Channels sent over the wire (payload width of every outbound packet)
     send_channels: Cell<u8>,
     /// Channels asked back from the peer (advertised in every outbound header)
@@ -335,7 +339,10 @@ impl WebTripSession {
         // Callers pass the address from [`create_audio_params`] (a leaked
         // `AudioParams` that outlives the session and every agent holding it).
         let audio_params = unsafe { SharedPtr::<AudioParams>::from_addr(audio_params_addr) };
-        let buffer_size = 128;
+        let send_fpp = DEFAULT_BUFFER_SIZE as usize;
+        // Only the regulator's geometry until the peer's first packet, whose
+        // frames per packet it adopts.
+        let receive_fpp = DEFAULT_BUFFER_SIZE as usize;
         let sample_rate = WIRE_SAMPLE_RATE;
         let send_channels = 1;
         let receive_channels = 2;
@@ -351,7 +358,7 @@ impl WebTripSession {
         // Regulator with auto-adaptive tolerance and headroom (-500.0).
         // The peer's actual count is still adopted from its first packet.
         let network_to_local_buffer = Box::new(
-            Regulator::with_params(receive_channels as usize, buffer_size, sample_rate, -500.0)
+            Regulator::with_params(receive_channels as usize, receive_fpp, sample_rate, -500.0)
                 .with_callback_capacity(MAX_WIRE_FRAMES_PER_CALLBACK),
         );
 
@@ -370,7 +377,7 @@ impl WebTripSession {
             capture_gate: RefCell::new(None),
             #[cfg(all(test, target_arch = "wasm32"))]
             capture_waiting: Rc::new(Cell::new(false)),
-            buffer_size,
+            send_fpp,
             send_channels: Cell::new(send_channels),
             receive_channels: Cell::new(receive_channels),
             input_channels: Cell::new(2),
@@ -839,7 +846,19 @@ impl WebTripSession {
     ) -> Result<(), JsValue> {
         let mut transport = new_transport()?;
         let transport_type = transport.transport_type();
-        transport.set_audio_buffers(self.audio_buffer_config());
+        let mut buffers = self.audio_buffer_config();
+        if let Some(max_packet_bytes) = transport.max_packet_bytes() {
+            // A transport that knows its packet limit up front is fitted here;
+            // one that discovers it on connecting fits itself (see `Transport`).
+            buffers.buffer_size = fit_send_fpp(
+                &format!("{transport_type:?}"),
+                max_packet_bytes,
+                buffers.send_channels,
+                buffers.buffer_size,
+            )
+            .map_err(|e| js_error(e.message()))?;
+        }
+        transport.set_audio_buffers(buffers);
         let failed_while_connecting = Rc::new(Cell::new(false));
         transport.set_on_state_change(self.failure_bridge(
             epoch,
@@ -976,7 +995,7 @@ impl WebTripSession {
             AudioBufferConfig {
                 local_to_network: SharedPtr::new(local_to_network),
                 network_to_local: SharedPtr::new(network_to_local),
-                buffer_size: self.buffer_size,
+                buffer_size: self.send_fpp,
                 send_channels: self.send_channels.get(),
                 receive_channels: self.receive_channels.get(),
             }

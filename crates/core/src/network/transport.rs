@@ -8,7 +8,7 @@ use std::future::Future;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-use crate::network::protocol::{AudioPacket, PacketHeader, ProtocolError};
+use crate::network::protocol::{fit_fpp, AudioPacket, FppLimit, PacketHeader, ProtocolError, DEFAULT_BIT_DEPTH};
 use crate::stream::regulator::{PushOutcome, Regulator};
 use crate::stream::shared_ptr::SharedPtr;
 
@@ -26,9 +26,9 @@ pub const HIGH_RATE_WARN_INTERVAL: u64 = 50;
 /// main-thread tick loop and the WebTransport worker's datagram receive loop
 /// both reuse this instead of duplicating deserialize-then-push. Deserializes
 /// `data` via [`AudioPacket::deserialize_into`] into `samples`, then pushes it
-/// with the header's declared incoming channel count at `now_ms` (the caller's
+/// with the header's declared incoming channel count and frames per packet at `now_ms` (the caller's
 /// clock; core reads none). On any non-`Stored`
-/// [`PushOutcome`] (bad channel count, a channel count that changed
+/// [`PushOutcome`] (bad channel count or fpp, either changed
 /// mid-stream, or a size mismatch — see `Regulator::push_at`), emits a
 /// throttled `log::warn!` so a persistently silent stream is diagnosable instead of
 /// failing with no stat and no log.
@@ -43,6 +43,7 @@ pub fn deliver_received_packet(
     let outcome = regulator.push_at(
         header.sequence_number,
         header.num_outgoing_channels as usize,
+        header.buffer_size as usize,
         samples,
         now_ms,
     );
@@ -58,6 +59,41 @@ pub fn deliver_received_packet(
     }
 
     Ok(outcome)
+}
+
+/// Pick the send fpp for a transport whose packets must stay within
+/// `max_packet_bytes`: [`fit_fpp`] at the wire's bit depth, with the outcome
+/// made diagnosable. A fit below `preferred` is logged with its reason; one
+/// that cannot fit even [`MIN_FPP`](crate::limits::MIN_FPP) is an error rather
+/// than a packet that would be dropped or fragmented.
+///
+/// Shared by the session (transports that know their limit up front) and the
+/// WebTransport worker (which learns it from the live session), so the
+/// decision and its message have one definition.
+#[doc(hidden)]
+pub fn fit_send_fpp(
+    transport_name: &str,
+    max_packet_bytes: usize,
+    send_channels: u8,
+    preferred_fpp: usize,
+) -> Result<usize, TransportError> {
+    let fit = fit_fpp(max_packet_bytes, send_channels, DEFAULT_BIT_DEPTH, preferred_fpp);
+    match fit.limited_by {
+        FppLimit::None => {}
+        FppLimit::PacketSize => log::warn!(
+            "⚠️ {transport_name}: sending {} frames per packet instead of {preferred_fpp}: a {send_channels}-channel \
+             packet must fit {max_packet_bytes} bytes ({} used)",
+            fit.fpp, fit.packet_bytes
+        ),
+        FppLimit::Floor => {
+            return Err(TransportError::new(format!(
+                "{transport_name}: {send_channels} channels cannot be sent: even {} frames per packet is {} bytes, \
+                 over the {max_packet_bytes}-byte packet limit",
+                fit.fpp, fit.packet_bytes
+            )))
+        }
+    }
+    Ok(fit.fpp)
 }
 
 /// Transport type selection
@@ -144,7 +180,14 @@ impl AudioBufferConfig {
     /// Interleaved samples in one outbound packet: `buffer_size` frames at
     /// `send_channels` wide.
     pub fn samples_per_packet(&self) -> usize {
-        self.buffer_size * self.send_channels as usize
+        let samples = self.buffer_size * self.send_channels as usize;
+        // A packet the ring cannot hold twice over would stall the send path
+        // forever (see `RING_BUFFER_SIZE`).
+        debug_assert!(
+            2 * samples <= crate::stream::ring_buffer::RING_BUFFER_SIZE,
+            "a {samples}-sample packet does not fit the send ring twice over"
+        );
+        samples
     }
 }
 
@@ -254,6 +297,18 @@ pub trait Transport {
     /// run its internal tick loop. Other transports can ignore this.
     fn set_audio_buffers(&mut self, _config: AudioBufferConfig) {
         // Default: no-op (not all transports need buffers)
+    }
+
+    /// The largest packet, in bytes, this transport carries without
+    /// fragmenting or dropping it, if it knows. The session fits the send fpp
+    /// to it before connecting (`fit_fpp`).
+    ///
+    /// `None` means the limit is not known before connecting: the transport
+    /// fits the send fpp itself once connected (WebTransport's worker reads
+    /// the datagram size from the live session). WebRTC answers with the
+    /// fragmentation-free floor.
+    fn max_packet_bytes(&self) -> Option<usize> {
+        None
     }
 
     /// Set callback for transport state changes
@@ -393,5 +448,18 @@ mod tests {
                 "{transport:?} transport state {state:?} mapped incorrectly"
             );
         }
+    }
+
+    /// `fit_send_fpp` maps `fit_fpp`'s outcomes onto the connect path: a fit
+    /// (full or reduced) yields the fpp to send, and a channel count that does
+    /// not fit even `MIN_FPP` is an error naming both numbers — never a
+    /// packet that would be dropped or fragmented.
+    #[test]
+    fn fit_send_fpp_errors_only_when_nothing_fits() {
+        assert_eq!(fit_send_fpp("test", 1200, 2, 128).unwrap(), 128);
+        assert_eq!(fit_send_fpp("test", 1200, 5, 128).unwrap(), 64);
+
+        let err = fit_send_fpp("test", 100, 8, 128).unwrap_err();
+        assert!(err.message().contains("8 channels") && err.message().contains("100-byte"), "{err}");
     }
 }

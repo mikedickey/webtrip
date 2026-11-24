@@ -18,15 +18,33 @@
 //!   values; see `protocol::AudioPacket`). It answers *identity and ordering*:
 //!   which packet is this, and is it newer than the one before it
 //!   ([`seq_is_newer`])?
-//! - **Slot space** is [`NUM_SLOTS`] entries deep ([`slot_index`]). It answers
+//! - **Slot space** is `num_slots` entries deep ([`slot_index`]), where
+//!   [`num_slots`] is chosen per stream from its adopted fpp. It answers
 //!   *storage*: where does this packet's audio live, and is it still there?
 //!
-//! Sequence space is 16x larger, so the seam between them has two rules:
+//! The ring holds a constant *time horizon* rather than a constant packet
+//! count: a budget of [`SLOT_FRAME_BUDGET`] frames (4096 packets at the
+//! reference fpp of 128, ~10.9 s at 48 kHz). `num_slots(fpp)` is the largest
+//! power of two whose slots fit that budget, capped at [`MAX_SLOTS`]:
 //!
-//! - Every `NUM_SLOTS`th sequence number aliases onto the same slot, so a slot
+//! - **A power of two**, so `seq % num_slots` stays continuous across the
+//!   `u16` wrap (a non-divisor of 65536 would jump at the wrap).
+//! - **The cap** keeps the ring at or under a quarter of sequence space,
+//!   inside [`seq_is_newer`]'s half-space window.
+//!
+//! Memory is therefore at most 16 MiB at 8 channels whatever the fpp, instead
+//! of growing with it (128 MiB at fpp 1024 with a fixed 4096 slots). The
+//! horizon is ~10.9 s at any fpp of 32 or more, and ~5.5 s at 16, where the cap
+//! binds. The slot array itself is allocated once at [`MAX_SLOTS`] entries
+//! with empty payloads; only the first `num_slots` are ever sized.
+//!
+//! Sequence space is at least 4x larger than the ring, so the seam between
+//! them has two rules:
+//!
+//! - Every `num_slots`th sequence number aliases onto the same slot, so a slot
 //!   holds only the most recent packet congruent to its index. Reading one is
 //!   meaningful only for a sequence number already known to be within
-//!   `NUM_SLOTS` of the write pointer.
+//!   `num_slots` of the write pointer.
 //! - A span wider than the ring is representable in sequence space but not
 //!   retrievable from slot space. When the read pointer falls that far behind
 //!   the write pointer it has lost contact with the stream permanently — no
@@ -69,10 +87,21 @@ fn f64_from_bits(v: u64) -> f64 {
 const HIST: usize = 2;
 /// Default FPP used for calibrating burg window
 const HIST_FPP: usize = 128;
-/// Depth of the packet ring, and with it the horizon over which a packet stays
-/// retrievable: ~10.9 s at fpp=128/48 kHz. Not the sequence-number space — see
-/// the module header.
-const NUM_SLOTS: usize = 4096;
+/// Frames the slot ring may hold, whatever the fpp: 4096 packets at the
+/// reference fpp, which is ~10.9 s at 48 kHz. See the module header.
+const SLOT_FRAME_BUDGET: usize = 4096 * HIST_FPP;
+/// Most slots the ring ever has. The array is preallocated at this size; the
+/// cap keeps the ring within a quarter of the `u16` sequence space.
+const MAX_SLOTS: usize = 16384;
+/// Fewest frames per packet a stream may carry. A local mirror of
+/// `limits::MIN_FPP` (this module has no `crate::` imports); a test pins the two.
+pub(crate) const MIN_FPP: usize = 16;
+/// Most frames per packet a stream may carry. A local mirror of
+/// `limits::MAX_FPP`; pinned by the same test as [`MIN_FPP`].
+pub(crate) const MAX_FPP: usize = 1024;
+/// Longest history the Burg model trains on, in samples: `packets_in_past *
+/// fpp` never exceeds this for any fpp in `[MIN_FPP, MAX_FPP]`.
+const UP_TO_NOW_MAX: usize = if 2 * 2 * HIST_FPP > MAX_FPP { 2 * 2 * HIST_FPP } else { MAX_FPP };
 /// Maximum channels a single stream may claim. A local mirror of
 /// `limits::MAX_WIRE_CHANNELS`, not an import of it: this module deliberately has
 /// no `crate::` imports (see the module header) so a native host can reuse it
@@ -97,15 +126,24 @@ const AUTO_SMOOTHING_FACTOR: f64 = 1.0 / (WINDOW_DIVISOR as f64 * AUTO_HISTORY_W
 // The sequence/slot seam
 // ============================================================================
 
-/// Map a sequence number onto its slot in the packet ring.
+/// Slots in the ring for a stream of `fpp` frames per packet: the largest
+/// power of two that fits [`SLOT_FRAME_BUDGET`], capped at [`MAX_SLOTS`].
+fn num_slots(fpp: usize) -> usize {
+    let fitting = (SLOT_FRAME_BUDGET / fpp.max(1)).max(1);
+    // Round down to a power of two.
+    let pow2 = 1usize << (usize::BITS - 1 - fitting.leading_zeros());
+    pow2.min(MAX_SLOTS)
+}
+
+/// Map a sequence number onto its slot in a ring of `num_slots` slots.
 ///
-/// Lossy by construction: every `NUM_SLOTS`th sequence number lands on the same
+/// Lossy by construction: every `num_slots`th sequence number lands on the same
 /// slot, so the packet found there is the one asked for only when that sequence
-/// number is within `NUM_SLOTS` of the write pointer. Callers establish that
+/// number is within `num_slots` of the write pointer. Callers establish that
 /// first — see the module header.
 #[inline]
-fn slot_index(seq: u16) -> usize {
-    seq as usize % NUM_SLOTS
+fn slot_index(seq: u16, num_slots: usize) -> usize {
+    seq as usize % num_slots
 }
 
 /// Is `seq` newer than `reference` in sequence space?
@@ -129,6 +167,36 @@ fn seq_span(first: u16, last: u16) -> usize {
     last.wrapping_sub(first).wrapping_add(1) as usize
 }
 
+/// Past packets the Burg model trains on, so that its history is about
+/// `HIST * HIST_FPP` samples whatever the packet size. Whole packets only: a
+/// fpp that does not divide `HIST_FPP` truncates, which merely shortens the
+/// history (power-of-two fpps divide exactly, which is why they are the ones
+/// a sender picks).
+fn packets_in_past(fpp: usize) -> usize {
+    if fpp < HIST_FPP {
+        HIST * (HIST_FPP / fpp.max(1))
+    } else if fpp > HIST_FPP * 2 {
+        1
+    } else {
+        HIST
+    }
+}
+
+/// Fill the crossfade ramps for packets of `fpp` frames.
+fn fill_fades(fade_up: &mut [f32], fade_down: &mut [f32], fpp: usize) {
+    for (i, (up, down)) in fade_up.iter_mut().zip(fade_down.iter_mut()).enumerate().take(fpp) {
+        *up = i as f32 / fpp as f32;
+        *down = 1.0 - *up;
+    }
+}
+
+/// Samples the frame FIFO needs to serve callbacks of `callback_frames` when
+/// a peer may announce packets of up to `max(fpp, MAX_FPP)` frames: one
+/// callback's worth plus the packet pulled to top it up, at the widest stream.
+fn fifo_samples(callback_frames: usize, fpp: usize) -> usize {
+    (callback_frames + fpp.max(MAX_FPP)) * MAX_CHANNELS
+}
+
 // ============================================================================
 // Burg Algorithm
 // ============================================================================
@@ -144,7 +212,7 @@ pub struct BurgAlgorithm {
     input_size: usize,
     /// Working buffer for AR coefficients
     ak: Vec<f32>,
-    /// Reset state for AR coefficients
+    /// Reset state for AR coefficients (only the first `input_size` entries are meaningful)
     ak_reset: Vec<f32>,
     /// Forward prediction error
     f: Vec<f32>,
@@ -158,20 +226,37 @@ impl BurgAlgorithm {
     /// # Arguments
     /// * `size` - The size of the input signal (typically packets_in_past * fpp)
     pub fn new(size: usize) -> Self {
-        let order = size.saturating_sub(1);
+        Self::with_capacity(size, size)
+    }
 
-        let mut ak_reset = vec![0.0f32; size];
-        if !ak_reset.is_empty() {
-            ak_reset[0] = 1.0;
-        }
+    /// Create an instance for `size` input samples whose buffers can later be
+    /// resized up to `capacity` with [`set_size`](Self::set_size), without
+    /// allocating.
+    pub fn with_capacity(capacity: usize, size: usize) -> Self {
+        let capacity = capacity.max(size);
+        let mut burg = Self {
+            order: 0,
+            input_size: 0,
+            ak: vec![0.0; capacity],
+            ak_reset: vec![0.0; capacity],
+            f: vec![0.0; capacity],
+            b: vec![0.0; capacity],
+        };
+        burg.set_size(size);
+        burg
+    }
 
-        Self {
-            order,
-            input_size: size,
-            ak: vec![0.0; size],
-            ak_reset,
-            f: vec![0.0; size],
-            b: vec![0.0; size],
+    /// Re-target the model at `size` input samples, within the capacity it was
+    /// built with: sets the order and re-initializes the `ak_reset` prefix.
+    /// Never allocates.
+    pub fn set_size(&mut self, size: usize) {
+        debug_assert!(size <= self.ak.len(), "Burg size {size} exceeds capacity {}", self.ak.len());
+        let size = size.min(self.ak.len());
+        self.order = size.saturating_sub(1);
+        self.input_size = size;
+        self.ak_reset[..size].fill(0.0);
+        if size > 0 {
+            self.ak_reset[0] = 1.0;
         }
     }
 
@@ -188,7 +273,7 @@ impl BurgAlgorithm {
         let m = n.min(self.order);
 
         // Initialize Ak
-        self.ak.copy_from_slice(&self.ak_reset);
+        self.ak[..self.input_size].copy_from_slice(&self.ak_reset[..self.input_size]);
 
         // Initialize forward and backward prediction errors
         for i in 0..size {
@@ -270,14 +355,20 @@ impl BurgAlgorithm {
 // ============================================================================
 
 /// Per-channel state for audio processing and prediction.
+///
+/// Every buffer is sized once, for the largest packet a peer may announce
+/// ([`MAX_FPP`]) and the longest history ([`UP_TO_NOW_MAX`]), so adopting a
+/// peer's fpp ([`ConsumerState::configure_fpp`]) never allocates. A stream
+/// uses a prefix of each: per-packet buffers `[..fpp]`, history buffers
+/// `[..up_to_now]` (`packets_in_past` chunks of `fpp`).
 struct ChannelState {
     /// Temporary buffer for incoming packet samples
     tmp_buf: Vec<f32>,
-    /// Ring buffer of past packets
-    packet_ring: Vec<Vec<f32>>,
-    /// Ring buffer write pointer
+    /// Ring buffer of past packets, as `ring_size` consecutive chunks of `fpp`
+    packet_ring: Vec<f32>,
+    /// Ring buffer write pointer, in chunks
     ring_wptr: usize,
-    /// Ring buffer size
+    /// Ring buffer size, in chunks
     ring_size: usize,
     /// Real samples from current packet
     real_now_packet: Vec<f32>,
@@ -287,8 +378,8 @@ struct ChannelState {
     output_now_packet: Vec<f32>,
     /// Future predicted packet (for crossfade)
     future_predicted_packet: Vec<f32>,
-    /// History of predicted packets
-    predicted_past: Vec<Vec<f32>>,
+    /// History of predicted packets, oldest first, `ring_size` chunks of `fpp`
+    predicted_past: Vec<f32>,
     /// Buffer for prediction (past + future)
     prediction: Vec<f32>,
     /// AR coefficients
@@ -298,30 +389,34 @@ struct ChannelState {
 }
 
 impl ChannelState {
-    /// Create new channel state for the given parameters.
-    ///
-    /// # Arguments
-    /// * `fpp` - Frames (samples) per packet
-    /// * `up_to_now` - History size in samples (packets_in_past * fpp)
-    /// * `packets_in_past` - Number of past packets to track
-    fn new(fpp: usize, up_to_now: usize, packets_in_past: usize) -> Self {
-        let tail_size = up_to_now + fpp * 2;
-        let coeffs_size = up_to_now.saturating_sub(1);
+    /// Create channel state able to hold any stream within the fpp range, at
+    /// least up to `fpp` frames per packet. Starts configured for `fpp` with
+    /// `packets_in_past` chunks of history.
+    fn new(fpp: usize, packets_in_past: usize) -> Self {
+        let packet_cap = fpp.max(MAX_FPP);
+        let history_cap = UP_TO_NOW_MAX.max(packets_in_past * fpp);
 
         Self {
-            tmp_buf: vec![0.0; fpp],
-            packet_ring: vec![vec![0.0; fpp]; packets_in_past],
+            tmp_buf: vec![0.0; packet_cap],
+            packet_ring: vec![0.0; history_cap],
             ring_wptr: packets_in_past / 2,
             ring_size: packets_in_past,
-            real_now_packet: vec![0.0; fpp],
-            predicted_now_packet: vec![0.0; fpp],
-            output_now_packet: vec![0.0; fpp],
-            future_predicted_packet: vec![0.0; fpp],
-            predicted_past: vec![vec![0.0; fpp]; packets_in_past],
-            prediction: vec![0.0; tail_size],
-            coeffs: vec![0.0; coeffs_size],
-            train_data: vec![0.0; up_to_now],
+            real_now_packet: vec![0.0; packet_cap],
+            predicted_now_packet: vec![0.0; packet_cap],
+            output_now_packet: vec![0.0; packet_cap],
+            future_predicted_packet: vec![0.0; packet_cap],
+            predicted_past: vec![0.0; history_cap],
+            prediction: vec![0.0; history_cap + 2 * packet_cap],
+            coeffs: vec![0.0; history_cap.saturating_sub(1)],
+            train_data: vec![0.0; history_cap],
         }
+    }
+
+    /// Adopt a new history geometry. The buffers are untouched: this is called
+    /// only on a stream's first packet, when they are fresh or were cleared.
+    fn configure(&mut self, packets_in_past: usize) {
+        self.ring_wptr = packets_in_past / 2;
+        self.ring_size = packets_in_past;
     }
 
     /// Return to the freshly-constructed state without reallocating.
@@ -331,38 +426,29 @@ impl ChannelState {
         self.predicted_now_packet.fill(0.0);
         self.output_now_packet.fill(0.0);
         self.future_predicted_packet.fill(0.0);
-        for ring_pkt in &mut self.packet_ring {
-            ring_pkt.fill(0.0);
-        }
-        for pred_pkt in &mut self.predicted_past {
-            pred_pkt.fill(0.0);
-        }
+        self.packet_ring.fill(0.0);
+        self.predicted_past.fill(0.0);
         self.prediction.fill(0.0);
         self.coeffs.fill(0.0);
         self.train_data.fill(0.0);
         self.ring_wptr = self.ring_size / 2;
     }
 
-    /// Push current tmp_buf to ring buffer
-    fn ring_buffer_push(&mut self) {
-        self.packet_ring[self.ring_wptr].copy_from_slice(&self.tmp_buf);
+    /// Push the first `fpp` samples of `tmp_buf` to the ring buffer.
+    fn ring_buffer_push(&mut self, fpp: usize) {
+        let at = self.ring_wptr * fpp;
+        self.packet_ring[at..at + fpp].copy_from_slice(&self.tmp_buf[..fpp]);
         self.ring_wptr = (self.ring_wptr + 1) % self.ring_size;
     }
 
     /// Lay the real-packet history into the front of `prediction`, oldest
     /// first. The oldest packet is the one `ring_wptr` will overwrite next.
-    fn real_past_into_prediction(&mut self) {
-        let (newer, older) = self.packet_ring.split_at(self.ring_wptr);
-        concat_packets(&mut self.prediction, older.iter().chain(newer));
-    }
-}
-
-/// Copy `packets` back to back into the front of `dst`, one block copy each.
-fn concat_packets<'a>(dst: &mut [f32], packets: impl Iterator<Item = &'a Vec<f32>>) {
-    let mut offset = 0;
-    for packet in packets {
-        dst[offset..offset + packet.len()].copy_from_slice(packet);
-        offset += packet.len();
+    fn real_past_into_prediction(&mut self, fpp: usize) {
+        let split = self.ring_wptr * fpp;
+        let end = self.ring_size * fpp;
+        let older = end - split;
+        self.prediction[..older].copy_from_slice(&self.packet_ring[split..end]);
+        self.prediction[older..end].copy_from_slice(&self.packet_ring[..split]);
     }
 }
 
@@ -435,15 +521,23 @@ struct TimingStats {
 }
 
 impl TimingStats {
+    /// Samples in one statistics window at `fpp`: an eighth of a second of packets.
+    fn window_for(sample_rate: u32, fpp: usize) -> usize {
+        (((sample_rate as usize) / fpp.max(1)) / WINDOW_DIVISOR).max(1)
+    }
+
+    /// `data` is preallocated for the smallest packet a peer may announce
+    /// ([`MIN_FPP`], the longest window), so [`set_window`](Self::set_window)
+    /// never allocates.
     fn new(sample_rate: u32, fpp: usize) -> Self {
-        let window = ((sample_rate as usize) / fpp) / WINDOW_DIVISOR;
+        let window = Self::window_for(sample_rate, fpp);
         Self {
-            window: window.max(1),
+            window,
             count: 0,
             accumulator: 0.0,
             min: f64::MAX,
             max: f64::MIN,
-            data: vec![0.0; window.max(1)],
+            data: vec![0.0; window.max(Self::window_for(sample_rate, MIN_FPP))],
             last_mean: 0.0,
             last_std_dev: 0.0,
             last_max: 0.0,
@@ -538,6 +632,13 @@ impl TimingStats {
         avg + AUTO_SMOOTHING_FACTOR * (current - avg)
     }
 
+    /// Re-size the window for packets of `fpp` frames and restart the
+    /// statistics, within the capacity `new` allocated.
+    fn set_window(&mut self, sample_rate: u32, fpp: usize) {
+        self.reset();
+        self.window = Self::window_for(sample_rate, fpp).min(self.data.len());
+    }
+
     /// Reset rolling and long-term statistics state.
     fn reset(&mut self) {
         self.count = 0;
@@ -593,8 +694,8 @@ struct SlotPayload {
 /// # Tolerated race
 ///
 /// The payload is plain data, so a producer that laps the ring onto the slot
-/// the consumer is copying — a whole ring ([`NUM_SLOTS`] packets, ~10.9 s at
-/// fpp=128/48 kHz) ahead of a copy in progress — races that copy. This is a
+/// the consumer is copying — a whole ring (`num_slots` packets, ~10.9 s at
+/// fpp >= 32/48 kHz) ahead of a copy in progress — races that copy. This is a
 /// deliberate exception to the crate's no-data-race rule, taken because the
 /// lap is out of reach of today's transports and callback timing, and the
 /// alternative (atomic samples) costs code for no practical gain:
@@ -614,7 +715,7 @@ struct SlotPayload {
 struct PacketSlot {
     payload: UnsafeCell<SlotPayload>,
     /// Sequence number occupying this slot, or [`SEQ_NONE`] if empty or
-    /// mid-write. Because every `NUM_SLOTS`th sequence number aliases onto the
+    /// mid-write. Because every `num_slots`th sequence number aliases onto the
     /// same slot (see the module header), `data` alone doesn't say *which*
     /// packet it belongs to — this is the identity check the read side
     /// verifies before and after trusting it.
@@ -749,15 +850,15 @@ pub struct RegulatorStats {
 ///   new `seq`; the consumer trusts a copy only if an `Acquire` load of the
 ///   stamp before it and a reload after it both show the `seq` it expects
 ///   ([`PacketSlot::read`]). A producer that laps the ring onto the slot the
-///   consumer is copying — a whole ring ([`NUM_SLOTS`] packets, ~10.9 s at
-///   fpp=128/48 kHz) ahead — therefore turns that copy into a concealed
+///   consumer is copying — a whole ring (`num_slots` packets, ~10.9 s at
+///   fpp >= 32/48 kHz) ahead — therefore turns that copy into a concealed
 ///   packet rather than torn audio. The copy itself races the overwrite —
 ///   the one data race this type tolerates; see [`PacketSlot`].
 /// - [`ConsumerState`] — tolerance, timing stats, Burg/channel state — sits
 ///   behind one [`UnsafeCell`] that only `pop` (and a quiesced `reset`)
 ///   borrows mutably. The producer has no non-atomic state of its own, and
 ///   takes a `&mut` only to resize slot payloads before a stream starts
-///   ([`Shared::adopt_channel_count`]).
+///   ([`Shared::adopt_stream_shape`]).
 ///
 /// Calling `push` from two threads at once, or `pop` from two threads at once,
 /// breaks this and is undefined behavior.
@@ -772,14 +873,13 @@ pub struct Regulator {
 // main-thread stats readers. The only non-`Sync` parts are the `UnsafeCell`s:
 // `consumer` is borrowed mutably only by the single consumer (or a quiesced
 // `reset`), and each slot payload only while no stream is running
-// (`Shared::adopt_channel_count`).
+// (`Shared::adopt_stream_shape`).
 // See the struct docs.
 unsafe impl Sync for Regulator {}
 
 /// Regulator state readable from every thread. Only ever borrowed `&`.
 struct Shared {
     // Configuration, fixed at construction
-    fpp: usize,
     sample_rate: u32,
     /// The most frames one `pop_frames_at` call may ask for. Written only by
     /// `with_callback_capacity`, before the regulator is shared; read-only
@@ -787,7 +887,8 @@ struct Shared {
     /// one is still popping) may read it through `&Shared`.
     max_callback_frames: usize,
 
-    /// Packet storage (circular buffer by sequence number)
+    /// Packet storage (circular buffer by sequence number). Allocated at
+    /// [`MAX_SLOTS`] entries; only the first `num_slots` carry a payload.
     slots: Box<[PacketSlot]>,
 
     // Sequence tracking
@@ -805,6 +906,10 @@ struct Shared {
     // `channels()` may read them while that first packet is being adopted.
     /// Channel count adopted from the peer's first packet.
     num_channels: AtomicUsize,
+    /// Frames per packet adopted from the peer's first packet.
+    fpp: AtomicUsize,
+    /// Slots in use: [`num_slots`] of the adopted fpp.
+    num_slots: AtomicUsize,
     /// Wall-clock time of the stream's first packet (f64 bits).
     start_time_bits: AtomicU64,
 
@@ -830,12 +935,17 @@ struct Shared {
 /// State owned by the consumer (`pop`). Reached only through
 /// [`Regulator::consumer_mut`].
 struct ConsumerState {
-    // Configuration, fixed at construction
+    // Stream geometry: the construction fpp until the peer's first packet
+    // announces its own ([`ConsumerState::configure_fpp`])
+    /// Frames per packet this consumer is rendering.
+    fpp: usize,
     packets_in_past: usize,
     up_to_now: usize,
     beyond_now: usize,
+    // Configuration, fixed at construction
     auto_mode: bool,
     auto_headroom: f64,
+    /// Crossfade ramps, `MAX_FPP` long, valid for `[..fpp]`.
     fade_up: Vec<f32>,
     fade_down: Vec<f32>,
 
@@ -892,8 +1002,8 @@ enum PacketDecision {
 
 /// Outcome of [`Regulator::push`].
 ///
-/// A JackTrip stream fixes frames-per-packet locally but *adopts* its channel
-/// count from the peer's first packet ([`Shared::adopt_channel_count`]).
+/// A JackTrip stream *adopts* its channel count and frames-per-packet from the
+/// peer's first packet ([`Shared::adopt_stream_shape`]).
 /// Every variant other than `Stored` means the packet was dropped before it
 /// could reach a slot or move the write pointer.
 #[must_use]
@@ -908,8 +1018,15 @@ pub enum PushOutcome {
     /// rather than re-adopted: a mid-stream change is either a peer bug or a
     /// renegotiation this regulator was never told about, and silently
     /// resizing state to match would corrupt whatever a concurrent `pop` is
-    /// reading (see [`Shared::adopt_channel_count`]'s concurrency note).
+    /// reading (see [`Shared::adopt_stream_shape`]'s concurrency note).
     ChannelCountChanged { adopted: usize, got: usize },
+    /// A stream's first packet announced a frames-per-packet outside
+    /// `[MIN_FPP, MAX_FPP]`, so the stream could not be adopted.
+    UnsupportedFpp { got: usize },
+    /// `fpp` differs from the value adopted from an earlier packet in this
+    /// stream. Rejected rather than re-adopted, for the same reason as
+    /// [`ChannelCountChanged`](Self::ChannelCountChanged).
+    FppChanged { adopted: usize, got: usize },
     /// `samples.len()` was not exactly `channels * fpp`.
     WrongPacketSize { expected: usize, got: usize },
 }
@@ -934,17 +1051,13 @@ impl Regulator {
     }
 
     /// Create a new Regulator with specific parameters.
+    ///
+    /// `channels` and `fpp` describe the stream until the peer's first packet
+    /// announces its own, which replaces them ([`Shared::adopt_stream_shape`]).
     pub fn with_params(channels: usize, fpp: usize, sample_rate: u32, tolerance_ms: f64) -> Self {
         let samples_per_packet = fpp * channels;
 
-        let packets_in_past = if fpp < HIST_FPP {
-            HIST * (HIST_FPP / fpp)
-        } else if fpp > HIST_FPP * 2 {
-            1
-        } else {
-            HIST
-        };
-
+        let packets_in_past = packets_in_past(fpp);
         let up_to_now = packets_in_past * fpp;
         let beyond_now = (packets_in_past + 1) * fpp;
 
@@ -959,26 +1072,30 @@ impl Regulator {
             (false, tolerance_ms, tolerance_ms)
         };
 
-        let fade_up: Vec<f32> = (0..fpp).map(|i| i as f32 / fpp as f32).collect();
-        let fade_down: Vec<f32> = fade_up.iter().map(|&x| 1.0 - x).collect();
+        let ramp_len = fpp.max(MAX_FPP);
+        let mut fade_up = vec![0.0; ramp_len];
+        let mut fade_down = vec![0.0; ramp_len];
+        fill_fades(&mut fade_up, &mut fade_down, fpp);
 
         let channel_states: Vec<ChannelState> = (0..channels.max(MAX_CHANNELS))
-            .map(|_| ChannelState::new(fpp, up_to_now, packets_in_past))
+            .map(|_| ChannelState::new(fpp, packets_in_past))
             .collect();
 
-        let slots = (0..NUM_SLOTS)
-            .map(|_| PacketSlot::new(samples_per_packet))
+        let initial_slots = num_slots(fpp);
+        let slots = (0..MAX_SLOTS)
+            .map(|i| PacketSlot::new(if i < initial_slots { samples_per_packet } else { 0 }))
             .collect();
 
         let current_headroom = if auto_headroom < 0.0 { 0.0 } else { auto_headroom };
         let shared = Shared {
-            fpp,
             sample_rate,
             max_callback_frames: fpp,
             slots,
             last_seq_in: AtomicI32::new(SEQ_NONE),
             last_seq_out: AtomicI32::new(SEQ_NONE),
             num_channels: AtomicUsize::new(channels),
+            fpp: AtomicUsize::new(fpp),
+            num_slots: AtomicUsize::new(initial_slots),
             start_time_bits: AtomicU64::new(f64_to_bits(0.0)),
             packets_rejected: AtomicU64::new(0),
             pub_tolerance_bits: AtomicU64::new(f64_to_bits(initial_tolerance)),
@@ -989,6 +1106,7 @@ impl Regulator {
             pub_queued_frames: AtomicU64::new(0),
         };
         let consumer = ConsumerState {
+            fpp,
             packets_in_past,
             up_to_now,
             beyond_now,
@@ -996,11 +1114,11 @@ impl Regulator {
             auto_headroom,
             fade_up,
             fade_down,
-            burg: BurgAlgorithm::new(up_to_now),
+            burg: BurgAlgorithm::with_capacity(UP_TO_NOW_MAX.max(up_to_now), up_to_now),
             channels: channel_states,
             num_channels: channels,
             last_stashed: None,
-            fifo: vec![0.0; 2 * fpp * MAX_CHANNELS],
+            fifo: vec![0.0; fifo_samples(fpp, fpp)],
             fifo_head: 0,
             fifo_len: 0,
             fifo_channels: channels,
@@ -1031,6 +1149,7 @@ impl Regulator {
     /// * `sequence` - Packet sequence number (u16 wraps at 65535)
     /// * `channels` - The channel count this packet claims to carry, from the
     ///   wire header
+    /// * `fpp` - The frames per packet it claims, from the wire header
     /// * `samples` - Interleaved audio samples
     /// * `now_ms` - Wall-clock time of arrival in milliseconds. The regulator
     ///   never reads a clock itself; every host supplies one (and must use the
@@ -1038,18 +1157,18 @@ impl Regulator {
     ///
     /// # Returns
     /// See [`PushOutcome`].
-    pub fn push_at(&self, sequence: u16, channels: usize, samples: &[f32], now_ms: f64) -> PushOutcome {
-        self.shared.push_internal(sequence, channels, samples, now_ms)
+    pub fn push_at(&self, sequence: u16, channels: usize, fpp: usize, samples: &[f32], now_ms: f64) -> PushOutcome {
+        self.shared.push_internal(sequence, channels, fpp, samples, now_ms)
     }
 
     /// Size the frame FIFO for callbacks of up to `frames` frames (default:
-    /// one packet). Call before the regulator is shared; this is the only
-    /// place the FIFO allocates.
+    /// one packet), with room for the largest packet a peer may announce
+    /// (`MAX_FPP`) so an adopted fpp never reallocates. Call before the
+    /// regulator is shared; this is the only place the FIFO allocates.
     pub fn with_callback_capacity(mut self, frames: usize) -> Self {
-        let fpp = self.shared.fpp;
         self.shared.max_callback_frames = frames;
         let consumer = self.consumer.get_mut();
-        consumer.fifo = vec![0.0; (frames + fpp) * MAX_CHANNELS];
+        consumer.fifo = vec![0.0; fifo_samples(frames, consumer.fpp)];
         self
     }
 
@@ -1127,9 +1246,10 @@ impl Regulator {
         f64_from_bits(self.shared.pub_tolerance_bits.load(Ordering::Relaxed))
     }
 
-    /// Get the frames per packet.
+    /// Get the frames per packet: the peer's, once its first packet has been
+    /// adopted, the construction value before.
     pub fn fpp(&self) -> usize {
-        self.shared.fpp
+        self.shared.fpp()
     }
 
     /// Wall-clock duration of `frames` frames at the wire sample rate.
@@ -1182,54 +1302,73 @@ impl Shared {
         f64_from_bits(self.start_time_bits.load(Ordering::Relaxed))
     }
 
-    fn fpp_duration_ms(&self) -> f64 {
-        frames_to_ms(self.fpp, self.sample_rate)
+    /// Frames per packet: the construction value until the peer's first
+    /// packet is adopted. Read it on the consumer only after the `Acquire` of
+    /// a started stream; elsewhere it is a display value.
+    fn fpp(&self) -> usize {
+        self.fpp.load(Ordering::Relaxed)
+    }
+
+    /// The slot a sequence number lives in, for the adopted ring depth.
+    fn slot_index(&self, seq: u16) -> usize {
+        slot_index(seq, self.num_slots.load(Ordering::Relaxed))
     }
 
     fn reject(&self) {
         self.packets_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn push_internal(&self, seq_num: u16, channels: usize, samples: &[f32], now_ms: f64) -> PushOutcome {
+    fn push_internal(&self, seq_num: u16, channels: usize, fpp: usize, samples: &[f32], now_ms: f64) -> PushOutcome {
         if channels == 0 || channels > MAX_CHANNELS {
             self.reject();
             return PushOutcome::UnsupportedChannelCount { got: channels };
         }
 
-        // Frames-per-packet is fixed locally for the life of this regulator;
-        // channel count is instead adopted from the peer's first packet
-        // (below), which is why this checks `channels * self.fpp` rather than
-        // against the adopted count — that may not reflect `channels` yet on
-        // the very packet that is about to establish it. Either way,
-        // every packet on the wire must carry exactly that many samples:
-        // anything else did not come from this stream's configuration, and
-        // there is no honest way to place it in the timeline. A short packet
-        // would play as a dropout in the middle of good audio, and a long one
-        // would be silently truncated. Reject it before it can occupy a slot
-        // or move the write pointer.
-        let expected = channels * self.fpp;
+        let current = self.last_seq_in.load(Ordering::Acquire);
+
+        // Channel count and frames-per-packet are both adopted from the peer's
+        // first packet (below); an fpp this regulator cannot render at all
+        // must not be adopted.
+        if current == SEQ_NONE && !(MIN_FPP..=MAX_FPP).contains(&fpp) {
+            self.reject();
+            return PushOutcome::UnsupportedFpp { got: fpp };
+        }
+
+        // Every packet on the wire must carry exactly `channels * fpp` samples
+        // — what its own header says. Anything else did not come from a
+        // well-formed stream, and there is no honest way to place it in the
+        // timeline. A short packet would play as a dropout in the middle of
+        // good audio, and a long one would be silently truncated. Reject it
+        // before it can occupy a slot or move the write pointer. (The header
+        // parser already guarantees this; this is the defensive check.)
+        let expected = channels * fpp;
         if samples.len() != expected {
             self.reject();
             return PushOutcome::WrongPacketSize { expected, got: samples.len() };
         }
 
-        let current = self.last_seq_in.load(Ordering::Acquire);
-        let adopted = self.channels();
-
         if current == SEQ_NONE {
-            // First packet of a stream: adopt its channel count rather than
-            // rejecting a mismatch against whatever this regulator happened
-            // to be constructed with.
-            if channels != adopted {
-                self.adopt_channel_count(channels);
+            // First packet of a stream: adopt its shape rather than rejecting
+            // a mismatch against whatever this regulator happened to be
+            // constructed with.
+            if channels != self.channels() || fpp != self.fpp() {
+                self.adopt_stream_shape(channels, fpp);
             }
             self.start_time_bits.store(f64_to_bits(now_ms), Ordering::Relaxed);
-        } else if channels != adopted {
-            // A later packet disagreeing with the already-adopted count is a
+        } else {
+            // A later packet disagreeing with the already-adopted shape is a
             // peer bug or an unsignaled renegotiation, not something to
             // re-adopt into — see `PushOutcome::ChannelCountChanged`.
-            self.reject();
-            return PushOutcome::ChannelCountChanged { adopted, got: channels };
+            let adopted_channels = self.channels();
+            if channels != adopted_channels {
+                self.reject();
+                return PushOutcome::ChannelCountChanged { adopted: adopted_channels, got: channels };
+            }
+            let adopted_fpp = self.fpp();
+            if fpp != adopted_fpp {
+                self.reject();
+                return PushOutcome::FppChanged { adopted: adopted_fpp, got: fpp };
+            }
         }
 
         let relative_now = now_ms - self.start_time_ms();
@@ -1239,7 +1378,7 @@ impl Shared {
         // slot, and a straggler the read side has not passed yet is playable.
         // Publishing the slot is independent of the conditional last_seq_in
         // advance below — stragglers must still publish their slots.
-        self.slots[slot_index(seq_num)].store(seq_num, relative_now, samples);
+        self.slots[self.slot_index(seq_num)].store(seq_num, relative_now, samples);
 
         // Advance the write pointer only for packets that are actually newer;
         // reordered stragglers leave it where it is. Sequence numbers on the
@@ -1261,47 +1400,58 @@ impl Shared {
     ///
     /// Only ever called from [`push_internal`](Self::push_internal) while
     /// `last_seq_in == SEQ_NONE`, i.e. before this stream has stored anything.
-    /// Stores the new `num_channels` and resizes every slot's `data` buffer —
-    /// **zeroed**, for the same reason `reset()` zeroes slot data: a slot left
-    /// over from a previous, differently-sized stream must not leak into this
-    /// one as a burst of garbage.
+    /// Stores the new `num_channels`, `fpp` and `num_slots` and resizes the
+    /// first `num_slots` slots' `data` buffers — **zeroed**, for the same
+    /// reason `reset()` zeroes slot data: a slot left over from a previous,
+    /// differently-sized stream must not leak into this one as a burst of
+    /// garbage. Slots past the new depth are released.
     ///
     /// Nothing the consumer owns is touched. Its per-channel Burg/ring state
-    /// is preallocated for [`MAX_CHANNELS`] and is already clean — freshly
-    /// constructed, or cleared by `reset()`, which is the only way back to
-    /// `SEQ_NONE` — so the consumer picks up the new width by reading
-    /// `num_channels` after its `Acquire`. The jitter policy is untouched too:
-    /// only `fpp` and the tolerance configuration survive from construction.
+    /// is preallocated for [`MAX_CHANNELS`] and [`MAX_FPP`] and is already
+    /// clean — freshly constructed, or cleared by `reset()`, which is the only
+    /// way back to `SEQ_NONE` — so the consumer picks up the new width by
+    /// reading `num_channels` after its `Acquire`, and reconfigures itself for
+    /// the new fpp ([`ConsumerState::observe_stream`]). The jitter policy is
+    /// untouched: only the tolerance configuration survives from construction.
     ///
     /// # Concurrency
     ///
-    /// This runs on the network thread, inside `push`, and resizes
-    /// [`NUM_SLOTS`] slot `Vec`s while the audio thread may concurrently be
+    /// This runs on the network thread, inside `push`, and resizes up to
+    /// [`MAX_SLOTS`] slot `Vec`s while the audio thread may concurrently be
     /// inside `pop`. It is sound only because it happens strictly before the
     /// `Release` store of `last_seq_in` in `push_internal`: `pop_internal`'s
     /// `SEQ_NONE` early return touches no slot. Any code path past that early
     /// return is reached only after an `Acquire` load has observed this call's
     /// later `Release` store, so it always sees the fully resized slots, never
-    /// a partial one.
+    /// a partial one. The relaxed `fpp`/`num_slots` stores are covered the same
+    /// way.
     ///
     /// This does **not** cover a `pop` still running the *previous* stream's
     /// real (non-`SEQ_NONE`) path when `reset()` re-arms `SEQ_NONE` and a new
-    /// peer then adopts a different channel count here — that `pop` could read
-    /// a slot already resized out from under it.
+    /// peer then adopts a different shape here — that `pop` could read a slot
+    /// already resized out from under it.
     /// `WebTripSession::disconnect` closes that window by awaiting
     /// `AudioContext.close()` inside `stop_capture` before `reset()` (WEB-53
     /// Bug 7 / WEB-66), so no worklet callback can still be inside `pop` when
     /// this runs.
-    fn adopt_channel_count(&self, channels: usize) {
-        let samples_per_packet = self.fpp * channels;
-        for slot in self.slots.iter() {
+    fn adopt_stream_shape(&self, channels: usize, fpp: usize) {
+        let samples_per_packet = fpp * channels;
+        let new_slots = num_slots(fpp);
+        let old_slots = self.num_slots.load(Ordering::Relaxed);
+        for (i, slot) in self.slots[..new_slots.max(old_slots)].iter().enumerate() {
             // SAFETY: this is the producer, and no consumer reads a slot
             // before `last_seq_in` leaves `SEQ_NONE` (see above).
             let payload = unsafe { slot.payload_mut() };
-            payload.data.clear();
-            payload.data.resize(samples_per_packet, 0.0);
+            if i < new_slots {
+                payload.data.clear();
+                payload.data.resize(samples_per_packet, 0.0);
+            } else {
+                payload.data = Vec::new();
+            }
         }
         self.num_channels.store(channels, Ordering::Relaxed);
+        self.fpp.store(fpp, Ordering::Relaxed);
+        self.num_slots.store(new_slots, Ordering::Relaxed);
     }
 
     /// Reset the shared half of the regulator. See [`Regulator::reset`] for
@@ -1362,7 +1512,7 @@ impl Shared {
         // not `fpp * channels`, which also carries the channel count and
         // would double-count latency for anything wider than mono.
         let queued = self.pub_queued_frames.load(Ordering::Relaxed) as f32;
-        let total_frames = (depth * self.fpp as u32) as f32 + queued;
+        let total_frames = (depth * self.fpp() as u32) as f32 + queued;
         (total_frames / self.sample_rate as f32) * 1000.0
     }
 }
@@ -1401,13 +1551,16 @@ impl ConsumerState {
     }
 
     /// Pull one packet's worth of output (no pull-clock tick). `output` must
-    /// be exactly `fpp * channels` long.
+    /// be exactly `fpp * channels` long, at the stream's adopted fpp.
     fn pull_packet(&mut self, sh: &Shared, output: &mut [f32], now_ms: f64) -> bool {
         // Acquire FIRST so the stream shape and slots written before the
         // matching Release are visible (WEB-53 Bug 2).
         let last_seq_in_raw = sh.last_seq_in.load(Ordering::Acquire);
         let last_seq_in = last_seq_in_raw as u16;
         let relative_now = now_ms - sh.start_time_ms();
+        if last_seq_in_raw != SEQ_NONE {
+            self.observe_stream(sh);
+        }
 
         // Return silence during startup
         if self.in_startup(last_seq_in_raw, relative_now) {
@@ -1451,13 +1604,13 @@ impl ConsumerState {
                 if copied.is_none() {
                     // Stamp mismatch: conceal rather than play torn audio.
                     self.pull_stats.underruns += 1;
-                    self.output_concealment(sh.fpp, output);
+                    self.output_concealment(output);
                     self.publish_stats(sh);
                     return false;
                 }
 
                 // Process with Burg algorithm
-                self.process_burg(sh.fpp, false);
+                self.process_burg(false);
                 self.interleave_output(output);
 
                 sh.last_seq_out.store(seq as i32, Ordering::Release);
@@ -1467,7 +1620,7 @@ impl ConsumerState {
             }
             Some(PacketDecision::ConcealSkippedPacket { skipped }) => {
                 self.pull_stats.overruns += skipped;
-                self.output_concealment(sh.fpp, output);
+                self.output_concealment(output);
                 self.publish_stats(sh);
                 false
             }
@@ -1488,6 +1641,9 @@ impl ConsumerState {
         // One Acquire for the whole call: whether the stream has started, and
         // therefore its width, is fixed for every packet pulled below.
         let last_seq_in_raw = sh.last_seq_in.load(Ordering::Acquire);
+        if last_seq_in_raw != SEQ_NONE {
+            self.observe_stream(sh);
+        }
         let in_startup = self.in_startup(last_seq_in_raw, now_ms - sh.start_time_ms());
         let channels = sh.channels();
         if channels != self.fifo_channels {
@@ -1500,7 +1656,7 @@ impl ConsumerState {
             return 0;
         }
 
-        let fpp = sh.fpp;
+        let fpp = self.fpp;
         while self.fifo_len < frames * channels {
             if in_startup {
                 // Startup silence is queued only as far as this callback needs:
@@ -1560,7 +1716,7 @@ impl ConsumerState {
         let last_out_raw = sh.last_seq_out.load(Ordering::Acquire);
         if last_out_raw != SEQ_NONE {
             let last_out = last_out_raw as u16;
-            if let Some(timestamp) = sh.slots[slot_index(last_out)].read(last_out, |p| p.timestamp) {
+            if let Some(timestamp) = sh.slots[sh.slot_index(last_out)].read(last_out, |p| p.timestamp) {
                 if now - timestamp > 10000.0 {
                     // Stuck - output silence
                     output.fill(0.0);
@@ -1570,15 +1726,16 @@ impl ConsumerState {
         }
 
         // Good underrun - use prediction
-        self.output_concealment(sh.fpp, output);
+        self.output_concealment(output);
         false
     }
 
-    fn output_concealment(&mut self, fpp: usize, output: &mut [f32]) {
+    fn output_concealment(&mut self, output: &mut [f32]) {
+        let fpp = self.fpp;
         for channel in &mut self.channels[..self.num_channels] {
-            channel.tmp_buf.fill(0.0);
+            channel.tmp_buf[..fpp].fill(0.0);
         }
-        self.process_burg(fpp, true);
+        self.process_burg(true);
         self.interleave_output(output);
     }
 
@@ -1587,13 +1744,9 @@ impl ConsumerState {
         // Exactly one packet: a shorter buffer would silently drop the tail
         // (`interleave_channel` zips), a longer one would keep stale audio in
         // it. Every caller hands over an exactly-sized buffer.
-        debug_assert_eq!(
-            output.len(),
-            self.channels.first().map_or(0, |c| c.output_now_packet.len()) * n,
-            "pop output must be exactly one packet"
-        );
+        debug_assert_eq!(output.len(), self.fpp * n, "pop output must be exactly one packet");
         for (ch, channel) in self.channels[..n].iter().enumerate() {
-            interleave_channel(&channel.output_now_packet, n, ch, output);
+            interleave_channel(&channel.output_now_packet[..self.fpp], n, ch, output);
         }
     }
 
@@ -1615,7 +1768,7 @@ impl ConsumerState {
         if new_pkts == 0 {
             return None;
         }
-        if new_pkts > NUM_SLOTS {
+        if new_pkts > sh.num_slots.load(Ordering::Relaxed) {
             // The seam: this span is representable in sequence space but not
             // retrievable from slot space, because every slot it names has been
             // overwritten by a later packet. Waiting cannot bring those packets
@@ -1642,7 +1795,7 @@ impl ConsumerState {
 
         for i in (0..new_pkts).rev() {
             let seq = last_seq_in.wrapping_sub(i as u16);
-            let slot_idx = slot_index(seq);
+            let slot_idx = sh.slot_index(seq);
 
             let Some(timestamp) = sh.slots[slot_idx].read(seq, |p| p.timestamp) else {
                 continue;
@@ -1706,10 +1859,10 @@ impl ConsumerState {
         let pkts = seq.wrapping_sub(last_out.wrapping_add(1)) as usize;
 
         // Stamp check before trusting timestamp (WEB-53 Bug 4).
-        let Some(last_timestamp) = sh.slots[slot_index(last_out)].read(last_out, |p| p.timestamp) else {
+        let Some(last_timestamp) = sh.slots[sh.slot_index(last_out)].read(last_out, |p| p.timestamp) else {
             return;
         };
-        let prev_time = last_timestamp + (pkts as f64 + 1.0) * sh.fpp_duration_ms();
+        let prev_time = last_timestamp + (pkts as f64 + 1.0) * self.fpp_duration_ms(sh);
         if prev_time < timestamp {
             let elapsed = timestamp - prev_time;
             let updated = self.push_stats.tick(elapsed, now);
@@ -1747,7 +1900,7 @@ impl ConsumerState {
         if self.auto_headroom < 0.0 {
             // Variable headroom mode
             let glitches_allowed =
-                ((AUTO_HEADROOM_GLITCH_TOLERANCE * sh.sample_rate as f64) / sh.fpp as f64)
+                ((AUTO_HEADROOM_GLITCH_TOLERANCE * sh.sample_rate as f64) / self.fpp as f64)
                     .ceil() as u64;
             let max_headroom = (self.push_stats.long_term_max * 3.0)
                 .max(self.last_max_latency + 10.0);
@@ -1777,85 +1930,138 @@ impl ConsumerState {
         let pull_tol = self.pull_stats.calc_auto();
         let mut new_tolerance = (push_tol + self.current_headroom).max(pull_tol);
 
-        new_tolerance = new_tolerance.clamp(sh.fpp_duration_ms(), AUTO_MAX_MS);
+        new_tolerance = new_tolerance.clamp(self.fpp_duration_ms(sh), AUTO_MAX_MS);
         self.tolerance_ms = new_tolerance;
         self.publish_stats(sh);
     }
 
     /// Process audio with Burg algorithm for PLC.
-    fn process_burg(&mut self, fpp: usize, glitch: bool) {
+    fn process_burg(&mut self, glitch: bool) {
+        let fpp = self.fpp;
+        let up_to_now = self.up_to_now;
+        let beyond_now = self.beyond_now;
         let primed = self.plc_packet_count > self.packets_in_past as u64;
 
         for channel in &mut self.channels[..self.num_channels] {
             // Copy real packet data, and if not a glitch push it to the ring
             if glitch {
-                channel.real_now_packet.fill(0.0);
+                channel.real_now_packet[..fpp].fill(0.0);
             } else {
-                channel.real_now_packet.copy_from_slice(&channel.tmp_buf);
-                channel.ring_buffer_push();
+                channel.real_now_packet[..fpp].copy_from_slice(&channel.tmp_buf[..fpp]);
+                channel.ring_buffer_push(fpp);
             }
 
             // Build real past from ring buffer
             if primed {
-                channel.real_past_into_prediction();
+                channel.real_past_into_prediction(fpp);
             }
 
             // Perform prediction on glitch
             if glitch {
                 // Copy predicted past into prediction buffer
-                concat_packets(&mut channel.prediction, channel.predicted_past.iter());
+                channel.prediction[..up_to_now].copy_from_slice(&channel.predicted_past[..up_to_now]);
 
                 // Train Burg model using pre-allocated buffer (no allocation!)
-                channel.train_data[..self.up_to_now].copy_from_slice(&channel.prediction[..self.up_to_now]);
-                self.burg.train(&channel.train_data, &mut channel.coeffs);
+                channel.train_data[..up_to_now].copy_from_slice(&channel.prediction[..up_to_now]);
+                self.burg.train(&channel.train_data[..up_to_now], &mut channel.coeffs);
 
                 // Predict future samples
-                let tail_size = channel.prediction.len();
-                self.burg.predict(&channel.coeffs, &mut channel.prediction, tail_size);
+                let tail_size = up_to_now + 2 * fpp;
+                self.burg.predict(&channel.coeffs, &mut channel.prediction[..tail_size], tail_size);
 
                 // Extract predicted now packet
-                channel
-                    .predicted_now_packet
-                    .copy_from_slice(&channel.prediction[self.up_to_now..self.up_to_now + fpp]);
+                channel.predicted_now_packet[..fpp]
+                    .copy_from_slice(&channel.prediction[up_to_now..up_to_now + fpp]);
             }
 
             // Generate output with crossfade
-            let output = &mut channel.output_now_packet;
+            let output = &mut channel.output_now_packet[..fpp];
             if glitch {
                 if primed {
-                    output.copy_from_slice(&channel.predicted_now_packet);
+                    output.copy_from_slice(&channel.predicted_now_packet[..fpp]);
                 } else {
                     output.fill(0.0);
                 }
             } else if self.last_was_glitch {
                 // Crossfade from prediction to real
-                let fades = self.fade_down.iter().zip(&self.fade_up);
-                let sources = channel.future_predicted_packet.iter().zip(&channel.real_now_packet);
+                let fades = self.fade_down[..fpp].iter().zip(&self.fade_up[..fpp]);
+                let sources = channel.future_predicted_packet[..fpp].iter().zip(&channel.real_now_packet[..fpp]);
                 for (out, ((&down, &up), (&predicted, &real))) in output.iter_mut().zip(fades.zip(sources)) {
                     *out = down * predicted + up * real;
                 }
             } else {
-                output.copy_from_slice(&channel.real_now_packet);
+                output.copy_from_slice(&channel.real_now_packet[..fpp]);
             }
 
             // Copy output to tmp_buf for consistency
-            channel.tmp_buf.copy_from_slice(&channel.output_now_packet);
+            channel.tmp_buf[..fpp].copy_from_slice(&channel.output_now_packet[..fpp]);
 
-            // Shift predicted past (rotate left without allocation)
-            // This moves all packets forward by one position in a single operation
-            channel.predicted_past.rotate_left(1);
+            // Shift predicted past (rotate left without allocation): this
+            // moves every packet forward by one position in a single operation.
+            channel.predicted_past[..up_to_now].rotate_left(fpp);
             // Now the last position is free, fill it with current output
-            channel.predicted_past[self.packets_in_past - 1]
-                .copy_from_slice(&channel.output_now_packet);
+            channel.predicted_past[up_to_now - fpp..up_to_now]
+                .copy_from_slice(&channel.output_now_packet[..fpp]);
 
             // Store future prediction for next crossfade
-            channel
-                .future_predicted_packet
-                .copy_from_slice(&channel.prediction[self.beyond_now..self.beyond_now + fpp]);
+            channel.future_predicted_packet[..fpp]
+                .copy_from_slice(&channel.prediction[beyond_now..beyond_now + fpp]);
         }
 
         self.last_was_glitch = glitch;
         self.plc_packet_count += 1;
+    }
+
+    /// Wall-clock duration of one packet at the stream's fpp.
+    fn fpp_duration_ms(&self, sh: &Shared) -> f64 {
+        frames_to_ms(self.fpp, sh.sample_rate)
+    }
+
+    /// The tolerance a stream opens with: a fraction of a packet in auto mode,
+    /// the configured value otherwise.
+    fn initial_tolerance_ms(&self) -> f64 {
+        if self.auto_mode {
+            self.fpp as f64 * AUTO_INIT_VAL_FACTOR
+        } else {
+            self.auto_headroom
+        }
+    }
+
+    /// Follow the stream's adopted frames-per-packet. Called right after the
+    /// `Acquire` that shows a started stream, so `sh.fpp()` is the value the
+    /// producer stored before the matching `Release`. Idempotent.
+    fn observe_stream(&mut self, sh: &Shared) {
+        let fpp = sh.fpp();
+        if fpp != self.fpp {
+            self.configure_fpp(sh.sample_rate, fpp);
+        }
+    }
+
+    /// Re-derive everything that depends on the packet size, for a stream
+    /// whose first packet announced `fpp`. Stays within capacity preallocated
+    /// at construction, so it never allocates. Nothing has run `process_burg`
+    /// yet for this stream — adoption happens before the first packet is
+    /// played — so there is no history to migrate, and the channel buffers
+    /// are already clean.
+    fn configure_fpp(&mut self, sample_rate: u32, fpp: usize) {
+        debug_assert!((MIN_FPP..=MAX_FPP).contains(&fpp), "adopted fpp {fpp} out of range");
+        self.fpp = fpp;
+        self.packets_in_past = packets_in_past(fpp);
+        self.up_to_now = self.packets_in_past * fpp;
+        self.beyond_now = (self.packets_in_past + 1) * fpp;
+        fill_fades(&mut self.fade_up, &mut self.fade_down, fpp);
+        self.burg.set_size(self.up_to_now);
+        for channel in &mut self.channels {
+            channel.configure(self.packets_in_past);
+        }
+        self.push_stats.set_window(sample_rate, fpp);
+        self.pull_stats.set_window(sample_rate, fpp);
+        if self.auto_mode {
+            self.tolerance_ms = self.initial_tolerance_ms();
+        }
+        // Frames pulled at the old packet size.
+        self.fifo_head = 0;
+        self.fifo_len = 0;
     }
 
     /// Reset the consumer's state. See [`Regulator::reset`] for the
@@ -1873,11 +2079,7 @@ impl ConsumerState {
         self.last_max_latency = 0.0;
         self.stats_max_latency = 0.0;
         self.last_was_glitch = false;
-        self.tolerance_ms = if self.auto_mode {
-            sh.fpp as f64 * AUTO_INIT_VAL_FACTOR
-        } else {
-            self.auto_headroom
-        };
+        self.tolerance_ms = self.initial_tolerance_ms();
         self.current_headroom = if self.auto_headroom < 0.0 {
             0.0
         } else {
@@ -1898,7 +2100,7 @@ impl ConsumerState {
         self.push_stats.reset();
 
         // Every channel, not just the ones in use: the next stream may adopt
-        // a wider count, and `adopt_channel_count` relies on these being clean.
+        // a wider count, and `adopt_stream_shape` relies on these being clean.
         for channel in &mut self.channels {
             channel.clear();
         }
@@ -1942,7 +2144,7 @@ pub(crate) mod test_support {
     /// or as no failure at all.
     pub fn push_stored(reg: &Regulator, seq: u16, channels: usize, samples: &[f32], now_ms: f64) {
         assert_eq!(
-            reg.push_at(seq, channels, samples, now_ms),
+            reg.push_at(seq, channels, samples.len() / channels, samples, now_ms),
             PushOutcome::Stored,
             "setup push of seq {seq} ({channels}ch) must be stored"
         );
@@ -1998,7 +2200,7 @@ mod tests {
     /// without driving the wall clock. `samples` must be a full packet — the
     /// same contract `push` enforces.
     fn plant_packet(reg: &Regulator, seq: u16, timestamp: f64, samples: &[f32]) {
-        reg.shared.slots[slot_index(seq)].store(seq, timestamp, samples);
+        reg.shared.slots[reg.shared.slot_index(seq)].store(seq, timestamp, samples);
     }
 
 
@@ -2056,13 +2258,13 @@ mod tests {
     fn real_past_lands_oldest_first_across_ring_wrap() {
         // 3 packets of 4 samples; 4 pushes into a 3-packet ring, so the write
         // pointer has wrapped and the oldest surviving packet is mid-ring.
-        let mut channel = ChannelState::new(4, 12, 3);
+        let mut channel = ChannelState::new(4, 3);
         for packet in 1..=4 {
             channel.tmp_buf.fill(packet as f32);
-            channel.ring_buffer_push();
+            channel.ring_buffer_push(4);
         }
 
-        channel.real_past_into_prediction();
+        channel.real_past_into_prediction(4);
 
         let expected: Vec<f32> = [2.0, 3.0, 4.0].iter().flat_map(|&p| [p; 4]).collect();
         assert_eq!(channel.prediction[..12], expected[..]);
@@ -2106,7 +2308,7 @@ mod tests {
     /// An inbound outage longer than the ring's horizon strands the read
     /// pointer: the peer keeps counting (sequence numbers on the wire only ever
     /// go up), so when packets resume the span from `last_seq_out` to
-    /// `last_seq_in` is wider than NUM_SLOTS and every slot it names has been
+    /// `last_seq_in` is wider than `num_slots` and every slot it names has been
     /// overwritten by a later packet.
     ///
     /// Nothing detects that on its own — the scan still finds *data* at those
@@ -2119,10 +2321,19 @@ mod tests {
     /// and resynchronize onto the live stream within a couple of callbacks.
     #[test]
     fn test_loss_burst_wider_than_ring_resyncs_read_pointer() {
+        // The ring's depth follows the adopted fpp, so the burst that outruns
+        // it does too: 16 hits the slot cap, 1024 the smallest ring. The
+        // regulator is built for 128, as the session builds it, and adopts.
+        for fpp in [MIN_FPP, 128, MAX_FPP] {
+            loss_burst_wider_than_ring_resyncs_read_pointer(fpp);
+        }
+    }
+
+    fn loss_burst_wider_than_ring_resyncs_read_pointer(fpp: usize) {
         let reg = Regulator::with_params(1, 128, 48_000, 5.0);
-        let samples = vec![0.5f32; reg.fpp()];
-        let dt = reg.shared.fpp_duration_ms();
-        let mut out = vec![0.0f32; reg.fpp()];
+        let samples = vec![0.5f32; fpp];
+        let dt = reg.frames_to_ms(fpp);
+        let mut out = vec![0.0f32; fpp];
 
         // A stream that is playing out normally.
         let mut t = 0.0;
@@ -2137,10 +2348,12 @@ mod tests {
         }
         assert_eq!(last_seq_out_opt(&reg), Some(109), "stream should be playing out");
 
-        // Nothing arrives for 5000 packets — 13.3 s at fpp=128, past the ring's
-        // 4096-packet (10.9 s) horizon. An ordinary wifi roam, not an exotic
-        // event. The peer never renumbers; it just keeps counting.
-        let gap = 5_000u16;
+        // Nothing arrives for a fifth more packets than the ring holds — 13.3 s
+        // at fpp=128, past its 10.9 s horizon. An ordinary wifi roam, not an
+        // exotic event. The peer never renumbers; it just keeps counting.
+        let ring = reg.shared.num_slots.load(Ordering::Relaxed);
+        assert_eq!(ring, num_slots(fpp), "fpp={fpp}: the stream adopted its ring depth");
+        let gap = (ring + ring / 5) as u16;
         let resume_t = t + gap as f64 * dt;
         let first_resumed = 109 + gap + 1;
 
@@ -2158,8 +2371,8 @@ mod tests {
             }
         }
 
-        let first_real_pkt =
-            first_real_pkt.expect("real audio must resume after a loss burst wider than the ring");
+        let first_real_pkt = first_real_pkt
+            .unwrap_or_else(|| panic!("fpp={fpp}: real audio must resume after a loss burst wider than the ring"));
         assert!(
             first_real_pkt <= 4,
             "the read pointer must resync within a couple of callbacks \
@@ -2182,7 +2395,7 @@ mod tests {
     }
 
     /// If a candidate sequence number's packet was actually lost (never
-    /// arrived), but a slot from `NUM_SLOTS` sequence numbers earlier — which
+    /// arrived), but a slot from `num_slots` sequence numbers earlier — which
     /// aliases onto the same slot index — is still sitting there
     /// unoverwritten, `find_best_packet` must not mistake that stale data for
     /// the candidate. The stale timestamp is deliberately kept close to the
@@ -2193,7 +2406,7 @@ mod tests {
         let reg = Regulator::with_params(1, 32, 48_000, 10.0);
         let last_seq = 5u16;
         let candidate_seq = last_seq.wrapping_add(1); // 6 — genuinely lost, never planted
-        let stale_seq = candidate_seq.wrapping_sub(NUM_SLOTS as u16); // aliases to same slot
+        let stale_seq = candidate_seq.wrapping_sub(reg.shared.num_slots.load(Ordering::Relaxed) as u16); // aliases to same slot
         let last_packet = vec![0.1f32; reg.fpp()];
         let stale_packet = vec![0.9f32; reg.fpp()];
         set_last_seq_out(&reg, Some(last_seq));
@@ -2225,18 +2438,15 @@ mod tests {
     #[test]
     fn test_burg_priming_uses_plc_iterations() {
         let mut reg = Regulator::with_params(1, 32, 48_000, 10.0);
-        let fpp = reg.fpp();
         let c = consumer(&mut reg);
         let history_packets = c.packets_in_past;
         let history: Vec<f32> = (0..c.up_to_now)
             .map(|i| (i as f32 * 0.1).sin())
             .collect();
 
-        for (i, packet) in c.channels[0].predicted_past.iter_mut().enumerate() {
-            packet.copy_from_slice(&history[i * fpp..(i + 1) * fpp]);
-        }
+        c.channels[0].predicted_past[..c.up_to_now].copy_from_slice(&history);
 
-        c.process_burg(fpp, true);
+        c.process_burg(true);
         assert!(
             c.channels[0]
                 .output_now_packet
@@ -2246,7 +2456,7 @@ mod tests {
         );
 
         c.plc_packet_count = history_packets as u64 + 1;
-        c.process_burg(fpp, true);
+        c.process_burg(true);
         assert!(
             c.channels[0]
                 .output_now_packet
@@ -2262,7 +2472,7 @@ mod tests {
     fn test_skipped_packet_outputs_concealment_before_stashed_real_packet() {
         let mut reg = Regulator::with_params(1, 32, 48_000, 10.0);
         let fpp = reg.fpp();
-        let fpp_duration_ms = reg.shared.fpp_duration_ms();
+        let fpp_duration_ms = reg.frames_to_ms(reg.fpp());
         let packet = vec![0.25f32; fpp];
         let last_packet = vec![0.1f32; fpp];
         let last_seq = 10u16;
@@ -2273,9 +2483,7 @@ mod tests {
             let history: Vec<f32> = (0..c.up_to_now)
                 .map(|i| (i as f32 * 0.1).sin())
                 .collect();
-            for (i, predicted) in c.channels[0].predicted_past.iter_mut().enumerate() {
-                predicted.copy_from_slice(&history[i * fpp..(i + 1) * fpp]);
-            }
+            c.channels[0].predicted_past[..c.up_to_now].copy_from_slice(&history);
             c.plc_packet_count = c.packets_in_past as u64 + 1;
         }
         set_last_seq_out(&reg, Some(last_seq));
@@ -2315,7 +2523,7 @@ mod tests {
     #[test]
     fn test_single_skipped_packet_defers_latency_adjustment() {
         let mut reg = Regulator::with_params(1, 32, 48_000, 10.0);
-        let fpp_duration_ms = reg.shared.fpp_duration_ms();
+        let fpp_duration_ms = reg.frames_to_ms(reg.fpp());
         let stale_packet = vec![0.25f32; reg.fpp()];
         let fresh_packet = vec![0.5f32; reg.fpp()];
         let last_seq = 10u16;
@@ -2407,7 +2615,7 @@ mod tests {
         // able to adopt again — reset() re-arms SEQ_NONE, which is the only
         // gate on adoption.
         let mono = vec![0.5f32; reg.fpp()];
-        let outcome = reg.push_at(0, 1, &mono, 0.0);
+        let outcome = reg.push_at(0, 1, reg.fpp(), &mono, 0.0);
         assert_eq!(outcome, PushOutcome::Stored);
         assert_eq!(reg.channels(), 1, "reconnect must re-adopt the new peer's channel count");
         assert_eq!(reg.fpp() * reg.channels(), reg.fpp());
@@ -2427,7 +2635,7 @@ mod tests {
         // primer connection seq 7, stash for "next-good" seq 9.
         reg.shared.last_seq_in.store(9, Ordering::Release);
         set_last_seq_out(&reg, Some(7));
-        consumer(&mut reg).last_stashed = Some((9, slot_index(9)));
+        consumer(&mut reg).last_stashed = Some((9, reg.shared.slot_index(9)));
         plant_packet(&reg, 9, 100.0, &samples);
 
         // SAFETY: single-threaded test; no concurrent push/pop.
@@ -2672,7 +2880,7 @@ mod tests {
     fn test_auto_tolerance_recomputes_from_long_term_stats() {
         let mut reg = Regulator::with_params(1, 32, 48_000, -1.0);
         let initial = consumer(&mut reg).tolerance_ms;
-        let fpp_duration_ms = reg.shared.fpp_duration_ms();
+        let fpp_duration_ms = reg.frames_to_ms(reg.fpp());
 
         // Phase 1: jittery push, calm pull — tolerance should rise sharply.
         consumer(&mut reg).push_stats.long_term_max = 80.0;
@@ -2903,7 +3111,7 @@ mod tests {
 
         // Peer sends 1 channel; this regulator was constructed for 2.
         let ramp: Vec<f32> = (0..reg.fpp()).map(|i| i as f32).collect();
-        assert_eq!(reg.push_at(0, 1, &ramp, 0.0), PushOutcome::Stored);
+        assert_eq!(reg.push_at(0, 1, reg.fpp(), &ramp, 0.0), PushOutcome::Stored);
         assert_eq!(reg.channels(), 1, "first packet must adopt the peer's channel count");
 
         let mut out = vec![0.0f32; reg.fpp()];
@@ -2918,13 +3126,12 @@ mod tests {
         assert_eq!(reg.fpp(), original_fpp, "fpp must be unchanged by adoption");
         assert_eq!(
             reg.tolerance_ms(), original_tolerance,
-            "adopt_channel_count must not touch the jitter policy"
+            "adoption must not touch the jitter policy"
         );
     }
 
-    /// A connection fixes frames-per-packet and channel count when it is
-    /// established, so a packet carrying any other number of samples cannot
-    /// belong to this stream. `push` must reject it outright rather than fit
+    /// A packet's header declares its channel count and frames-per-packet, so a
+    /// packet carrying any other number of samples cannot be well-formed. `push` must reject it outright rather than fit
     /// it to the slot: a short packet padded or left partially written plays
     /// as a burst of garbage or silence inside otherwise good audio, and
     /// either size would still drag the write pointer forward onto a slot the
@@ -2933,7 +3140,7 @@ mod tests {
     fn test_push_rejects_packets_that_are_not_exactly_one_packet_long() {
         let mut reg = Regulator::with_params(2, 64, 48_000, 5.0);
         let good = vec![0.5f32; reg.fpp() * reg.channels()];
-        assert_eq!(reg.push_at(10, 2, &good, 0.0), PushOutcome::Stored);
+        assert_eq!(reg.push_at(10, 2, reg.fpp(), &good, 0.0), PushOutcome::Stored);
         assert_eq!(reg.shared.last_seq_in.load(Ordering::Acquire), 10);
 
         let wrong_sizes = [
@@ -2947,7 +3154,7 @@ mod tests {
         for len in wrong_sizes {
             let packet = vec![0.25f32; len];
             assert_eq!(
-                reg.push_at(11, 2, &packet, 1.0),
+                reg.push_at(11, 2, reg.fpp(), &packet, 1.0),
                 PushOutcome::WrongPacketSize { expected: reg.fpp() * reg.channels(), got: len },
                 "accepted a {len}-sample packet on a {}-sample stream",
                 reg.fpp() * reg.channels()
@@ -2958,7 +3165,7 @@ mod tests {
         // packets targeted is still empty, and the newest sequence number is
         // still the last good packet's.
         assert_eq!(reg.shared.last_seq_in.load(Ordering::Acquire), 10);
-        let slot = &mut reg.shared.slots[slot_index(11)];
+        let slot = &mut reg.shared.slots[reg.shared.slot_index(11)];
         assert!(slot.read(11, |_| ()).is_none());
         let payload = slot.payload.get_mut();
         assert_eq!(payload.timestamp, 0.0);
@@ -2969,11 +3176,11 @@ mod tests {
         // check even runs.
         let rejected_before = reg.stats().packets_rejected;
         assert_eq!(
-            reg.push_at(12, 0, &[], 2.0),
+            reg.push_at(12, 0, reg.fpp(), &[], 2.0),
             PushOutcome::UnsupportedChannelCount { got: 0 }
         );
         assert_eq!(
-            reg.push_at(12, MAX_CHANNELS + 1, &[0.0], 2.0),
+            reg.push_at(12, MAX_CHANNELS + 1, reg.fpp(), &[0.0], 2.0),
             PushOutcome::UnsupportedChannelCount { got: MAX_CHANNELS + 1 }
         );
         assert_eq!(reg.stats().packets_rejected, rejected_before + 2);
@@ -2983,34 +3190,43 @@ mod tests {
         // re-adopted — see `PushOutcome::ChannelCountChanged`.
         let mismatched = vec![0.5f32; reg.fpp()]; // 1ch-sized; this stream adopted 2ch
         assert_eq!(
-            reg.push_at(13, 1, &mismatched, 3.0),
+            reg.push_at(13, 1, reg.fpp(), &mismatched, 3.0),
             PushOutcome::ChannelCountChanged { adopted: 2, got: 1 }
         );
         assert_eq!(
             reg.shared.last_seq_in.load(Ordering::Acquire), 10,
             "a rejected packet must not move the write pointer"
         );
+
+        // Likewise a well-formed packet at a different fpp than the stream
+        // adopted (64): rejected, not re-adopted.
+        let other_fpp = vec![0.5f32; 128 * 2];
+        assert_eq!(
+            reg.push_at(14, 2, 128, &other_fpp, 4.0),
+            PushOutcome::FppChanged { adopted: 64, got: 128 }
+        );
+        assert_eq!(reg.fpp(), 64, "a rejected packet must not change the adopted fpp");
+        assert_eq!(reg.shared.last_seq_in.load(Ordering::Acquire), 10);
     }
 
-    /// `push`'s explicit `channels` argument (rather than inferring it as
-    /// `samples.len() / fpp`) exists to prevent exactly this ambiguity: 4
+    /// `push`'s explicit `channels` and `fpp` arguments (rather than inferring
+    /// one from the sample count) exist to prevent exactly this ambiguity: 4
     /// channels at fpp=64 and 2 channels at fpp=128 both total 256 samples.
-    /// With `fpp` fixed locally and `channels` read from the wire header, a
-    /// packet claiming 4 channels on a 128-fpp stream must be rejected for
-    /// its size — never silently reinterpreted as a valid 2-channel packet
-    /// just because the sample count happens to match.
+    /// Both come from the wire header, so a packet claiming 4 channels at
+    /// fpp=128 must be rejected for its size — never silently reinterpreted as
+    /// a valid 2-channel packet just because the sample count happens to match.
     #[test]
     fn test_push_channel_count_is_explicit_not_inferred_from_sample_count() {
         let reg = Regulator::with_params(2, 128, 48_000, 5.0);
         let first = vec![0.1f32; 256]; // 2ch * 128fpp
-        assert_eq!(reg.push_at(0, 2, &first, 0.0), PushOutcome::Stored);
+        assert_eq!(reg.push_at(0, 2, 128, &first, 0.0), PushOutcome::Stored);
 
         // Same total sample count as a valid 2ch*128fpp packet, but claiming
         // 4 channels — must be rejected for its size (4*128=512 != 256), not
         // accepted as if it were secretly the 2ch stride.
         let same_len_but_4ch = vec![0.2f32; 256];
         assert_eq!(
-            reg.push_at(1, 4, &same_len_but_4ch, 1.0),
+            reg.push_at(1, 4, 128, &same_len_but_4ch, 1.0),
             PushOutcome::WrongPacketSize { expected: 4 * 128, got: 256 }
         );
     }
@@ -3035,7 +3251,7 @@ mod tests {
             12,
             "straggler must not advance last_seq_in"
         );
-        let first_sample = reg.shared.slots[slot_index(11)]
+        let first_sample = reg.shared.slots[reg.shared.slot_index(11)]
             .read(11, |payload| payload.data[0])
             .expect("straggler must Release-publish its slot stamp");
         assert!(
@@ -3054,7 +3270,7 @@ mod tests {
     fn test_slot_read_rejects_copy_overlapping_a_producer_write() {
         let slot = PacketSlot::new(4);
         let seq = 7u16;
-        let lapped = seq.wrapping_add(NUM_SLOTS as u16);
+        let lapped = seq.wrapping_add(num_slots(HIST_FPP) as u16);
 
         slot.store(seq, 1.0, &[0.25; 4]);
         assert_eq!(slot.read(seq, |p| p.data[0]), Some(0.25));
@@ -3147,6 +3363,149 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Peer-fpp adoption
+    // ------------------------------------------------------------------
+
+    /// The first packet of a stream adopts the peer's frames-per-packet as it
+    /// adopts its channel count: every fpp-derived quantity follows, the
+    /// packet plays back whole at the adopted size, and `fpp()` / `latency_ms()`
+    /// report the adopted value. The regulator is built for 128, as the
+    /// session builds it, so every other fpp here is a genuine change.
+    #[test]
+    fn test_first_packet_adopts_peer_fpp_across_the_range() {
+        for fpp in [MIN_FPP, 64, 128, 256, MAX_FPP] {
+            for channels in [1usize, 2, MAX_CHANNELS] {
+                let ctx = format!("fpp={fpp} ch={channels}");
+                let mut reg = Regulator::with_params(2, 128, 48_000, 5.0);
+                let packets: Vec<Vec<f32>> = (0..3).map(|seq| ramp_packet(seq, fpp, channels)).collect();
+                push_stored(&reg, 0, channels, &packets[0], 0.0);
+                assert_eq!(reg.fpp(), fpp, "{ctx}");
+                assert_eq!(reg.channels(), channels, "{ctx}");
+                assert_eq!(reg.shared.num_slots.load(Ordering::Relaxed), num_slots(fpp), "{ctx}");
+
+                // Past the 5 ms tolerance: the first pop plays packet 0, whole.
+                let mut out = vec![0.0f32; fpp * channels];
+                assert!(reg.pop_at(&mut out, 10.0), "{ctx}: adopted packet must play as real audio");
+                assert_eq!(out, packets[0], "{ctx}");
+
+                // Two more arrive and wait, at the adopted size.
+                push_stored(&reg, 1, channels, &packets[1], 11.0);
+                push_stored(&reg, 2, channels, &packets[2], 12.0);
+                let expected_ms = reg.frames_to_ms(2 * fpp) as f32;
+                assert!((reg.latency_ms() - expected_ms).abs() < 1e-3, "{ctx}: latency {}", reg.latency_ms());
+
+                // The consumer re-derived its geometry from the adopted fpp.
+                let c = consumer(&mut reg);
+                assert_eq!(c.fpp, fpp, "{ctx}");
+                assert_eq!(c.up_to_now, c.packets_in_past * fpp, "{ctx}");
+                assert!(c.up_to_now <= UP_TO_NOW_MAX, "{ctx}: history outgrew its preallocation");
+                assert_eq!(c.tolerance_ms, 5.0, "{ctx}: a fixed tolerance is not an fpp-derived value");
+            }
+        }
+    }
+
+    /// An fpp outside the supported range cannot be adopted: it is refused on
+    /// both sides of each edge, the regulator keeps its construction geometry,
+    /// and — because the stream never started — a valid first packet can still
+    /// adopt afterwards.
+    #[test]
+    fn test_first_packet_fpp_outside_range_is_refused() {
+        let reg = Regulator::with_params(1, 128, 48_000, 5.0);
+        for (i, fpp) in [0, MIN_FPP - 1, MAX_FPP + 1].into_iter().enumerate() {
+            assert_eq!(
+                reg.push_at(0, 1, fpp, &vec![0.5; fpp], 0.0),
+                PushOutcome::UnsupportedFpp { got: fpp }
+            );
+            assert_eq!(reg.stats().packets_rejected, i as u64 + 1);
+        }
+        assert!(!reg.is_initialized(), "a refused first packet must not start the stream");
+        assert_eq!(reg.fpp(), 128);
+
+        push_stored(&reg, 0, 1, &vec![0.5; MAX_FPP], 0.0);
+        assert_eq!(reg.fpp(), MAX_FPP);
+    }
+
+    /// The ring's depth is a constant time horizon, not a constant packet
+    /// count: the largest power of two that fits the frame budget, capped. The
+    /// power of two keeps `seq % num_slots` continuous across the `u16` wrap,
+    /// and the cap keeps the ring inside the half-space window of
+    /// `seq_is_newer`.
+    #[test]
+    fn test_num_slots_is_a_constant_horizon_power_of_two_below_the_cap() {
+        for fpp in MIN_FPP..=MAX_FPP {
+            let n = num_slots(fpp);
+            assert!(n.is_power_of_two(), "fpp={fpp}: {n} slots");
+            assert!(n <= MAX_SLOTS, "fpp={fpp}: {n} slots exceeds the cap");
+            // Over the supported fpp range the cap never binds above the budget, so
+            // the budget is a hard ceiling (a round-up bug would breach it).
+            assert!(n * fpp <= SLOT_FRAME_BUDGET, "fpp={fpp}: {n} slots overshoots the frame budget");
+            assert!(
+                n == MAX_SLOTS || 2 * n * fpp > SLOT_FRAME_BUDGET,
+                "fpp={fpp}: {n} slots leaves room for twice as many"
+            );
+            assert!(65_536 % n == 0 && n * 4 <= 65_536, "fpp={fpp}: {n} slots");
+        }
+        // Memory, the reason for the budget: never more than the old 4096-slot ring at 128.
+        assert!(MAX_FPP * num_slots(MAX_FPP) <= 4096 * HIST_FPP);
+    }
+
+    /// Sequence numbers wrap at 65536 while the ring wraps at its own depth;
+    /// for a depth other than 4096 the stream must still play in order across
+    /// the seam. 64 frames adopts 8192 slots.
+    #[test]
+    fn test_sequence_wraparound_at_an_adopted_ring_depth() {
+        const FPP: usize = 64;
+        let reg = Regulator::with_params(1, 128, 48_000, 5.0);
+        let first = u16::MAX - 2;
+        let packets: Vec<Vec<f32>> = (0..6).map(|i| ramp_packet(i, FPP, 1)).collect();
+        let mut out = vec![0.0f32; FPP];
+        for (i, packet) in packets.iter().enumerate() {
+            let seq = first.wrapping_add(i as u16);
+            // A stream starts on its newest packet, so play each as it arrives.
+            let now = 10.0 * (i + 1) as f64;
+            // Popped past the opening 5 ms tolerance window.
+            push_stored(&reg, seq, 1, packet, now - 6.0);
+            assert!(reg.pop_at(&mut out, now), "packet {i} (seq {seq}) must play as real audio");
+            assert_eq!(&out, packet, "packet {i} (seq {seq}) must play in order across the sequence wrap");
+        }
+        assert_ne!(reg.shared.num_slots.load(Ordering::Relaxed), 4096);
+        assert_eq!(last_seq_out_opt(&reg), Some(first.wrapping_add(5)));
+    }
+
+    /// Concealment after adoption uses the reconfigured model: the Burg
+    /// training window, the prediction tail and the crossfade ramps are all
+    /// sized from the *adopted* fpp. A stale `up_to_now` or `beyond_now` (the
+    /// construction fpp's) slices the wrong prefix. A regulator that adopts
+    /// must therefore conceal exactly as one built for that fpp does — and the
+    /// concealment must actually continue the tone, not play silence.
+    #[test]
+    fn test_loss_burst_at_adopted_fpp_conceals_like_a_regulator_built_for_it() {
+        let concealed = |built_fpp: usize, fpp: usize| -> Vec<f32> {
+            let tone = |n: usize| (n as f32 * 0.07).sin() * 0.5;
+            let reg = Regulator::with_params(1, built_fpp, 48_000, 5.0);
+            // Enough real packets to prime the predictor at any history length.
+            let played = 3 * packets_in_past(fpp) + 4;
+            let mut out = vec![0.0f32; fpp];
+            for seq in 0..played {
+                let t = seq as f64 * reg.frames_to_ms(fpp);
+                let packet: Vec<f32> = (0..fpp).map(|i| tone(seq * fpp + i)).collect();
+                push_stored(&reg, seq as u16, 1, &packet, t);
+                reg.pop_at(&mut out, t + 1.0);
+            }
+            // The next packet never arrives.
+            let real = reg.pop_at(&mut out, played as f64 * reg.frames_to_ms(fpp) + 1.0);
+            assert!(!real, "fpp={fpp}: nothing new arrived, so this is concealment");
+            out
+        };
+        for fpp in [MIN_FPP, 32, 256, MAX_FPP] {
+            let adopted = concealed(128, fpp);
+            assert_eq!(adopted, concealed(fpp, fpp), "fpp={fpp}: adoption must reconfigure the model fully");
+            let energy: f32 = adopted.iter().map(|s| s * s).sum();
+            assert!(energy > 0.1, "fpp={fpp}: concealment is silent (energy {energy})");
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Frame-granular pop (`pop_frames_at`)
     // ------------------------------------------------------------------
 
@@ -3163,8 +3522,17 @@ mod tests {
     /// called before any `Regulator` exists to ask it.
     const CALLBACK_RUN_RATE: u32 = 48_000;
 
-    fn run_callbacks(fpp: usize, frames: usize, channels: usize, callbacks: usize, tolerance_ms: f64) -> CallbackRun {
-        let reg = Regulator::with_params(channels, fpp, CALLBACK_RUN_RATE, tolerance_ms).with_callback_capacity(frames);
+    /// `built_fpp` is the geometry the regulator is constructed with; the peer
+    /// sends `fpp`, which is adopted from its first packet when they differ.
+    fn run_callbacks(
+        built_fpp: usize,
+        fpp: usize,
+        frames: usize,
+        channels: usize,
+        callbacks: usize,
+        tolerance_ms: f64,
+    ) -> CallbackRun {
+        let reg = Regulator::with_params(channels, built_fpp, CALLBACK_RUN_RATE, tolerance_ms).with_callback_capacity(frames);
         let mut served = Vec::new();
         let mut settled = (0, 0);
         let mut out = vec![0.0f32; frames * MAX_CHANNELS];
@@ -3195,10 +3563,25 @@ mod tests {
     #[test]
     fn frame_pop_is_sample_exact_across_fpp_and_callback_ratios() {
         // (fpp, callback frames): callback < packet, ==, >, and a non-divisor.
-        for &(fpp, frames) in &[(32, 128), (64, 128), (128, 128), (256, 128), (128, 64), (512, 128), (128, 100)] {
+        // The peer's fpp is adopted from its first packet, so every ratio also
+        // runs against a regulator built for a different fpp, as the session
+        // builds one (128): including 1024 against a 128-frame callback.
+        for &(fpp, frames) in &[
+            (16, 128),
+            (32, 128),
+            (64, 128),
+            (128, 128),
+            (256, 128),
+            (128, 64),
+            (512, 128),
+            (1024, 128),
+            (128, 100),
+            (100, 128),
+        ] {
+          for built_fpp in [fpp, 128] {
             for channels in [1usize, 2, 5] {
-                let ctx = format!("fpp={fpp} frames={frames} ch={channels}");
-                let run = run_callbacks(fpp, frames, channels, 400, 5.0);
+                let ctx = format!("built={built_fpp} fpp={fpp} frames={frames} ch={channels}");
+                let run = run_callbacks(built_fpp, fpp, frames, channels, 400, 5.0);
                 let total = run.served.len() / channels;
                 let start_frame = (run.served[0] as usize - 1) / 16;
                 for i in 0..total {
@@ -3215,6 +3598,7 @@ mod tests {
                     run.played
                 );
             }
+          }
         }
     }
 
@@ -3228,7 +3612,7 @@ mod tests {
     fn pull_clock_ticks_once_per_callback_at_the_callback_interval() {
         for &(fpp, frames) in &[(32, 128), (64, 128), (128, 128), (256, 128), (128, 64), (512, 128), (256, 64), (128, 100)] {
             // Past AUTO_INIT_DURATION_MS and the headroom warmup.
-            let mut run = run_callbacks(fpp, frames, 2, callbacks_for_ms(12_000.0, frames), -1.0);
+            let mut run = run_callbacks(fpp, fpp, frames, 2, callbacks_for_ms(12_000.0, frames), -1.0);
             let cb_period = run.reg.frames_to_ms(frames);
             let packet_period = run.reg.frames_to_ms(fpp);
             let pull = &consumer(&mut run.reg).pull_stats;
@@ -3254,7 +3638,7 @@ mod tests {
     fn latency_includes_pulled_unplayed_frames_and_reset_discards_them() {
         const FPP: usize = 256;
         const FRAMES: usize = 128;
-        let run = run_callbacks(FPP, FRAMES, 1, 100, 5.0);
+        let run = run_callbacks(FPP, FPP, FRAMES, 1, 100, 5.0);
         let reg = &run.reg;
         // A packet is twice the callback, so every other callback leaves one
         // callback's worth of the packet queued. Find that callback.

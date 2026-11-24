@@ -6,14 +6,23 @@
 //! Note: Receiving is handled directly by the LockFreeJitterBuffer,
 //! which the worklet reads from directly - no intermediate buffer needed!
 
+use crate::limits::{MAX_FPP, MAX_WIRE_CHANNELS};
 use std::cell::UnsafeCell;
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-/// Size of the ring buffer in samples
-const RING_BUFFER_SIZE: usize = 4096;
+/// Size of the ring buffer in samples: two packets at the widest, longest
+/// stream the wire allows (`MAX_FPP` frames of `MAX_WIRE_CHANNELS` channels).
+///
+/// A hard ceiling on `fpp * send_channels`, not a sizing nit: `write` rejects
+/// an oversized write while both send paths wait for `available >= fpp *
+/// channels`, so a packet larger than the ring is a permanent silent stall.
+/// Holding two packets lets the producer write one while the consumer drains
+/// the other. A power of two, because positions wrap as `u32`, which only
+/// stays continuous modulo a divisor of 2^32.
+pub const RING_BUFFER_SIZE: usize = (2 * MAX_FPP * MAX_WIRE_CHANNELS as usize).next_power_of_two();
 
 /// Shared ring buffer between worklet and main thread
 /// 

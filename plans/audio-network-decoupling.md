@@ -792,6 +792,24 @@ oversized writes (`:155-158`) while both send paths wait for
 Raise it to hold ≥2 packets at the wire ceiling and add a `debug_assert!` in
 `set_audio_buffers`.
 
+**As built.** Where the implementation settled details the text above leaves open:
+
+- `Regulator::push_at(seq, channels, fpp, samples, now_ms)`. `FppFit.limited_by` is
+  `FppLimit::{None, PacketSize, Floor}`.
+- `transport::fit_send_fpp(name, max_bytes, send_channels, preferred)` wraps `fit_fpp`
+  for both callers (the session, and the WebTransport worker): it logs a reduced fit
+  with its reason and turns `Floor` into a `TransportError`. `limits.rs` carries
+  `MIN_FPP`, `MAX_FPP` and `MAX_UNFRAGMENTED_PACKET_BYTES` (1200).
+- The session fits at `bring_up` for a transport whose `max_packet_bytes()` is
+  `Some` (WebRTC: the 1200-byte floor). WebTransport returns `None` until its
+  worker's `fpp` message reports the datagram size it fitted to, then
+  `Some(datagram size)`.
+- `RING_BUFFER_SIZE` is `2 * MAX_FPP * MAX_WIRE_CHANNELS` (16384 samples). The
+  two-packets check is a `debug_assert!` in `AudioBufferConfig::samples_per_packet`,
+  which every transport's `set_audio_buffers` path reaches.
+- `session.rs` keeps `send_fpp`; `receive_fpp` is only the construction-time local
+  the regulator is built with.
+
 ### Phase 6 — Per-connection stream buffers; retirement replaces reset
 *Delivers: every connection gets its own `Regulator` and `RingBuffer`, and
 `Regulator::reset` is deleted. Ships with connect and the engine still

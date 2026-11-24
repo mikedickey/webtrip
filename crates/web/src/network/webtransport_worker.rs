@@ -39,7 +39,9 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use webtrip_core::stream::ring_buffer::RingBuffer;
 use webtrip_core::stream::regulator::Regulator;
 use webtrip_core::stream::shared_ptr::SharedPtr;
-use webtrip_core::network::protocol::{AudioPacket, make_exit_packet, HEADER_SIZE};
+use webtrip_core::network::protocol::{AudioPacket, make_exit_packet, packet_bytes, DEFAULT_BIT_DEPTH};
+use webtrip_core::limits::MAX_FPP;
+use webtrip_core::network::transport::fit_send_fpp;
 #[cfg(target_arch = "wasm32")]
 use webtrip_core::network::transport::HIGH_RATE_WARN_INTERVAL;
 use webtrip_core::network::transport::deliver_received_packet;
@@ -390,19 +392,16 @@ impl WorkerState {
         // buffers are dropped or `Regulator::reset` runs.
         self.ring_buffer_ptr = unsafe { SharedPtr::from_addr(ring_ptr) };
         self.regulator_ptr = unsafe { SharedPtr::from_addr(reg_ptr) };
-        self.buffer_size = buffer_size;
         self.send_channels = send_channels;
         self.receive_channels = receive_channels;
+        self.set_send_fpp(buffer_size);
+        // Receive scratch is sized by what the peer may send (the widest
+        // packet the wire allows at our channel count), independent of the
+        // send fpp, so the receive loop never grows it and a send-fpp change
+        // never touches it.
+        *self.samples_buffer.borrow_mut() =
+            Vec::with_capacity(MAX_FPP * receive_channels as usize);
 
-        // Pre-allocate buffers
-        let samples_per_packet = samples_per_packet(buffer_size, send_channels) as usize;
-        *self.audio_buffer.borrow_mut() = vec![0.0f32; samples_per_packet];
-        
-        // Max packet size: header + samples as 16-bit
-        let max_packet_size = HEADER_SIZE + samples_per_packet * 2;
-        *self.packet_buffer.borrow_mut() = vec![0u8; max_packet_size];
-        *self.samples_buffer.borrow_mut() = Vec::with_capacity(samples_per_packet);
-        
         // Set up Int32Array for Atomics.wait() on the ring buffer's has_data flag
         if let Some(ring_buffer) = self.ring_buffer_ptr.as_ref() {
             let flag_ptr = ring_buffer.get_has_data_flag_ptr();
@@ -424,6 +423,20 @@ impl WorkerState {
         }
     }
 
+    /// Change the frames per outbound packet and resize the scratch buffers
+    /// that depend on it — only those. Deliberately not a re-`configure()`,
+    /// which would also re-derive the ring-buffer view. Called before the
+    /// send loop starts: once at `configure` with the preferred fpp, and again
+    /// once connected if the session's datagram limit requires fewer frames.
+    fn set_send_fpp(&mut self, fpp: usize) {
+        self.buffer_size = fpp;
+        let samples_per_packet = samples_per_packet(fpp, self.send_channels) as usize;
+        *self.audio_buffer.borrow_mut() = vec![0.0f32; samples_per_packet];
+
+        let max_packet_size = packet_bytes(fpp, self.send_channels, DEFAULT_BIT_DEPTH);
+        *self.packet_buffer.borrow_mut() = vec![0u8; max_packet_size];
+    }
+
     fn start(&self) {
         self.running.store(true, Ordering::SeqCst);
         // Loops are about to be spawned; clear prior-exit / ack state.
@@ -435,6 +448,28 @@ impl WorkerState {
 
     fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// Undo [`start`](Self::start) when connect fails before the loops are
+    /// spawned: nothing will ever run, so mark both loops exited (the idle
+    /// state `new()` begins in) rather than leave them "pending" forever.
+    ///
+    /// Returns `true` when [`stop`](Self::stop) already ran during the connect
+    /// (a `worker_disconnect` landed while it was awaiting). That call saw the
+    /// loops as live and so posted no ack; the caller owes it now.
+    fn abort_start(&self) -> bool {
+        let disconnect_requested = !self.running.swap(false, Ordering::SeqCst);
+        self.send_loop_exited.store(true, Ordering::SeqCst);
+        self.receive_loop_exited.store(true, Ordering::SeqCst);
+        disconnect_requested
+    }
+
+    /// True when neither loop is live (never started, finished, or aborted).
+    /// Only a loop can arm and post the disconnect ack, so with none live
+    /// `worker_disconnect` must ack itself.
+    fn loops_idle(&self) -> bool {
+        self.send_loop_exited.load(Ordering::SeqCst)
+            && self.receive_loop_exited.load(Ordering::SeqCst)
     }
 
     fn is_running(&self) -> bool {
@@ -499,6 +534,23 @@ pub async fn worker_connect(server_url: String) -> Result<(), JsValue> {
         state.borrow().start();
     });
 
+    let result = connect_and_spawn_loops(server_url).await;
+    if result.is_err() {
+        // No loops were spawned; undo `start()` so a following disconnect
+        // does not wait on loops that will never run.
+        let disconnect_requested = WORKER_STATE.with(|state| state.borrow().abort_start());
+        if disconnect_requested {
+            // `worker_disconnect` ran mid-connect, saw the loops as live, and
+            // posted nothing; no loop exists to post the ack either.
+            post_message_to_main(&JsValue::from_str("disconnected"));
+        }
+    }
+    result
+}
+
+/// Everything in [`worker_connect`] after `start()`. Returns `Err` only
+/// before the loops are spawned.
+async fn connect_and_spawn_loops(server_url: String) -> Result<(), JsValue> {
     // Create WebTransport using browser's native API
     let transport = web_sys::WebTransport::new(&server_url)
         .map_err(|e| {
@@ -518,6 +570,26 @@ pub async fn worker_connect(server_url: String) -> Result<(), JsValue> {
             JsValue::from_str(&format!("WebTransport connection failed: {:?}", e))
         })?;
     
+    // The session's datagram limit is known only now. Fit the send fpp to it
+    // before the send loop exists, and tell the main thread (before the caller
+    // posts "connected", so the value is there when the session publishes the
+    // transport). A channel count that cannot fit even `MIN_FPP` fails the
+    // connect loudly instead of dropping every packet.
+    let max_datagram_size = transport.datagrams().max_datagram_size() as usize;
+    let (preferred_fpp, send_channels) = WORKER_STATE.with(|state| {
+        let state = state.borrow();
+        (state.buffer_size, state.send_channels)
+    });
+    let fpp = match fit_send_fpp("WebTransport", max_datagram_size, send_channels, preferred_fpp) {
+        Ok(fpp) => fpp,
+        Err(e) => {
+            transport.close();
+            return Err(JsValue::from_str(e.message()));
+        }
+    };
+    WORKER_STATE.with(|state| state.borrow_mut().set_send_fpp(fpp));
+    post_message_to_main(&fpp_message(fpp, max_datagram_size));
+
     // Wrap transport in Rc<RefCell> for shared ownership
     let transport = Rc::new(RefCell::new(transport));
 
@@ -540,6 +612,16 @@ pub async fn worker_connect(server_url: String) -> Result<(), JsValue> {
     Ok(())
 }
 
+/// The `fpp` message: the send fpp this worker settled on and the datagram
+/// limit it was fitted to, for the main-thread transport to report.
+fn fpp_message(fpp: usize, max_datagram_size: usize) -> JsValue {
+    let obj = Object::new();
+    let _ = Reflect::set(&obj, &"type".into(), &"fpp".into());
+    let _ = Reflect::set(&obj, &"fpp".into(), &JsValue::from_f64(fpp as f64));
+    let _ = Reflect::set(&obj, &"maxDatagramSize".into(), &JsValue::from_f64(max_datagram_size as f64));
+    obj.into()
+}
+
 /// Disconnect from the server and stop all loops
 ///
 /// Sets `running = false`, cancels any pending datagram `read()` so the
@@ -553,12 +635,18 @@ pub async fn worker_connect(server_url: String) -> Result<(), JsValue> {
 pub fn worker_disconnect() {
     // Clone out the Int32Array first so we don't hold the RefCell borrow across
     // the notify call (which also avoids lifetime issues with the inner borrow).
-    let array = WORKER_STATE.with(|state| {
+    let (array, idle) = WORKER_STATE.with(|state| {
         let state = state.borrow();
         state.stop();
         let cloned = state.has_data_int32_array.borrow().clone();
-        cloned
+        (cloned, state.loops_idle())
     });
+    if idle {
+        // No loop exists to arm and post the ack (connect failed or never
+        // ran), so ack now instead of leaving the caller on its fallback timer.
+        post_message_to_main(&JsValue::from_str("disconnected"));
+        return;
+    }
     // Unblock a pending `reader.read()` so receive_loop can observe
     // running=false without waiting for the next datagram (~2.7 ms).
     cancel_datagram_reader();
@@ -1061,6 +1149,7 @@ pub fn handle_worker_message(msg: JsValue) -> js_sys::Promise {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use webtrip_core::network::protocol::HEADER_SIZE;
 
     // --- send_decision ("process vs wait") ---
 
@@ -1269,6 +1358,33 @@ mod tests {
             stats.receive_errors, 0,
             "no regulator means no deserialize attempt, so no error is recorded"
         );
+    }
+
+    /// Regression (PR #118 review): `worker_connect` calls `start()` before
+    /// fitting the send fpp; a failed fit returned without spawning loops, so
+    /// `loops_idle()` stayed false and `worker_disconnect` never acked.
+    #[test]
+    fn abort_start_restores_idle_loops_after_failed_connect() {
+        let state = WorkerState::new();
+        assert!(state.loops_idle(), "fresh worker has no live loops");
+
+        state.start();
+        assert!(!state.loops_idle(), "start() marks loops as about to run");
+
+        assert!(
+            !state.abort_start(),
+            "no disconnect arrived, so no ack is owed"
+        );
+        assert!(state.loops_idle());
+        assert!(!state.is_running());
+
+        // Regression (PR #118 review): `worker_disconnect` landing while the
+        // connect is still awaiting `ready()` sees live loops and posts no
+        // ack; the failing connect must report that the ack is now owed.
+        state.start();
+        state.stop();
+        assert!(state.abort_start(), "disconnect during connect owes the ack");
+        assert!(state.loops_idle());
     }
 
     // ── Browser tests (worker-side #[wasm_bindgen] entry points) ──────────────
