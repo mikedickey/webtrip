@@ -51,7 +51,7 @@
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-use crate::limits::{MAX_WIRE_CHANNELS, WIRE_SAMPLE_RATE};
+use crate::limits::{MAX_FPP, MAX_WIRE_CHANNELS, MIN_FPP, WIRE_SAMPLE_RATE};
 
 /// JackTrip native header size (16 bytes)
 pub const HEADER_SIZE: usize = 16;
@@ -67,6 +67,64 @@ fn audio_data_size(buffer_size: u16, channels: u8, bit_depth: u8) -> usize {
     let samples = buffer_size as usize * channels as usize;
     let bytes_per_sample = (bit_depth as usize + 7) / 8;
     samples * bytes_per_sample
+}
+
+/// Wire size of one packet, header included: `fpp` frames of `channels`
+/// interleaved samples at `bit_depth`. The one definition of packet geometry;
+/// size buffers and budgets from this, never from a hand-written
+/// `HEADER_SIZE + samples * bytes`.
+pub fn packet_bytes(fpp: usize, channels: u8, bit_depth: u8) -> usize {
+    HEADER_SIZE + audio_data_size(fpp as u16, channels, bit_depth)
+}
+
+/// Why [`fit_fpp`] chose the fpp it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FppLimit {
+    /// The preferred fpp fit; nothing constrained it.
+    None,
+    /// The preferred fpp's packet exceeded the byte budget, so it was halved
+    /// until one fit.
+    PacketSize,
+    /// Not even [`MIN_FPP`] fits the byte budget. `fpp` is `MIN_FPP` and its
+    /// packet is over budget: the caller must treat this as an error, never
+    /// send the oversized packet.
+    Floor,
+}
+
+/// A frames-per-packet choice for a send stream. See [`fit_fpp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FppFit {
+    pub fpp: usize,
+    /// Wire size of one packet at `fpp`, header included.
+    pub packet_bytes: usize,
+    pub limited_by: FppLimit,
+}
+
+/// Pick the send fpp: the largest power of two not above `preferred` whose
+/// packet (header + audio) fits in `max_bytes`, clamped to
+/// `[MIN_FPP, MAX_FPP]`.
+///
+/// A power of two because the regulator sizes its history as whole packets of
+/// `HIST_FPP / fpp`, which truncates for a non-divisor. Packet geometry comes
+/// from [`packet_bytes`], so there is one definition of it.
+pub fn fit_fpp(max_bytes: usize, channels: u8, bit_depth: u8, preferred: usize) -> FppFit {
+    let packet_bytes = |fpp: usize| packet_bytes(fpp, channels, bit_depth);
+
+    let preferred = preferred.clamp(MIN_FPP, MAX_FPP);
+    // Largest power of two <= preferred; MIN_FPP is itself a power of two.
+    let mut fpp = 1usize << (usize::BITS - 1 - preferred.leading_zeros());
+    let start = fpp;
+    while fpp > MIN_FPP && packet_bytes(fpp) > max_bytes {
+        fpp /= 2;
+    }
+    let limited_by = if packet_bytes(fpp) > max_bytes {
+        FppLimit::Floor
+    } else if fpp < start {
+        FppLimit::PacketSize
+    } else {
+        FppLimit::None
+    };
+    FppFit { fpp, packet_bytes: packet_bytes(fpp), limited_by }
 }
 
 /// Sample rate encoding (matches JackTrip's enum)
@@ -231,7 +289,7 @@ impl PacketHeader {
     /// Total packet size for outgoing packets (header + audio data). The
     /// payload is `num_outgoing_channels` wide — the channels the sender transmits.
     pub fn total_packet_size_out(&self) -> usize {
-        HEADER_SIZE + audio_data_size(self.buffer_size, self.num_outgoing_channels, self.bit_depth)
+        packet_bytes(self.buffer_size as usize, self.num_outgoing_channels, self.bit_depth)
     }
 
     /// Serialize header to bytes (little-endian byte order)
@@ -302,10 +360,10 @@ impl PacketHeader {
             );
             return Err(ProtocolError::InvalidBitDepth);
         }
-        if buffer_size == 0 || buffer_size > 4096 {
+        if !(MIN_FPP..=MAX_FPP).contains(&(buffer_size as usize)) {
             log::error!(
-                "❌ Invalid buffer size: {} (expected 1-4096)", 
-                buffer_size
+                "❌ Invalid buffer size: {} (expected {}-{})",
+                buffer_size, MIN_FPP, MAX_FPP
             );
             return Err(ProtocolError::InvalidBufferSize);
         }
@@ -1118,32 +1176,64 @@ mod tests {
 
     #[test]
     fn test_deserialize_buffer_size_boundaries() {
-        // buffer_size 0 is invalid (empty packet).
-        let mut header = valid_header();
-        header.buffer_size = 0;
-        assert_eq!(
-            PacketHeader::deserialize(&header_bytes(&header)).unwrap_err(),
-            ProtocolError::InvalidBufferSize,
-            "buffer_size 0 must be rejected"
-        );
-
-        // 1 and 4096 are the inclusive valid bounds.
-        for size in [1u16, 4096] {
+        // Both sides of each edge of the supported fpp range. The wire check,
+        // the send-side fit and the regulator share one definition of it.
+        for size in [0, MIN_FPP - 1, MAX_FPP + 1, u16::MAX as usize] {
             let mut header = valid_header();
-            header.buffer_size = size;
-            let decoded = PacketHeader::deserialize(&header_bytes(&header))
-                .unwrap_or_else(|e| panic!("buffer_size {size} should be valid: {e:?}"));
-            assert_eq!(decoded.buffer_size, size);
+            header.buffer_size = size as u16;
+            assert_eq!(
+                PacketHeader::deserialize(&header_bytes(&header)).unwrap_err(),
+                ProtocolError::InvalidBufferSize,
+                "buffer_size {size} must be rejected"
+            );
         }
 
-        // 4097 (one past the max) is invalid.
-        let mut header = valid_header();
-        header.buffer_size = 4097;
-        assert_eq!(
-            PacketHeader::deserialize(&header_bytes(&header)).unwrap_err(),
-            ProtocolError::InvalidBufferSize,
-            "buffer_size 4097 must be rejected"
-        );
+        for size in [MIN_FPP, MAX_FPP] {
+            let mut header = valid_header();
+            header.buffer_size = size as u16;
+            let decoded = PacketHeader::deserialize(&header_bytes(&header))
+                .unwrap_or_else(|e| panic!("buffer_size {size} should be valid: {e:?}"));
+            assert_eq!(decoded.buffer_size as usize, size);
+        }
+    }
+
+    /// `fit_fpp` over its boundaries: the byte budget at exactly a packet's
+    /// size and one byte short, the power-of-two rounding of the preference,
+    /// both ends of the fpp range, and the floor that surfaces as an error
+    /// rather than an oversized packet.
+    #[test]
+    fn test_fit_fpp_boundaries_and_limit_reasons() {
+        let packet = |fpp: usize, ch: u8| HEADER_SIZE + audio_data_size(fpp as u16, ch, 16);
+        let fit = |max, ch, pref| fit_fpp(max, ch, 16, pref);
+
+        // Fits exactly: the preference stands. One byte short: it halves.
+        let exact = fit(packet(128, 2), 2, 128);
+        assert_eq!((exact.fpp, exact.packet_bytes, exact.limited_by), (128, packet(128, 2), FppLimit::None));
+        let short = fit(packet(128, 2) - 1, 2, 128);
+        assert_eq!((short.fpp, short.packet_bytes, short.limited_by), (64, packet(64, 2), FppLimit::PacketSize));
+
+        // Halves as often as it takes, not just once.
+        let narrow = fit(packet(16, 2), 2, 1024);
+        assert_eq!((narrow.fpp, narrow.limited_by), (MIN_FPP, FppLimit::PacketSize));
+
+        // A preference that is not a power of two rounds down to one, and is
+        // not itself a limit.
+        let odd = fit(usize::MAX, 1, 200);
+        assert_eq!((odd.fpp, odd.limited_by), (128, FppLimit::None));
+
+        // The range clamps the preference at both ends.
+        assert_eq!(fit(usize::MAX, 1, 1).fpp, MIN_FPP);
+        assert_eq!(fit(usize::MAX, 1, 1 << 20).fpp, MAX_FPP);
+
+        // Not even MIN_FPP fits: the floor, with the packet it would have been.
+        let floor = fit(packet(MIN_FPP, 8) - 1, 8, 128);
+        assert_eq!((floor.fpp, floor.packet_bytes, floor.limited_by), (MIN_FPP, packet(MIN_FPP, 8), FppLimit::Floor));
+
+        // The motivating case: 5 channels at 128 fpp is 1296 bytes and does
+        // not fit a 1200-byte datagram.
+        let wide = fit(1200, 5, 128);
+        assert_eq!((wide.fpp, wide.limited_by), (64, FppLimit::PacketSize));
+        assert!(wide.packet_bytes <= 1200);
     }
 
     // ----- AudioPacket::deserialize_into payload guards & bit-depth arms -----

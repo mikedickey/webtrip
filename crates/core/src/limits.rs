@@ -18,6 +18,26 @@ pub const MAX_WIRE_CHANNELS: u8 = 8;
 /// so a wide interface never allocates on the render thread.
 pub const MAX_DEVICE_CHANNELS: u8 = 32;
 
+/// Fewest frames per packet a stream may carry, in either direction: JackTrip's
+/// low-latency setting. Header overhead at small fpp is a cost, not a
+/// correctness limit, so it sets no higher floor. `stream::regulator` mirrors
+/// this value (no `crate::` imports there); a test pins the two.
+pub const MIN_FPP: usize = 16;
+
+/// Most frames per packet a stream may carry, in either direction: JackTrip's
+/// largest common buffer size. Bounds the regulator's preallocated per-packet
+/// state, so a peer announcing more is refused rather than reallocating on the
+/// audio thread. Mirrored by `stream::regulator`, pinned by a test.
+pub const MAX_FPP: usize = 1024;
+
+/// Largest packet WebTrip puts on the wire when the transport cannot say how
+/// much it carries. A QUIC DATAGRAM frame must fit one packet (RFC 9221) and
+/// QUIC forbids IP fragmentation (RFC 9000 §14), so ~1200 bytes is the
+/// fragmentation-free floor; WebRTC data channels use the same figure so a
+/// packet never fragments across SCTP chunks (the channel is unordered with
+/// no retransmits, so every fragment multiplies loss).
+pub const MAX_UNFRAGMENTED_PACKET_BYTES: usize = 1200;
+
 /// Frames in one Web Audio render quantum — the callback size the worklet
 /// hands the processor. Sizes every render-thread scratch buffer.
 pub const RENDER_QUANTUM_FRAMES: usize = 128;
@@ -65,5 +85,14 @@ mod tests {
     #[test]
     fn regulator_mirror_matches_wire_ceiling() {
         assert_eq!(crate::stream::regulator::MAX_CHANNELS, MAX_WIRE_CHANNELS as usize);
+    }
+
+    /// Same mirror rule for the fpp range: the regulator rejects what its
+    /// preallocated state cannot hold, and the protocol accepts what the
+    /// regulator rejects if the two drift.
+    #[test]
+    fn regulator_mirror_matches_fpp_range() {
+        assert_eq!(crate::stream::regulator::MIN_FPP, MIN_FPP);
+        assert_eq!(crate::stream::regulator::MAX_FPP, MAX_FPP);
     }
 }

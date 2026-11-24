@@ -366,6 +366,19 @@ impl WebTransportImpl {
                                 let _ = reject.call1(&JsValue::NULL, &JsValue::from_str(&error));
                             }
                         }
+                        "fpp" => {
+                            let number = |key: &str| {
+                                Reflect::get(&data, &key.into()).ok().and_then(|v| v.as_f64()).map(|v| v as usize)
+                            };
+                            web_sys::console::debug_1(
+                                &format!(
+                                    "[WebTransport] 📦 Sending {:?} frames per packet (max datagram {:?} bytes)",
+                                    number("fpp"),
+                                    number("maxDatagramSize"),
+                                )
+                                .into(),
+                            );
+                        }
                         "stats" => {
                             web_sys::console::debug_1(&"[WebTransport] 📊 Stats update received".into());
                             // Stats updates - could be forwarded to UI

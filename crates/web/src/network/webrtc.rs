@@ -17,7 +17,8 @@
 //! - No retransmissions (maxRetransmits = 0)
 //! - Binary mode (ArrayBuffer)
 
-use webtrip_core::network::protocol::{AudioPacket, make_exit_packet};
+use webtrip_core::limits::MAX_UNFRAGMENTED_PACKET_BYTES;
+use webtrip_core::network::protocol::{AudioPacket, make_exit_packet, packet_bytes, DEFAULT_BIT_DEPTH};
 use crate::network::signaling::HubSignaling;
 use crate::network::{SharedStateCallback, notify_transport_state, transport_error_from_js};
 use webtrip_core::network::signaling_message::parse_ice_candidate_json;
@@ -269,7 +270,7 @@ impl WebRtcTransport {
         let buffer_size = 128; // Default, will be updated
         let channels = 2; // Default, will be updated
         let audio_to_send_buffer = vec![0.0; buffer_size * channels];
-        let max_packet_bytes = 16 + (buffer_size * channels * 4);
+        let max_packet_bytes = packet_bytes(buffer_size, channels as u8, MAX_BIT_DEPTH);
         let packet_serialize_buffer = vec![0u8; max_packet_bytes];
 
         Ok(WebRtcTransport {
@@ -1018,8 +1019,15 @@ impl WebRtcTransport {
         // Set up open handler
         let on_state_change = self.on_state_change.clone();
         let channel_label = channel.label();
+        let sctp_probe = self.audio_buffers.map(|buffers| {
+            (pc.clone(), packet_bytes(buffers.buffer_size, buffers.send_channels, DEFAULT_BIT_DEPTH))
+        });
         let on_open = Closure::wrap(Box::new(move || {
             web_sys::console::debug_1(&format!("Data channel '{}' opened!", channel_label).into());
+            // The SCTP association is up exactly now, so `pc.sctp` is non-null.
+            if let Some((pc, packet_bytes)) = &sctp_probe {
+                warn_if_sctp_limit_below(pc, *packet_bytes);
+            }
             if let Some(ref callback) = on_state_change {
                 callback(TransportState::Connected);
             }
@@ -1043,6 +1051,32 @@ impl WebRtcTransport {
 
     fn notify_state_change(&self) {
         notify_transport_state(self.state, &self.on_state_change);
+    }
+}
+
+/// Widest bit depth the protocol carries; send buffers are sized for it.
+const MAX_BIT_DEPTH: u8 = 32;
+
+/// Warn loudly if the browser's SCTP message limit (`pc.sctp.maxMessageSize`)
+/// is below the packets we send. Purely diagnostic: the send fpp is fitted to
+/// the fragmentation-free floor ([`MAX_UNFRAGMENTED_PACKET_BYTES`]) and never
+/// to this, so a limit that cannot be read, or arrives late, changes nothing.
+fn warn_if_sctp_limit_below(pc: &RtcPeerConnection, packet_bytes: usize) {
+    let limit = Reflect::get(pc, &"sctp".into())
+        .ok()
+        .filter(|sctp| !sctp.is_null() && !sctp.is_undefined())
+        .and_then(|sctp| Reflect::get(&sctp, &"maxMessageSize".into()).ok())
+        .and_then(|v| v.as_f64());
+    if let Some(limit) = limit {
+        if limit < packet_bytes as f64 {
+            web_sys::console::warn_1(
+                &format!(
+                    "⚠️ WebRTC: the browser's SCTP message limit ({limit} bytes) is below our {packet_bytes}-byte packets; \
+                     audio will be dropped"
+                )
+                .into(),
+            );
+        }
     }
 }
 
@@ -1084,7 +1118,7 @@ impl Transport for WebRtcTransport {
         
         // Resize internal buffers based on configuration
         self.audio_to_send_buffer.resize(config.samples_per_packet(), 0.0);
-        let max_packet_bytes = 16 + (config.samples_per_packet() * 4);
+        let max_packet_bytes = packet_bytes(config.buffer_size, config.send_channels, MAX_BIT_DEPTH);
         self.packet_serialize_buffer.resize(max_packet_bytes, 0);
 
         webtrip_core::network::transport::log_audio_buffers_set("WebRTC", &config);
@@ -1092,6 +1126,15 @@ impl Transport for WebRtcTransport {
 
     fn set_on_state_change(&mut self, callback: StateCallback) {
         self.on_state_change = Some(Rc::from(callback));
+    }
+
+    /// The fragmentation-free floor, not `RTCSctpTransport.maxMessageSize`:
+    /// browsers report >= 64 KiB there, which would accept packets that
+    /// fragment across many SCTP chunks, and this channel is unordered with no
+    /// retransmits, so every fragment multiplies loss. Known synchronously,
+    /// which is what lets the session fit the send fpp before connecting.
+    fn max_packet_bytes(&self) -> Option<usize> {
+        Some(MAX_UNFRAGMENTED_PACKET_BYTES)
     }
 
     fn connect(
