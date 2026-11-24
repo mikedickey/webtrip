@@ -203,6 +203,14 @@ impl Drop for AudioCallbackLoop {
 /// is 2.67 ms of audio and a tick drains everything queued, so this only
 /// bounds how long a received packet waits for its tick; browsers clamp
 /// timers below this anyway.
+///
+/// Browsers also throttle `setInterval` in a hidden tab (to about once a
+/// second, or less), so while the tab is hidden and audio is stopped a WebRTC
+/// connection's data-channel packets wait in the transport's receive queue
+/// until the next tick. That is tolerable only because nothing consumes the
+/// stream buffers with audio stopped: no playback can underrun, and the queue
+/// drains into the regulator in one tick. Starting audio switches the clock to
+/// the audio callback, which is not subject to timer throttling.
 pub const INTERVAL_TICK_PERIOD_MS: i32 = 4;
 
 /// A tick on a fixed period, for a network connection that has no audio
@@ -229,10 +237,6 @@ impl IntervalTickLoop {
         if let (Some(handle), Some(window)) = (self.handle.take(), web_sys::window()) {
             window.clear_interval_with_handle(handle);
         }
-    }
-
-    pub fn is_running(&self) -> bool {
-        self.handle.is_some()
     }
 }
 

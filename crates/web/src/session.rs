@@ -205,6 +205,14 @@ struct CaptureParams {
     noise_suppression: bool,
 }
 
+/// The engine worklet's `(send ring, receive regulator)` pointers.
+type NetworkBuffers = (*mut RingBuffer, *mut Regulator);
+
+/// `buffers`, or null pointers (a worklet node that reads no connection).
+fn or_detached(buffers: Option<NetworkBuffers>) -> NetworkBuffers {
+    buffers.unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()))
+}
+
 /// A connection's stream buffers as the engine's worklet is pointed at them.
 #[derive(Clone, Copy)]
 struct Published {
@@ -221,7 +229,7 @@ struct Published {
 /// stuck permission prompt; `capture_waiting` is set while that gate is held.
 async fn bring_up_engine(
     params_addr: usize,
-    network: Option<(*mut RingBuffer, *mut Regulator)>,
+    network: Option<NetworkBuffers>,
     capture: CaptureParams,
     output_device_id: Option<String>,
     input_channels: u32,
@@ -234,8 +242,7 @@ async fn bring_up_engine(
     // `AudioEngine` is a `#[wasm_bindgen]` boundary type, so it takes raw
     // pointers / addresses here and wraps them in `SharedPtr` internally
     // when it builds the `AudioProcessor`.
-    let (local_to_network, network_to_local) =
-        network.unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+    let (local_to_network, network_to_local) = or_detached(network);
     let mut engine =
         AudioEngine::create_with_network(params_addr, local_to_network, network_to_local).await?;
     // Lets an abort close the context while `getUserMedia` is still pending.
@@ -288,6 +295,10 @@ enum Detached {
     Pending(js_sys::Promise),
     /// The node could not be replaced, so it may still be reading them
     Failed,
+    /// The engine is starting or stopping, so a node holding them may be
+    /// running that this cannot replace; only that engine's own successful
+    /// close proves it gone
+    InTransit,
 }
 
 /// WebTrip Session - coordinates all audio and network components
@@ -314,7 +325,12 @@ pub struct WebTripSession {
     /// Which engine is current; tags the buffers retired against its worklet
     /// node, so its successful close frees exactly those
     engine_generation: Cell<u64>,
-    /// The connection whose buffers the engine's worklet node reads
+    /// The connection whose buffers the engine's worklet node reads, or may
+    /// still read: set when an engine start begins (the node is handed the
+    /// pointers before the engine is published) and cleared only once the
+    /// engine's close has settled (`stopAudio` unpublishes the engine well
+    /// before its worklet is proven gone). With no engine published it means
+    /// the engine is in transit, which [`Detached::InTransit`] reports.
     engine_attached: Cell<Option<u64>>,
     /// Settles when the audio start in flight has finished (successfully or
     /// after releasing everything it created)
@@ -326,6 +342,10 @@ pub struct WebTripSession {
     /// Whether the audio running was started by `connect`, and so
     /// stops with its connection
     audio_owned_by_connect: Cell<bool>,
+    /// Set by a `disconnect()` that found another disconnect's teardown in
+    /// flight: the teardown's winner then stops connect-owned audio on its
+    /// behalf, whichever disconnect claimed the teardown
+    disconnect_stops_audio: Cell<bool>,
 
     // The live connections, each owning its transport and stream buffers
     // (shared with the AudioWorklet and the transport via pointers). At most
@@ -410,6 +430,7 @@ impl WebTripSession {
             abort_audio_in_flight: RefCell::new(None),
             audio_teardown_in_flight: RefCell::new(None),
             audio_owned_by_connect: Cell::new(false),
+            disconnect_stops_audio: Cell::new(false),
             connections: RefCell::new(Vec::new()),
             next_connection_id: Cell::new(0),
             retired: Rc::new(RefCell::new(RetiredList::new())),
@@ -586,18 +607,15 @@ impl WebTripSession {
     /// Set the output audio device for playback
     ///
     /// Call while audio is stopped to store a sink for the next start, or while
-    /// it is running to route the live engine. Rejected while a connect or an
-    /// audio start is in flight: there is no published engine yet, and a
-    /// store-only update would be lost or force a deferred re-apply that races
-    /// connect/disconnect (WEB-72).
+    /// it is running to route the live engine, whatever the network is doing
+    /// (a dial in progress included). Rejected while an audio start is in
+    /// flight: the engine is not published yet, and a store-only update would
+    /// be lost or force a deferred re-apply that races stop (WEB-72).
     ///
     /// # Arguments
     /// * `device_id` - The device ID from the output device selector, or empty string/None for default
     #[wasm_bindgen(js_name = setOutputDevice)]
     pub async fn set_output_device(&self, device_id: Option<String>) -> Result<(), JsValue> {
-        if self.state() == SessionState::Connecting {
-            return Err(js_error("Cannot change output device while connecting"));
-        }
         if self.audio_lifecycle.phase() == AudioPhase::Starting {
             return Err(js_error("Cannot change output device while audio is starting"));
         }
@@ -786,6 +804,12 @@ impl WebTripSession {
         match self.lifecycle.begin_disconnect() {
             DisconnectStart::AlreadyIdle => return,
             DisconnectStart::AlreadyDisconnecting => {
+                // The winner may have been asked to leave audio running; this
+                // call was asked to stop it, and the winner has not decided yet
+                // (it decides after its network teardown, with no await after).
+                if stop_owned_audio {
+                    self.disconnect_stops_audio.set(true);
+                }
                 await_in_flight(&self.teardown_in_flight).await;
                 return;
             }
@@ -810,7 +834,8 @@ impl WebTripSession {
         if let Some(connection) = connection {
             self.end_connection(connection, transport).await;
         }
-        if self.audio_owned_by_connect.replace(false) && stop_owned_audio {
+        let stop_audio = self.disconnect_stops_audio.replace(false) || stop_owned_audio;
+        if self.audio_owned_by_connect.replace(false) && stop_audio {
             self.stop_audio_inner().await;
         }
 
@@ -872,36 +897,26 @@ impl WebTripSession {
     ///
     /// Unit-test only. Runs the same [`connect_with`] path as
     /// `connect` (admission, audio bring-up, dial, `Connected`)
-    /// against a mock transport with no live hub. Pair with [`disconnect`] for
-    /// the teardown half.
+    /// against a mock transport with no live hub. With `with_audio` false it
+    /// is `connect_network()`'s path instead: no audio is started. Pair with
+    /// [`disconnect`] for the teardown half.
     ///
     /// [`connect_with`]: Self::connect_with
     /// [`disconnect`]: Self::disconnect
     #[cfg(all(test, target_arch = "wasm32"))]
     pub(crate) async fn connect_with_test_transport(
         &self,
+        with_audio: bool,
         transport: Box<dyn Transport>,
         timeout_ms: i32,
     ) -> Result<(), JsValue> {
-        let capture = CaptureParams {
+        let capture = with_audio.then_some(CaptureParams {
             device_id: None,
             auto_gain_control: false,
             echo_cancellation: false,
             noise_suppression: false,
-        };
-        self.connect_with(|| Ok(transport), "test-host", DEFAULT_SIGNALING_PORT, "", Some(capture), timeout_ms)
-            .await
-    }
-
-    /// Like [`connect_with_test_transport`](Self::connect_with_test_transport),
-    /// over the network only (`connect()`'s path): no audio is started.
-    #[cfg(all(test, target_arch = "wasm32"))]
-    pub(crate) async fn connect_network_with_test_transport(
-        &self,
-        transport: Box<dyn Transport>,
-        timeout_ms: i32,
-    ) -> Result<(), JsValue> {
-        self.connect_with(|| Ok(transport), "test-host", DEFAULT_SIGNALING_PORT, "", None, timeout_ms)
+        });
+        self.connect_with(|| Ok(transport), "test-host", DEFAULT_SIGNALING_PORT, "", capture, timeout_ms)
             .await
     }
 
@@ -1035,14 +1050,25 @@ impl WebTripSession {
         let attached = self.published_buffers();
         let attached_id = attached.map(|p| p.id);
         let generation = self.engine_generation.get() + 1;
+        // From here the node being built may be handed these buffers, and a
+        // disconnect can end their connection before the engine is published:
+        // `end_connection` finds this and retires them against `generation`.
+        self.engine_generation.set(generation);
+        self.engine_attached.set(attached_id);
         let engine = match self
             .start_engine_unless_aborted(attached.map(|p| (p.ring, p.regulator)), capture, abort)
             .await
         {
             Ok(engine) => engine,
             Err((e, engine)) => {
-                if let Some(engine) = engine {
-                    self.stop_engine(engine, attached_id, generation).await;
+                match engine {
+                    Some(engine) => self.stop_engine(engine, attached_id, generation).await,
+                    None => {
+                        // No worklet was installed (an aborted bring-up never
+                        // installs one), so nothing retired against it is read.
+                        self.engine_attached.set(None);
+                        self.retired.borrow_mut().free_tagged(generation);
+                    }
                 }
                 return Err(e);
             }
@@ -1051,8 +1077,6 @@ impl WebTripSession {
         // Publish with no await in between, so `Running` is never observable
         // without the engine, and a connection published while the engine was
         // starting is picked up.
-        self.engine_generation.set(generation);
-        self.engine_attached.set(attached_id);
         *self.audio_engine.borrow_mut() = Some(engine);
         let mut failure = None;
         if self.published_buffers().map(|p| p.id) != attached_id {
@@ -1063,7 +1087,7 @@ impl WebTripSession {
         }
         if let Some(e) = failure {
             let engine = self.audio_engine.borrow_mut().take().expect("the engine just published");
-            let attached = self.engine_attached.take();
+            let attached = self.engine_attached.get();
             self.stop_engine(engine, attached, generation).await;
             return Err(e);
         }
@@ -1093,7 +1117,7 @@ impl WebTripSession {
 
         let engine = self.audio_engine.borrow_mut().take();
         if let Some(engine) = engine {
-            let attached = self.engine_attached.take();
+            let attached = self.engine_attached.get();
             self.stop_engine(engine, attached, self.engine_generation.get()).await;
         }
         // Audio is no longer running: a WebRTC connection falls back to the
@@ -1112,6 +1136,9 @@ impl WebTripSession {
     /// so a connection the node was `attached` to is held (see
     /// [`ConsumerHold`]) until the node's own `"stopped"` acknowledgement, if
     /// one ever comes.
+    ///
+    /// `engine_attached` stays set until the close has settled, so a connection
+    /// ended meanwhile is retired against `generation` rather than freed.
     async fn stop_engine(&self, mut engine: AudioEngine, attached: Option<u64>, generation: u64) {
         let had_node = engine.is_capturing();
         let (closed, stopped) = engine.stop_capture_acknowledged().await;
@@ -1120,28 +1147,27 @@ impl WebTripSession {
             // its sets retired because its worklet may still be popping, and
             // this (different) context closing proves nothing about it.
             self.retired.borrow_mut().free_tagged(generation);
-            return;
-        }
-        web_sys::console::warn_1(
-            &"⚠️ AudioContext.close timed out; keeping the buffers its worklet read alive until \
-              the worklet acknowledges it stopped"
-                .into(),
-        );
-        if let (true, Some(id)) = (had_node, attached) {
-            let hold = stopped.map_or(ConsumerHold::Forever, ConsumerHold::Until);
-            if let Some(connection) = self.connections.borrow_mut().iter_mut().find(|c| c.id == id) {
-                connection.hold = hold;
+        } else {
+            web_sys::console::warn_1(
+                &"⚠️ AudioContext.close timed out; keeping the buffers its worklet read alive until \
+                  the worklet acknowledges it stopped"
+                    .into(),
+            );
+            if let (true, Some(id)) = (had_node, attached) {
+                let hold = stopped.map_or(ConsumerHold::Forever, ConsumerHold::Until);
+                if let Some(connection) = self.connections.borrow_mut().iter_mut().find(|c| c.id == id) {
+                    connection.hold = hold;
+                }
             }
         }
+        self.engine_attached.set(None);
     }
 
     /// Point the engine's worklet node at the published connection's buffers,
     /// or at none when there is no such connection.
     fn attach_published(&self) -> Result<(), JsValue> {
         let target = self.published_buffers();
-        let (ring, regulator) = target
-            .map(|p| (p.ring, p.regulator))
-            .unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+        let (ring, regulator) = or_detached(target.map(|p| (p.ring, p.regulator)));
         let mut engine = self.audio_engine.borrow_mut();
         let Some(engine) = engine.as_mut() else { return Ok(()) };
         // The replaced node read no connection (a connection is only attached
@@ -1159,7 +1185,7 @@ impl WebTripSession {
             return Detached::NotAttached;
         }
         let mut engine = self.audio_engine.borrow_mut();
-        let Some(engine) = engine.as_mut() else { return Detached::NotAttached };
+        let Some(engine) = engine.as_mut() else { return Detached::InTransit };
         match engine.attach_network(std::ptr::null_mut(), std::ptr::null_mut()) {
             Ok(replaced) => {
                 self.engine_attached.set(None);
@@ -1195,15 +1221,18 @@ impl WebTripSession {
 
         let (abort, abort_fn, _reject) = crate::audio::make_promise();
         *self.abort_in_flight.borrow_mut() = Some(abort_fn.clone());
-        let started_audio = Cell::new(false);
         let result = self
-            .bring_up(epoch, new_transport, server, port, client_name, audio, &started_audio, abort, abort_fn, timeout_ms)
+            .bring_up(epoch, new_transport, server, port, client_name, audio, abort, abort_fn, timeout_ms)
             .await;
         self.abort_in_flight.borrow_mut().take();
 
         if result.is_err() {
-            // Audio this connect started goes with it.
-            if started_audio.get() {
+            // Audio this connect started goes with it, unless `stopAudio`
+            // took it out of the connect's hands (and the caller may have
+            // started audio of their own since). When a disconnect overtook
+            // this connect, the disconnect decides: `disconnect()` stops the
+            // audio, `disconnectNetwork()` leaves it running.
+            if self.lifecycle.is_current(epoch) && self.audio_owned_by_connect.replace(false) {
                 self.stop_audio_inner().await;
             }
             if self.lifecycle.abort_connect(epoch) {
@@ -1231,7 +1260,7 @@ impl WebTripSession {
     /// (under the connect timeout), and publish it, checking after every await
     /// that no disconnect has overtaken this connect (`epoch`). Anything
     /// created is released before an `Err` is returned, except audio this
-    /// connect started, which `started_audio` tells the caller to stop.
+    /// connect started, which `audio_owned_by_connect` tells the caller to stop.
     #[allow(clippy::too_many_arguments)]
     async fn bring_up(
         &self,
@@ -1241,7 +1270,6 @@ impl WebTripSession {
         port: u16,
         client_name: &str,
         audio: Option<CaptureParams>,
-        started_audio: &Cell<bool>,
         abort: js_sys::Promise,
         abort_fn: js_sys::Function,
         timeout_ms: i32,
@@ -1249,9 +1277,25 @@ impl WebTripSession {
         // Audio first, so a permission prompt is answered before the hub is
         // dialed, and under the same abort so `disconnect()` never waits on it.
         if let Some(capture) = audio {
+            // A `startAudio` already in flight is adopted rather than raced:
+            // wait for it (abortably, as it may sit on a permission prompt),
+            // then see whether it left audio running or failed.
+            while self.audio_lifecycle.phase() == AudioPhase::Starting {
+                unless_aborted(
+                    async {
+                        await_in_flight(&self.audio_start_in_flight).await;
+                        Ok(())
+                    },
+                    abort.clone(),
+                )
+                .await?;
+            }
             if self.audio_lifecycle.state() != AudioState::Running {
                 self.start_audio_with(capture, abort.clone(), abort_fn.clone()).await?;
-                started_audio.set(true);
+                // Owned from the moment it runs, so a `stopAudio` during the
+                // dial releases it and a later caller-started engine is not
+                // mistaken for this connect's.
+                self.audio_owned_by_connect.set(true);
             }
             if !self.lifecycle.is_current(epoch) {
                 return Err(cancelled_error());
@@ -1337,7 +1381,6 @@ impl WebTripSession {
             self.end_connection(connection, transport).await;
             return Err(e);
         }
-        self.audio_owned_by_connect.set(started_audio.get());
         self.refresh_tick_clock();
         emit_state(&self.on_state_change, SessionState::Connected);
         Ok(())
@@ -1459,6 +1502,7 @@ impl WebTripSession {
         let mut waits = Vec::new();
         let mut engine_tag = None;
         let mut never = matches!(detached, Detached::Failed);
+        let in_transit = matches!(detached, Detached::InTransit);
         if let Detached::Pending(stopped) = detached {
             waits.push(stopped);
             engine_tag = Some(self.engine_generation.get());
@@ -1474,7 +1518,15 @@ impl WebTripSession {
             ConsumerHold::Forever => never = true,
         }
 
-        if !producer_quiescent || never {
+        if in_transit && producer_quiescent && !never && waits.is_empty() {
+            // Freed by the closing (or failed-start) engine once it has proven
+            // its worklet gone.
+            self.retired.borrow_mut().retire_for(connection.buffers, self.engine_generation.get());
+            return;
+        }
+        // An engine in transit that an earlier engine's hold also covers has
+        // two proofs to wait for and only one is tracked: keep it alive.
+        if !producer_quiescent || never || in_transit {
             self.retired.borrow_mut().retire(connection.buffers);
             web_sys::console::warn_1(
                 &"⚠️ Teardown was not clean (the transport worker was force-terminated or an audio \
@@ -1545,7 +1597,7 @@ impl WebTripSession {
     /// from installing a worklet against buffers that are about to be freed.
     async fn start_engine_unless_aborted(
         &self,
-        network: Option<(*mut RingBuffer, *mut Regulator)>,
+        network: Option<NetworkBuffers>,
         capture: CaptureParams,
         abort: js_sys::Promise,
     ) -> Result<AudioEngine, (JsValue, Option<AudioEngine>)> {
@@ -1728,18 +1780,14 @@ impl Drop for WebTripSession {
         let generation = self.engine_generation.get();
         let retired = Rc::clone(&self.retired);
         // Each connection's buffers, retired, and whether anything but this
-        // engine's own close could still be reading them.
-        let sets: Vec<(u64, Option<u64>)> = self
+        // engine's own close could still be reading them (`hold`).
+        let sets: Vec<(u64, u64, ConsumerHold)> = self
             .connections
             .get_mut()
             .drain(..)
             .map(|connection| {
-                let id = connection.id;
-                let held = !matches!(connection.hold, ConsumerHold::Clear);
                 let key = retired.borrow_mut().retire(connection.buffers);
-                // A held set stays retired: an earlier engine's worklet may
-                // still be popping it.
-                (key, (!held).then_some(id))
+                (key, connection.id, connection.hold)
             })
             .collect();
         wasm_bindgen_futures::spawn_local(async move {
@@ -1755,16 +1803,26 @@ impl Drop for WebTripSession {
                 // A force-terminated worker may still be pushing: leak.
                 return;
             }
-            for (key, id) in sets {
-                let Some(id) = id else { continue };
+            for (key, id, hold) in sets {
                 let read_by_engine = attached == Some(id);
-                if consumer_quiescent || !read_by_engine {
-                    retired.borrow_mut().free(key);
-                } else if let Some(stopped) = stopped.clone() {
-                    // Only the close failed: the worklet's `"stopped"` still
-                    // proves it is done with this set. Otherwise a worklet may
-                    // still be popping and it is leaked rather than freed.
-                    free_when_stopped(&retired, key, vec![stopped]);
+                match hold {
+                    ConsumerHold::Clear => {
+                        if consumer_quiescent || !read_by_engine {
+                            retired.borrow_mut().free(key);
+                        } else if let Some(stopped) = stopped.clone() {
+                            // Only the close failed: the worklet's `"stopped"`
+                            // still proves it is done with this set. Otherwise
+                            // a worklet may still be popping and it is leaked
+                            // rather than freed.
+                            free_when_stopped(&retired, key, vec![stopped]);
+                        }
+                    }
+                    // An earlier engine's close timed out: only its own
+                    // acknowledgement frees the set, as in `end_connection`.
+                    // Also read by this engine, two proofs are needed and only
+                    // one is tracked: keep it alive.
+                    ConsumerHold::Until(earlier) if !read_by_engine => free_when_stopped(&retired, key, vec![earlier]),
+                    ConsumerHold::Until(_) | ConsumerHold::Forever => {}
                 }
             }
             if consumer_quiescent {
@@ -1877,26 +1935,17 @@ mod tests {
         output
     }
 
-    /// Spawn a mock connect on `session` (see [`spawn`]).
+    /// Spawn a mock connect on `session` (see [`spawn`]); `with_audio` false
+    /// is the network-only connect.
     #[cfg(target_arch = "wasm32")]
     fn spawn_connect(
         session: &Rc<WebTripSession>,
+        with_audio: bool,
         transport: MockTransport,
         timeout_ms: i32,
     ) -> Rc<RefCell<Option<Result<(), JsValue>>>> {
         let session = session.clone();
-        spawn(async move { session.connect_with_test_transport(Box::new(transport), timeout_ms).await })
-    }
-
-    /// Spawn a network-only mock connect on `session` (see [`spawn`]).
-    #[cfg(target_arch = "wasm32")]
-    fn spawn_network_connect(
-        session: &Rc<WebTripSession>,
-        transport: MockTransport,
-        timeout_ms: i32,
-    ) -> Rc<RefCell<Option<Result<(), JsValue>>>> {
-        let session = session.clone();
-        spawn(async move { session.connect_network_with_test_transport(Box::new(transport), timeout_ms).await })
+        spawn(async move { session.connect_with_test_transport(with_audio, Box::new(transport), timeout_ms).await })
     }
 
     /// Start audio with no capture options and no device (the fake one).
@@ -1969,7 +2018,7 @@ mod tests {
         let transport = MockTransport::new();
         let probe = transport.probe();
         session
-            .connect_with_test_transport(Box::new(transport), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(true, Box::new(transport), CONNECT_TIMEOUT_MS)
             .await
             .expect("mock connect should succeed");
 
@@ -2058,7 +2107,7 @@ mod tests {
         let session = new_session(&params);
 
         session
-            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(true, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("first mock connect should succeed");
 
@@ -2088,7 +2137,7 @@ mod tests {
         );
 
         session
-            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(true, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("reconnect after a closed context must succeed");
         assert_eq!(session.get_state(), "connected");
@@ -2118,7 +2167,7 @@ mod tests {
         let session = new_session(&params);
 
         session
-            .connect_with_test_transport(Box::new(MockTransport::new().with_forced_close()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(true, Box::new(MockTransport::new().with_forced_close()), CONNECT_TIMEOUT_MS)
             .await
             .expect("mock connect should succeed");
         session.disconnect().await;
@@ -2138,7 +2187,7 @@ mod tests {
         let params = AudioParams::default();
         let session = new_session(&params);
         session
-            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(true, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("mock connect should succeed");
 
@@ -2201,7 +2250,7 @@ mod tests {
         let (dial_gate, finish_dial) = gate();
         let transport = MockTransport::new().with_connect_gate(dial_gate);
         let probe = transport.probe();
-        let connect = spawn_network_connect(&session, transport, CONNECT_TIMEOUT_MS);
+        let connect = spawn_connect(&session, false, transport, CONNECT_TIMEOUT_MS);
         assert!(wait_until(|| probe.connects.get() == 1, 1000, 1).await, "the dial never started");
 
         session.disconnect().await;
@@ -2235,7 +2284,7 @@ mod tests {
         let dial_flag = dial_succeeded.clone();
         probe.on_connected(move || dial_flag.set(true));
 
-        let connect = spawn_network_connect(&session, transport, CONNECT_TIMEOUT_MS);
+        let connect = spawn_connect(&session, false, transport, CONNECT_TIMEOUT_MS);
         assert!(wait_until(|| probe.connects.get() == 1, 1000, 1).await, "the dial never started");
 
         // Open the dial, then disconnect in the same turn (no yield between):
@@ -2268,75 +2317,39 @@ mod tests {
         );
     }
 
-    /// `setOutputDevice` during `Connecting` must reject without overwriting
-    /// the stored sink: a store-only update would be lost (no published
-    /// engine) or force a deferred re-apply that races connect/disconnect
-    /// (WEB-72). Idle store and post-connect apply remain allowed.
+    /// `setOutputDevice` is not gated on the network: while a `connectNetwork`
+    /// dial is in flight over audio that is already running, the live engine
+    /// is rerouted (PR 121 review). The Starting rejection is covered by
+    /// `session_stop_audio_cancels_a_pending_start`.
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
-    async fn session_set_output_device_rejected_while_connecting() {
+    async fn session_set_output_device_applies_while_dialing_over_running_audio() {
         let params = AudioParams::default();
         let session = new_session(&params);
 
-        session
-            .set_output_device(Some("speaker-before-connect".to_string()))
-            .await
-            .expect("setOutputDevice while Idle must store the sink");
-        assert_eq!(
-            session.stored_output_device_id().as_deref(),
-            Some("speaker-before-connect")
-        );
-        // Clear before dialing so `start_capture` does not call `setSinkId`
-        // with a synthetic id the browser would reject.
-        session
-            .set_output_device(None)
-            .await
-            .expect("clearing the stored sink while Idle must succeed");
-
-        let (capture_gate, finish_capture) = gate();
-        session.set_capture_gate(capture_gate);
-
-        let connect = spawn_connect(&session, MockTransport::new(), CONNECT_TIMEOUT_MS);
-        assert!(
-            wait_until(|| session.is_capture_waiting(), 2000, 5).await,
-            "bring-up never reached the capture gate"
-        );
+        start_audio(&session).await.expect("audio should start");
+        let (dial_gate, finish_dial) = gate();
+        let transport = MockTransport::new().with_connect_gate(dial_gate);
+        let probe = transport.probe();
+        let connect = spawn_connect(&session, false, transport, CONNECT_TIMEOUT_MS);
+        assert!(wait_until(|| probe.connects.get() == 1, 3000, 5).await, "the dial never started");
         assert_eq!(session.get_state(), "connecting");
 
-        let err = session
-            .set_output_device(Some("speaker-during-connect".to_string()))
-            .await
-            .expect_err("setOutputDevice while Connecting must reject");
-        let message = js_sys::Reflect::get(&err, &"message".into())
-            .ok()
-            .and_then(|v| v.as_string())
-            .unwrap_or_default();
-        assert!(
-            message.contains("while connecting"),
-            "rejection must name the Connecting restriction, got {message:?}"
-        );
-        assert_eq!(
-            session.stored_output_device_id(),
-            None,
-            "a rejected setOutputDevice must not overwrite the stored sink"
-        );
-
-        let _ = finish_capture.call0(&JsValue::NULL);
-        settled(&connect, "connect after rejected setOutputDevice")
-            .await
-            .expect("connect must succeed after the capture gate opens");
-        assert_eq!(session.get_state(), "connected");
-
-        // Connected still accepts changes (default sink via `None` so we need
-        // no real device id / `setSinkId` stub).
+        // `None` selects the default sink, so no real device id is needed.
         session
             .set_output_device(None)
             .await
-            .expect("setOutputDevice while Connected must still apply");
+            .expect("setOutputDevice while dialing over running audio must apply");
         assert_eq!(session.stored_output_device_id(), None);
 
+        let _ = finish_dial.call0(&JsValue::NULL);
+        settled(&connect, "connect after setOutputDevice")
+            .await
+            .expect("connect must succeed after the dial gate opens");
+        assert_eq!(session.get_state(), "connected");
+
         session.disconnect().await;
-        assert_eq!(session.get_state(), "idle");
+        session.stop_audio().await;
     }
 
     /// A disconnect while capture is stuck (gated mid-bring-up, as when the
@@ -2356,7 +2369,7 @@ mod tests {
 
         let transport = MockTransport::new();
         let probe = transport.probe();
-        let connect = spawn_connect(&session, transport, CONNECT_TIMEOUT_MS);
+        let connect = spawn_connect(&session, true, transport, CONNECT_TIMEOUT_MS);
         assert!(
             wait_until(|| session.is_capture_waiting(), 2000, 5).await,
             "bring-up never reached the capture gate"
@@ -2382,7 +2395,7 @@ mod tests {
         // A later connect is admitted while the abandoned bring-up is still
         // blocked on the gate.
         session
-            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(true, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("connect after aborting a gated capture should succeed");
         assert_eq!(session.get_state(), "connected");
@@ -2409,7 +2422,7 @@ mod tests {
         let (dial_gate, _never_opened) = gate();
         let transport = MockTransport::new().with_connect_gate(dial_gate);
         let probe = transport.probe();
-        let connect = spawn_connect(&session, transport, CONNECT_TIMEOUT_MS);
+        let connect = spawn_connect(&session, true, transport, CONNECT_TIMEOUT_MS);
         assert!(wait_until(|| probe.connects.get() == 1, 3000, 5).await, "the dial never started");
         assert_eq!(session.get_audio_state(), "running", "audio must be up before the hub is dialed");
 
@@ -2422,6 +2435,119 @@ mod tests {
         assert_eq!(session.get_audio_state(), "stopped");
         assert_eq!(session.get_state(), "idle");
         assert_log(&log, &["connecting", "disconnecting", "idle"], "around a cancelled dial");
+    }
+
+    /// Regression (PR 121 review): `disconnectNetwork()` cancelling a dial
+    /// cancels the connect but leaves the audio it started running, as it does
+    /// for a connect that completed; the audio is then the caller's to stop.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_disconnect_network_during_the_dial_leaves_the_connect_audio_running() {
+        let params = AudioParams::default();
+        let session = new_session(&params);
+
+        let (dial_gate, _never_opened) = gate();
+        let transport = MockTransport::new().with_connect_gate(dial_gate);
+        let probe = transport.probe();
+        let connect = spawn_connect(&session, true, transport, CONNECT_TIMEOUT_MS);
+        assert!(wait_until(|| probe.connects.get() == 1, 3000, 5).await, "the dial never started");
+
+        session.disconnect_network().await;
+        let (name, message) = rejection(settled(&connect, "cancelled connect").await);
+        assert_eq!(name, "AbortError", "unexpected rejection: {message}");
+        assert_eq!(probe.closes.get(), 1, "the cancelled connect must close its transport");
+        assert_eq!(session.get_state(), "idle");
+        assert_eq!(session.get_audio_state(), "running", "disconnectNetwork stopped the connect's audio");
+        session.stop_audio().await;
+    }
+
+    /// Regression (PR 121 review): `stopAudio` during the dial takes the
+    /// connect's audio out of its hands, so audio the caller starts afterwards
+    /// is theirs, and neither the connect completing nor `disconnect()` stops it.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_audio_restarted_during_the_dial_is_not_owned_by_the_connect() {
+        let params = AudioParams::default();
+        let session = new_session(&params);
+
+        let (dial_gate, open_dial) = gate();
+        let transport = MockTransport::new().with_connect_gate(dial_gate);
+        let probe = transport.probe();
+        let connect = spawn_connect(&session, true, transport, CONNECT_TIMEOUT_MS);
+        assert!(wait_until(|| probe.connects.get() == 1, 3000, 5).await, "the dial never started");
+
+        session.stop_audio().await;
+        start_audio(&session).await.expect("the caller restarts audio");
+        let _ = open_dial.call0(&JsValue::NULL);
+        settled(&connect, "connect").await.expect("the connect completes");
+
+        session.disconnect().await;
+        assert_eq!(session.get_audio_state(), "running", "disconnect stopped audio the caller started");
+        session.stop_audio().await;
+    }
+
+    /// Regression (PR 121 review): a `connect()` issued while a `startAudio()`
+    /// is in flight adopts that start instead of failing with "already
+    /// starting", and the audio stays the caller's: `disconnect()` leaves it
+    /// running.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_connect_adopts_an_audio_start_in_flight() {
+        let params = AudioParams::default();
+        let session = new_session(&params);
+
+        let (capture_gate, finish_capture) = gate();
+        session.set_capture_gate(capture_gate);
+        let pending = {
+            let session = session.clone();
+            spawn(async move { start_audio(&session).await })
+        };
+        assert!(wait_until(|| session.is_capture_waiting(), 3000, 5).await, "bring-up never reached the gate");
+
+        let connect = spawn_connect(&session, true, MockTransport::new(), CONNECT_TIMEOUT_MS);
+        crate::test_support::sleep_ms(50).await;
+        assert!(connect.borrow().is_none(), "the connect must wait for the start, not fail or race it");
+
+        let _ = finish_capture.call0(&JsValue::NULL);
+        settled(&pending, "start").await.expect("the start completes");
+        settled(&connect, "connect").await.expect("the connect adopts the start");
+
+        session.disconnect().await;
+        assert_eq!(session.get_audio_state(), "running", "disconnect stopped audio the caller started");
+        session.stop_audio().await;
+    }
+
+    /// Regression (PR 121 review): a `disconnect()` that arrives while a
+    /// `disconnectNetwork()` teardown is in flight was still asked to stop the
+    /// audio the connect started, so that audio stops.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_disconnect_joining_a_network_disconnect_still_stops_connect_audio() {
+        let params = AudioParams::default();
+        let session = new_session(&params);
+        let (close_gate, finish_close) = gate();
+        session
+            .connect_with_test_transport(true, Box::new(MockTransport::new().with_close_gate(close_gate)), CONNECT_TIMEOUT_MS)
+            .await
+            .expect("connect should succeed");
+        assert_eq!(session.get_audio_state(), "running");
+
+        let network = {
+            let session = session.clone();
+            spawn(async move { session.disconnect_network().await })
+        };
+        crate::test_support::sleep_ms(30).await;
+        let full = {
+            let session = session.clone();
+            spawn(async move { session.disconnect().await })
+        };
+        crate::test_support::sleep_ms(30).await;
+        let _ = finish_close.call0(&JsValue::NULL);
+        settled(&network, "disconnectNetwork").await;
+        settled(&full, "disconnect").await;
+
+        assert_eq!(session.get_state(), "idle");
+        assert_eq!(session.get_audio_state(), "stopped", "disconnect() was asked to stop the connect's audio");
     }
 
     /// A transport failure reported after the dial succeeded but before the
@@ -2441,7 +2567,7 @@ mod tests {
         let reporter = probe.clone();
         probe.on_connected(move || reporter.report(TransportState::Failed));
 
-        let result = session.connect_with_test_transport(Box::new(transport), CONNECT_TIMEOUT_MS).await;
+        let result = session.connect_with_test_transport(true, Box::new(transport), CONNECT_TIMEOUT_MS).await;
         let (name, message) = rejection(result);
         assert_eq!(name, "Error", "a failed bring-up is a failure, not a cancellation: {message}");
         assert_eq!(probe.closes.get(), 1, "the failed connect must close its transport");
@@ -2464,7 +2590,7 @@ mod tests {
         let (dial_gate, _never_opened) = gate();
         let transport = MockTransport::new().with_connect_gate(dial_gate);
         let probe = transport.probe();
-        let result = session.connect_with_test_transport(Box::new(transport), 20).await;
+        let result = session.connect_with_test_transport(true, Box::new(transport), 20).await;
 
         let (name, message) = rejection(result);
         assert_eq!(name, "TimeoutError", "unexpected rejection: {message}");
@@ -2490,13 +2616,13 @@ mod tests {
         let (dial_gate, finish_dial) = gate();
         let first = MockTransport::new().with_connect_gate(dial_gate);
         let first_probe = first.probe();
-        let first_connect = spawn_connect(&session, first, CONNECT_TIMEOUT_MS);
+        let first_connect = spawn_connect(&session, true, first, CONNECT_TIMEOUT_MS);
         assert!(wait_until(|| first_probe.connects.get() == 1, 3000, 5).await, "the dial never started");
 
         let overlapping = MockTransport::new();
         let overlapping_probe = overlapping.probe();
         let (name, message) = rejection(
-            session.connect_with_test_transport(Box::new(overlapping), CONNECT_TIMEOUT_MS).await,
+            session.connect_with_test_transport(true, Box::new(overlapping), CONNECT_TIMEOUT_MS).await,
         );
         assert_eq!(name, "Error", "a rejected connect is a failure, not a cancellation");
         assert!(message.contains("already in progress"), "unexpected rejection: {message}");
@@ -2512,7 +2638,7 @@ mod tests {
         let from_error = MockTransport::new();
         let from_error_probe = from_error.probe();
         let (_, message) = rejection(
-            session.connect_with_test_transport(Box::new(from_error), CONNECT_TIMEOUT_MS).await,
+            session.connect_with_test_transport(true, Box::new(from_error), CONNECT_TIMEOUT_MS).await,
         );
         assert!(message.contains("disconnect()"), "unexpected rejection: {message}");
         assert_eq!(from_error_probe.connects.get(), 0, "a connect from error must not dial");
@@ -2521,7 +2647,7 @@ mod tests {
         // Recovery, and isolation from the old transport.
         session.disconnect().await;
         session
-            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(true, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("connect after clearing the error should succeed");
         first_probe.report(TransportState::Failed);
@@ -2553,7 +2679,7 @@ mod tests {
         let transport = MockTransport::new().with_close_gate(close_gate);
         let probe = transport.probe();
         session
-            .connect_with_test_transport(Box::new(transport), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(true, Box::new(transport), CONNECT_TIMEOUT_MS)
             .await
             .expect("mock connect should succeed");
 
@@ -2562,7 +2688,7 @@ mod tests {
         let second_disconnect = spawn_disconnect(&session);
         let next = MockTransport::new();
         let next_probe = next.probe();
-        let reconnect = spawn_connect(&session, next, CONNECT_TIMEOUT_MS);
+        let reconnect = spawn_connect(&session, true, next, CONNECT_TIMEOUT_MS);
 
         crate::test_support::sleep_ms(20).await;
         assert_eq!(session.get_state(), "disconnecting");
@@ -2661,7 +2787,7 @@ mod tests {
         let transport = MockTransport::new().with_close_gate(close_gate);
         let probe = transport.probe();
         session
-            .connect_with_test_transport(Box::new(transport), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(true, Box::new(transport), CONNECT_TIMEOUT_MS)
             .await
             .expect("mock connect should succeed");
         assert_log(&log, &["connecting", "connected"], "after connect");
@@ -2697,7 +2823,7 @@ mod tests {
         let session = new_session(&params);
 
         session
-            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(true, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("first connect should succeed");
         assert_eq!(session.peer_shape(), Some((2, 128, false)), "before any packet: the construction geometry");
@@ -2707,7 +2833,7 @@ mod tests {
         assert_eq!(session.peer_shape(), None, "no connection, no regulator");
 
         session
-            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(true, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("reconnect should succeed");
         assert_eq!(session.peer_shape(), Some((2, 128, false)), "a reconnect starts from a fresh regulator");
@@ -2747,7 +2873,7 @@ mod tests {
         let (never, late) = gate();
         session.retire_until_stopped(StreamBuffers::new(1, 2, 128), vec![never], None);
         session
-            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(true, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("connect should succeed");
         assert_eq!(session.retired_count(), 1);
@@ -2774,7 +2900,7 @@ mod tests {
         let transport = MockTransport::new();
         let probe = transport.probe();
         session
-            .connect_network_with_test_transport(Box::new(transport), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(false, Box::new(transport), CONNECT_TIMEOUT_MS)
             .await
             .expect("a network-only connect should succeed");
         assert_eq!(session.get_state(), "connected");
@@ -2826,7 +2952,7 @@ mod tests {
         assert!(start_audio(&session).await.is_err(), "a second start must be refused");
 
         session
-            .connect_network_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(false, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("connecting with audio running should succeed");
         assert_eq!(session.engine_attached(), session.connection_id());
@@ -2847,7 +2973,7 @@ mod tests {
 
         // A second connection attaches to the same engine.
         session
-            .connect_network_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(false, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("reconnecting with audio running should succeed");
         assert_eq!(session.engine_attached(), session.connection_id());
@@ -2871,7 +2997,7 @@ mod tests {
         start_audio(&session).await.expect("audio should start");
 
         session
-            .connect_network_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(false, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("first connect should succeed");
         session.push_peer_packet(0, 2, 128);
@@ -2879,7 +3005,7 @@ mod tests {
         session.disconnect().await;
 
         session
-            .connect_network_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(false, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("reconnect should succeed");
         assert_eq!(session.peer_shape(), Some((2, 128, false)), "a reconnect starts from a fresh regulator");
@@ -2900,7 +3026,7 @@ mod tests {
         let session = new_session(&params);
 
         session
-            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(true, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("connect should succeed");
         assert_eq!(session.get_audio_state(), "running");
@@ -2910,7 +3036,7 @@ mod tests {
 
         start_audio(&session).await.expect("audio should start");
         session
-            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(true, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("connect with audio already running should succeed");
         session.disconnect().await;
@@ -2920,7 +3046,7 @@ mod tests {
         // audio running, and hands it to the caller: a later `disconnect()` is
         // a no-op for audio.
         session
-            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(true, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("connect should succeed");
         session.disconnect_network().await;
@@ -2933,7 +3059,7 @@ mod tests {
         // An explicit stop takes audio out of a connect's hands: the
         // connection stays up and a later disconnect leaves audio alone.
         session
-            .connect_network_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .connect_with_test_transport(false, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
             .expect("network connect should succeed");
         session.stop_audio().await;
@@ -2979,5 +3105,45 @@ mod tests {
         let _ = finish_capture.call0(&JsValue::NULL);
         crate::test_support::sleep_ms(50).await;
         session.stop_audio().await;
+    }
+
+    /// Regression (PR 121 review): a start that has been handed a connection's
+    /// buffers but has not published its engine yet is still a reader of them,
+    /// so ending that connection retires them against the starting engine
+    /// instead of freeing them under the node about to be built. The engine's
+    /// close then frees them.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_disconnect_during_an_audio_start_keeps_the_buffers_for_the_engine() {
+        let params = AudioParams::default();
+        let session = new_session(&params);
+        session
+            .connect_with_test_transport(false, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .await
+            .expect("network connect should succeed");
+
+        let (capture_gate, finish_capture) = gate();
+        session.set_capture_gate(capture_gate);
+        let pending = {
+            let session = session.clone();
+            spawn(async move { start_audio(&session).await })
+        };
+        assert!(
+            wait_until(|| session.is_capture_waiting(), 3000, 5).await,
+            "bring-up never reached the capture gate"
+        );
+
+        session.disconnect_network().await;
+        assert_eq!(
+            session.retired_count(),
+            1,
+            "the starting engine was handed these buffers: they must not be freed before it closes"
+        );
+
+        let _ = finish_capture.call0(&JsValue::NULL);
+        settled(&pending, "start").await.expect("the start completes");
+        assert_eq!(session.engine_attached(), None, "the engine must end up reading no connection");
+        session.stop_audio().await;
+        assert_eq!(session.retired_count(), 0, "the engine's fulfilled close frees what was retired against it");
     }
 }
