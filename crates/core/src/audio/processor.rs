@@ -198,7 +198,7 @@ impl AudioProcessor {
         // empty and the mixer skips the conform entirely. The ring is read
         // through its `&self` API (sound shared borrow, see `RingBuffer`).
         let ring = self.local_to_network_buffer.as_ref().filter(|ring| ring.is_streaming());
-        let wire_channels = (self.params.get_send_channels() as usize).max(1);
+        let wire_channels = ring.map_or(1, |ring| ring.wire_channels());
         // The mixer yields a varying number of wire frames per call when it
         // converts rates; the staging buffer holds the most it can.
         let wire_out_len = wire_frames_per_callback(frames, self.device_rate, self.wire_rate) * wire_channels;
@@ -415,10 +415,10 @@ mod tests {
         const MONITOR: f32 = 0.5;
 
         let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
-        params.set_send_channels(2); // wire width matches the capture width here
         params.set_monitor_volume(MONITOR);
 
         let mut ring = RingBuffer::new();
+        ring.set_wire_format(2);
         let mut processor = networked_processor(params, &mut ring);
 
         let input = planar_capture(&[LEFT, RIGHT], FRAMES);
@@ -467,7 +467,7 @@ mod tests {
     }
 
     /// Regression test: the transports frame every outbound packet at the
-    /// session's fixed send width (`AudioParams::send_channels`, chosen at
+    /// session's fixed send width (`RingBuffer::wire_channels`, chosen at
     /// connect time), so when the capture is NARROWER than the send width —
     /// a mono-only device against a stereo send — `process` must conform
     /// before writing. Writing `frames * in_channels`
@@ -479,9 +479,9 @@ mod tests {
         const LEVEL: f32 = 0.4;
 
         let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
-        params.set_send_channels(2); // the wire is stereo …
 
         let mut ring = RingBuffer::new();
+        ring.set_wire_format(2); // the wire is stereo …
         let mut processor = networked_processor(params, &mut ring);
 
         // … but the browser granted mono.
@@ -514,8 +514,8 @@ mod tests {
         const WIDE: usize = MAX_DEVICE_CHANNELS as usize;
 
         let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
-        params.set_send_channels(2);
         let mut ring = RingBuffer::new();
+        ring.set_wire_format(2);
         let mut processor = networked_processor(params, &mut ring);
         let lens = |p: &AudioProcessor| [p.remote_interleaved.len(), p.wire_staging.len()];
         let before = lens(&processor);
@@ -538,8 +538,8 @@ mod tests {
         const LEVEL: f32 = 0.25;
 
         let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
-        params.set_send_channels(1);
         let mut ring = RingBuffer::new();
+        ring.set_wire_format(1);
         let mut processor = networked_processor(params, &mut ring);
 
         let input = planar_capture(&[LEVEL], FRAMES);

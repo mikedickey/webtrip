@@ -207,7 +207,7 @@ fn signal_connection_lost() {
 /// Whether the worker may post `"disconnected"` to the main thread.
 ///
 /// The ack is the synchronization point the session awaits before
-/// `Regulator::reset()`: both the send loop (after flushing exit packets) and
+/// freeing the connection's buffers: both the send loop (after flushing exit packets) and
 /// the receive loop must have exited. Posting earlier would let a still-running
 /// receive task push into the regulator after the main thread proceeds.
 fn should_post_disconnected(
@@ -389,7 +389,7 @@ impl WorkerState {
     ) {
         // SAFETY: addresses published by the main-thread session from buffers
         // it owns; the worker is terminated (and its loops exit) before those
-        // buffers are dropped or `Regulator::reset` runs.
+        // buffers are freed.
         self.ring_buffer_ptr = unsafe { SharedPtr::from_addr(ring_ptr) };
         self.regulator_ptr = unsafe { SharedPtr::from_addr(reg_ptr) };
         self.send_channels = send_channels;

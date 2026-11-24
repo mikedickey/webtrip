@@ -322,7 +322,7 @@ impl AudioEngine {
         // `map_to_output`'s job) at the requested width, clamped to the device.
         self.requested_output_channels = output_channels;
         let output_channels = self.configure_destination(output_channels)?;
-        self.build_and_connect_worklet_node(worklet_input_channels as usize, output_channels as usize)?;
+        let _ = self.build_and_connect_worklet_node(worklet_input_channels as usize, output_channels as usize)?;
 
         // Resume the audio context.
         // On iOS Safari, AudioContext.resume() returns a promise that *never* resolves when
@@ -369,7 +369,15 @@ impl AudioEngine {
     /// count) — `outputChannelCount`/`channelCount` are construction-time
     /// only on `AudioWorkletNode`, so a width change means a new node, not a
     /// reconfigure.
-    fn build_and_connect_worklet_node(&mut self, input_channels: usize, output_channels: usize) -> Result<(), JsValue> {
+    ///
+    /// Returns the replaced node's port (see
+    /// [`teardown_worklet_node`](Self::teardown_worklet_node)), or `None` when
+    /// there was no previous node.
+    fn build_and_connect_worklet_node(
+        &mut self,
+        input_channels: usize,
+        output_channels: usize,
+    ) -> Result<Option<web_sys::MessagePort>, JsValue> {
         // Create processor with network support. `AudioEngine` stores raw
         // buffer pointers (it is a `#[wasm_bindgen]` boundary type); wrap them
         // in `SharedPtr` here so the processor and the flag read below go
@@ -426,15 +434,13 @@ impl AudioEngine {
         }
         worklet_node.connect_with_audio_node(&self.ctx.destination())?;
 
-        if let Some(ref old_node) = self.worklet_node {
-            self.teardown_worklet_node(old_node);
-        }
+        let stopped = self.worklet_node.as_ref().and_then(|old_node| self.teardown_worklet_node(old_node));
 
         self.worklet_node = Some(worklet_node);
         self.worklet_input_channels = input_channels;
         self.worklet_output_channels = output_channels;
 
-        Ok(())
+        Ok(stopped)
     }
 
     /// Fully detach `node` from the audio graph: post `"stop"` on its port
@@ -451,14 +457,23 @@ impl AudioEngine {
     /// the send ring buffer every callback alongside its replacement.
     ///
     /// [`Regulator`]: webtrip_core::stream::regulator::Regulator
-    fn teardown_worklet_node(&self, node: &AudioWorkletNode) {
-        if let Ok(port) = node.port() {
+    ///
+    /// Returns the node's port, on which the processor replies `"stopped"`
+    /// (see `worklet.js`); [`stopped_acknowledgement`] turns that into a
+    /// promise. The reply is *not* wired here: its one-shot closure is leaked
+    /// until it fires, and a reply that is never delivered (a context about to
+    /// close) would leak it for good, so only a caller that will consume the
+    /// acknowledgement wires it.
+    fn teardown_worklet_node(&self, node: &AudioWorkletNode) -> Option<web_sys::MessagePort> {
+        let port = node.port().ok();
+        if let Some(ref port) = port {
             let _ = port.post_message(&JsValue::from_str("stop"));
         }
         if let Some(ref source) = self.source_node {
             let _ = source.disconnect_with_audio_node(node);
         }
         let _ = node.disconnect();
+        port
     }
 
     /// Check whether the AudioContext is still suspended (e.g. waiting for a user gesture on iOS).
@@ -483,15 +498,15 @@ impl AudioEngine {
     /// becomes inert within one render quantum, then awaits
     /// [`AudioContext.close`](https://developer.mozilla.org/en-US/docs/Web/API/AudioContext/close)
     /// (with a timeout) so the worklet global scope is destroyed before the
-    /// caller may [`Regulator::reset`](webtrip_core::stream::regulator::Regulator::reset)
-    /// (WEB-53 Bug 7 / WEB-66). Closing — not merely suspending — also
+    /// caller frees the connection's stream buffers (WEB-53 Bug 7 / WEB-66).
+    /// Closing — not merely suspending — also
     /// prevents a leaked context from being resumed and racing a freed
     /// regulator as a second consumer.
     ///
     /// Returns `true` only when `close()`'s promise **fulfilled** (worklet
     /// quiescence established). A timeout or rejection returns `false`; the
-    /// caller must not [`Regulator::reset`](webtrip_core::stream::regulator::Regulator::reset)
-    /// in that case.
+    /// caller must keep the stream buffers retired rather than free them in
+    /// that case.
     ///
     /// This is terminal for the engine: a closed context cannot be restarted.
     /// Callers that only need to rebuild capture on the same context (e.g.
@@ -509,23 +524,66 @@ impl AudioEngine {
         close_audio_context(&self.ctx, timeout_ms).await
     }
 
+    /// Like [`stop_capture`](Self::stop_capture), but when the close did not
+    /// fulfil also returns the worklet node's `"stopped"` acknowledgement
+    /// (`None` when the close fulfilled, or no node was built). That
+    /// acknowledgement is then the only proof the render thread has stopped
+    /// touching the stream buffers: once it settles they may be freed even
+    /// though the close never did. It is wired only in that case, since after
+    /// a fulfilled close the reply is never delivered and nobody needs it.
+    pub(crate) async fn stop_capture_acknowledged(&mut self) -> (bool, Option<js_sys::Promise>) {
+        let port = self.stop_nodes();
+        let closed = close_audio_context(&self.ctx, AUDIO_CONTEXT_CLOSE_TIMEOUT_MS).await;
+        let stopped = if closed { None } else { port.map(|port| stopped_acknowledgement(&port)) };
+        (closed, stopped)
+    }
+
     /// Tear down the worklet and media tracks and fire `AudioContext.close()`
     /// without awaiting it (skipped when already closed). Used from [`Drop`]
     /// and other sync paths that cannot await; prefer
     /// [`stop_capture`](Self::stop_capture) whenever async is available so
-    /// close can finish (or time out) before
-    /// [`Regulator::reset`](webtrip_core::stream::regulator::Regulator::reset).
+    /// close can finish (or time out) before the buffers are freed.
     pub(crate) fn stop_capture_now(&mut self) {
         self.stop_nodes();
         close_audio_context_now(&self.ctx);
     }
 
+    /// Point the engine at a connection's stream buffers (or, with null
+    /// pointers, at none), rebuilding the running node against them.
+    ///
+    /// A processor's stream list is immutable for the life of its node, so
+    /// attaching or detaching a connection while capture runs replaces the
+    /// node (the same rebuild an output-device change causes). Returns the
+    /// replaced node's `"stopped"` acknowledgement: once it settles, the
+    /// previous buffers are no longer referenced by the render thread. With no
+    /// node running, only the pointers are stored (the first node built picks
+    /// them up) and there is nothing to acknowledge.
+    ///
+    /// Not yet called by the session: connect still brings the engine up
+    /// after the dial, against the new connection's buffers directly. The
+    /// device/network split is what makes this the hot path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn attach_network(
+        &mut self,
+        local_to_network: *mut RingBuffer,
+        network_to_local: *mut Regulator,
+    ) -> Result<Option<js_sys::Promise>, JsValue> {
+        self.local_to_network_buffer_ptr = local_to_network;
+        self.network_to_local_buffer_ptr = network_to_local;
+        if self.worklet_node.is_none() {
+            return Ok(None);
+        }
+        let port = self.build_and_connect_worklet_node(self.worklet_input_channels, self.worklet_output_channels)?;
+        Ok(port.map(|port| stopped_acknowledgement(&port)))
+    }
+
     /// Disconnect the worklet / media graph without closing the AudioContext.
     /// Safe to call when capture will be restarted on the same engine.
-    fn stop_nodes(&mut self) {
-        if let Some(ref node) = self.worklet_node {
-            self.teardown_worklet_node(node);
-        }
+    ///
+    /// Returns the torn-down node's port, if there was a node (see
+    /// [`teardown_worklet_node`](Self::teardown_worklet_node)).
+    fn stop_nodes(&mut self) -> Option<web_sys::MessagePort> {
+        let stopped = self.worklet_node.as_ref().and_then(|node| self.teardown_worklet_node(node));
 
         // Stop all tracks in the stream
         if let Some(ref stream) = self.current_stream {
@@ -535,6 +593,7 @@ impl AudioEngine {
         self.source_node = None;
         self.worklet_node = None;
         self.current_stream = None;
+        stopped
     }
 
     /// Check if audio is currently being captured
@@ -606,7 +665,7 @@ impl AudioEngine {
         if self.worklet_node.is_some() {
             let output_channels = self.configure_destination(self.requested_output_channels)?;
             if output_channels as usize != self.worklet_output_channels {
-                self.build_and_connect_worklet_node(self.worklet_input_channels, output_channels as usize)?;
+                let _ = self.build_and_connect_worklet_node(self.worklet_input_channels, output_channels as usize)?;
             }
         }
 
@@ -645,6 +704,24 @@ pub(crate) enum TimeoutRace {
     TimedOut,
 }
 
+/// A promise that resolves when the processor on `port` replies `"stopped"` to
+/// the `"stop"` posted by `teardown_worklet_node`: from then on its `process()`
+/// never runs again, so the buffers it was built over may be freed. It never
+/// settles if the render thread cannot deliver port messages (a suspended or
+/// closed context), so a caller freeing on it must also free on a fulfilled
+/// `AudioContext.close`. The one-shot handler is leaked until it fires, which
+/// is why callers wire it only when they will consume the result.
+fn stopped_acknowledgement(port: &web_sys::MessagePort) -> js_sys::Promise {
+    let (stopped, resolve, _reject) = crate::audio::make_promise();
+    let on_message = Closure::once_into_js(move |event: web_sys::MessageEvent| {
+        if event.data().as_string().as_deref() == Some("stopped") {
+            let _ = resolve.call0(&JsValue::NULL);
+        }
+    });
+    port.set_onmessage(Some(on_message.unchecked_ref()));
+    stopped
+}
+
 /// Fire `AudioContext.close()` without awaiting, unless the context is already
 /// `"closed"`.
 ///
@@ -670,8 +747,8 @@ pub(crate) fn close_audio_context_now(ctx: &AudioContext) {
 ///
 /// Returns `true` only when the close promise **fulfilled** (or the context
 /// was already `"closed"`). A timeout or rejection returns `false` — the
-/// worklet is not proven quiescent, so callers must not
-/// [`Regulator::reset`](webtrip_core::stream::regulator::Regulator::reset).
+/// worklet is not proven quiescent, so callers must not free the buffers it
+/// may still be popping.
 pub(crate) async fn close_audio_context(ctx: &AudioContext, timeout_ms: i32) -> bool {
     if audio_context_state(ctx).as_deref() == Some("closed") {
         return true;
@@ -1052,6 +1129,49 @@ mod tests {
             "stop_capture must close the AudioContext (WEB-66)"
         );
 
+        close_engine(engine).await;
+    }
+
+    /// Attaching a connection's buffers to a running engine replaces its
+    /// worklet node, and the replaced node acknowledges `"stopped"` from the
+    /// render thread: the proof a retiring connection's buffers are free to go.
+    /// The new node must be live and carry the same widths.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn attach_network_replaces_the_node_and_acknowledges_the_old_one() {
+        let params = AudioParams::default();
+        let mut engine = create_engine(&params).await;
+        engine
+            .start_capture(None, None, false, false, false, 2, 2)
+            .await
+            .expect("start_capture should resolve with the fake-device flags");
+        let widths = (engine.worklet_input_channels, engine.worklet_output_channels);
+
+        // No network yet, so this first replacement is of a network-less node.
+        let mut ring = RingBuffer::new();
+        let mut regulator = Regulator::new();
+        let first = engine
+            .attach_network(&mut ring as *mut RingBuffer, &mut regulator as *mut Regulator)
+            .expect("attaching a connection should rebuild the node")
+            .expect("a running node must be replaced, and so acknowledged");
+        let stopped = await_with_timeout(first, 2000).await;
+        assert!(
+            matches!(stopped, TimeoutRace::Fulfilled),
+            "the replaced node must acknowledge \"stopped\" from the render thread"
+        );
+        assert!(engine.is_capturing(), "the replacement node must be live");
+        assert_eq!((engine.worklet_input_channels, engine.worklet_output_channels), widths);
+
+        // Detaching rebuilds again, at the same widths, against no buffers.
+        let second = engine
+            .attach_network(std::ptr::null_mut(), std::ptr::null_mut())
+            .expect("detaching should rebuild the node")
+            .expect("the network-attached node must be acknowledged on replacement");
+        assert!(matches!(await_with_timeout(second, 2000).await, TimeoutRace::Fulfilled));
+
+        // Without a running node there is nothing to rebuild or acknowledge.
+        engine.stop_capture().await;
+        assert!(engine.attach_network(std::ptr::null_mut(), std::ptr::null_mut()).unwrap().is_none());
         close_engine(engine).await;
     }
 

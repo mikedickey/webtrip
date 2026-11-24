@@ -23,10 +23,15 @@ registerProcessor("WasmProcessor", class WasmProcessor extends AudioWorkletProce
         this.inputViews = null;
         this.outputViews = null;
 
-        // Listen for stop message from main thread
+        // Listen for stop message from main thread. This handler and
+        // process() both run on the render thread and never overlap, so once
+        // it has set the flag, process() never calls into this processor
+        // again: the 'stopped' acknowledgement is the main thread's proof that
+        // the buffers this processor was built over are no longer touched.
         this.port.onmessage = (event) => {
             if (event.data === 'stop') {
                 this.stopped = true;
+                this.port.postMessage('stopped');
             }
         };
     }

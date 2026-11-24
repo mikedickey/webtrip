@@ -362,7 +362,13 @@ pub trait Transport {
     /// before resetting a `Regulator`) must `await` the returned future. For
     /// best-effort cleanup (e.g. in `Drop`) the future can be discarded; the
     /// synchronous teardown has already been initiated.
-    fn close(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>>;
+    ///
+    /// The future resolves to `true` when the transport's writers are known to
+    /// have stopped, so the audio buffers may be freed. It resolves to `false`
+    /// when teardown was forced (a worker terminated after a timeout): an
+    /// in-flight write may still be running, and the caller must keep the
+    /// buffers alive.
+    fn close(&mut self) -> Pin<Box<dyn Future<Output = bool> + '_>>;
 }
 
 #[cfg(test)]

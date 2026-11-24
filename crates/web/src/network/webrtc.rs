@@ -1168,10 +1168,10 @@ impl Transport for WebRtcTransport {
         self.do_tick();
     }
 
-    fn close(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+    fn close(&mut self) -> Pin<Box<dyn Future<Output = bool> + '_>> {
         self.close_sync();
         // WebRTC teardown is fully synchronous; the future is immediately ready.
-        Box::pin(async move {})
+        Box::pin(async move { true })
     }
 }
 

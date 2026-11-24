@@ -3,8 +3,8 @@
 //! High-level session management that coordinates all components:
 //! - AudioEngine (capture/playback via AudioWorklet)
 //! - Transport (abstraction for network layer - WebRTC or WebTransport)
-//! - RingBuffer (send path: worklet -> network)
-//! - JitterBuffer (receive path: network -> worklet)
+//! - Connection (the transport plus its own RingBuffer, send path: worklet ->
+//!   network, and Regulator, receive path: network -> worklet)
 //!
 //! ## Connection Flow
 //!
@@ -17,7 +17,8 @@
 //!        WebRtcTransport.connect_to_hub()
 //!
 //! 2. Once the transport is connected
-//!    └─> AudioEngine created and capture started
+//!    └─> AudioEngine created and capture started, against this connection's
+//!        fresh stream buffers
 //!    └─> Transport and engine published to the session → Connected
 //!    └─> Network loop begins
 //!
@@ -30,10 +31,15 @@
 //! release what it created (or to hand abandoned engine cleanup to a detached
 //! task), then tears down the published connection. Every state change is
 //! reported through `set_on_state_change` and readable with `getState()`.
+//!
+//! ## Buffer lifetime
+//!
+//! Every connection allocates its own stream buffers and never reuses them. At
+//! teardown they are *retired*, not reset: freed only once the render thread
+//! can no longer reach them (see [`crate::connection`]).
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
-use std::mem::ManuallyDrop;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,12 +51,13 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
 use crate::audio::audio_callback_loop::AudioCallbackLoop;
+use crate::connection::{check_connection_capacity, Connection, RetiredList, StreamBuffers};
 use crate::audio::{cancelled_error, named_error};
 use crate::audio::engine::{close_audio_context_now, resume_context, route_output_sink, AudioEngine};
 use webtrip_core::audio::params::AudioParams;
-use webtrip_core::limits::{MAX_DEVICE_CHANNELS, MAX_WIRE_CHANNELS, MAX_WIRE_FRAMES_PER_CALLBACK, WIRE_SAMPLE_RATE};
+use webtrip_core::limits::{MAX_DEVICE_CHANNELS, MAX_WIRE_CHANNELS};
 use webtrip_core::stream::regulator::Regulator;
-use webtrip_core::session_stats::build_session_stats;
+use webtrip_core::session_stats::aggregate_session_stats;
 use webtrip_core::stream::ring_buffer::RingBuffer;
 use webtrip_core::stream::shared_ptr::SharedPtr;
 use webtrip_core::network::protocol::DEFAULT_BUFFER_SIZE;
@@ -83,9 +90,6 @@ pub(crate) fn is_valid_channel_count(channels: u8, max: u8) -> bool {
 // ============================================================================
 // Callback-boundary plumbing
 // ============================================================================
-
-/// The published transport, shared with the audio-callback tick closure.
-type TransportSlot = Rc<RefCell<Option<Box<dyn Transport>>>>;
 
 /// The app's state-change callback, shared with each transport's failure
 /// bridge so a callback replaced after connecting still hears about failures.
@@ -278,14 +282,15 @@ pub struct WebTripSession {
     audio_params: SharedPtr<AudioParams>,
     audio_engine: RefCell<Option<AudioEngine>>,
 
-    // Owned buffers (shared with AudioWorklet and Transport via pointers).
-    // `ManuallyDrop` because `Drop` must hand them to a deferred task that
-    // frees them only once both consumers have quiesced (see `Drop`).
-    local_to_network_buffer: ManuallyDrop<Box<RingBuffer>>,
-    network_to_local_buffer: ManuallyDrop<Box<Regulator>>,
-
-    // Network components
-    transport: TransportSlot,
+    // The live connections, each owning its transport and stream buffers
+    // (shared with the AudioWorklet and the transport via pointers). At most
+    // `MAX_CONNECTIONS`.
+    connections: RefCell<Vec<Connection>>,
+    next_connection_id: Cell<u64>,
+    /// Buffers of connections that have ended, kept alive until nothing can
+    /// still reach them. Shared with the tasks awaiting a worklet node's
+    /// `"stopped"` acknowledgement (see [`Self::retire_until_stopped`]).
+    retired: Rc<RefCell<RetiredList<StreamBuffers>>>,
     transport_type: Cell<TransportType>,
 
     lifecycle: Arc<Lifecycle>,
@@ -311,6 +316,9 @@ pub struct WebTripSession {
     /// packet-size limit sends fewer (`fit_send_fpp`); the peer is told by the
     /// packet header, so nothing else needs to agree.
     send_fpp: usize,
+    /// Frames per packet each connection's regulator starts at, before it
+    /// adopts the peer's from its first packet
+    receive_fpp: usize,
     /// Channels sent over the wire (payload width of every outbound packet)
     send_channels: Cell<u8>,
     /// Channels asked back from the peer (advertised in every outbound header)
@@ -340,34 +348,18 @@ impl WebTripSession {
         // `AudioParams` that outlives the session and every agent holding it).
         let audio_params = unsafe { SharedPtr::<AudioParams>::from_addr(audio_params_addr) };
         let send_fpp = DEFAULT_BUFFER_SIZE as usize;
-        // Only the regulator's geometry until the peer's first packet, whose
-        // frames per packet it adopts.
+        // Only each connection's regulator geometry until the peer's first
+        // packet, whose frames per packet it adopts.
         let receive_fpp = DEFAULT_BUFFER_SIZE as usize;
-        let sample_rate = WIRE_SAMPLE_RATE;
         let send_channels = 1;
         let receive_channels = 2;
-
-        // Sync the send width to AudioParams: the render thread conforms
-        // captured audio to it (see `conform_interleaved_channels`).
-        if let Some(params) = audio_params.as_ref() {
-            params.set_send_channels(send_channels as u32);
-        }
-
-        // Create owned buffers
-        let local_to_network_buffer = Box::new(RingBuffer::new());
-        // Regulator with auto-adaptive tolerance and headroom (-500.0).
-        // The peer's actual count is still adopted from its first packet.
-        let network_to_local_buffer = Box::new(
-            Regulator::with_params(receive_channels as usize, receive_fpp, sample_rate, -500.0)
-                .with_callback_capacity(MAX_WIRE_FRAMES_PER_CALLBACK),
-        );
 
         Ok(WebTripSession {
             audio_params,
             audio_engine: RefCell::new(None),
-            local_to_network_buffer: ManuallyDrop::new(local_to_network_buffer),
-            network_to_local_buffer: ManuallyDrop::new(network_to_local_buffer),
-            transport: Rc::new(RefCell::new(None)),
+            connections: RefCell::new(Vec::new()),
+            next_connection_id: Cell::new(0),
+            retired: Rc::new(RefCell::new(RetiredList::new())),
             transport_type: Cell::new(TransportType::WebRTC), // Default to WebRTC
             lifecycle: Arc::new(Lifecycle::new()),
             connect_in_flight: RefCell::new(None),
@@ -378,6 +370,7 @@ impl WebTripSession {
             #[cfg(all(test, target_arch = "wasm32"))]
             capture_waiting: Rc::new(Cell::new(false)),
             send_fpp,
+            receive_fpp,
             send_channels: Cell::new(send_channels),
             receive_channels: Cell::new(receive_channels),
             input_channels: Cell::new(2),
@@ -401,28 +394,25 @@ impl WebTripSession {
         self.state().as_str().to_string()
     }
 
-    /// Get current statistics
+    /// Get current statistics: the aggregate over the live connections (all
+    /// zero when there are none).
     pub fn get_stats(&self) -> SessionStats {
-        let reg_stats = self.network_to_local_buffer.stats();
-        build_session_stats(
-            reg_stats,
-            self.network_to_local_buffer.depth(),
-            self.network_to_local_buffer.latency_ms(),
-            self.network_to_local_buffer.is_initialized(),
-            self.local_to_network_buffer.available(),
-            self.local_to_network_buffer.writes(),
-            self.local_to_network_buffer.samples_written(),
-            self.local_to_network_buffer.overruns(),
-        )
+        let stats: Vec<_> = self.connections.borrow().iter().map(|c| c.buffers.stats()).collect();
+        aggregate_session_stats(&stats)
     }
 
-    /// Get the ring buffer flag pointer for event-driven wake-up
+    /// Get the current connection's send ring buffer flag pointer for
+    /// event-driven wake-up, or 0 when there is no connection.
     ///
     /// Used with Atomics.waitAsync() in JavaScript for zero-CPU idle behavior.
     /// Returns the memory address of the atomic flag that signals data availability.
+    /// Each connection has its own ring, so the address changes per connection:
+    /// read it after connecting and drop it when the connection ends. A cached
+    /// pointer from before connect is 0, and one kept across a disconnect
+    /// addresses a retired (possibly freed) ring that never wakes.
     #[wasm_bindgen(js_name = getRingBufferFlagPtr)]
     pub fn get_ring_buffer_flag_ptr(&self) -> usize {
-        self.local_to_network_buffer.get_has_data_flag_ptr()
+        self.with_send_ring(|ring| ring.get_has_data_flag_ptr()).unwrap_or(0)
     }
 
     /// Set how many channels this client sends over the wire (default 1).
@@ -436,16 +426,13 @@ impl WebTripSession {
     /// This is each outbound packet's payload width, independent of the
     /// input device: captured audio is conformed to it on the render thread
     /// (`conform_interleaved_channels`), e.g. 2 input channels averaged into
-    /// 1 sent.
+    /// 1 sent. Each connection's send ring carries the width it was opened with.
     #[wasm_bindgen(js_name = setSendChannels)]
     pub fn set_send_channels(&self, channels: u8) {
         if !self.can_set_channel_count("send", channels, MAX_WIRE_CHANNELS) {
             return;
         }
         self.send_channels.set(channels);
-        if let Some(params) = self.audio_params.as_ref() {
-            params.set_send_channels(channels as u32);
-        }
     }
 
     /// Get the configured send channel count
@@ -460,7 +447,7 @@ impl WebTripSession {
     ///
     /// The peer decides what it actually sends: the regulator adopts the
     /// count from its first packet
-    /// ([`Regulator::push`](webtrip_core::stream::regulator::Regulator::push)) and
+    /// ([`Regulator::push_at`](webtrip_core::stream::regulator::Regulator::push_at)) and
     /// `map_to_output` maps it onto the output device.
     #[wasm_bindgen(js_name = setReceiveChannels)]
     pub fn set_receive_channels(&self, channels: u8) {
@@ -625,20 +612,19 @@ impl WebTripSession {
     /// cancelled first, and its own cleanup is awaited before anything else
     /// is torn down.
     ///
-    /// Teardown awaits full transport shutdown before resetting the
-    /// network-to-local buffer. That ordering is load-bearing: the
-    /// `Regulator`'s sequence-number state is shared via a raw pointer with
-    /// the transport (for WebTransport, the worker thread writes to it), so
-    /// resetting before the transport has quiesced creates a race in which a
-    /// late `regulator.push()` from the old connection pins `last_seq_in`
-    /// high and causes the *next* connection's packets to be rejected by the
-    /// wrap-distance check. Awaiting `transport.close()` establishes the
-    /// happens-before ordering we need: for WebTransport the future resolves
-    /// after the worker posts `"disconnected"` (both send and receive loops
-    /// have exited); for WebRTC the teardown is fully synchronous. The 2s
-    /// WebTransport force-terminate fallback is a residual race — see
-    /// `WebTransportImpl::close`. A connect issued meanwhile waits for this
-    /// to finish.
+    /// Teardown awaits full transport shutdown before retiring the
+    /// connection's buffers. That ordering is load-bearing: the `Regulator`
+    /// is shared via a raw pointer with the transport (for WebTransport, the
+    /// worker thread writes to it), so freeing it before the transport has
+    /// quiesced would let a late `regulator.push()` write freed memory.
+    /// Awaiting `transport.close()` establishes the happens-before ordering
+    /// we need: for WebTransport the future resolves after the worker posts
+    /// `"disconnected"` (both send and receive loops have exited); for WebRTC
+    /// the teardown is fully synchronous. The 2s WebTransport
+    /// force-terminate fallback is a residual race — see
+    /// `WebTransportImpl::close`. The buffers are then freed only once the
+    /// audio side is quiescent too (see [`crate::connection`]). A connect
+    /// issued meanwhile waits for this to finish.
     pub async fn disconnect(&self) {
         match self.lifecycle.begin_disconnect() {
             DisconnectStart::AlreadyIdle => return,
@@ -663,9 +649,9 @@ impl WebTripSession {
         await_in_flight(&self.connect_in_flight).await;
 
         self.stop_network_loop();
-        let transport = self.transport.borrow_mut().take();
+        let (connection, transport) = self.take_live_transport();
         let engine = self.audio_engine.borrow_mut().take();
-        self.release(transport, engine).await;
+        self.release(connection, transport, engine).await;
 
         self.lifecycle.finish_disconnect();
         drop(teardown);
@@ -736,7 +722,38 @@ impl WebTripSession {
     /// Whether a connected transport is published (test-only observer).
     #[cfg(all(test, target_arch = "wasm32"))]
     pub(crate) fn has_transport(&self) -> bool {
-        self.transport.borrow().is_some()
+        self.connections.borrow().iter().any(|c| c.transport.borrow().is_some())
+    }
+
+    /// The live connection's send-ring width (test-only).
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub(crate) fn wire_channels(&self) -> Option<usize> {
+        self.with_send_ring(|ring| ring.wire_channels())
+    }
+
+    /// How many retired buffer sets are still being kept alive (test-only).
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub(crate) fn retired_count(&self) -> usize {
+        self.retired.borrow().len()
+    }
+
+    /// The current connection's (channels, fpp, initialized) as its regulator
+    /// sees the peer (test-only).
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub(crate) fn peer_shape(&self) -> Option<(usize, usize, bool)> {
+        self.connections.borrow().first().map(|c| {
+            let regulator = &c.buffers.regulator;
+            (regulator.channels(), regulator.fpp(), regulator.is_initialized())
+        })
+    }
+
+    /// Feed the current connection's regulator a packet as its transport
+    /// would (test-only).
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub(crate) fn push_peer_packet(&self, seq: u16, channels: usize, fpp: usize) {
+        let connections = self.connections.borrow();
+        let regulator = &connections.first().expect("a connection to push to").buffers.regulator;
+        regulator.push_at(seq, channels, fpp, &vec![0.0; channels * fpp], 0.0);
     }
 
     /// Whether an audio engine is published (test-only observer).
@@ -846,17 +863,24 @@ impl WebTripSession {
     ) -> Result<(), JsValue> {
         let mut transport = new_transport()?;
         let transport_type = transport.transport_type();
-        let mut buffers = self.audio_buffer_config();
+        let connection = self.open_connection()?;
+        let mut buffers = self.audio_buffer_config(connection);
         if let Some(max_packet_bytes) = transport.max_packet_bytes() {
             // A transport that knows its packet limit up front is fitted here;
             // one that discovers it on connecting fits itself (see `Transport`).
-            buffers.buffer_size = fit_send_fpp(
+            match fit_send_fpp(
                 &format!("{transport_type:?}"),
                 max_packet_bytes,
                 buffers.send_channels,
                 buffers.buffer_size,
-            )
-            .map_err(|e| js_error(e.message()))?;
+            ) {
+                Ok(fpp) => buffers.buffer_size = fpp,
+                Err(e) => {
+                    // Nothing was shared yet, so there is nothing to wait on.
+                    self.release(Some(connection), None, None).await;
+                    return Err(js_error(e.message()));
+                }
+            }
         }
         transport.set_audio_buffers(buffers);
         let failed_while_connecting = Rc::new(Cell::new(false));
@@ -884,14 +908,14 @@ impl WebTripSession {
             if self.lifecycle.is_current(epoch) { Ok(()) } else { Err(cancelled_error()) }
         });
         if let Err(e) = dialed {
-            self.release(Some(transport), None).await;
+            self.release(Some(connection), Some(transport), None).await;
             return Err(e);
         }
 
-        let engine = match self.start_engine_unless_aborted(capture, abort).await {
+        let engine = match self.start_engine_unless_aborted(connection, capture, abort).await {
             Ok(engine) => engine,
             Err((e, engine)) => {
-                self.release(Some(transport), engine).await;
+                self.release(Some(connection), Some(transport), engine).await;
                 return Err(e);
             }
         };
@@ -899,16 +923,16 @@ impl WebTripSession {
         // A failure reported before `Connected` cannot fail the connection
         // (there is none yet), so it fails the connect instead.
         if failed_while_connecting.get() {
-            self.release(Some(transport), Some(engine)).await;
+            self.release(Some(connection), Some(transport), Some(engine)).await;
             return Err(js_error("The connection failed while it was being set up"));
         }
         if !self.lifecycle.finish_connect(epoch) {
-            self.release(Some(transport), Some(engine)).await;
+            self.release(Some(connection), Some(transport), Some(engine)).await;
             return Err(cancelled_error());
         }
         // Publish and start the network loop with no await in between, so the
         // `Connected` state is never observable without them.
-        *self.transport.borrow_mut() = Some(transport);
+        self.publish_transport(connection, transport);
         *self.audio_engine.borrow_mut() = Some(engine);
         self.start_network_loop(transport_type);
         emit_state(&self.on_state_change, SessionState::Connected);
@@ -939,62 +963,140 @@ impl WebTripSession {
         })
     }
 
-    /// Quiesce and drop a connection's transport and engine, then reset the
-    /// regulator for the next connection when worklet quiescence is proven.
+    /// Open a connection: refuse one beyond `MAX_CONNECTIONS`, otherwise
+    /// allocate its fresh stream buffers and register it. Returns its id.
+    /// Every path that fails or ends it goes through [`release`](Self::release).
+    fn open_connection(&self) -> Result<u64, JsValue> {
+        check_connection_capacity(self.connections.borrow().len()).map_err(|e| js_error(&e))?;
+        let id = self.next_connection_id.get();
+        self.next_connection_id.set(id + 1);
+        let buffers = StreamBuffers::new(self.send_channels.get(), self.receive_channels.get(), self.receive_fpp);
+        self.connections.borrow_mut().push(Connection {
+            id,
+            transport: Rc::new(RefCell::new(None)),
+            buffers,
+        });
+        Ok(id)
+    }
+
+    /// Put `transport` in connection `id`'s slot, where the tick loop finds it.
+    fn publish_transport(&self, id: u64, transport: Box<dyn Transport>) {
+        self.with_connection(id, |connection| *connection.transport.borrow_mut() = Some(transport));
+    }
+
+    /// Run `f` on connection `id`, if it is still live.
+    fn with_connection<R>(&self, id: u64, f: impl FnOnce(&Connection) -> R) -> Option<R> {
+        self.connections.borrow().iter().find(|c| c.id == id).map(f)
+    }
+
+    /// Run `f` on connection `id`'s buffers; the connection must have been
+    /// opened by the caller and not yet released.
+    fn with_opened_buffers<R>(&self, id: u64, f: impl FnOnce(&StreamBuffers) -> R) -> R {
+        self.with_connection(id, |c| f(&c.buffers)).expect("the connection was just opened")
+    }
+
+    /// Take the published transport out of the live connection, returning its
+    /// id too (`None` for both when there is no connection).
+    fn take_live_transport(&self) -> (Option<u64>, Option<Box<dyn Transport>>) {
+        match self.connections.borrow().first() {
+            Some(connection) => (Some(connection.id), connection.transport.borrow_mut().take()),
+            None => (None, None),
+        }
+    }
+
+    /// Run `f` on the live connection's send ring, if there is one.
+    fn with_send_ring<R>(&self, f: impl FnOnce(&RingBuffer) -> R) -> Option<R> {
+        self.connections.borrow().first().map(|c| f(&c.buffers.ring))
+    }
+
+    /// Quiesce and drop a connection's transport and engine, then retire its
+    /// buffers, freeing its own retired set when audio quiescence is proven.
     /// The caller must already have stopped the network loop if it was started.
-    async fn release(&self, transport: Option<Box<dyn Transport>>, engine: Option<AudioEngine>) {
-        if let Some(mut transport) = transport {
-            transport.close().await;
+    ///
+    /// The buffers are retired rather than reset for the next connection:
+    /// the next connection allocates its own. The producer is quiesced when
+    /// `Transport::close` reports a clean shutdown (not a force-terminated
+    /// worker); the consumer is quiesced when `AudioEngine::stop_capture` has
+    /// awaited `AudioContext.close` (or there was no engine). Either failing
+    /// leaves the retired buffers in the list, alive, since a worker or
+    /// worklet may still be touching them. If only the close failed, the
+    /// worklet node's `"stopped"` acknowledgement frees them later instead.
+    async fn release(&self, connection: Option<u64>, transport: Option<Box<dyn Transport>>, engine: Option<AudioEngine>) {
+        let producer_quiescent = match transport {
             // `transport` is dropped at end of scope; its `Drop` impl is a
             // no-op on already-closed state.
-        }
-        // Awaits worklet quiescence (via `AudioEngine::stop_capture`'s
-        // `AudioContext.close`, with timeout), as `Regulator::reset` requires
-        // (WEB-53 Bug 7 / WEB-66). Closing also releases the worklet global so
-        // the context cannot leak across reconnects. Reset only when close
-        // fulfilled — a timeout must not race `reset` against a live `pop`.
-        let quiescent = match engine {
-            Some(mut engine) => engine.stop_capture().await,
-            // No engine means nothing is popping the regulator.
+            Some(mut transport) => transport.close().await,
             None => true,
         };
+        // Awaits worklet quiescence (via `AudioEngine::stop_capture`'s
+        // `AudioContext.close`, with timeout; WEB-53 Bug 7 / WEB-66). Closing
+        // also releases the worklet global so the context cannot leak across
+        // reconnects.
+        let (consumer_quiescent, stopped) = match engine {
+            Some(mut engine) => engine.stop_capture_acknowledged().await,
+            // No engine means nothing is popping the regulator.
+            None => (true, None),
+        };
+        let quiescent = producer_quiescent && consumer_quiescent;
+        let key = connection.and_then(|id| self.retire_connection(id));
+        if !quiescent && producer_quiescent {
+            // Only the close failed: the worklet's own `"stopped"` still
+            // proves it is done with these buffers, if it ever arrives.
+            if let (Some(key), Some(stopped)) = (key, stopped) {
+                free_when_stopped(&self.retired, key, stopped);
+            }
+        }
         if quiescent {
-            // SAFETY: producer is quiesced — `transport.close().await` above
-            // stopped the network loop (no more `push`). Consumer is quiesced —
-            // `AudioEngine::stop_capture` awaited `AudioContext.close` (or
-            // there was no engine), so the worklet is no longer calling `pop`
-            // (WEB-53 Bug 7 / WEB-66 / WEB-71).
-            unsafe { self.network_to_local_buffer.reset() };
+            // Only this connection's buffers: an earlier close that timed out
+            // left its set retired because its worklet may still be popping,
+            // and this (different) context closing proves nothing about it.
+            if let Some(key) = key {
+                self.retired.borrow_mut().free(key);
+            }
         } else {
             web_sys::console::warn_1(
-                &"⚠️ AudioContext.close did not finish in time; skipping Regulator::reset \
-                  to avoid racing a live worklet"
+                &"⚠️ Teardown was not clean (AudioContext.close timed out or the transport worker \
+                  was force-terminated); keeping the connection's buffers alive until the worklet \
+                  acknowledges it stopped (never, after a forced worker)"
                     .into(),
             );
         }
     }
 
-    /// Raw pointers to the owned buffers, for consumers that cross agents.
-    /// Both are only ever dereferenced as shared references (`SharedPtr::as_ref`);
-    /// their mutable state is atomics and `UnsafeCell`.
-    fn buffer_ptrs(&self) -> (*mut RingBuffer, *mut Regulator) {
-        (
-            std::ptr::from_ref::<RingBuffer>(&self.local_to_network_buffer).cast_mut(),
-            std::ptr::from_ref::<Regulator>(&self.network_to_local_buffer).cast_mut(),
-        )
+    /// Move connection `id`'s buffers from the live list to the retired list,
+    /// returning the key that frees them.
+    fn retire_connection(&self, id: u64) -> Option<u64> {
+        let connection = {
+            let mut connections = self.connections.borrow_mut();
+            connections.iter().position(|c| c.id == id).map(|index| connections.remove(index))
+        };
+        connection.map(|connection| self.retired.borrow_mut().retire(connection.buffers))
     }
 
-    /// The session's audio buffers and channel counts, as handed to a
-    /// transport before it connects.
-    fn audio_buffer_config(&self) -> AudioBufferConfig {
-        let (local_to_network, network_to_local) = self.buffer_ptrs();
-        // SAFETY: both pointers are from `buffer_ptrs()` into session-owned
-        // buffers that outlive every transport/worklet borrow; those agents
-        // are stopped before the session drops the buffers.
+    /// Retire `buffers` until `stopped` settles, then free them: `stopped` is
+    /// the `"stopped"` acknowledgement of the worklet node that was attached
+    /// to them (see `AudioEngine::attach_network`), after which the render
+    /// thread never touches them again. If it never settles (a suspended
+    /// context delivers no port messages), they stay alive: no other
+    /// context's close proves that node idle.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn retire_until_stopped(&self, buffers: StreamBuffers, stopped: js_sys::Promise) {
+        let key = self.retired.borrow_mut().retire(buffers);
+        free_when_stopped(&self.retired, key, stopped);
+    }
+
+    /// Connection `id`'s buffers, as handed to a transport before it connects.
+    fn audio_buffer_config(&self, id: u64) -> AudioBufferConfig {
+        let (ring, regulator) = self.with_opened_buffers(id, |b| (b.ring_ptr(), b.regulator_ptr()));
+        // SAFETY: both pointers are into the connection's boxed buffers, which
+        // stay alive (live, then retired) until every agent holding them has
+        // stopped; they are only ever dereferenced as shared references
+        // (`SharedPtr::as_ref`), their mutable state being atomics and
+        // `UnsafeCell`.
         unsafe {
             AudioBufferConfig {
-                local_to_network: SharedPtr::new(local_to_network),
-                network_to_local: SharedPtr::new(network_to_local),
+                local_to_network: SharedPtr::new(ring),
+                network_to_local: SharedPtr::new(regulator),
                 buffer_size: self.send_fpp,
                 send_channels: self.send_channels.get(),
                 receive_channels: self.receive_channels.get(),
@@ -1010,19 +1112,21 @@ impl WebTripSession {
     /// pending, a detached task finishes it and stops the engine (no worklet
     /// is installed once cancelled). If bring-up had already stored a live
     /// engine, it is returned alongside the error so the caller's `release`
-    /// awaits `AudioContext.close` before `Regulator::reset`.
+    /// awaits `AudioContext.close` before retiring frees the buffers.
     /// A cancel flag checked after each await prevents an abandoned capture
-    /// from installing a worklet against buffers a later connect may already
-    /// own.
+    /// from installing a worklet against buffers that `release` is about to
+    /// free.
     async fn start_engine_unless_aborted(
         &self,
+        connection: u64,
         capture: CaptureParams,
         abort: js_sys::Promise,
     ) -> Result<AudioEngine, (JsValue, Option<AudioEngine>)> {
         #[cfg(all(test, target_arch = "wasm32"))]
         crate::test_support::note_start_engine();
         let params_addr = self.audio_params.addr();
-        let (local_to_network, network_to_local) = self.buffer_ptrs();
+        let (local_to_network, network_to_local) =
+            self.with_opened_buffers(connection, |b| (b.ring_ptr(), b.regulator_ptr()));
         let output_device_id = self.output_device_id.borrow().clone();
         let input_channels = self.input_channels.get() as u32;
         let output_channels = self.output_channels.get() as u32;
@@ -1085,8 +1189,8 @@ impl WebTripSession {
                 // If bring-up already stored a live engine (its worklet may
                 // still be popping the regulator on the audio thread), hand it
                 // back with the error so `release` awaits `AudioContext.close`
-                // before `Regulator::reset`. Detaching it here would let
-                // `release(.., None)` reset immediately.
+                // before the buffers are freed. Detaching it here would let
+                // `release(.., None)` free them immediately.
                 let engine = match outcome.borrow_mut().take() {
                     Some(Ok(engine)) => Some(engine),
                     Some(Err(_)) => None,
@@ -1114,7 +1218,7 @@ impl WebTripSession {
             TransportType::WebTransport => {
                 // WebTransport worker handles send/receive loops - no tick() needed!
                 // Just enable streaming on ring buffer for the worker to read
-                self.local_to_network_buffer.set_streaming(true);
+                self.with_send_ring(|ring| ring.set_streaming(true));
             }
             TransportType::WebRTC => {
                 // WebRTC needs the main-thread audio callback loop for tick()
@@ -1128,7 +1232,7 @@ impl WebTripSession {
         if let Some((mut callback_loop, _tick)) = self.audio_callback_loop.borrow_mut().take() {
             callback_loop.stop();
         }
-        self.local_to_network_buffer.set_streaming(false);
+        self.with_send_ring(|ring| ring.set_streaming(false));
     }
 
     /// Start the audio callback loop
@@ -1137,18 +1241,23 @@ impl WebTripSession {
             return; // Already started
         }
 
-        // Enable streaming on ring buffer
-        self.local_to_network_buffer.set_streaming(true);
-
-        // Get ring buffer flag pointer
-        let flag_ptr = self.local_to_network_buffer.get_has_data_flag_ptr();
+        // Enable streaming on the connection's ring buffer and get its flag
+        // pointer.
+        let Some(flag_ptr) = self.with_send_ring(|ring| {
+            ring.set_streaming(true);
+            ring.get_has_data_flag_ptr()
+        }) else {
+            return;
+        };
 
         // Create audio callback loop
         let mut callback_loop = AudioCallbackLoop::new();
 
         // Tick the published transport. The slot is never borrowed across an
         // await, so the borrow only fails if a tick re-enters itself; skip it then.
-        let transport = Rc::clone(&self.transport);
+        let Some(transport) = self.connections.borrow().first().map(|c| Rc::clone(&c.transport)) else {
+            return;
+        };
         let tick_closure = Closure::<dyn FnMut()>::new(move || {
             if let Ok(mut slot) = transport.try_borrow_mut() {
                 if let Some(transport) = slot.as_mut() {
@@ -1193,17 +1302,28 @@ impl WebTripSession {
     }
 }
 
+/// Free entry `key` of `retired` once `stopped` (a worklet node's `"stopped"`
+/// acknowledgement, after which its render thread never touches the buffers
+/// again) settles. If it never settles (a suspended or closed context delivers
+/// no port messages) the entry stays alive.
+fn free_when_stopped(retired: &Rc<RefCell<RetiredList<StreamBuffers>>>, key: u64, stopped: js_sys::Promise) {
+    let retired = Rc::clone(retired);
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = JsFuture::from(stopped).await;
+        retired.borrow_mut().free(key);
+    });
+}
+
 impl Drop for WebTripSession {
     fn drop(&mut self) {
         // Drop can't await, but the worklet render thread and the WebTransport
-        // worker both hold raw pointers into the buffers, and neither stops
-        // synchronously (`"stop"` and `{type:"disconnect"}` are just posted
-        // messages). Freeing the buffers here would let a pending `process()`
-        // or worker `push()` dereference freed storage. Instead, move the
-        // buffers into a task that runs the same quiescing teardown as
-        // `disconnect()` and frees them only afterwards. No reset needed: the
-        // buffers are being deallocated. (No connect can be in flight: it
-        // borrows the session for its whole duration.)
+        // worker both hold raw pointers into the connection's buffers, and
+        // neither stops synchronously (`"stop"` and `{type:"disconnect"}` are
+        // just posted messages). Freeing the buffers here would let a pending
+        // `process()` or worker `push()` dereference freed storage. Instead,
+        // retire them into a task that runs the same quiescing teardown as
+        // `disconnect()` and frees them only afterwards. (No connect can be in
+        // flight: it borrows the session for its whole duration.)
         //
         // Retire the lifecycle epoch before the deferred `transport.close()`
         // runs: WebRTC's close notifies `"closed"`, which `failure_bridge`
@@ -1212,23 +1332,40 @@ impl Drop for WebTripSession {
         // emit `"error"` for a session that no longer exists (WEB-68).
         let _ = self.lifecycle.begin_disconnect();
         self.stop_network_loop();
-        let transport = self.transport.borrow_mut().take();
+        let (_, transport) = self.take_live_transport();
         let engine = self.audio_engine.get_mut().take();
-        // SAFETY: `Drop::drop` runs once and nothing reads the fields after.
-        let buffers = unsafe {
-            (
-                ManuallyDrop::take(&mut self.local_to_network_buffer),
-                ManuallyDrop::take(&mut self.network_to_local_buffer),
-            )
-        };
+        let retired = Rc::clone(&self.retired);
+        let keys: Vec<u64> = self
+            .connections
+            .get_mut()
+            .drain(..)
+            .map(|connection| retired.borrow_mut().retire(connection.buffers))
+            .collect();
         wasm_bindgen_futures::spawn_local(async move {
-            if let Some(mut transport) = transport {
-                transport.close().await;
+            let producer_quiescent = match transport {
+                Some(mut transport) => transport.close().await,
+                None => true,
+            };
+            let (consumer_quiescent, stopped) = match engine {
+                Some(mut engine) => engine.stop_capture_acknowledged().await,
+                None => (true, None),
+            };
+            if producer_quiescent && consumer_quiescent {
+                // Only this session's live buffers; sets an earlier timed-out
+                // close left retired stay alive (`RetiredList` leaks what is
+                // left when it is dropped).
+                for key in keys {
+                    retired.borrow_mut().free(key);
+                }
+            } else if let (true, Some(stopped)) = (producer_quiescent, stopped) {
+                // Only the close failed: the worklet's `"stopped"` still
+                // proves it is done with this session's buffers. Otherwise a
+                // worklet may still be popping, or a force-terminated worker
+                // pushing, and they are leaked rather than freed under it.
+                for key in keys {
+                    free_when_stopped(&retired, key, stopped.clone());
+                }
             }
-            if let Some(mut engine) = engine {
-                engine.stop_capture().await;
-            }
-            drop(buffers);
         });
     }
 }
@@ -1404,11 +1541,6 @@ mod tests {
         session.set_input_channels(configured.2);
         session.set_output_channels(configured.3);
         assert_eq!(channel_config(&session), configured, "setters must apply while Idle");
-        assert_eq!(
-            params.get_send_channels(),
-            u32::from(configured.0),
-            "setSendChannels must reach the render thread's AudioParams"
-        );
 
         let transport = MockTransport::new();
         let probe = transport.probe();
@@ -1420,6 +1552,11 @@ mod tests {
         assert_eq!(session.get_state(), "connected");
         assert!(session.has_transport());
         assert_log(&log, &["connecting", "connected"], "after connect");
+        assert_eq!(
+            session.wire_channels(),
+            Some(usize::from(configured.0)),
+            "setSendChannels must reach the connection's send ring, which the render thread conforms to"
+        );
 
         // The connect created a live `AudioEngine`, so the AudioContext-backed
         // controls now hit their engine branch. `is_audio_suspended` reads
@@ -1441,7 +1578,7 @@ mod tests {
             configured,
             "channel-count setters must be ignored while connected"
         );
-        assert_eq!(params.get_send_channels(), u32::from(configured.0));
+        assert_eq!(session.wire_channels(), Some(usize::from(configured.0)));
 
         // The mock reports WebRTC, so `start_network_loop` starts the
         // audio-callback tick loop. Wait until it has actually called
@@ -1484,12 +1621,13 @@ mod tests {
     }
 
     /// Connect → disconnect must close the first engine's `AudioContext`
-    /// before `Regulator::reset` runs (and before disconnect returns), so a
-    /// reconnect cannot leave a suspended worklet as a second consumer
-    /// (WEB-66). A second connect then succeeds with a fresh engine.
+    /// before the connection's buffers are freed (and before disconnect
+    /// returns), so a reconnect cannot leave a suspended worklet as a second
+    /// consumer (WEB-66), and a fulfilled close frees every retired buffer set.
+    /// A second connect then succeeds with a fresh engine and fresh buffers.
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
-    async fn session_closes_audiocontext_before_reset_on_disconnect() {
+    async fn session_closes_audiocontext_before_freeing_buffers_on_disconnect() {
         use crate::audio::engine::audio_context_state;
 
         let params = AudioParams::default();
@@ -1517,8 +1655,9 @@ mod tests {
         assert_eq!(
             audio_context_state(&first_ctx).as_deref(),
             Some("closed"),
-            "disconnect must close the first AudioContext before reset returns (WEB-66)"
+            "disconnect must close the first AudioContext before it returns (WEB-66)"
         );
+        assert_eq!(session.retired_count(), 0, "a fulfilled close must free the retired buffers");
         assert!(
             session.audio_engine.borrow().is_none(),
             "disconnect must drop the engine after closing its context"
@@ -1543,6 +1682,24 @@ mod tests {
 
         session.disconnect().await;
         assert_eq!(session.get_state(), "idle");
+    }
+
+    /// A transport whose close was forced (a worker terminated after its
+    /// timeout, which is not a join) may still have a push in flight, so the
+    /// connection's buffers stay retired instead of being freed (WEB-67).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn forced_transport_close_keeps_the_buffers_alive() {
+        let params = AudioParams::default();
+        let session = new_session(&params);
+
+        session
+            .connect_with_test_transport(Box::new(MockTransport::new().with_forced_close()), CONNECT_TIMEOUT_MS)
+            .await
+            .expect("mock connect should succeed");
+        session.disconnect().await;
+        assert_eq!(session.get_state(), "idle");
+        assert_eq!(session.retired_count(), 1, "a forced close must not free buffers a worker may still write");
     }
 
     /// A hanging `AudioContext.close()` must not leave the session stuck in
@@ -1587,6 +1744,13 @@ mod tests {
             elapsed >= min_ms && elapsed < max_ms,
             "disconnect should finish around the {AUDIO_CONTEXT_CLOSE_TIMEOUT_MS}ms close \
              timeout, got {elapsed}ms"
+        );
+
+        // The close never settled, so the worklet is not proven idle by it; its
+        // own `"stopped"` acknowledgement is what frees the buffers.
+        assert!(
+            wait_until(|| session.retired_count() == 0, 1000, 5).await,
+            "the worklet's acknowledgement must free the buffers after a close that timed out"
         );
 
         // Restore the real close and finish tearing down so this test does not
@@ -2100,5 +2264,80 @@ mod tests {
             *log.borrow()
         );
         assert_log(&log, &["connecting", "connected"], "after Drop teardown");
+    }
+
+    /// A reconnect must start from a fresh regulator: the second peer's channel
+    /// count and fpp are adopted, not refused against the first peer's. This
+    /// catches a regulator carried across connections, which is the bug the
+    /// old `Regulator::reset` existed to prevent.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn session_reconnect_adopts_the_second_peers_shape() {
+        let params = AudioParams::default();
+        let session = new_session(&params);
+
+        session
+            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .await
+            .expect("first connect should succeed");
+        assert_eq!(session.peer_shape(), Some((2, 128, false)), "before any packet: the construction geometry");
+        session.push_peer_packet(0, 2, 128);
+        assert_eq!(session.peer_shape(), Some((2, 128, true)));
+        session.disconnect().await;
+        assert_eq!(session.peer_shape(), None, "no connection, no regulator");
+
+        session
+            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .await
+            .expect("reconnect should succeed");
+        assert_eq!(session.peer_shape(), Some((2, 128, false)), "a reconnect starts from a fresh regulator");
+        session.push_peer_packet(500, 1, 256);
+        assert_eq!(
+            session.peer_shape(),
+            Some((1, 256, true)),
+            "the second peer's channel count and fpp must be adopted"
+        );
+        session.disconnect().await;
+    }
+
+    /// Retired buffers are freed only when the replaced node's `"stopped"`
+    /// acknowledgement arrives. A set no acknowledgement ever came for (as a
+    /// close that timed out leaves) survives a *different* context's fulfilled
+    /// close, which proves nothing about its worklet.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn retired_buffers_are_freed_by_the_stopped_acknowledgement() {
+        let params = AudioParams::default();
+        let session = new_session(&params);
+
+        let (stopped, acknowledge) = gate();
+        session.retire_until_stopped(StreamBuffers::new(1, 2, 128), stopped);
+        crate::test_support::sleep_ms(20).await;
+        assert_eq!(session.retired_count(), 1, "buffers must stay alive until the node acknowledges");
+
+        let _ = acknowledge.call0(&JsValue::NULL);
+        assert!(
+            wait_until(|| session.retired_count() == 0, 1000, 5).await,
+            "the acknowledgement must free the retired buffers"
+        );
+
+        // Never acknowledged (a suspended context delivers no port messages):
+        // kept, even across another connection's fulfilled close; a late
+        // acknowledgement then frees it.
+        let (never, late) = gate();
+        session.retire_until_stopped(StreamBuffers::new(1, 2, 128), never);
+        session
+            .connect_with_test_transport(Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
+            .await
+            .expect("connect should succeed");
+        assert_eq!(session.retired_count(), 1);
+        session.disconnect().await;
+        assert_eq!(
+            session.retired_count(),
+            1,
+            "a fulfilled close frees only its own connection's buffers, not an earlier set"
+        );
+        let _ = late.call0(&JsValue::NULL);
+        assert!(wait_until(|| session.retired_count() == 0, 1000, 5).await);
     }
 }

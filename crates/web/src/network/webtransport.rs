@@ -320,14 +320,14 @@ impl WebTransportImpl {
                         // their next interrupt check. Do not treat terminate()
                         // returning as proof the agent has stopped executing —
                         // the `"disconnected"` message is the happens-before
-                        // edge the session relies on before Regulator::reset().
+                        // edge the session relies on before freeing the connection's buffers.
                         if let Some(worker) = worker_slot.borrow_mut().take() {
                             worker.set_onmessage(None);
                             worker.set_onerror(None);
                             worker.terminate();
                         }
                         if let Some(resolve) = close_resolve.borrow_mut().take() {
-                            let _ = resolve.call0(&JsValue::NULL);
+                            let _ = resolve.call1(&JsValue::NULL, &JsValue::TRUE);
                         }
                         if let Some(ref callback) = state_change_cb {
                             callback(TransportState::Disconnected);
@@ -603,12 +603,12 @@ impl Transport for WebTransportImpl {
         matches!(self.state, TransportState::Connected)
     }
 
-    fn close(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+    fn close(&mut self) -> Pin<Box<dyn Future<Output = bool> + '_>> {
         // Snapshot current state and eagerly fire off the synchronous shutdown
         // work, then return a future that resolves once the worker has
         // acknowledged that both send and receive loops have exited (happy
-        // path), so the session may `Regulator::reset()` without racing a
-        // late push.
+        // path), so the session may free the connection's buffers without racing
+        // a late push.
         //
         // Ordering for the happy path:
         //   1. Post `{type:"disconnect"}` to the worker.
@@ -623,11 +623,12 @@ impl Transport for WebTransportImpl {
         //      and resolves the promise returned below.
         //
         // Fallback (worker hung for >2s): the timer below force-terminates the
-        // worker and resolves the promise. Residual risk: `Worker.terminate()`
+        // worker and resolves the promise with `false`. `Worker.terminate()`
         // runs in parallel with the worker's main loop (HTML spec); an
-        // in-flight wasm `regulator.push()` may still be executing when the
-        // main thread proceeds to `Regulator::reset()`. Prefer the happy path;
-        // the fallback exists so a hung writer cannot block disconnect forever.
+        // in-flight wasm `regulator.push()` may still be executing, so the
+        // caller must keep the connection's buffers alive rather than free
+        // them. The fallback exists so a hung writer cannot block disconnect
+        // forever.
 
         let worker_opt = self.worker.borrow().clone();
 
@@ -636,7 +637,7 @@ impl Transport for WebTransportImpl {
         let Some(worker) = worker_opt else {
             self.state = TransportState::Closed;
             self.notify_state_change();
-            return Box::pin(async move {});
+            return Box::pin(async move { true });
         };
 
         // Build the close promise and stash its resolver for `onmessage` and
@@ -660,11 +661,11 @@ impl Transport for WebTransportImpl {
         // (e.g. `writer.write_with_chunk` stalls after a network loss) and
         // never gets to post "disconnected".
         //
-        // Residual risk (WEB-67): unlike the happy path, force-terminate does
-        // not wait for the receive loop to exit. `terminate()` is not a join;
-        // a push that was already in wasm may still race `Regulator::reset()`
-        // on the main thread. Acceptable only because the alternative is an
-        // unbounded hang on disconnect.
+        // WEB-67: unlike the happy path, force-terminate does not wait for the
+        // receive loop to exit. `terminate()` is not a join; a push that was
+        // already in wasm may still touch the connection's buffers. The close
+        // future therefore resolves `false`, and the session leaves them
+        // retired instead of freeing them.
         //
         // Transfer ownership of the worker-level closures into the fallback
         // callback so they stay alive long enough to receive the worker's
@@ -678,14 +679,15 @@ impl Transport for WebTransportImpl {
         let cb = Closure::wrap(Box::new(move || {
             if let Some(worker) = worker_slot.borrow_mut().take() {
                 web_sys::console::warn_1(
-                    &"[WebTransport] Worker did not report disconnect within 2s — force-terminating (may race Regulator::reset)".into(),
+                    &"[WebTransport] Worker did not report disconnect within 2s — force-terminating (may race freeing the connection's buffers)".into(),
                 );
                 worker.set_onmessage(None);
                 worker.set_onerror(None);
                 worker.terminate();
             }
+            // Forced: the worker may still be inside a push, so report `false`.
             if let Some(resolve) = close_resolve.borrow_mut().take() {
-                let _ = resolve.call0(&JsValue::NULL);
+                let _ = resolve.call1(&JsValue::NULL, &JsValue::FALSE);
             }
             let _ = &msg_closure;
             let _ = &err_closure;
@@ -702,7 +704,7 @@ impl Transport for WebTransportImpl {
                 worker.terminate();
             }
             if let Some(resolve) = self.close_promise_resolve.borrow_mut().take() {
-                let _ = resolve.call0(&JsValue::NULL);
+                let _ = resolve.call1(&JsValue::NULL, &JsValue::FALSE);
             }
         }
         cb.forget();
@@ -712,7 +714,9 @@ impl Transport for WebTransportImpl {
 
         Box::pin(async move {
             // Ignore any rejection — the resolver above only ever resolves.
-            let _ = JsFuture::from(promise).await;
+            // Only the worker's own `"disconnected"` resolves `true`; the
+            // force-terminate fallbacks resolve `false` (WEB-67).
+            JsFuture::from(promise).await.is_ok_and(|clean| clean.is_truthy())
         })
     }
 }

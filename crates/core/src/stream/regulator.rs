@@ -419,21 +419,6 @@ impl ChannelState {
         self.ring_size = packets_in_past;
     }
 
-    /// Return to the freshly-constructed state without reallocating.
-    fn clear(&mut self) {
-        self.tmp_buf.fill(0.0);
-        self.real_now_packet.fill(0.0);
-        self.predicted_now_packet.fill(0.0);
-        self.output_now_packet.fill(0.0);
-        self.future_predicted_packet.fill(0.0);
-        self.packet_ring.fill(0.0);
-        self.predicted_past.fill(0.0);
-        self.prediction.fill(0.0);
-        self.coeffs.fill(0.0);
-        self.train_data.fill(0.0);
-        self.ring_wptr = self.ring_size / 2;
-    }
-
     /// Push the first `fpp` samples of `tmp_buf` to the ring buffer.
     fn ring_buffer_push(&mut self, fpp: usize) {
         let at = self.ring_wptr * fpp;
@@ -737,9 +722,8 @@ impl PacketSlot {
     ///
     /// # Safety
     ///
-    /// Only the producer may call this (or [`Regulator::reset`] once both
-    /// sides are quiesced), and no reference from an earlier call may still be
-    /// live. The consumer must not be reading this slot, other than in the
+    /// Only the producer may call this, and no reference from an earlier call
+    /// may still be live. The consumer must not be reading this slot, other than in the
     /// tolerated race documented on [`PacketSlot`].
     #[allow(clippy::mut_from_ref)]
     unsafe fn payload_mut(&self) -> &mut SlotPayload {
@@ -786,16 +770,6 @@ impl PacketSlot {
         fence(Ordering::Acquire);
         (self.seq.load(Ordering::Relaxed) == seq as i32).then_some(result)
     }
-
-    /// Empty the slot and zero its payload. See [`Regulator::reset`] for the
-    /// quiescence the caller must provide.
-    fn clear(&self) {
-        self.seq.store(SEQ_NONE, Ordering::Release);
-        // SAFETY: producer and consumer are quiesced (`Regulator::reset`).
-        let payload = unsafe { self.payload_mut() };
-        payload.timestamp = 0.0;
-        payload.data.fill(0.0);
-    }
 }
 
 // ============================================================================
@@ -820,7 +794,7 @@ pub struct RegulatorStats {
     /// Last packet sequence number received (u16, wraps at 65535)
     pub last_seq_received: u16,
     /// Packets rejected by `push` (bad channel count, size mismatch, or a
-    /// channel count that changed mid-stream) since the last `reset()`.
+    /// channel count that changed mid-stream) for the life of this regulator.
     pub packets_rejected: u64,
 }
 
@@ -855,8 +829,7 @@ pub struct RegulatorStats {
 ///   packet rather than torn audio. The copy itself races the overwrite —
 ///   the one data race this type tolerates; see [`PacketSlot`].
 /// - [`ConsumerState`] — tolerance, timing stats, Burg/channel state — sits
-///   behind one [`UnsafeCell`] that only `pop` (and a quiesced `reset`)
-///   borrows mutably. The producer has no non-atomic state of its own, and
+///   behind one [`UnsafeCell`] that only `pop` borrows mutably. The producer has no non-atomic state of its own, and
 ///   takes a `&mut` only to resize slot payloads before a stream starts
 ///   ([`Shared::adopt_stream_shape`]).
 ///
@@ -871,9 +844,8 @@ pub struct Regulator {
 
 // SAFETY: `Regulator` is shared across the network producer, audio consumer, and
 // main-thread stats readers. The only non-`Sync` parts are the `UnsafeCell`s:
-// `consumer` is borrowed mutably only by the single consumer (or a quiesced
-// `reset`), and each slot payload only while no stream is running
-// (`Shared::adopt_stream_shape`).
+// `consumer` is borrowed mutably only by the single consumer, and each slot
+// payload only while no stream is running (`Shared::adopt_stream_shape`).
 // See the struct docs.
 unsafe impl Sync for Regulator {}
 
@@ -1224,23 +1196,6 @@ impl Regulator {
         self.shared.stats()
     }
 
-    /// Reset the regulator state.
-    ///
-    /// # Safety
-    ///
-    /// The caller must have quiesced both the producer and the consumer first:
-    /// this rewrites slot payloads and the consumer's state in place through
-    /// `UnsafeCell`. Concurrent `push` / `pop` is a data race (WEB-53 Bug 7).
-    /// `WebTripSession::release` upholds that by awaiting transport teardown
-    /// and `AudioContext.close()` (with a timeout) before calling it (WEB-66).
-    pub unsafe fn reset(&self) {
-        self.shared.reset();
-        // SAFETY: the consumer is quiesced (caller contract above), so this is
-        // the only borrow of its state.
-        let consumer = unsafe { self.consumer_mut() };
-        consumer.reset(&self.shared);
-    }
-
     /// Get the current tolerance in milliseconds.
     pub fn tolerance_ms(&self) -> f64 {
         f64_from_bits(self.shared.pub_tolerance_bits.load(Ordering::Relaxed))
@@ -1401,15 +1356,13 @@ impl Shared {
     /// Only ever called from [`push_internal`](Self::push_internal) while
     /// `last_seq_in == SEQ_NONE`, i.e. before this stream has stored anything.
     /// Stores the new `num_channels`, `fpp` and `num_slots` and resizes the
-    /// first `num_slots` slots' `data` buffers — **zeroed**, for the same
-    /// reason `reset()` zeroes slot data: a slot left over from a previous,
-    /// differently-sized stream must not leak into this one as a burst of
-    /// garbage. Slots past the new depth are released.
+    /// first `num_slots` slots' `data` buffers, zeroed. Slots past the new
+    /// depth are released.
     ///
     /// Nothing the consumer owns is touched. Its per-channel Burg/ring state
     /// is preallocated for [`MAX_CHANNELS`] and [`MAX_FPP`] and is already
-    /// clean — freshly constructed, or cleared by `reset()`, which is the only
-    /// way back to `SEQ_NONE` — so the consumer picks up the new width by
+    /// clean — a regulator is never reused, so adoption runs once, against a
+    /// freshly constructed one — so the consumer picks up the new width by
     /// reading `num_channels` after its `Acquire`, and reconfigures itself for
     /// the new fpp ([`ConsumerState::observe_stream`]). The jitter policy is
     /// untouched: only the tolerance configuration survives from construction.
@@ -1426,14 +1379,11 @@ impl Shared {
     /// a partial one. The relaxed `fpp`/`num_slots` stores are covered the same
     /// way.
     ///
-    /// This does **not** cover a `pop` still running the *previous* stream's
-    /// real (non-`SEQ_NONE`) path when `reset()` re-arms `SEQ_NONE` and a new
-    /// peer then adopts a different shape here — that `pop` could read a slot
-    /// already resized out from under it.
-    /// `WebTripSession::disconnect` closes that window by awaiting
-    /// `AudioContext.close()` inside `stop_capture` before `reset()` (WEB-53
-    /// Bug 7 / WEB-66), so no worklet callback can still be inside `pop` when
-    /// this runs.
+    /// No other adoption can race a running `pop`: the stream shape is fixed
+    /// for the life of a regulator, and a reconnect builds a fresh regulator
+    /// (a *connection's* buffers are retired, never reset) instead of
+    /// re-arming this one. The session frees a retired regulator only after
+    /// the render thread has confirmed it has let go of it.
     fn adopt_stream_shape(&self, channels: usize, fpp: usize) {
         let samples_per_packet = fpp * channels;
         let new_slots = num_slots(fpp);
@@ -1452,25 +1402,6 @@ impl Shared {
         self.num_channels.store(channels, Ordering::Relaxed);
         self.fpp.store(fpp, Ordering::Relaxed);
         self.num_slots.store(new_slots, Ordering::Relaxed);
-    }
-
-    /// Reset the shared half of the regulator. See [`Regulator::reset`] for
-    /// the quiescence the caller must provide.
-    fn reset(&self) {
-        // Publish SEQ_NONE first so a concurrent pop's next Acquire exits early.
-        self.last_seq_in.store(SEQ_NONE, Ordering::Release);
-        self.last_seq_out.store(SEQ_NONE, Ordering::Release);
-        self.start_time_bits.store(f64_to_bits(0.0), Ordering::Relaxed);
-        self.packets_rejected.store(0, Ordering::Relaxed);
-
-        // Reset slots without deallocating. The audio is zeroed, not just the
-        // timestamp: after a reset the next stream can jump the write pointer
-        // over slots this one filled, and those slots are readable again as
-        // soon as they fall inside the new stream's span. Silence there is a
-        // dropout; the previous connection's audio is a burst of garbage.
-        for slot in self.slots.iter() {
-            slot.clear();
-        }
     }
 
     /// Get current statistics.
@@ -1569,7 +1500,7 @@ impl ConsumerState {
             return false;
         }
 
-        // A started stream's width is fixed until the next reset, and the
+        // A started stream's width is fixed for the regulator's life, and the
         // Acquire above ordered its adoption.
         self.num_channels = sh.channels();
 
@@ -2064,49 +1995,6 @@ impl ConsumerState {
         self.fifo_len = 0;
     }
 
-    /// Reset the consumer's state. See [`Regulator::reset`] for the
-    /// quiescence the caller must provide.
-    fn reset(&mut self, sh: &Shared) {
-        // A stash left over from the previous connection would otherwise be
-        // returned on the first pop after reconnect, pinning `last_seq_out` to
-        // a stale sequence number and triggering thousands of spurious PLCs
-        // until the new stream's sequence numbers caught up.
-        self.last_stashed = None;
-        self.packet_count = 0;
-        self.plc_packet_count = 0;
-        self.last_glitches = 0;
-        self.stats_glitches = 0;
-        self.last_max_latency = 0.0;
-        self.stats_max_latency = 0.0;
-        self.last_was_glitch = false;
-        self.tolerance_ms = self.initial_tolerance_ms();
-        self.current_headroom = if self.auto_headroom < 0.0 {
-            0.0
-        } else {
-            self.auto_headroom
-        };
-        self.skip_auto_headroom = true;
-        self.auto_headroom_start_time = 6000.0;
-
-        // Frames pulled for the previous stream must not play in the next.
-        self.fifo_head = 0;
-        self.fifo_len = 0;
-
-        // Reset timing
-        self.last_pop_time_ms = 0.0;
-
-        // Reset timing stats state
-        self.pull_stats.reset();
-        self.push_stats.reset();
-
-        // Every channel, not just the ones in use: the next stream may adopt
-        // a wider count, and `adopt_stream_shape` relies on these being clean.
-        for channel in &mut self.channels {
-            channel.clear();
-        }
-        self.publish_stats(sh);
-    }
-
     /// Publish the consumer-owned stats snapshot (WEB-53 Bug 6).
     fn publish_stats(&self, sh: &Shared) {
         let total_glitches = self.pull_stats.underruns + self.pull_stats.overruns;
@@ -2559,102 +2447,6 @@ mod tests {
         assert_eq!(last_seq_out_opt(&reg), Some(fresh_seq));
         assert_eq!(consumer(&mut reg).packet_count, 2);
         assert_eq!(consumer(&mut reg).pull_stats.overruns, 0);
-    }
-
-    /// After a full push/pop cycle that accumulates state (stats, sequence
-    /// numbers, timing), `reset()` must scrub the regulator back to a
-    /// freshly-constructed state. This covers the field-by-field cleanup
-    /// required for safe stream reconnection.
-    #[test]
-    fn test_reset_clears_state_after_active_stream() {
-        let mut reg = Regulator::with_params(2, 32, 48_000, 5.0);
-        let samples = vec![0.25f32; reg.fpp() * reg.channels()];
-
-        // Drive a small stream through the regulator.
-        push_stored(&reg, 0, 2, &samples, 0.0);
-        push_stored(&reg, 1, 2, &samples, 2.0);
-        let mut out = vec![0.0f32; reg.fpp() * reg.channels()];
-        let _ = reg.pop_at(&mut out, 10.0);
-        let _ = reg.pop_at(&mut out, 12.0);
-        let _ = reg.pop_at(&mut out, 14.0); // forces underrun -> PLC
-
-        assert!(reg.is_initialized());
-        assert!(last_seq_out_opt(&reg).is_some());
-        assert!(consumer(&mut reg).packet_count > 0);
-        assert!(consumer(&mut reg).pull_stats.underruns > 0);
-
-        // SAFETY: single-threaded test; no concurrent push/pop.
-        unsafe { reg.reset() };
-
-        assert!(!reg.is_initialized(), "last_seq_in should be cleared");
-        assert_eq!(last_seq_out_opt(&reg), None);
-        assert_eq!(consumer(&mut reg).last_stashed, None);
-        assert_eq!(consumer(&mut reg).packet_count, 0);
-        assert_eq!(consumer(&mut reg).plc_packet_count, 0);
-        assert_eq!(consumer(&mut reg).last_glitches, 0);
-        assert_eq!(consumer(&mut reg).stats_glitches, 0);
-        assert_eq!(consumer(&mut reg).last_max_latency, 0.0);
-        assert_eq!(consumer(&mut reg).stats_max_latency, 0.0);
-        assert!(!consumer(&mut reg).last_was_glitch);
-        assert_eq!(reg.shared.start_time_ms(), 0.0);
-        assert_eq!(consumer(&mut reg).last_pop_time_ms, 0.0);
-        assert_eq!(consumer(&mut reg).pull_stats.underruns, 0);
-        assert_eq!(consumer(&mut reg).pull_stats.overruns, 0);
-        assert_eq!(consumer(&mut reg).push_stats.long_term_count, 0);
-        assert_eq!(reg.depth(), 0);
-
-        // Channels should be zeroed and ring write pointer should be re-centered.
-        for channel in &consumer(&mut reg).channels {
-            assert!(channel.tmp_buf.iter().all(|s| *s == 0.0));
-            assert!(channel.real_now_packet.iter().all(|s| *s == 0.0));
-            assert!(channel.output_now_packet.iter().all(|s| *s == 0.0));
-            assert_eq!(channel.ring_wptr, channel.ring_size / 2);
-        }
-
-        // A reconnect on a new stream with a different channel count must be
-        // able to adopt again — reset() re-arms SEQ_NONE, which is the only
-        // gate on adoption.
-        let mono = vec![0.5f32; reg.fpp()];
-        let outcome = reg.push_at(0, 1, reg.fpp(), &mono, 0.0);
-        assert_eq!(outcome, PushOutcome::Stored);
-        assert_eq!(reg.channels(), 1, "reconnect must re-adopt the new peer's channel count");
-        assert_eq!(reg.fpp() * reg.channels(), reg.fpp());
-    }
-
-    /// The 7def5fc race fix: a `last_stashed` slot left from a prior connection
-    /// must be cleared by `reset()`. Otherwise the first pop after reconnect
-    /// would replay a stale packet and pin `last_seq_out` to an old sequence
-    /// number, triggering a storm of spurious PLC events while the new stream
-    /// catches up.
-    #[test]
-    fn test_reset_clears_stashed_packet_to_avoid_stale_pop() {
-        let mut reg = Regulator::with_params(1, 32, 48_000, 5.0);
-        let samples = vec![0.5f32; reg.fpp()];
-
-        // Simulate a prior connection that landed with a stashed packet:
-        // primer connection seq 7, stash for "next-good" seq 9.
-        reg.shared.last_seq_in.store(9, Ordering::Release);
-        set_last_seq_out(&reg, Some(7));
-        consumer(&mut reg).last_stashed = Some((9, reg.shared.slot_index(9)));
-        plant_packet(&reg, 9, 100.0, &samples);
-
-        // SAFETY: single-threaded test; no concurrent push/pop.
-        unsafe { reg.reset() };
-
-        assert_eq!(
-            consumer(&mut reg).last_stashed, None,
-            "stashed packet from prior connection must be cleared"
-        );
-        assert!(!reg.is_initialized());
-        assert_eq!(last_seq_out_opt(&reg), None);
-
-        // After reset, the first pop on a fresh stream should return silence
-        // (startup), not the stale stashed buffer.
-        push_stored(&reg, 0, 1, &samples, 0.0);
-        let mut out = vec![0.0f32; reg.fpp()];
-        let result = reg.pop_at(&mut out, 1.0); // still inside tolerance window
-        assert!(!result, "should not replay the pre-reset stash");
-        assert!(out.iter().all(|s| *s == 0.0));
     }
 
     /// Push two packets with a 2-packet gap, then pop. The regulator should
@@ -3633,9 +3425,9 @@ mod tests {
     }
 
     /// Frames already pulled from the jitter buffer but not yet played are
-    /// latency too, and a reset must not carry them into the next stream.
+    /// latency too.
     #[test]
-    fn latency_includes_pulled_unplayed_frames_and_reset_discards_them() {
+    fn latency_includes_pulled_unplayed_frames() {
         const FPP: usize = 256;
         const FRAMES: usize = 128;
         let run = run_callbacks(FPP, FPP, FRAMES, 1, 100, 5.0);
@@ -3657,10 +3449,6 @@ mod tests {
             (queued_ms - reg.frames_to_ms(FRAMES)).abs() < 1e-3,
             "queued frames must reach latency_ms: {queued_ms} ms"
         );
-
-        // SAFETY: single-threaded test; nothing else touches `reg`.
-        unsafe { reg.reset() };
-        assert_eq!(reg.latency_ms(), 0.0, "reset must discard frames queued from the previous stream");
     }
 
     /// Pops before the peer starts must not delay the first real audio: startup

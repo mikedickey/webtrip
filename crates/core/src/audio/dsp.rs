@@ -125,7 +125,7 @@ pub(crate) fn map_to_output(src: &[f32], src_channels: usize, out: &mut [f32], o
 /// source *and* destination.
 ///
 /// Used to conform the capture width to the network wire's send channel
-/// count (fixed for the connection, `AudioParams::send_channels`) — e.g.
+/// count (fixed for the connection, `RingBuffer::wire_channels`) — e.g.
 /// averaging two captured channels into one sent — which `map_to_output`'s
 /// planar output layout cannot serve directly. The two functions deliberately keep
 /// separate implementations: they walk genuinely different memory layouts,
