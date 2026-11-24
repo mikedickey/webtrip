@@ -141,12 +141,14 @@ The four setters (`setSendChannels`, `setReceiveChannels`,
 
 `Idle`-only is deliberate. The transports snapshot the wire counts into
 `AudioBufferConfig` at connect time, and the render thread reads the send
-count from `AudioParams::send_channels`. Changing either mid-connection would
+count from the connection's `RingBuffer::wire_channels`. Changing either mid-connection would
 desync the `RingBuffer`'s producer (the worklet) from its consumer (the
 transport's send loop).
 
-`setSendChannels` also stores the count into `AudioParams::send_channels`, the
-atomic the render thread reads.
+The count reaches the render thread through the connection's send ring: each
+connect builds a fresh `RingBuffer` and declares the send width on it
+(`RingBuffer::set_wire_format`), so it is per-connection wire state and not part
+of the device-wide `AudioParams`.
 
 ---
 
@@ -259,7 +261,7 @@ Key points:
   on purpose. Converting twice would duplicate work and risk the two consumers
   drifting apart.
 - **Step ⑥ is where the capture width and the send count meet.**
-  `send_local_to_network` reads `AudioParams::get_send_channels()` and pays for
+  `send_local_to_network` reads `RingBuffer::wire_channels()` and pays for
   the conform only when `in_channels != send_channels`. This is how two
   captured channels are averaged into one sent channel, and how a mono capture
   against a stereo send is duplicated rather than mis-framed.

@@ -30,6 +30,12 @@ pub const MIN_FPP: usize = 16;
 /// audio thread. Mirrored by `stream::regulator`, pinned by a test.
 pub const MAX_FPP: usize = 1024;
 
+/// Most network connections a session holds at once. The session is built as a
+/// list of connections (each with its own stream buffers); only one is
+/// supported, and a connect beyond the limit is refused with an error naming
+/// it rather than ignored.
+pub const MAX_CONNECTIONS: usize = 1;
+
 /// Largest packet WebTrip puts on the wire when the transport cannot say how
 /// much it carries. A QUIC DATAGRAM frame must fit one packet (RFC 9221) and
 /// QUIC forbids IP fragmentation (RFC 9000 §14), so ~1200 bytes is the

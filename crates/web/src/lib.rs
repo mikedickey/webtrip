@@ -6,6 +6,7 @@ pub mod audio;
 pub mod network;
 
 // Other web modules
+mod connection;
 mod console_log;
 mod dependent_module;
 pub mod session;

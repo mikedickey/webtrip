@@ -219,6 +219,7 @@ pub(crate) struct MockTransport {
     probe: std::rc::Rc<MockProbe>,
     connect_gate: Option<js_sys::Promise>,
     close_gate: Option<js_sys::Promise>,
+    forced_close: bool,
 }
 
 impl MockTransport {
@@ -230,6 +231,7 @@ impl MockTransport {
             probe: Default::default(),
             connect_gate: None,
             close_gate: None,
+            forced_close: false,
         }
     }
 
@@ -240,6 +242,13 @@ impl MockTransport {
     /// Hold `connect` pending until `gate` resolves.
     pub(crate) fn with_connect_gate(mut self, gate: js_sys::Promise) -> Self {
         self.connect_gate = Some(gate);
+        self
+    }
+
+    /// Make `close` report a forced teardown (`false`), as a worker that had
+    /// to be terminated does.
+    pub(crate) fn with_forced_close(mut self) -> Self {
+        self.forced_close = true;
         self
     }
 
@@ -310,7 +319,7 @@ impl webtrip_core::network::transport::Transport for MockTransport {
         })
     }
 
-    fn close(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
+    fn close(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + '_>> {
         self.probe.closes.set(self.probe.closes.get() + 1);
         self.state = webtrip_core::network::transport::TransportState::Closed;
         // Match WebRTC's `close_sync`: notify `"closed"` before the async
@@ -320,6 +329,11 @@ impl webtrip_core::network::transport::Transport for MockTransport {
         if let Some(callback) = self.probe.on_state_change.borrow().clone() {
             callback(webtrip_core::network::transport::TransportState::Closed);
         }
-        Box::pin(pass(self.close_gate.take()))
+        let gate = self.close_gate.take();
+        let clean = !self.forced_close;
+        Box::pin(async move {
+            pass(gate).await;
+            clean
+        })
     }
 }

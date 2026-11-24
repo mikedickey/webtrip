@@ -76,6 +76,12 @@ pub struct RingBuffer {
     /// 0 = no data, 1 = data available
     /// Used with Atomics.waitAsync() for zero-CPU idle behavior
     has_data_flag: AtomicU32,
+
+    /// Channels in every packet this ring feeds: the stride of its contents,
+    /// fixed by the connection that owns it (see [`set_wire_format`]).
+    ///
+    /// [`set_wire_format`]: RingBuffer::set_wire_format
+    wire_channels: AtomicU32,
 }
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
@@ -92,6 +98,7 @@ impl RingBuffer {
             writes: AtomicU64::new(0),
             samples_written: AtomicU64::new(0),
             has_data_flag: AtomicU32::new(0),
+            wire_channels: AtomicU32::new(1),
         }
     }
 
@@ -260,6 +267,22 @@ impl RingBuffer {
 }
 
 impl RingBuffer {
+    /// Declare the width of the packets this ring feeds, clamped to
+    /// `[1, MAX_WIRE_CHANNELS]`. The render thread conforms captured audio to
+    /// it before writing, so a reader that frames packets at the same width
+    /// always finds whole packets. Per-connection wire state: it lives with
+    /// the ring, not with the device-wide `AudioParams`. Set it before the
+    /// ring is attached to a worklet.
+    pub fn set_wire_format(&self, channels: u8) {
+        let channels = u32::from(channels).clamp(1, u32::from(MAX_WIRE_CHANNELS));
+        self.wire_channels.store(channels, Ordering::Relaxed);
+    }
+
+    /// The width of the packets this ring feeds.
+    pub fn wire_channels(&self) -> usize {
+        self.wire_channels.load(Ordering::Relaxed) as usize
+    }
+
     /// Raw pointer to slot `idx`, valid for access up to the end of `buffer`.
     /// `UnsafeCell<f32>` has the same layout as `f32`, so the slots from `idx`
     /// on form a contiguous `f32` run.
@@ -308,6 +331,17 @@ impl RingBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_format_clamps_to_the_wire_ceiling() {
+        // The wire ceiling, not the device one: a 0 or oversized request must
+        // still leave a width the packet framing can use.
+        let ring = RingBuffer::new();
+        for (requested, expected) in [(0u8, 1usize), (1, 1), (4, 4), (MAX_WIRE_CHANNELS, MAX_WIRE_CHANNELS as usize), (MAX_WIRE_CHANNELS + 1, MAX_WIRE_CHANNELS as usize)] {
+            ring.set_wire_format(requested);
+            assert_eq!(ring.wire_channels(), expected, "requested {requested}");
+        }
+    }
     use std::thread;
 
     /// Convenience: a streaming-enabled buffer ready for writes.

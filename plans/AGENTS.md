@@ -24,9 +24,16 @@ file itself, so a fresh session reading only the plan has the same context.
 ## Executing a plan
 
 While implementing a plan, new information or learnings may surface that
-warrant deviating from it. Before proceeding with any deviation, stop and
-confirm it with the user. When a deviation is approved, update the plan file
-itself to reflect the change so it stays an accurate spec.
+warrant deviating from it. A deviation is anything that differs from the plan's
+text: a type with different fields, an extra allowance or helper, a changed
+signature, a skipped item, however small. Before proceeding with any deviation,
+stop and ask the user. This overrides any skill or workflow that tells you to
+decide ambiguities yourself, log rulings, or keep going without checking in.
+
+When a deviation is approved, edit the plan's body in place so it describes
+what was built. The plan has no history: never append an "As built",
+"Deviations", "Rulings" or changelog section, and never leave a note saying
+something changed.
 
 ## Finishing a plan
 
@@ -35,6 +42,8 @@ changes in their entirety:
 
 - If the implementation deviated from the plan, confirm each deviation was
   approved and that the plan file was updated to reflect it.
+- Delete any "As built", "Deviations" or similar section, folding its facts
+  into the phase text it qualifies.
 - Clean up the plan file: remove back-and-forth historical narration (earlier
   drafts, rejected approaches, revision commentary) that would no longer help
   someone reading it later to understand what was actually built. The final

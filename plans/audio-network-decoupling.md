@@ -640,11 +640,18 @@ limit, so it sets no floor. In practice `fit_fpp` cannot reach the floor at the
 `[MIN_FPP, MAX_FPP]` and keeps its `InvalidBufferSize` error, so the send-side
 fit, the wire check and the regulator share one definition.
 `FppLimit::Floor` surfaces as an **error**, not a silently oversized packet.
+`FppFit.limited_by` is `FppLimit::{None, PacketSize, Floor}`.
+`transport::fit_send_fpp(name, max_bytes, send_channels, preferred)` wraps
+`fit_fpp` for both callers (the session and the WebTransport worker): it logs a
+reduced fit with its reason and turns `Floor` into a `TransportError`.
+`limits.rs` carries `MIN_FPP`, `MAX_FPP` and `MAX_UNFRAGMENTED_PACKET_BYTES`
+(1200).
 
 `session.rs:412`'s single `buffer_size` splits into `send_fpp` and
 `receive_fpp` — genuinely different things (`:449-454` configures receive via
 `Regulator::with_params`, `:1061` send via `audio_buffer_config`). Because the regulator adopts the
-peer's fpp (below), `receive_fpp` is only the regulator's pre-adoption geometry:
+peer's fpp (below), `receive_fpp` is only the geometry each connection's
+regulator is built with before adoption:
 its initial tolerance and its startup silence. **No serializer change is needed**: `serialize_samples_into` derives
 `header.buffer_size = samples.len()/send_channels` (`protocol.rs:401`), so send
 fpp is implicit in how many samples a transport reads per packet, and both
@@ -652,7 +659,10 @@ transports already use `AudioBufferConfig.buffer_size` as their chunk size
 (`webrtc.rs:388`, `webtransport_worker.rs:608`).
 
 Add `fn max_packet_bytes(&self) -> Option<usize> { None }` to the `Transport`
-trait (`transport.rs`, near `connect` at `:230`).
+trait (`transport.rs`, near `connect` at `:230`). The session fits at `bring_up`
+for a transport whose `max_packet_bytes()` is `Some` (WebRTC: the 1200-byte
+floor). WebTransport returns `None` until its worker's `fpp` message reports the
+datagram size it fitted to, then `Some(datagram size)`.
 
 - **WebTransport — discovered.** In `worker_connect`
   (`webtransport_worker.rs:491`) right after `ready()` resolves (`:505`), read
@@ -690,7 +700,7 @@ state that is clean because it is fresh or was cleared by a quiesced
 `reset()`. fpp follows the same path:
 
 - **Where the value comes from.** `deliver_received_packet` (`transport.rs`)
-  passes `header.buffer_size`. `Regulator::push_at` gains an `fpp` parameter.
+  passes `header.buffer_size`. `Regulator::push_at(seq, channels, fpp, samples, now_ms)` gains an `fpp` parameter.
 - **Producer, first packet** (`last_seq_in == SEQ_NONE`):
   - If fpp is outside `[MIN_FPP, MAX_FPP]`, reject it as
     `PushOutcome::UnsupportedFpp { got }`.
@@ -789,26 +799,10 @@ which is at the old stride/packet size.
 hard ceiling on `fpp × send_channels`, not a sizing nit — `write` rejects
 oversized writes (`:155-158`) while both send paths wait for
 `available >= fpp*channels`, so any excess is a **permanent silent stall**.
-Raise it to hold ≥2 packets at the wire ceiling and add a `debug_assert!` in
-`set_audio_buffers`.
-
-**As built.** Where the implementation settled details the text above leaves open:
-
-- `Regulator::push_at(seq, channels, fpp, samples, now_ms)`. `FppFit.limited_by` is
-  `FppLimit::{None, PacketSize, Floor}`.
-- `transport::fit_send_fpp(name, max_bytes, send_channels, preferred)` wraps `fit_fpp`
-  for both callers (the session, and the WebTransport worker): it logs a reduced fit
-  with its reason and turns `Floor` into a `TransportError`. `limits.rs` carries
-  `MIN_FPP`, `MAX_FPP` and `MAX_UNFRAGMENTED_PACKET_BYTES` (1200).
-- The session fits at `bring_up` for a transport whose `max_packet_bytes()` is
-  `Some` (WebRTC: the 1200-byte floor). WebTransport returns `None` until its
-  worker's `fpp` message reports the datagram size it fitted to, then
-  `Some(datagram size)`.
-- `RING_BUFFER_SIZE` is `2 * MAX_FPP * MAX_WIRE_CHANNELS` (16384 samples). The
-  two-packets check is a `debug_assert!` in `AudioBufferConfig::samples_per_packet`,
-  which every transport's `set_audio_buffers` path reaches.
-- `session.rs` keeps `send_fpp`; `receive_fpp` is only the construction-time local
-  the regulator is built with.
+It is `2 * MAX_FPP * MAX_WIRE_CHANNELS` (16384 samples), two packets at the
+wire ceiling. The two-packets check is a `debug_assert!` in
+`AudioBufferConfig::samples_per_packet`, which every transport's
+`set_audio_buffers` path reaches.
 
 ### Phase 6 — Per-connection stream buffers; retirement replaces reset
 *Delivers: every connection gets its own `Regulator` and `RingBuffer`, and
@@ -841,43 +835,63 @@ overlap. `worklet.js`'s `'stop'` handler sets `this.stopped`. `process()`
 checks that flag before calling `this.processor.render(...)`. So once the
 handler has run, that processor never touches its pointers again. The handler
 now also posts `'stopped'` back on the port. Receiving it on the main thread
-is the proof, with no context close. `teardown_worklet_node`
-(`engine.rs:413`) returns a future (or registers a callback) that settles on
-that acknowledgement.
+is the proof, with no context close. `teardown_worklet_node` returns a
+promise that settles on that acknowledgement, and
+`build_and_connect_worklet_node` returns the replaced node's.
 
-- **`Connection { id, transport, regulator: Box<Regulator>, ring:
-  Box<RingBuffer>, wire, state }`** is in `webtrip-web`, because it holds a
-  transport. The session holds `Vec<Connection>`. `connect()` enforces
-  `len <= 1` by **returning an error naming the limit**, never by silently
-  ignoring the call.
+- **`Connection { id, transport, buffers }`** is in `webtrip-web`
+  (`connection.rs`), because it holds a transport (the `TransportSlot` the
+  tick closure ticks). `buffers` is a `StreamBuffers { ring: Box<RingBuffer>,
+  regulator: Box<Regulator> }`, the one allocation site: it declares the send
+  width on the ring and builds the regulator. There is no separate wire or
+  state field: the wire width lives on the ring, and connection state is the
+  session `Lifecycle`'s. The session holds `Vec<Connection>`. `limits::MAX_CONNECTIONS`
+  (1) is the named limit, and `connect()` enforces it through
+  `check_connection_capacity` by **returning an error naming the limit**,
+  never by silently ignoring the call.
   - The session's `local_to_network_buffer` / `network_to_local_buffer`
     fields (`session.rs:283-284`) and their `ManuallyDrop` go away.
-  - `audio_buffer_config` and `buffer_ptrs` read from the connection.
+  - `audio_buffer_config` and the engine bring-up read from the connection.
+    `receive_fpp` is a session setting: the geometry each new regulator is
+    built with before it adopts the peer's.
+  - `getRingBufferFlagPtr()` returns 0 with no connection: the ring is per
+    connection, so its address changes on every connect.
 - **The processor's stream list is immutable for the life of a worklet node.**
   The node is built pointing at one connection's buffers, or at none
   (`AudioProcessor::new`, the empty `net_in`/`net_out` case). Adding or
   removing a connection while an engine runs rebuilds the node through
-  `build_and_connect_worklet_node` (`engine.rs:343`). The output-device change
-  already uses and exercises that path.
+  `build_and_connect_worklet_node` (`engine.rs:343`), exposed as
+  `AudioEngine::attach_network(ring, regulator)` (null pointers detach). The
+  output-device change already uses and exercises that path.
   - In this phase connect still brings the engine up after the dial, so the
-    first node is simply built against the new connection. The rebuild path
-    is wired and tested here, and becomes the hot path in Phase 7.
+    first node is simply built against the new connection's buffers. The
+    session does not yet call `attach_network` or `retire_until_stopped`
+    (both carry `#[cfg_attr(not(test), allow(dead_code))]`); browser tests
+    exercise them, and they become the hot path in Phase 7.
 - **Retirement.**
   - On disconnect, the transport is closed first, so the producer is
     quiesced.
   - The connection's buffers then move into a session-owned retired list,
     keyed by the node they were attached to.
-  - That entry is freed when the node's `'stopped'` arrives.
+  - That entry is freed when the node's `'stopped'` arrives
+    (`retire_until_stopped(buffers, stopped)`).
   - If the context closes first (`stopAudio`, or the session `Drop` path),
-    the successful close frees every retired entry.
-  - If the close times out, the entries stay in the list, as `release`
-    already keeps the regulator un-reset on timeout today.
+    the successful close frees only the entries its own connection retired.
+    A set left by an earlier timed-out close stays: a different context's
+    close proves nothing about that worklet.
+  - If the close times out but the transport shut down cleanly, the worklet
+    node's `'stopped'` frees the entry (`release`, `Drop`). Without it, or
+    after a force-terminated transport worker, the entry stays in the list
+    and is leaked rather than freed.
   - If no acknowledgement ever arrives (for example, a suspended context
-    might not deliver port messages), the entry waits for the context close.
-    That is sound and bounded to one buffer pair per missing
+    might not deliver port messages), the entry stays alive: no other context's
+    close proves that node idle. That is sound and bounded to one buffer pair per missing
     acknowledgement.
-  - The session `Drop` path (`session.rs:1177`) uses the same retirement
-    rule in place of its hand-built buffer tuple.
+  - The session `Drop` path uses the same retirement rule.
+  - `WebTransportImpl::close`'s 2 s force-terminate fallback (WEB-67) can
+    leave a worker `push` in flight. It used to race a live `reset`; it now
+    races freeing the buffers. The fallback is a bounded-hang escape hatch
+    and is unchanged.
 - **Delete `Regulator::reset`** with its `Shared::reset` / `ConsumerState::reset`
   helpers and its `unsafe` contract.
   - Re-adoption after a reconnect is now construction, since a fresh
@@ -896,10 +910,12 @@ that acknowledgement.
   per-connection send-side object, the render thread already reaches it
   through `SharedPtr`, and the stride of its contents is its own property.
   `AudioParams` is then purely device and metering state.
-- **Stats.** `SessionStats` splits into `ConnectionStats` plus an aggregate.
-  `build_session_stats` (`session_stats.rs:59`) splits into a pure
-  `build_connection_stats` plus a trivial aggregate. The existing
-  `build_session_stats_maps_all_fields` test ports onto the former.
+- **Stats.** `SessionStats` keeps its flat field shape (what JavaScript
+  reads) and is the aggregate; `ConnectionStats` is an alias of it, so one
+  connection's stats and the session's share a single definition. `build_connection_stats` is the single mapping point and
+  `aggregate_session_stats` folds the live connections: counts add, timings
+  take the worst, and one connection passes through unchanged. The existing
+  `build_session_stats_maps_all_fields` test ported onto the former.
 - **Cost, stated in the commit.** Each connect allocates a regulator on the
   main thread, off the audio thread. Connecting or disconnecting while an
   engine runs swaps the worklet node, which is the same brief glitch an

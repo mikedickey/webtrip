@@ -2,9 +2,6 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-use crate::limits::MAX_WIRE_CHANNELS;
-#[cfg(test)]
-use crate::limits::MAX_DEVICE_CHANNELS;
 use crate::stream::shared_ptr::SharedPtr;
 
 /// Minimum dB level (silence threshold)
@@ -40,11 +37,6 @@ pub struct AudioParams {
     pub(crate) monitor_volume: AtomicU32,
     /// Total number of audio callbacks (process() calls)
     pub(crate) callback_count: AtomicU64,
-    /// Number of channels sent over the wire, fixed for a connection. The
-    /// render thread conforms captured audio to this width before writing
-    /// the send ring buffer. Governs only the send path — playback width is
-    /// the peer's to declare (see [`crate::stream::regulator::Regulator::push`]).
-    pub(crate) send_channels: AtomicU32,
 }
 
 impl Default for AudioParams {
@@ -57,20 +49,7 @@ impl Default for AudioParams {
             output_volume: AtomicU32::new(1000), // 1.0 (full volume)
             monitor_volume: AtomicU32::new(0), // 0.0 (monitoring off by default)
             callback_count: AtomicU64::new(0),
-            send_channels: AtomicU32::new(1), // Default to mono
         }
-    }
-}
-
-impl AudioParams {
-    /// Set the wire send channel count, clamped to `[1, MAX_WIRE_CHANNELS]`
-    pub fn set_send_channels(&self, channels: u32) {
-        self.send_channels.store(channels.clamp(1, MAX_WIRE_CHANNELS as u32), Ordering::Relaxed);
-    }
-
-    /// Get the wire send channel count
-    pub fn get_send_channels(&self) -> u32 {
-        self.send_channels.load(Ordering::Relaxed)
     }
 }
 
@@ -308,21 +287,6 @@ mod tests {
     }
 
     #[test]
-    fn test_send_channels_roundtrip_and_clamp() {
-        let p = AudioParams::default();
-        let max = MAX_WIRE_CHANNELS as u32;
-        for c in [1_u32, 2, 4, max] {
-            p.set_send_channels(c);
-            assert_eq!(p.get_send_channels(), c);
-        }
-        // Clamp to [1, MAX_WIRE_CHANNELS]: the wire ceiling, not the device one.
-        p.set_send_channels(0);
-        assert_eq!(p.get_send_channels(), 1);
-        p.set_send_channels(MAX_DEVICE_CHANNELS as u32 * 2);
-        assert_eq!(p.get_send_channels(), max);
-    }
-
-    #[test]
     fn test_db_level_conversion_boundaries() {
         let p = AudioParams::default();
         // Silence: stored 0 decodes to MIN_DB.
@@ -361,49 +325,6 @@ mod tests {
         p.peak_db_level.store(encode_db(-80.0), Ordering::Relaxed);
         assert!((p.get_volume_level() - 0.0).abs() < EPS);
         assert!((p.get_peak_level() - 0.0).abs() < EPS);
-    }
-
-    #[test]
-    fn test_cross_thread_concurrent_reader_observes_latest() {
-        // A reader spinning concurrently with a writer must observe the final value
-        // without tearing or deadlock (single writer, relaxed atomics).
-        let params = Arc::new(AudioParams::default());
-        let target_channels = 6_u32;
-
-        let writer = {
-            let p = Arc::clone(&params);
-            thread::spawn(move || {
-                for c in 1..=target_channels {
-                    p.set_send_channels(c);
-                    thread::yield_now();
-                }
-            })
-        };
-
-        let reader = {
-            let p = Arc::clone(&params);
-            thread::spawn(move || {
-                // Wait on a generous wall-clock deadline rather than a fixed iteration
-                // count. The writer performs only a handful of trivial stores, so under
-                // any normal scheduling the sticky target value is observed within
-                // microseconds. Bounding by time (not iteration count) avoids a spurious
-                // miss under scheduling pressure while still failing fast — instead of
-                // hanging forever — if cross-thread visibility ever regresses.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                while std::time::Instant::now() < deadline {
-                    if p.get_send_channels() == target_channels {
-                        return true;
-                    }
-                    thread::yield_now();
-                }
-                false
-            })
-        };
-
-        writer.join().unwrap();
-        let observed = reader.join().unwrap();
-        assert_eq!(params.get_send_channels(), target_channels);
-        assert!(observed, "reader thread never observed the final value");
     }
 
     #[test]
