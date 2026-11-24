@@ -929,62 +929,60 @@ transports. Last, because it depends on Phase 6's retirement. A network-only
 `disconnect()` retires the connection's buffers while the worklet keeps
 running.*
 
-Today engine bring-up is a step inside connect. `bring_up` (`session.rs:829`)
-dials the transport, then runs `start_engine_unless_aborted` (`:998`). That
-spawns `bring_up_engine` (`:201`) and races it against the connect's abort
-promise, so `disconnect()` is never blocked on `getUserMedia` (WEB-69). On
-success it publishes the transport and engine and starts the network loop
-with no await in between. Teardown is `disconnect` (`:635`) →
-`stop_network_loop` → `release` (`:926`).
-
-- **Split the engine half out of `bring_up`/`release`.**
-  - Public `startAudio` runs the engine bring-up
-    (`start_engine_unless_aborted`). It keeps the abort race and the cancel
-    flag, so a `stopAudio()`/`disconnect()` during a pending permission
-    prompt still settles promptly.
-  - `stopAudio` runs the engine half of `release`: `AudioContext.close`,
-    which also frees the retired entries.
-  - `connect` keeps the dial, the failure bridge and publishing the
-    transport. When an engine is running, it then rebuilds the node against
-    the new connection (Phase 6).
-  - `disconnect` closes the transport, then rebuilds the node with no
-    network stream if an engine is running, and retires the buffers.
-  - `connect_to_studio` keeps its exact signature (Demo.tsx is out of scope)
-    and becomes `start_audio(...)` then `connect(...)`. This reverses today's
-    order, which dials first and then starts the engine.
-- **Tick wiring stays as is.** The tick closure already ticks the shared
-  `TransportSlot` (`Rc<RefCell<Option<Box<dyn Transport>>>>`, `session.rs:87`,
-  set up in `start_network_loop` at `:1093`). There is no self-pointer and no
-  `unsafe`, and `Rc`/`RefCell` stay at the `web_sys` callback boundary. The
-  `TickClock` below must drive this same slot, which becomes the
-  connection's transport.
-- **State split.**
-  - `SessionState` becomes the *network* state.
-  - Add `AudioState { Stopped, Running }`.
-  - Session-level state becomes a pure
-    `aggregate_network_state(&[NetworkState]) -> SessionState`. It is
-    natively testable, and it is the seam where 1→N generalises.
-  - `SessionState` and the connect/disconnect gate live in `Lifecycle`
-    (`lifecycle.rs`, one atomic epoch+state word). The network state and
-    `AudioState` must be expressed in that state machine, or in a sibling
-    with the same epoch discipline, not as a separate flag alongside it.
-- **The WebRTC tick-clock asymmetry, addressed not papered over.**
-  - WebRTC's tick is driven by `Atomics.waitAsync` on the ring's has-data
-    flag. Only `RingBuffer::write` from the worklet sets that flag, so with
-    no worklet there are no ticks and WebRTC cannot *receive* either.
-    Packets pile up in `receive_queue` (`webrtc.rs:227`), which is drained
-    only inside `tick`.
-  - Introduce a session-owned
-    `TickClock { None, Atomics(AudioCallbackLoop), Interval(IntervalTickLoop) }`
-    with `ensure_running_for(audio_running, any_connection_live)`.
-  - `IntervalTickLoop` is a small sibling of `AudioCallbackLoop`
-    (`audio_callback_loop.rs:142`) with the same stop-on-Drop discipline.
+- **Public API.** `startAudio(deviceId, agc, echo, ns)` and `stopAudio()` bring
+  the engine up and down; `connect(host, port, clientName)` dials with no audio;
+  `getAudioState()` reports `"stopped"`/`"running"`. `connectToStudio` keeps its
+  exact signature (Demo.tsx is out of scope).
+  - **`connectToStudio` owns the audio it started** (decided with the user): it
+    starts audio first (unless audio is already running), then dials, and
+    `disconnect()` or a failed connect stops that audio again. Audio the caller
+    already had running survives `disconnect()`, and an explicit `stopAudio()`
+    takes audio out of a connect's hands. This keeps the demo, which only knows
+    `connectToStudio`/`disconnect`, releasing the mic as before.
+  - The audio start runs *inside* the connect (after `Connecting` is entered,
+    under the connect's abort), not as a separate call before it, so
+    `disconnect()` during a permission prompt still settles promptly (WEB-69).
+    The dial timeout is armed just before the dial and bounds only it.
+  - `startAudio` keeps the abort race and cancel flag; `stopAudio` cancels a
+    start in flight, then closes the `AudioContext`.
+- **Attaching.** A connection is attached to the engine's worklet node
+  (`attach_network`) when its transport is published, and an engine is attached
+  to the published connection when it finishes starting; a connection still
+  dialing is never attached. `disconnect` closes the transport, then rebuilds the
+  node with no network stream (`detach_engine_from`) and retires the buffers
+  until the replaced node's `'stopped'` arrives. Retired sets carry the
+  generation of the engine whose node read them, so that engine's fulfilled
+  `AudioContext.close` frees exactly those. An engine whose close times out
+  leaves its connection under a `ConsumerHold`: the connection's buffers are
+  freed only after the node's own acknowledgement, never if none can come.
+- **State split.** `SessionState` is the *network* state, aggregated by the pure
+  `aggregate_network_state(&[SessionState]) -> SessionState` (core). Audio has
+  `AudioLifecycle` (core), a sibling of `Lifecycle` with the same epoch word
+  (`EpochWord<P>`, shared): phases `Stopped → Starting → Running → Stopping`,
+  with `AudioState { Stopped, Running }` as what callers see. Stopping bumps the
+  epoch, so a start a stop has overtaken can never publish its engine. The
+  wire channel counts (send/receive) are settable only while the network is
+  `Idle`, the device counts (input/output) only while audio is stopped;
+  `setOutputDevice` is also refused while audio is starting.
+- **The WebRTC tick-clock asymmetry.** WebRTC's tick is driven by
+  `Atomics.waitAsync` on the ring's has-data flag, which only the worklet's
+  `RingBuffer::write` sets, so with no worklet nothing ticks and WebRTC cannot
+  even receive. The session owns a `TickClock` (`tick_clock.rs`, web) that
+  ticks the published connection's existing `TransportSlot`
+  (`Rc<RefCell<Option<Box<dyn Transport>>>>`; no self-pointer, no `unsafe`):
+  `Atomics` (an `AudioCallbackLoop`) while audio runs, `Interval` (an
+  `IntervalTickLoop`, the same stop-on-`Drop` sibling) otherwise, `None` for a
+  connection that needs no tick (WebTransport's worker drives itself). It
+  falls back to `Interval` when `Atomics.waitAsync` is unavailable.
+  `ensure_running_for(audio_running, source)` rebuilds it whenever audio starts
+  or stops or the connection changes; `tick_kind` is the pure choice.
   - A network-only connection's regulator has no consumer. It fills, and its
     slot ring overwrites, exactly as when a worklet stalls today. When audio
     starts later, the node is built against it and `find_best_packet`'s
     resync handles the backlog.
-- **Homes.** `TickClock` and `IntervalTickLoop` are `webtrip-web`.
-  `AudioState` and `aggregate_network_state` are `webtrip-core`.
+- **Homes.** `TickClock`, `IntervalTickLoop` and the session wiring are
+  `webtrip-web`. `AudioState`, `AudioLifecycle` and `aggregate_network_state`
+  are `webtrip-core`.
 
 **Non-negotiable sequencing:** 0a → 0b → 0c → 0d, all before Phase 1, so
 later phases create new files in their final crate.

@@ -558,11 +558,6 @@ impl AudioEngine {
     /// previous buffers are no longer referenced by the render thread. With no
     /// node running, only the pointers are stored (the first node built picks
     /// them up) and there is nothing to acknowledge.
-    ///
-    /// Not yet called by the session: connect still brings the engine up
-    /// after the dial, against the new connection's buffers directly. The
-    /// device/network split is what makes this the hot path.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn attach_network(
         &mut self,
         local_to_network: *mut RingBuffer,

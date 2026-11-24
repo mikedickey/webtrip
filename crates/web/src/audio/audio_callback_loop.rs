@@ -199,6 +199,49 @@ impl Drop for AudioCallbackLoop {
     }
 }
 
+/// How often an [`IntervalTickLoop`] ticks. A packet at the default 128 frames
+/// is 2.67 ms of audio and a tick drains everything queued, so this only
+/// bounds how long a received packet waits for its tick; browsers clamp
+/// timers below this anyway.
+pub const INTERVAL_TICK_PERIOD_MS: i32 = 4;
+
+/// A tick on a fixed period, for a network connection that has no audio
+/// callback to wake it (audio not running). The sibling of
+/// [`AudioCallbackLoop`], with the same stop-on-`Drop` discipline.
+pub struct IntervalTickLoop {
+    /// The `setInterval` handle, while running
+    handle: Option<i32>,
+}
+
+impl IntervalTickLoop {
+    /// Start calling `tick_callback` every [`INTERVAL_TICK_PERIOD_MS`].
+    pub fn start(tick_callback: &js_sys::Function) -> Result<Self, JsValue> {
+        let window = web_sys::window().ok_or_else(|| JsValue::from_str("No window available"))?;
+        let handle = window.set_interval_with_callback_and_timeout_and_arguments_0(
+            tick_callback,
+            INTERVAL_TICK_PERIOD_MS,
+        )?;
+        Ok(Self { handle: Some(handle) })
+    }
+
+    /// Stop ticking.
+    pub fn stop(&mut self) {
+        if let (Some(handle), Some(window)) = (self.handle.take(), web_sys::window()) {
+            window.clear_interval_with_handle(handle);
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.handle.is_some()
+    }
+}
+
+impl Drop for IntervalTickLoop {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 // ── Browser tests (web_sys / Atomics.waitAsync) ──────────────────────────────
 //
 // Real-browser coverage run in headless Chrome via `npm run test:wasm`. The

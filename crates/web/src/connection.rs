@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use webtrip_core::limits::{MAX_CONNECTIONS, MAX_WIRE_FRAMES_PER_CALLBACK, WIRE_SAMPLE_RATE};
-use webtrip_core::network::transport::Transport;
+use webtrip_core::network::transport::{Transport, TransportType};
 use webtrip_core::session_stats::{build_connection_stats, ConnectionStats};
 use webtrip_core::stream::regulator::Regulator;
 use webtrip_core::stream::ring_buffer::RingBuffer;
@@ -69,12 +69,29 @@ impl StreamBuffers {
     }
 }
 
+/// Whether a worklet may still be popping a connection's regulator after the
+/// engine it belonged to was stopped. That happens when `AudioContext.close`
+/// timed out: nothing then proves the render thread idle, short of the node's
+/// own `"stopped"` acknowledgement.
+pub(crate) enum ConsumerHold {
+    /// No stopped engine may still be reading these buffers
+    Clear,
+    /// Until the stopped node's acknowledgement settles
+    Until(js_sys::Promise),
+    /// No acknowledgement can come: the buffers must never be freed
+    Forever,
+}
+
 /// One network connection: its transport and the buffers it moves audio
 /// through.
 pub(crate) struct Connection {
     pub(crate) id: u64,
     pub(crate) transport: TransportSlot,
+    /// Fixed when the connection opens; the transport itself is only
+    /// published once it has connected.
+    pub(crate) transport_type: TransportType,
     pub(crate) buffers: StreamBuffers,
+    pub(crate) hold: ConsumerHold,
 }
 
 /// Refuse a connection beyond [`MAX_CONNECTIONS`], with an error naming the
@@ -92,8 +109,13 @@ pub(crate) fn check_connection_capacity(live: usize) -> Result<(), String> {
 /// Values waiting to be freed, each under a key handed back by
 /// [`retire`](Self::retire). Dropping an entry is the only way it is freed, so
 /// a value nothing frees (a close that timed out) is simply kept.
+///
+/// An entry may also carry a tag naming what proves it safe: the generation
+/// of the audio engine whose worklet node it was attached to
+/// ([`retire_for`](Self::retire_for)). A successful `AudioContext.close` of
+/// that engine proves every entry with its tag, and no other.
 pub(crate) struct RetiredList<T> {
-    entries: Vec<(u64, T)>,
+    entries: Vec<(u64, Option<u64>, T)>,
     next_key: u64,
 }
 
@@ -104,22 +126,39 @@ impl<T> RetiredList<T> {
 
     /// Keep `value` alive; the returned key frees it via [`free`](Self::free).
     pub(crate) fn retire(&mut self, value: T) -> u64 {
+        self.retire_tagged(value, None)
+    }
+
+    /// Like [`retire`](Self::retire), also freeable as a group through
+    /// [`free_tagged`](Self::free_tagged).
+    pub(crate) fn retire_for(&mut self, value: T, tag: u64) -> u64 {
+        self.retire_tagged(value, Some(tag))
+    }
+
+    fn retire_tagged(&mut self, value: T, tag: Option<u64>) -> u64 {
         let key = self.next_key;
         self.next_key += 1;
-        self.entries.push((key, value));
+        self.entries.push((key, tag, value));
         key
     }
 
     /// Free the entry under `key`. A key already freed is a no-op, so a late
     /// acknowledgement cannot free anything twice.
     pub(crate) fn free(&mut self, key: u64) -> bool {
-        match self.entries.iter().position(|(k, _)| *k == key) {
+        match self.entries.iter().position(|(k, ..)| *k == key) {
             Some(index) => {
                 self.entries.remove(index);
                 true
             }
             None => false,
         }
+    }
+
+    /// Free every entry retired under `tag`, returning how many.
+    pub(crate) fn free_tagged(&mut self, tag: u64) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|(_, t, _)| *t != Some(tag));
+        before - self.entries.len()
     }
 
     #[cfg(test)]
@@ -186,6 +225,24 @@ mod tests {
         assert!(fourth > third, "a freed key must not be handed out again");
         assert!(!list.free(first), "a stale key must not free the new entry");
         assert_eq!(alive.get(), 1);
+    }
+
+    /// A tag frees exactly the entries retired under it, so one engine's
+    /// successful close cannot free a set another (timed-out) engine left.
+    #[test]
+    fn a_tag_frees_only_its_own_entries() {
+        let alive = Rc::new(std::cell::Cell::new(0));
+        let mut list = RetiredList::new();
+        list.retire_for(Live::new(&alive), 1);
+        let other = list.retire_for(Live::new(&alive), 2);
+        list.retire_for(Live::new(&alive), 1);
+        let untagged = list.retire(Live::new(&alive));
+
+        assert_eq!(list.free_tagged(1), 2);
+        assert_eq!((list.len(), alive.get()), (2, 2));
+        assert_eq!(list.free_tagged(1), 0, "a tag already freed frees nothing");
+        assert!(list.free(other) && list.free(untagged));
+        assert_eq!(alive.get(), 0);
     }
 
     #[test]
