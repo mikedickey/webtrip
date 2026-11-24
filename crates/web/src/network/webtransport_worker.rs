@@ -40,7 +40,7 @@ use webtrip_core::stream::ring_buffer::RingBuffer;
 use webtrip_core::stream::regulator::Regulator;
 use webtrip_core::stream::shared_ptr::SharedPtr;
 use webtrip_core::network::protocol::{AudioPacket, make_exit_packet, packet_bytes, DEFAULT_BIT_DEPTH};
-use webtrip_core::limits::MAX_FPP;
+use webtrip_core::limits::{MAX_FPP, MAX_WIRE_CHANNELS};
 use webtrip_core::network::transport::fit_send_fpp;
 #[cfg(target_arch = "wasm32")]
 use webtrip_core::network::transport::HIGH_RATE_WARN_INTERVAL;
@@ -395,12 +395,14 @@ impl WorkerState {
         self.send_channels = send_channels;
         self.receive_channels = receive_channels;
         self.set_send_fpp(buffer_size);
-        // Receive scratch is sized by what the peer may send (the widest
-        // packet the wire allows at our channel count), independent of the
-        // send fpp, so the receive loop never grows it and a send-fpp change
-        // never touches it.
+        // Receive scratch is sized by the widest packet the wire allows
+        // (`MAX_FPP` frames of `MAX_WIRE_CHANNELS`). The peer's payload width
+        // (`num_outgoing_channels`) is independent of the `receive_channels`
+        // we requested, and the regulator adopts it up to that same limit, so
+        // sizing by our request would regrow the Vec on the first wider packet.
+        // Independent of the send fpp, so a send-fpp change never touches it.
         *self.samples_buffer.borrow_mut() =
-            Vec::with_capacity(MAX_FPP * receive_channels as usize);
+            Vec::with_capacity(MAX_FPP * MAX_WIRE_CHANNELS as usize);
 
         // Set up Int32Array for Atomics.wait() on the ring buffer's has_data flag
         if let Some(ring_buffer) = self.ring_buffer_ptr.as_ref() {
