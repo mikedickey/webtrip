@@ -10,6 +10,7 @@ mod connection;
 mod console_log;
 mod dependent_module;
 pub mod session;
+mod tick_clock;
 
 // Shared scaffolding for browser (`wasm-bindgen-test`) tests. Holds the single
 // `wasm_bindgen_test_configure!(run_in_browser)` for the lib unit-test binary

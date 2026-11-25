@@ -145,12 +145,13 @@ never imports `network` (both may use `stream`); `session.rs` composes them.
 - **`crates/webtrip/`** — package `webtrip`: the facade; re-exports only (`webtrip::core`, `webtrip::api`, and `webtrip::web` behind the off-by-default `web` feature)
 - **`crates/core/`** — package `webtrip-core`; portable: `audio/`, `network/` (protocol, transport trait), `stream/` (shared_ptr, ring_buffer, regulator), `lifecycle.rs`, `session_stats.rs`
 - **`crates/api/`** — package `webtrip-api`; portable: `api/` (reqwest client) and `models/`
-- **`crates/web/`** — package `webtrip-web`, the cdylib built as `pkg/webtrip.js` (`--out-name webtrip`); browser hosts: `audio/` (devices, engine, worklet), `network/` (webrtc, webtransport, signaling), `session.rs`, `connection.rs`, `lib.rs`
+- **`crates/web/`** — package `webtrip-web`, the cdylib built as `pkg/webtrip.js` (`--out-name webtrip`); browser hosts: `audio/` (devices, engine, worklet), `network/` (webrtc, webtransport, signaling), `session.rs`, `connection.rs`, `tick_clock.rs`, `lib.rs`
 
 ### Key Modules
 
-- **`crates/web/src/session.rs`** — `WebTripSession`: top-level orchestrator; owns the audio engine and its connections; each connection owns its transport and its own `Regulator` + `RingBuffer`, retired (never reset) when it ends
-- **`crates/core/src/lifecycle.rs`** — Portable connect/disconnect state machine (one atomic epoch+state word) that `WebTripSession` consults before acquiring, publishing, or releasing resources
+- **`crates/web/src/session.rs`** — `WebTripSession`: top-level orchestrator; audio (`startAudio`/`stopAudio`) and network (`connectNetwork`/`disconnectNetwork`) are independent, `connect`/`disconnect` do both; owns the audio engine and its connections; each connection owns its transport and its own `Regulator` + `RingBuffer`, retired (never reset) when it ends
+- **`crates/core/src/lifecycle.rs`** — Portable connect/disconnect (`Lifecycle`) and audio start/stop (`AudioLifecycle`) state machines (each one atomic epoch+state word) that `WebTripSession` consults before acquiring, publishing, or releasing resources
+- **`crates/web/src/tick_clock.rs`** — `TickClock`: ticks a published WebRTC transport from the audio callback while audio runs, on an interval otherwise
 - **`crates/core/src/stream/regulator.rs`** — Jitter buffer with Burg PLC (packet loss concealment), ported from JackTrip C++
 - **`crates/core/src/network/protocol.rs`** — JackTrip 16-byte wire protocol (serialization, sample rate encoding)
 - **`crates/web/src/network/signaling.rs`** — Hub server WebSocket signaling for WebRTC/WebTransport

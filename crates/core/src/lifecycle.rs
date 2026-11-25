@@ -1,4 +1,5 @@
-//! The session's connect/disconnect state machine.
+//! The session's connect/disconnect state machine, and its sibling for audio
+//! start/stop ([`AudioLifecycle`]), which has the same epoch discipline.
 //!
 //! Portable by construction: no browser types, and every transition is a
 //! single compare-and-swap on one [`AtomicU64`], so the invariants below hold
@@ -28,6 +29,7 @@
 //! the one atomic word so that "is this still my connect?" and "make the
 //! transition" are one indivisible step rather than a check-then-act.
 
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Where the session is in its connect/disconnect lifecycle.
@@ -110,23 +112,78 @@ pub enum DisconnectStart {
 const STATE_BITS: u32 = 8;
 const STATE_MASK: u64 = (1 << STATE_BITS) - 1;
 
-fn pack(epoch: u64, state: SessionState) -> u64 {
-    (epoch << STATE_BITS) | state as u64
+/// A state that can live in an [`EpochWord`]: its zero code is the initial one.
+trait Phase: Copy + PartialEq + 'static {
+    const ALL: &'static [Self];
+    fn code(self) -> u8;
 }
 
-fn unpack(word: u64) -> (u64, SessionState) {
-    let bits = (word & STATE_MASK) as u8;
-    let state = ALL_STATES
-        .into_iter()
-        .find(|s| *s as u8 == bits)
-        .expect("only `pack` writes the lifecycle word");
-    (word >> STATE_BITS, state)
+impl Phase for SessionState {
+    const ALL: &'static [Self] = &ALL_STATES;
+    fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+/// An (epoch, state) pair packed in one atomic word, so "is this still my
+/// operation?" and "make the transition" are one indivisible step. Shared by
+/// the network and audio lifecycles, which differ only in their states.
+struct EpochWord<P> {
+    word: AtomicU64,
+    _phase: PhantomData<fn() -> P>,
+}
+
+impl<P> Default for EpochWord<P> {
+    fn default() -> Self {
+        Self { word: AtomicU64::new(0), _phase: PhantomData }
+    }
+}
+
+impl<P> std::fmt::Debug for EpochWord<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("EpochWord").field(&self.word).finish()
+    }
+}
+
+impl<P: Phase> EpochWord<P> {
+    fn pack(epoch: u64, phase: P) -> u64 {
+        (epoch << STATE_BITS) | u64::from(phase.code())
+    }
+
+    fn unpack(word: u64) -> (u64, P) {
+        let bits = (word & STATE_MASK) as u8;
+        let phase = P::ALL
+            .iter()
+            .copied()
+            .find(|p| p.code() == bits)
+            .expect("only `pack` writes the lifecycle word");
+        (word >> STATE_BITS, phase)
+    }
+
+    fn load(&self) -> (u64, P) {
+        Self::unpack(self.word.load(Ordering::Acquire))
+    }
+
+    /// Apply `transition` to the current (epoch, state) atomically. Returns the
+    /// (epoch, state) it was applied to, or the one that made it decline.
+    fn transition(
+        &self,
+        transition: impl Fn(u64, P) -> Option<(u64, P)>,
+    ) -> Result<(u64, P), (u64, P)> {
+        self.word
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+                let (epoch, phase) = Self::unpack(word);
+                transition(epoch, phase).map(|(e, p)| Self::pack(e, p))
+            })
+            .map(Self::unpack)
+            .map_err(Self::unpack)
+    }
 }
 
 /// The atomic (epoch, state) pair; see the module docs.
 #[derive(Debug, Default)]
 pub struct Lifecycle {
-    word: AtomicU64,
+    word: EpochWord<SessionState>,
 }
 
 impl Lifecycle {
@@ -135,27 +192,19 @@ impl Lifecycle {
     }
 
     pub fn state(&self) -> SessionState {
-        unpack(self.word.load(Ordering::Acquire)).1
+        self.word.load().1
     }
 
     /// Whether no disconnect has started since `epoch` was handed out.
     pub fn is_current(&self, epoch: u64) -> bool {
-        unpack(self.word.load(Ordering::Acquire)).0 == epoch
+        self.word.load().0 == epoch
     }
 
-    /// Apply `transition` to the current (epoch, state) atomically. Returns the
-    /// (epoch, state) it was applied to, or the one that made it decline.
     fn transition(
         &self,
         transition: impl Fn(u64, SessionState) -> Option<(u64, SessionState)>,
     ) -> Result<(u64, SessionState), (u64, SessionState)> {
-        self.word
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |word| {
-                let (epoch, state) = unpack(word);
-                transition(epoch, state).map(|(e, s)| pack(e, s))
-            })
-            .map(unpack)
-            .map_err(unpack)
+        self.word.transition(transition)
     }
 
     /// `Idle → Connecting`. Returns the epoch the connect must quote to every
@@ -225,6 +274,178 @@ impl Lifecycle {
             (state == SessionState::Disconnecting).then_some((epoch, SessionState::Idle))
         });
         debug_assert!(finished.is_ok(), "only the teardown owner leaves Disconnecting");
+    }
+}
+
+/// The session-level network state over its connections' states: the worst
+/// news first (`Error`), then whatever is still in motion (`Connecting`,
+/// `Disconnecting`), then `Connected`; no connections is `Idle`. One
+/// connection passes through unchanged.
+pub fn aggregate_network_state(states: &[SessionState]) -> SessionState {
+    [
+        SessionState::Error,
+        SessionState::Connecting,
+        SessionState::Disconnecting,
+        SessionState::Connected,
+    ]
+    .into_iter()
+    .find(|state| states.contains(state))
+    .unwrap_or(SessionState::Idle)
+}
+
+/// Whether the audio engine is running, independent of any connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioState {
+    Stopped,
+    Running,
+}
+
+impl AudioState {
+    /// The string reported to JavaScript by `getAudioState()`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AudioState::Stopped => "stopped",
+            AudioState::Running => "running",
+        }
+    }
+}
+
+/// Where audio is between [`AudioState::Stopped`] and [`AudioState::Running`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AudioPhase {
+    Stopped = 0,
+    /// Bringing the engine up (possibly waiting on a permission prompt)
+    Starting = 1,
+    Running = 2,
+    /// Tearing the engine down; a start issued now waits for this to finish
+    Stopping = 3,
+}
+
+impl Phase for AudioPhase {
+    const ALL: &'static [Self] = &[AudioPhase::Stopped, AudioPhase::Starting, AudioPhase::Running, AudioPhase::Stopping];
+    fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Why an audio start was not admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartRejected {
+    AlreadyStarting,
+    AlreadyRunning,
+    /// A stop is in flight; retry once it finishes
+    Stopping,
+}
+
+impl StartRejected {
+    pub fn message(self) -> &'static str {
+        match self {
+            StartRejected::AlreadyStarting => "Audio is already starting",
+            StartRejected::AlreadyRunning => "Audio is already running; call stopAudio() first",
+            StartRejected::Stopping => "Audio is stopping",
+        }
+    }
+}
+
+/// What a `begin_stop` call must do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopStart {
+    AlreadyStopped,
+    AlreadyStopping,
+    /// This caller owns the teardown and must call `finish_stop` when done
+    Started,
+}
+
+/// The audio engine's start/stop state machine: the network [`Lifecycle`]'s
+/// sibling, with the same epoch discipline. Stopping (or a failed start) bumps
+/// the epoch, so a start that a stop has overtaken can never publish its
+/// engine.
+///
+/// ```text
+/// Stopped  ── begin_start ──▶ Starting
+/// Starting ── finish_start(e) ▶ Running
+/// Starting ── abort_start(e) ─▶ Stopped    (start failed, cleaned up; bumps the epoch)
+/// Starting ┐
+/// Running  ┴─ begin_stop ────▶ Stopping    (bumps the epoch)
+/// Stopping ── finish_stop ───▶ Stopped
+/// ```
+#[derive(Debug, Default)]
+pub struct AudioLifecycle {
+    word: EpochWord<AudioPhase>,
+}
+
+impl AudioLifecycle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn phase(&self) -> AudioPhase {
+        self.word.load().1
+    }
+
+    pub fn state(&self) -> AudioState {
+        match self.phase() {
+            AudioPhase::Running => AudioState::Running,
+            _ => AudioState::Stopped,
+        }
+    }
+
+    /// Whether no stop has started since `epoch` was handed out.
+    pub fn is_current(&self, epoch: u64) -> bool {
+        self.word.load().0 == epoch
+    }
+
+    /// `Stopped → Starting`. Returns the epoch the start must quote to every
+    /// later transition.
+    pub fn begin_start(&self) -> Result<u64, StartRejected> {
+        self.word
+            .transition(|epoch, phase| (phase == AudioPhase::Stopped).then_some((epoch, AudioPhase::Starting)))
+            .map(|(epoch, _)| epoch)
+            .map_err(|(_, phase)| match phase {
+                AudioPhase::Starting => StartRejected::AlreadyStarting,
+                AudioPhase::Running => StartRejected::AlreadyRunning,
+                AudioPhase::Stopping => StartRejected::Stopping,
+                AudioPhase::Stopped => unreachable!("Stopped always admits a start"),
+            })
+    }
+
+    /// `Starting → Running`, only for the start admitted under `epoch`.
+    pub fn finish_start(&self, epoch: u64) -> bool {
+        self.starting_to(epoch, epoch, AudioPhase::Running)
+    }
+
+    /// `Starting → Stopped` after a failed start has released what it created,
+    /// only for the start admitted under `epoch`.
+    pub fn abort_start(&self, epoch: u64) -> bool {
+        self.starting_to(epoch, epoch.wrapping_add(1), AudioPhase::Stopped)
+    }
+
+    fn starting_to(&self, epoch: u64, next_epoch: u64, to: AudioPhase) -> bool {
+        self.word
+            .transition(|e, phase| (e == epoch && phase == AudioPhase::Starting).then_some((next_epoch, to)))
+            .is_ok()
+    }
+
+    /// `Starting | Running → Stopping`, bumping the epoch so a start still in
+    /// flight is cancelled.
+    pub fn begin_stop(&self) -> StopStart {
+        match self.word.transition(|epoch, phase| match phase {
+            AudioPhase::Starting | AudioPhase::Running => Some((epoch.wrapping_add(1), AudioPhase::Stopping)),
+            AudioPhase::Stopped | AudioPhase::Stopping => None,
+        }) {
+            Ok(_) => StopStart::Started,
+            Err((_, AudioPhase::Stopping)) => StopStart::AlreadyStopping,
+            Err(_) => StopStart::AlreadyStopped,
+        }
+    }
+
+    /// `Stopping → Stopped`, by the caller that got `StopStart::Started`.
+    pub fn finish_stop(&self) {
+        let finished = self
+            .word
+            .transition(|epoch, phase| (phase == AudioPhase::Stopping).then_some((epoch, AudioPhase::Stopped)));
+        debug_assert!(finished.is_ok(), "only the teardown owner leaves Stopping");
     }
 }
 
@@ -393,5 +614,102 @@ mod tests {
             assert_eq!(started, 1, "round {round}: teardowns started");
             lc.finish_disconnect();
         }
+    }
+
+    #[test]
+    fn network_state_aggregates_worst_first() {
+        use SessionState::*;
+        assert_eq!(aggregate_network_state(&[]), Idle);
+        // One connection passes through unchanged.
+        for state in ALL_STATES {
+            assert_eq!(aggregate_network_state(&[state]), state);
+        }
+        // Several: failure, then motion, then connected.
+        assert_eq!(aggregate_network_state(&[Connected, Error, Connecting]), Error);
+        assert_eq!(aggregate_network_state(&[Connected, Connecting, Disconnecting]), Connecting);
+        assert_eq!(aggregate_network_state(&[Idle, Connected, Disconnecting]), Disconnecting);
+        assert_eq!(aggregate_network_state(&[Idle, Connected]), Connected);
+        assert_eq!(aggregate_network_state(&[Idle, Idle]), Idle);
+    }
+
+    /// Pins the cross-language contract: `getAudioState()` emits these strings.
+    #[test]
+    fn audio_state_strings_are_the_js_contract() {
+        assert_eq!(AudioState::Stopped.as_str(), "stopped");
+        assert_eq!(AudioState::Running.as_str(), "running");
+    }
+
+    /// An audio lifecycle driven into `phase`, plus the epoch its start was
+    /// admitted under.
+    fn audio_in(phase: AudioPhase) -> (AudioLifecycle, u64) {
+        let lc = AudioLifecycle::new();
+        let epoch = lc.begin_start().unwrap();
+        match phase {
+            AudioPhase::Stopped => assert!(lc.abort_start(epoch)),
+            AudioPhase::Starting => {}
+            AudioPhase::Running => assert!(lc.finish_start(epoch)),
+            AudioPhase::Stopping => assert_eq!(lc.begin_stop(), StopStart::Started),
+        }
+        assert_eq!(lc.phase(), phase);
+        (lc, epoch)
+    }
+
+    #[test]
+    fn audio_start_and_stop_are_admitted_by_phase() {
+        let starts = [
+            (AudioPhase::Stopped, Ok(())),
+            (AudioPhase::Starting, Err(StartRejected::AlreadyStarting)),
+            (AudioPhase::Running, Err(StartRejected::AlreadyRunning)),
+            (AudioPhase::Stopping, Err(StartRejected::Stopping)),
+        ];
+        for (phase, expected) in starts {
+            let (lc, _) = audio_in(phase);
+            assert_eq!(lc.begin_start().map(|_| ()), expected, "begin_start from {phase:?}");
+        }
+
+        let stops = [
+            (AudioPhase::Stopped, StopStart::AlreadyStopped),
+            (AudioPhase::Starting, StopStart::Started),
+            (AudioPhase::Running, StopStart::Started),
+            (AudioPhase::Stopping, StopStart::AlreadyStopping),
+        ];
+        for (phase, expected) in stops {
+            let (lc, epoch) = audio_in(phase);
+            let was_current = lc.is_current(epoch);
+            assert_eq!(lc.begin_stop(), expected, "begin_stop from {phase:?}");
+            if expected == StopStart::Started {
+                assert!(!lc.is_current(epoch), "stopping from {phase:?} must cancel the epoch");
+                lc.finish_stop();
+                assert_eq!(lc.phase(), AudioPhase::Stopped);
+            } else {
+                assert_eq!(lc.phase(), phase, "{phase:?} must be left alone");
+                assert_eq!(lc.is_current(epoch), was_current);
+            }
+        }
+    }
+
+    /// A start overtaken by a stop can neither publish (`finish_start`) nor
+    /// reset the state (`abort_start`), even once a newer start is `Starting`.
+    #[test]
+    fn overtaken_audio_start_cannot_publish_even_after_a_new_start() {
+        let lc = AudioLifecycle::new();
+        let stale = lc.begin_start().unwrap();
+        assert_eq!(lc.begin_stop(), StopStart::Started);
+        assert!(!lc.finish_start(stale));
+        assert!(!lc.abort_start(stale));
+        lc.finish_stop();
+
+        let fresh = lc.begin_start().unwrap();
+        assert_ne!(fresh, stale);
+        assert!(!lc.finish_start(stale), "stale epoch must not complete the new start");
+        assert!(!lc.abort_start(stale), "stale epoch must not abort the new start");
+        assert!(lc.finish_start(fresh));
+        assert_eq!(lc.state(), AudioState::Running);
+
+        // A failed start retires its epoch too.
+        let (lc, failed) = audio_in(AudioPhase::Starting);
+        assert!(lc.abort_start(failed));
+        assert!(!lc.is_current(failed));
+        assert_eq!(lc.state(), AudioState::Stopped);
     }
 }

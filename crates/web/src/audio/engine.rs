@@ -110,6 +110,15 @@ pub struct AudioEngine {
     params: SharedPtr<AudioParams>,
     local_to_network_buffer_ptr: *mut RingBuffer,
     network_to_local_buffer_ptr: *mut Regulator,
+    /// `"stopped"` acknowledgements of nodes replaced by an output-device
+    /// rebuild ([`reconfigure_for_sink`](Self::reconfigure_for_sink)), joined,
+    /// that no caller has consumed yet. Those nodes read the same buffers as
+    /// their replacement, and each port delivers independently, so the
+    /// replacement's acknowledgement does not prove them stopped. The next
+    /// [`attach_network`](Self::attach_network) or
+    /// [`stop_capture_acknowledged`](Self::stop_capture_acknowledged) folds
+    /// them into what it returns.
+    superseded_stops: Option<js_sys::Promise>,
     /// The output channel count the current `worklet_node` was built with
     /// (`outputChannelCount` is construction-time only, so a change means
     /// rebuilding the node — see `build_and_connect_worklet_node` and its
@@ -190,6 +199,7 @@ impl AudioEngine {
             params: unsafe { SharedPtr::from_addr(params_addr) },
             local_to_network_buffer_ptr,
             network_to_local_buffer_ptr,
+            superseded_stops: None,
             worklet_output_channels: 0,
             worklet_input_channels: 0,
             requested_output_channels: 2,
@@ -534,7 +544,12 @@ impl AudioEngine {
     pub(crate) async fn stop_capture_acknowledged(&mut self) -> (bool, Option<js_sys::Promise>) {
         let port = self.stop_nodes();
         let closed = close_audio_context(&self.ctx, AUDIO_CONTEXT_CLOSE_TIMEOUT_MS).await;
-        let stopped = if closed { None } else { port.map(|port| stopped_acknowledgement(&port)) };
+        let superseded = self.superseded_stops.take();
+        let stopped = if closed {
+            None
+        } else {
+            join_acknowledgements(superseded, port.map(|port| stopped_acknowledgement(&port)))
+        };
         (closed, stopped)
     }
 
@@ -557,24 +572,32 @@ impl AudioEngine {
     /// replaced node's `"stopped"` acknowledgement: once it settles, the
     /// previous buffers are no longer referenced by the render thread. With no
     /// node running, only the pointers are stored (the first node built picks
-    /// them up) and there is nothing to acknowledge.
-    ///
-    /// Not yet called by the session: connect still brings the engine up
-    /// after the dial, against the new connection's buffers directly. The
-    /// device/network split is what makes this the hot path.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// them up) and there is nothing to acknowledge. If the rebuild fails the
+    /// previous pointers are kept, matching the node that is still running.
     pub(crate) fn attach_network(
         &mut self,
         local_to_network: *mut RingBuffer,
         network_to_local: *mut Regulator,
     ) -> Result<Option<js_sys::Promise>, JsValue> {
+        let previous = (self.local_to_network_buffer_ptr, self.network_to_local_buffer_ptr);
         self.local_to_network_buffer_ptr = local_to_network;
         self.network_to_local_buffer_ptr = network_to_local;
         if self.worklet_node.is_none() {
             return Ok(None);
         }
-        let port = self.build_and_connect_worklet_node(self.worklet_input_channels, self.worklet_output_channels)?;
-        Ok(port.map(|port| stopped_acknowledgement(&port)))
+        match self.build_and_connect_worklet_node(self.worklet_input_channels, self.worklet_output_channels) {
+            Ok(port) => {
+                let superseded = self.superseded_stops.take();
+                Ok(join_acknowledgements(superseded, port.map(|port| stopped_acknowledgement(&port))))
+            }
+            Err(e) => {
+                // A failed rebuild leaves the old node running on the old
+                // buffers, and the caller keeps owning (and may free) the new
+                // ones: the next rebuild must not pick them up.
+                (self.local_to_network_buffer_ptr, self.network_to_local_buffer_ptr) = previous;
+                Err(e)
+            }
+        }
     }
 
     /// Disconnect the worklet / media graph without closing the AudioContext.
@@ -665,7 +688,12 @@ impl AudioEngine {
         if self.worklet_node.is_some() {
             let output_channels = self.configure_destination(self.requested_output_channels)?;
             if output_channels as usize != self.worklet_output_channels {
-                let _ = self.build_and_connect_worklet_node(self.worklet_input_channels, output_channels as usize)?;
+                let replaced =
+                    self.build_and_connect_worklet_node(self.worklet_input_channels, output_channels as usize)?;
+                // Keep the replaced node's acknowledgement for whoever later
+                // detaches the buffers it read (see `superseded_stops`).
+                let ack = replaced.map(|port| stopped_acknowledgement(&port));
+                self.superseded_stops = join_acknowledgements(self.superseded_stops.take(), ack);
             }
         }
 
@@ -720,6 +748,14 @@ fn stopped_acknowledgement(port: &web_sys::MessagePort) -> js_sys::Promise {
     });
     port.set_onmessage(Some(on_message.unchecked_ref()));
     stopped
+}
+
+/// A promise that settles once every given acknowledgement has.
+fn join_acknowledgements(a: Option<js_sys::Promise>, b: Option<js_sys::Promise>) -> Option<js_sys::Promise> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(js_sys::Promise::all(&js_sys::Array::of2(&a, &b))),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Fire `AudioContext.close()` without awaiting, unless the context is already
@@ -1172,6 +1208,38 @@ mod tests {
         // Without a running node there is nothing to rebuild or acknowledge.
         engine.stop_capture().await;
         assert!(engine.attach_network(std::ptr::null_mut(), std::ptr::null_mut()).unwrap().is_none());
+        close_engine(engine).await;
+    }
+
+    /// Regression (PR 121 review): a failed rebuild leaves the old node
+    /// running, so the engine must keep the old buffer pointers. The caller
+    /// frees the rejected connection's buffers, and the next rebuild (an
+    /// output-device change) would otherwise build a node over them.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn failed_attach_network_keeps_the_previous_buffer_pointers() {
+        let params = AudioParams::default();
+        let mut engine = create_engine(&params).await;
+        engine
+            .start_capture(None, None, false, false, false, 2, 2)
+            .await
+            .expect("start_capture should resolve with the fake-device flags");
+
+        let valid_params = engine.params;
+        // SAFETY: a null address makes the rebuild's params lookup fail; it is
+        // restored before the engine is used again.
+        engine.params = unsafe { SharedPtr::from_addr(0) };
+        let mut ring = RingBuffer::new();
+        let mut regulator = Regulator::new();
+        let result = engine.attach_network(&mut ring as *mut RingBuffer, &mut regulator as *mut Regulator);
+        engine.params = valid_params;
+
+        assert!(result.is_err(), "the rebuild was made to fail");
+        assert!(engine.is_capturing(), "the old node keeps running");
+        assert!(
+            engine.local_to_network_buffer_ptr.is_null() && engine.network_to_local_buffer_ptr.is_null(),
+            "the rejected buffers must not be what the next rebuild picks up"
+        );
         close_engine(engine).await;
     }
 

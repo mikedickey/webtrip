@@ -7,7 +7,7 @@
 // the page is served at the site root with `pkg/` present. So we serve the real
 // app via `website/server.js`, point a headless browser at it, and run each transport
 // through the actual exported session API
-// (`createAudioParams` → `WebTripSession` → `connectToStudio`).
+// (`createAudioParams` → `WebTripSession` → `connect`).
 //
 // The page is served over plain HTTP on `localhost` — a "secure context" in
 // Chrome — so with the COOP/COEP headers `website/server.js` already sets we still get
@@ -171,7 +171,7 @@ async function inPageDrive({ transportName, host, port, connectTimeoutMs, sendPo
 
   // Race the connect against a timeout, clearing the timer on settle so the
   // loser never fires a late (unhandled) rejection into the page.
-  const connectPromise = session.connectToStudio(
+  const connectPromise = session.connect(
     host, port, undefined, false, false, false, `webtrip-it-${transportName}`,
   );
   // If the timeout wins, connectPromise may still settle later; swallow it.
@@ -278,7 +278,7 @@ async function runFailureCase(page) {
   } catch (err) {
     // Only a failure from the connect phase counts as the expected outcome.
     // Unrelated setup/page errors (transport lookup, WASM init, a synchronous
-    // throw from connectToStudio) must NOT be swallowed as success — surface
+    // throw from connect) must NOT be swallowed as success — surface
     // them so a broken harness/build can't masquerade as a passing failure case.
     const msg = (err && err.message) || String(err);
     if (msg.includes("connect-failed:")) {
