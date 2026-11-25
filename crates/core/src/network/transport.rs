@@ -137,16 +137,22 @@ impl TransportType {
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportState {
+    /// Not connected: before the first connect, or after the peer closed an
+    /// established connection.
     Disconnected,
+    /// A connection attempt is in progress.
     Connecting,
+    /// Connected and able to carry audio.
     Connected,
+    /// The connection attempt or an established connection failed.
     Failed,
+    /// Closed locally by the host; the transport's resources are released.
     Closed,
 }
 
 /// Audio buffer configuration passed to transports that need internal tick loops.
 ///
-/// The buffers live in shared WASM memory owned by [`WebTripSession`]; the
+/// The buffers live in shared WASM memory owned by `WebTripSession` (in `webtrip-web`); the
 /// transport reaches them through [`SharedPtr`], which carries the `Send`/`Sync`
 /// assertion so this struct needs no hand-rolled `unsafe impl`.
 #[derive(Debug, Clone, Copy)]
@@ -251,10 +257,12 @@ pub struct TransportError {
 }
 
 impl TransportError {
+    /// An error carrying `message`.
     pub fn new(message: impl Into<String>) -> Self {
         Self { message: message.into() }
     }
 
+    /// The human-readable reason.
     pub fn message(&self) -> &str {
         &self.message
     }

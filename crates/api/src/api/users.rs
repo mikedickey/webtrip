@@ -1,6 +1,48 @@
-//! Users API endpoints
+//! Users API endpoints.
 //!
-//! User profile management, preferences, and related operations.
+//! User profiles, notifications, conversations, referrals, and channel
+//! membership. Obtain a [`UsersApi`] with [`ApiClient::users`].
+//!
+//! **Authentication:** every endpoint requires a bearer token
+//! ([`ApiClient::set_bearer_token`]). Most take a `user_id`; call
+//! [`UsersApi::get_current_user`] first to learn the caller's own ID
+//! ([`models::User::user_id`], which is `user_id` in JavaScript too).
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use webtrip_api::api::{ApiClient, ApiError};
+//!
+//! # async fn run() -> Result<(), ApiError> {
+//! let client = ApiClient::new();
+//! client.set_bearer_token("your-jwt-token".to_string());
+//!
+//! let me = client.users().get_current_user().await?;
+//! if let Some(user_id) = me.user_id.as_deref() {
+//!     let unread = client.users().get_unread_messages_count(user_id).await?;
+//!     println!("unread: {:?}", unread.count);
+//!
+//!     // First page of 20 channels the user follows.
+//!     let follows = client.users().get_user_follows(user_id, Some(1), Some(20)).await?;
+//!     println!("{} of {}", follows.results.len(), follows.meta.total);
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! From JavaScript (the `webtrip` package):
+//!
+//! ```js
+//! import init, { ApiClient } from 'webtrip';
+//!
+//! await init();
+//! const client = new ApiClient();
+//! client.setBearerToken('your-jwt-token');
+//!
+//! const me = await client.users().getCurrentUser();
+//! const { count } = await client.users().getUnreadMessagesCount(me.user_id);
+//! const follows = await client.users().getUserFollows(me.user_id, 1, 20);
+//! ```
 
 #[cfg(feature = "wasm")]
 use super::to_js_value;
@@ -21,18 +63,19 @@ api_module_struct!(UsersApi);
 // =============================================================================
 
 impl UsersApi {
-    /// Get the currently authenticated user
+    /// Get the currently authenticated user (`GET /users/me`).
     pub async fn get_current_user(&self) -> Result<models::User, ApiError> {
         self.client.get("/users/me").await
     }
 
-    /// Get a user by ID
+    /// Get a user by ID (`GET /users/{user_id}`).
     pub async fn get_user(&self, user_id: &str) -> Result<models::User, ApiError> {
         let path = format!("/users/{}", urlencode(user_id));
         self.client.get(&path).await
     }
 
-    /// Update a user's metadata
+    /// Update a user's profile metadata (`PUT /users/{user_id}`), returning
+    /// the stored metadata.
     pub async fn update_user(
         &self,
         user_id: &str,
@@ -42,31 +85,33 @@ impl UsersApi {
         self.client.put(&path, metadata).await
     }
 
-    /// Delete a user account
+    /// Delete a user account (`DELETE /users/{user_id}`).
     pub async fn delete_user(&self, user_id: &str) -> Result<(), ApiError> {
         let path = format!("/users/{}", urlencode(user_id));
         self.client.delete(&path).await
     }
 
-    /// Get all regions available to a user, keyed by region identifier.
+    /// Get all regions available to a user (`GET /users/{user_id}/regions`),
+    /// keyed by region identifier like [`SystemApi::list_regions`](super::system::SystemApi::list_regions).
     pub async fn get_user_regions(&self, user_id: &str) -> Result<HashMap<String, models::Region>, ApiError> {
         let path = format!("/users/{}/regions", urlencode(user_id));
         self.client.get(&path).await
     }
 
-    /// Get a user's notifications
+    /// Get a user's notifications (`GET /users/{user_id}/notifications`).
     pub async fn get_notifications(&self, user_id: &str) -> Result<Vec<models::Notification>, ApiError> {
         let path = format!("/users/{}/notifications", urlencode(user_id));
         self.client.get(&path).await
     }
 
-    /// Get a user's conversations
+    /// Get a user's conversations (`GET /users/{user_id}/conversations`).
     pub async fn get_conversations(&self, user_id: &str) -> Result<Vec<models::Conversation>, ApiError> {
         let path = format!("/users/{}/conversations", urlencode(user_id));
         self.client.get(&path).await
     }
 
-    /// Get a specific conversation between the user and a studio, identified by stream ID
+    /// Get the conversation between the user and a studio, identified by the
+    /// studio's stream/channel ID (`GET /users/{user_id}/conversations/{stream_id}`).
     pub async fn get_conversation(
         &self,
         user_id: &str,
@@ -77,30 +122,40 @@ impl UsersApi {
     }
 
     /// Get a HubSpot visitor identification token for the user
+    /// (`GET /users/{user_id}/hubspot-token`).
+    ///
+    /// Used to identify the visitor to the HubSpot Conversations API on the
+    /// frontend. Users may only fetch their own token.
     pub async fn get_hubspot_token(&self, user_id: &str) -> Result<models::HubSpotToken, ApiError> {
         let path = format!("/users/{}/hubspot-token", urlencode(user_id));
         self.client.get(&path).await
     }
 
-    /// Get unread message count for a user
+    /// Get the count of unread messages for a user
+    /// (`GET /users/{user_id}/unread-messages`).
     pub async fn get_unread_messages_count(&self, user_id: &str) -> Result<models::UnreadMessagesResponse, ApiError> {
         let path = format!("/users/{}/unread-messages", urlencode(user_id));
         self.client.get(&path).await
     }
 
-    /// Get a user's referrals
+    /// Get a user's referrals (`GET /users/{user_id}/referrals`).
     pub async fn get_referrals(&self, user_id: &str) -> Result<Vec<models::Referral>, ApiError> {
         let path = format!("/users/{}/referrals", urlencode(user_id));
         self.client.get(&path).await
     }
 
-    /// Create a new referral
+    /// Create a new referral code for the user (`POST /users/{user_id}/referrals`).
     pub async fn create_referral(&self, user_id: &str) -> Result<models::Referral, ApiError> {
         let path = format!("/users/{}/referrals", urlencode(user_id));
         self.client.post_empty(&path).await
     }
 
-    /// Get paginated channels the user is a member of
+    /// Get a page of channels the user is a member of
+    /// (`GET /users/{user_id}/channels-paginated`).
+    ///
+    /// `page` and `limit` are sent as query parameters only when set; with
+    /// both `None` the server's defaults apply. The response's
+    /// [`models::PaginationMeta`] describes the totals.
     pub async fn get_user_channels(
         &self,
         user_id: &str,
@@ -116,7 +171,10 @@ impl UsersApi {
         }
     }
 
-    /// Get paginated channels the user follows
+    /// Get a page of channels the user follows
+    /// (`GET /users/{user_id}/follows-paginated`).
+    ///
+    /// Pagination behaves as in [`Self::get_user_channels`].
     pub async fn get_user_follows(
         &self,
         user_id: &str,
@@ -164,6 +222,8 @@ impl UsersApi {
         self.delete_user(&user_id).await
     }
 
+    /// Resolves to a plain object mapping region identifier → `Region`; see
+    /// [`UsersApi::get_user_regions`].
     #[wasm_bindgen(js_name = getUserRegions)]
     pub async fn get_user_regions_js(&self, user_id: String) -> Result<JsValue, ApiError> {
         let regions = self.get_user_regions(&user_id).await?;

@@ -1,10 +1,23 @@
 [package]
 name = "webtrip-web"
-description = "Rust rewrite of JackTrip for audio in web browsers"
+description = "WebTrip browser host: AudioWorklet engine, WebRTC and WebTransport transports, WebTripSession"
 authors.workspace = true
 edition.workspace = true
-publish.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["audio", "jacktrip", "webrtc", "webtransport", "wasm"]
+categories = ["multimedia::audio", "wasm", "web-programming"]
+
+# docs.rs builds on nightly and does not link, so the shared-memory link args
+# in package.json are not needed here; atomics + build-std are (std must match).
+[package.metadata.docs.rs]
+targets = ["wasm32-unknown-unknown"]
+rustc-args = ["--cfg=web_sys_unstable_apis", "-Ctarget-feature=+atomics"]
+rustdoc-args = ["--cfg=web_sys_unstable_apis"]
+cargo-args = ["-Zbuild-std=std,panic_abort"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -26,8 +39,8 @@ js-sys = "0.3.83"
 wasm-bindgen = "0.2.106"
 wasm-bindgen-futures = "0.4.56"
 
-webtrip-core = { path = "../core", features = ["wasm"] }
-webtrip-api = { path = "../api", features = ["wasm"] }
+webtrip-core = { path = "../core", version = "0.2.0", features = ["wasm"] }
+webtrip-api = { path = "../api", version = "0.2.0", features = ["wasm"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde-wasm-bindgen = "0.6"

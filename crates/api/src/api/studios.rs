@@ -1,6 +1,54 @@
-//! Studios API endpoints
+//! Studios API endpoints.
 //!
-//! Virtual studio management, configuration, and related operations.
+//! Create, configure, and delete JackTrip virtual studios, and query their
+//! access rights, participants, sessions, chat, and mixers. Obtain a
+//! [`StudiosApi`] with [`ApiClient::studios`].
+//!
+//! A studio is modeled as [`models::Server`] (its spec name). Create and update
+//! take a `Server`; reads return [`models::ServerWithSubscription`], which adds
+//! the caller's relationship to the studio (`admin`, `owner`, `subStatus`).
+//!
+//! **Authentication:** every endpoint requires a bearer token
+//! ([`ApiClient::set_bearer_token`]) except [`StudiosApi::list_mixers`].
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use webtrip_api::api::{ApiClient, ApiError};
+//! use webtrip_api::models::{Server, ServerConfig};
+//!
+//! # async fn run() -> Result<(), ApiError> {
+//! let client = ApiClient::new();
+//! client.set_bearer_token("your-jwt-token".to_string());
+//!
+//! let new_studio = Server {
+//!     config: ServerConfig { name: Some("My Studio".into()), ..Default::default() },
+//!     region: Some("us-west-1".into()),
+//!     ..Default::default()
+//! };
+//! let studio = client.studios().create_studio(&new_studio).await?;
+//!
+//! if let Some(id) = studio.server.id.as_deref() {
+//!     let participants = client.studios().get_participants(id).await?;
+//!     println!("{} participants", participants.len());
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! From JavaScript (the `webtrip` package):
+//!
+//! ```js
+//! import init, { ApiClient } from 'webtrip';
+//!
+//! await init();
+//! const client = new ApiClient();
+//! client.setBearerToken('your-jwt-token');
+//!
+//! const studio = await client.studios().createStudio({ name: 'My Studio', region: 'us-west-1' });
+//! const { token, url } = await client.studios().getLivekitToken(studio.id);
+//! await client.studios().updateBanner(studio.id, pngBytes, 'image/png'); // pngBytes: Uint8Array
+//! ```
 
 #[cfg(feature = "wasm")]
 use super::to_js_value;
@@ -20,7 +68,7 @@ api_module_struct!(StudiosApi);
 // =============================================================================
 
 impl StudiosApi {
-    /// List all studios for the authenticated user.
+    /// List all studios for the authenticated user (`GET /studios`).
     ///
     /// Responses carry the caller's relationship to each studio (`admin`,
     /// `owner`, `subStatus`), so they deserialize into [`models::ServerWithSubscription`].
@@ -28,31 +76,31 @@ impl StudiosApi {
         self.client.get("/studios").await
     }
 
-    /// Create a new studio. The request payload is a [`models::Server`]; the
+    /// Create a new studio (`POST /studios`). The request payload is a [`models::Server`]; the
     /// response includes the caller's relationship fields.
     pub async fn create_studio(&self, studio: &models::Server) -> Result<models::ServerWithSubscription, ApiError> {
         self.client.post("/studios", studio).await
     }
 
-    /// Get a studio by ID
+    /// Get a studio by ID (`GET /studios/{studio_id}`).
     pub async fn get_studio(&self, studio_id: &str) -> Result<models::ServerWithSubscription, ApiError> {
         let path = format!("/studios/{}", urlencode(studio_id));
         self.client.get(&path).await
     }
 
-    /// Update a studio's configuration
+    /// Update a studio's configuration (`PUT /studios/{studio_id}`).
     pub async fn update_studio(&self, studio_id: &str, studio: &models::Server) -> Result<models::ServerWithSubscription, ApiError> {
         let path = format!("/studios/{}", urlencode(studio_id));
         self.client.put(&path, studio).await
     }
 
-    /// Delete a studio
+    /// Delete a studio (`DELETE /studios/{studio_id}`).
     pub async fn delete_studio(&self, studio_id: &str) -> Result<(), ApiError> {
         let path = format!("/studios/{}", urlencode(studio_id));
         self.client.delete(&path).await
     }
 
-    /// Extend a studio's expiration time.
+    /// Extend a studio's expiration time (`POST /studios/{studio_id}/extend`).
     ///
     /// The endpoint responds with `202 Accepted` (extended) or `204 No Content`
     /// (no extension needed) and never returns a body.
@@ -62,14 +110,19 @@ impl StudiosApi {
     }
 
     /// Get the authenticated user's access rights for a studio
+    /// (`GET /studios/{studio_id}/access`): admin/owner flags plus named
+    /// permissions.
     pub async fn get_access_settings(&self, studio_id: &str) -> Result<models::ServerAccess, ApiError> {
         let path = format!("/studios/{}/access", urlencode(studio_id));
         self.client.get(&path).await
     }
 
-    /// Update a studio's banner image (also used for its JackTrip Radio
-    /// broadcast banner). The payload is the raw image bytes; the endpoint
-    /// responds `200` with no body.
+    /// Update a studio's banner image (`PUT /studios/{studio_id}/banner`), also
+    /// used for its JackTrip Radio broadcast banner.
+    ///
+    /// The body is the raw image bytes sent with `content_type` (e.g.
+    /// `image/png`) — not JSON or multipart. The endpoint responds `200` with
+    /// no body. From JavaScript, pass a `Uint8Array`.
     pub async fn update_banner(
         &self,
         studio_id: &str,
@@ -80,36 +133,43 @@ impl StudiosApi {
         self.client.put_bytes(&path, image, content_type).await
     }
 
-    /// Get all mixers, keyed by mixer name (`GET /mixers` returns a map)
+    /// Get all mixers, keyed by mixer name (`GET /mixers` returns a map).
+    ///
+    /// Does not require authentication.
     pub async fn list_mixers(&self) -> Result<std::collections::HashMap<String, models::Mixer>, ApiError> {
         self.client.get("/mixers").await
     }
 
-    /// Get a LiveKit token for the studio
+    /// Get a LiveKit access token and server URL for the studio
+    /// (`POST /studios/{studio_id}/lktoken`).
     pub async fn get_livekit_token(&self, studio_id: &str) -> Result<models::LiveKitTokenResponse, ApiError> {
         let path = format!("/studios/{}/lktoken", urlencode(studio_id));
         self.client.post_empty(&path).await
     }
 
-    /// Send an invite for a studio
+    /// Send an invite for a studio (`POST /studios/{studio_id}/invite`).
+    /// The server returns no body.
     pub async fn send_invite(&self, studio_id: &str, invite: &models::InviteRequest) -> Result<(), ApiError> {
         let path = format!("/studios/{}/invite", urlencode(studio_id));
         self.client.post_no_response(&path, invite).await
     }
 
     /// Submit feedback for a studio session
+    /// (`POST /studios/{studio_id}/feedback`). The server returns no body.
     pub async fn submit_feedback(&self, studio_id: &str, feedback: &models::FeedbackRequest) -> Result<(), ApiError> {
         let path = format!("/studios/{}/feedback", urlencode(studio_id));
         self.client.post_no_response(&path, feedback).await
     }
 
-    /// Get chat session for a studio
+    /// Get a chat session for a studio (`GET /studios/{studio_id}/chat/{chat_id}`).
+    ///
+    /// The studio's chat ID is its `chatId` field.
     pub async fn get_chat(&self, studio_id: &str, chat_id: &str) -> Result<models::ChatSession, ApiError> {
         let path = format!("/studios/{}/chat/{}", urlencode(studio_id), urlencode(chat_id));
         self.client.get(&path).await
     }
 
-    /// Get participants in a studio
+    /// Get the participants in a studio (`GET /studios/{studio_id}/participants`).
     pub async fn get_participants(&self, studio_id: &str) -> Result<Vec<models::Participant>, ApiError> {
         let path = format!("/studios/{}/participants", urlencode(studio_id));
         self.client.get(&path).await
@@ -117,8 +177,9 @@ impl StudiosApi {
 
     /// Get a single studio participant's full user metadata by user ID.
     ///
-    /// The spec returns a complete [`models::User`] (not the lighter
-    /// session-scoped `Participant` from [`Self::get_participants`]).
+    /// `GET /studios/{studio_id}/participants/{user_id}` returns a complete
+    /// [`models::User`], not the lighter session-scoped [`models::Participant`]
+    /// from [`Self::get_participants`].
     pub async fn get_participant(&self, studio_id: &str, user_id: &str) -> Result<models::User, ApiError> {
         let path = format!(
             "/studios/{}/participants/{}",
@@ -128,7 +189,7 @@ impl StudiosApi {
         self.client.get(&path).await
     }
 
-    /// Get the current session for a studio
+    /// Get the current session for a studio (`GET /studios/{studio_id}/session`).
     pub async fn get_session(&self, studio_id: &str) -> Result<models::Session, ApiError> {
         let path = format!("/studios/{}/session", urlencode(studio_id));
         self.client.get(&path).await

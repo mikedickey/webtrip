@@ -5,7 +5,9 @@
 
 pub mod dsp;
 pub mod mixer;
+/// Atomic level, gain and meter state shared between the control and audio threads.
 pub mod params;
+/// The per-callback processor that feeds a [`mixer::MixEngine`] from the network buffers and publishes meters.
 pub mod processor;
 
 pub use params::AudioParams;

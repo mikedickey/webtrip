@@ -156,7 +156,6 @@ async function inPageDrive({ transportName, host, port, connectTimeoutMs, sendPo
   const ttByName = {
     webrtc: m.TransportType.WebRTC,
     webtransport: m.TransportType.WebTransport,
-    mock: m.TransportType.Mock,
   };
   const tt = ttByName[transportName];
   if (tt === undefined) throw new Error(`unknown transport: ${transportName}`);

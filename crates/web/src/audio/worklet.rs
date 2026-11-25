@@ -99,7 +99,7 @@ impl ProcessorHandle {
     ///
     /// # Safety
     ///
-    /// `val` must be an address previously returned by [`into_raw_ptr`] and must
+    /// `val` must be an address previously returned by [`into_raw_ptr`](Self::into_raw_ptr) and must
     /// not have been reconstructed already.
     pub unsafe fn from_raw_ptr(val: usize) -> Self {
         *Box::from_raw(val as *mut _)

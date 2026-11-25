@@ -71,6 +71,9 @@ pub struct RingBuffer {
     writes: AtomicU64,
     /// Total samples written
     samples_written: AtomicU64,
+    /// Packets the consumer (the transport) has put on the network from this
+    /// ring; see [`record_packet_sent`](RingBuffer::record_packet_sent).
+    packets_sent: AtomicU64,
     
     /// Event-driven notification flag
     /// 0 = no data, 1 = data available
@@ -97,6 +100,7 @@ impl RingBuffer {
             streaming_active: AtomicU32::new(0),
             writes: AtomicU64::new(0),
             samples_written: AtomicU64::new(0),
+            packets_sent: AtomicU64::new(0),
             has_data_flag: AtomicU32::new(0),
             wire_channels: AtomicU32::new(1),
         }
@@ -127,6 +131,18 @@ impl RingBuffer {
         self.samples_written.load(Ordering::Relaxed)
     }
 
+    /// Count one packet built from this ring as sent. The transport calls it
+    /// once the network has accepted the packet, from whichever thread runs
+    /// its send loop.
+    pub fn record_packet_sent(&self) {
+        self.packets_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Packets recorded with [`record_packet_sent`](Self::record_packet_sent)
+    pub fn packets_sent(&self) -> u64 {
+        self.packets_sent.load(Ordering::Relaxed)
+    }
+
     /// Get available samples to read
     pub fn available(&self) -> u32 {
         let write = self.write_pos.load(Ordering::Acquire);
@@ -139,6 +155,7 @@ impl RingBuffer {
         self.overruns.store(0, Ordering::Relaxed);
         self.writes.store(0, Ordering::Relaxed);
         self.samples_written.store(0, Ordering::Relaxed);
+        self.packets_sent.store(0, Ordering::Relaxed);
     }
 
     /// Get pointer to the has_data flag for JavaScript Atomics.waitAsync()

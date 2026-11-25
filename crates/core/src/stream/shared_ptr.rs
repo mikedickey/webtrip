@@ -2,7 +2,7 @@
 //!
 //! WebTrip hands buffer addresses across the AudioWorklet / WebTransport-worker
 //! boundary as integers — the browser only lets you `postMessage` numbers, not
-//! Rust references (see [`docs/ARCHITECTURE.md`](../../../docs/ARCHITECTURE.md)).
+//! Rust references (see [`docs/architecture.md`](https://webtrip.dev/docs/architecture)).
 //! On the receiving side the address is turned back into a reference.
 //!
 //! `SharedPtr<T>` is the single place that address reconstruction and deref

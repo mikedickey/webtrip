@@ -289,7 +289,7 @@ impl AudioEngine {
         let stream = get_user_media_audio(&media_devices, &audio_constraints).await?;
         if cancelled.is_some_and(|c| c.load(Ordering::Acquire)) {
             stop_media_stream(&stream);
-            return Err(crate::audio::cancelled_error());
+            return Err(crate::js_util::cancelled_error());
         }
 
         // The constraints open the device at its native width; the worklet
@@ -323,7 +323,7 @@ impl AudioEngine {
             route_output_sink(self.ctx.as_ref(), output_device_id).await?;
             if cancelled.is_some_and(|c| c.load(Ordering::Acquire)) {
                 self.stop_nodes();
-                return Err(crate::audio::cancelled_error());
+                return Err(crate::js_util::cancelled_error());
             }
         }
 
@@ -740,7 +740,7 @@ pub(crate) enum TimeoutRace {
 /// `AudioContext.close`. The one-shot handler is leaked until it fires, which
 /// is why callers wire it only when they will consume the result.
 fn stopped_acknowledgement(port: &web_sys::MessagePort) -> js_sys::Promise {
-    let (stopped, resolve, _reject) = crate::audio::make_promise();
+    let (stopped, resolve, _reject) = crate::js_util::make_promise();
     let on_message = Closure::once_into_js(move |event: web_sys::MessageEvent| {
         if event.data().as_string().as_deref() == Some("stopped") {
             let _ = resolve.call0(&JsValue::NULL);

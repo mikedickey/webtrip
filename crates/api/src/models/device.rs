@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn device_fixture_known_good() {
-        // Fixture modeled after docs/api/devices.md — typical agent config payload.
+        // Fixture modeled after the `api::devices` module docs — typical agent config payload.
         let json = r#"{
           "id": "dev-1",
           "mac": "AA:BB:CC:DD:EE:FF",

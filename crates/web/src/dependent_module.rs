@@ -31,14 +31,15 @@ pub fn on_the_fly(code: &str) -> Result<String, JsValue> {
     )?)
 }
 
-// dependent_module! takes a local file name to a JS module as input and
-// returns a URL to a slightly modified module in run time. This modified module
-// has an additional import statement in the header that imports the current
-// bindgen JS module under the `bindgen` alias, and the separate init function.
-// How this URL is produced does not matter for the macro user. on_the_fly
-// creates a blob URL in run time. A better, more sophisticated solution
-// would add wasm_bindgen support to put such a module in pkg/ during build time
-// and return a URL to this file instead (described in #3019).
+/// Takes a local file name to a JS module and returns, at run time, a URL to a
+/// slightly modified copy of it. The copy has an extra import statement in its
+/// header that imports the current bindgen JS module under the `bindgen` alias,
+/// plus the separate init function.
+///
+/// How the URL is produced does not matter to the caller: `on_the_fly` creates
+/// a blob URL at run time. A more sophisticated solution would have
+/// wasm-bindgen put such a module in `pkg/` at build time and return a URL to
+/// that file instead (wasm-bindgen issue #3019).
 #[macro_export]
 macro_rules! dependent_module {
     ($file_name:expr) => {

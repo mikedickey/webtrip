@@ -3,8 +3,22 @@ name = "webtrip"
 description = "WebTrip facade: re-exports webtrip-core, webtrip-api and (behind `web`) webtrip-web"
 authors.workspace = true
 edition.workspace = true
-publish.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["audio", "jacktrip", "realtime", "networking", "wasm"]
+categories = ["multimedia::audio", "network-programming", "wasm"]
+
+# Document `webtrip::web` too: it only builds for the threaded wasm target, so
+# docs.rs uses the same target and flags as webtrip-web.
+[package.metadata.docs.rs]
+features = ["web"]
+targets = ["wasm32-unknown-unknown"]
+rustc-args = ["--cfg=web_sys_unstable_apis", "-Ctarget-feature=+atomics"]
+rustdoc-args = ["--cfg=web_sys_unstable_apis"]
+cargo-args = ["-Zbuild-std=std,panic_abort"]
 
 # Platform rule: with default features this crate is as portable as core.
 # `npm run check:core` builds it natively with no features to enforce that.
@@ -15,6 +29,6 @@ wasm = ["webtrip-core/wasm", "webtrip-api/wasm"]
 web = ["dep:webtrip-web"]
 
 [dependencies]
-webtrip-core = { path = "../core" }
-webtrip-api = { path = "../api" }
-webtrip-web = { path = "../web", optional = true }
+webtrip-core = { path = "../core", version = "0.2.0" }
+webtrip-api = { path = "../api", version = "0.2.0" }
+webtrip-web = { path = "../web", version = "0.2.0", optional = true }

@@ -12,13 +12,19 @@ use wasm_bindgen::prelude::*;
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(Debug, Clone, Default)]
 pub struct SessionStats {
+    /// Packets the transport has put on the network.
     pub packets_sent: u64,
+    /// Packets the regulator has received.
     pub packets_received: u64,
 
     // Ring buffer stats (send path)
+    /// Samples waiting in the send ring buffer.
     pub send_buffer_available: u32,
+    /// Successful writes into the send ring buffer.
     pub ring_buffer_writes: u64,
+    /// Total samples written into the send ring buffer.
     pub ring_buffer_samples_written: u64,
+    /// Writes refused because the send ring buffer was full.
     pub ring_buffer_overruns: u64,
 
     // Regulator stats (receive path with Burg PLC)
@@ -51,6 +57,7 @@ pub type ConnectionStats = SessionStats;
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 impl SessionStats {
+    /// All counters zero.
     #[cfg_attr(feature = "wasm", wasm_bindgen(constructor))]
     pub fn new() -> Self {
         Self::default()
@@ -73,9 +80,10 @@ pub fn build_connection_stats(
     ring_buffer_writes: u64,
     ring_buffer_samples_written: u64,
     ring_buffer_overruns: u64,
+    packets_sent: u64,
 ) -> ConnectionStats {
     ConnectionStats {
-        packets_sent: 0, // TODO: Get from transport if needed
+        packets_sent,
         packets_received: reg_stats.packets_received,
 
         send_buffer_available,
@@ -192,10 +200,10 @@ mod tests {
             /* ring_buffer_writes */ 200,
             /* ring_buffer_samples_written */ 25_600,
             /* ring_buffer_overruns */ 0,
+            /* packets_sent */ 250,
         );
 
-        // packets_sent is always 0 (not yet tracked by transport)
-        assert_eq!(s.packets_sent, 0);
+        assert_eq!(s.packets_sent, 250);
         assert_eq!(s.packets_received, 1000);
 
         assert!((s.regulator_tolerance_ms - 12.5).abs() < 1e-9);

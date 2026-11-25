@@ -10,7 +10,7 @@ output device.
 
 For the broader threading model (why there's an AudioWorklet thread, a main
 thread, and sometimes a WebTransport worker thread, and how they share
-memory) see [ARCHITECTURE.md](ARCHITECTURE.md) — this document assumes that
+memory) see [architecture.md](architecture.md) — this document assumes that
 context and focuses specifically on channels. For design rationale see
 [`plans/channel-config.md`](../plans/channel-config.md) (and the earlier
 [`plans/channel-model.md`](../plans/channel-model.md)) — but treat those as
@@ -41,8 +41,10 @@ guaranteed to reflect the code as it stands today. This document is.
 is the source of most bugs in this area. None of them is required to equal any
 other, and the code is written to tolerate all of them disagreeing at once.
 
-A session has four **configured** counts. All four are set only while `Idle`,
-are fixed for the life of a connection, and are retained across disconnects:
+A session has four **configured** counts. The wire counts (send/receive) are
+set only while the network is `Idle` and are fixed for the life of a
+connection; the device counts (input/output) are set only while audio is
+stopped and are fixed while it runs. All four are retained across disconnects:
 
 | Count | Default | Meaning | Setter (JS) |
 |---|---|---|---|
@@ -137,13 +139,18 @@ the defaults still works on any hardware.
 The four setters (`setSendChannels`, `setReceiveChannels`,
 `setInputChannels`, `setOutputChannels`) share one guard,
 `can_set_channel_count`: the count must be in `[1, MAX_WIRE_CHANNELS]` (send/receive) or
-`[1, MAX_DEVICE_CHANNELS]` (input/output) and the session must be `Idle`. Otherwise the call logs a warning and does nothing.
+`[1, MAX_DEVICE_CHANNELS]` (input/output). The wire counts (send/receive)
+are settable only while the network is `Idle`, the device counts
+(input/output) only while audio is stopped. Otherwise the call logs a warning
+and does nothing.
 
-`Idle`-only is deliberate. The transports snapshot the wire counts into
+Both gates are deliberate. The transports snapshot the wire counts into
 `AudioBufferConfig` at connect time, and the render thread reads the send
-count from the connection's `RingBuffer::wire_channels`. Changing either mid-connection would
-desync the `RingBuffer`'s producer (the worklet) from its consumer (the
-transport's send loop).
+count from the connection's `RingBuffer::wire_channels`; changing either
+mid-connection would desync the `RingBuffer`'s producer (the worklet) from its
+consumer (the transport's send loop). The device counts size the capture and
+the worklet node when audio starts, so they take effect on the next
+`startAudio`.
 
 The count reaches the render thread through the connection's send ring: each
 connect builds a fresh `RingBuffer` and declares the send width on it
@@ -221,9 +228,10 @@ The engine keeps the worklet's input width and the requested output count, so
         │                                    │                                    │
         │                            ② ProcessorHandle::render(in_channels, ...)   │
         │                               → AudioProcessor::process(...)             │
+        │                               → SimpleMixer::render (mixer.rs)          │
         │                                    │                                    │
         │                            ③ apply_gain over the planar                  │
-        │                               gained_buffer (in_channels × frames)      │
+        │                               `gained` scratch (in_channels × frames)   │
         │                                    │                                    │
         │                            ④ level meter: max_channel_rms                │
         │                               (loudest channel, not the average)        │
@@ -232,10 +240,11 @@ The engine keeps the worklet's input width and the requested output count, so
         │                               (ONE conversion; feeds both ⑥ and the     │
         │                                monitor mix on the receive side)         │
         │                                    │                                    │
-        │                            ⑥ send_local_to_network:                     │
-        │                               conform_interleaved_channels if           │
-        │                               in_channels != send_channels, then        │
-        │                               RingBuffer::write()                       │
+        │                            ⑥ conform_interleaved_channels to the       │
+        │                               ring's wire_channels (if they differ),    │
+        │                               resample to the wire rate (if the device  │
+        │                               rate differs); AudioProcessor then        │
+        │                               RingBuffer::write()s the wire frames      │
         │                                    │                                    │
         │                                    │      (shared WASM memory)          │
         │                                    │ ──────────────────────────────────>│
@@ -254,19 +263,20 @@ Key points:
   quantum (`RENDER_QUANTUM_FRAMES = 128` samples, `worklet.rs`).
 - **`in_channels` is the real capture width this callback.** It flows from
   `worklet.js`'s `inputs[0].length` through `ProcessorHandle::render` into
-  `AudioProcessor::process(input, in_channels, output, out_channels)`
-  (`processor.rs`).
+  `AudioProcessor::process(input, in_channels, output, out_channels, now_ms)`
+  (`processor.rs`), which hands the mixing to `SimpleMixer::render`
+  (`mixer.rs`).
 - **Step ⑤ is the one and only planar→interleaved conversion per callback.**
   `captured_interleaved` is shared by the send path and the local monitor mix
   on purpose. Converting twice would duplicate work and risk the two consumers
   drifting apart.
 - **Step ⑥ is where the capture width and the send count meet.**
-  `send_local_to_network` reads `RingBuffer::wire_channels()` and pays for
-  the conform only when `in_channels != send_channels`. This is how two
+  The processor reads the connection ring's `RingBuffer::wire_channels()`,
+  and the mixer pays for the conform only when `in_channels != send_channels`. This is how two
   captured channels are averaged into one sent channel, and how a mono capture
   against a stereo send is duplicated rather than mis-framed.
 - **Step ⑦ happens on the main thread (WebRTC) or a dedicated worker
-  (WebTransport).** See [ARCHITECTURE.md](ARCHITECTURE.md) for why network I/O
+  (WebTransport).** See [architecture.md](architecture.md) for why network I/O
   can't run on the AudioWorklet thread. Both header channel fields come from
   `AudioBufferConfig`, never from what the worklet actually captured.
 
@@ -281,18 +291,22 @@ Key points:
       │      deliver_received_packet   │                                  │                        │
       │      (transport.rs)            │                                  │                        │
       │                                │                                  │                        │
-      │            ⑨ Regulator::push(seq, header.num_outgoing_channels,   │                        │
-      │               samples) — ADOPTS the peer's channel count from     │                        │
-      │               their first packet; rejects a mid-stream change     │                        │
-      │               instead of silently reinterpreting it               │                        │
+      │            ⑨ Regulator::push_at(seq, header.num_outgoing_channels,│                        │
+      │               header.buffer_size, samples, now) — ADOPTS the      │                        │
+      │               peer's channel count and fpp from their first       │                        │
+      │               packet; rejects a mid-stream change instead of      │                        │
+      │               silently reinterpreting it                          │                        │
       │                                │                                  │                        │
       │                                │       (shared WASM memory)       │                        │
       │                                │ <────────────────────────────────│                        │
       │                                │                                  │                        │
       │                                │                        ⑩ AudioProcessor::process:          │
       │                                │                           regulator.pop_frames_at(          │
-      │                                │                           remote_interleaved, 128 frames)  │
+      │                                │                           remote_interleaved, wire frames  │
+      │                                │                           this callback spans, now)        │
       │                                │                           → peer channel count (0 = silence)│
+      │                                │                        SimpleMixer::render resamples to the │
+      │                                │                           device rate (if it differs), then:│
       │                                │                                  │                        │
       │                                │                        ⑪ map_to_output(remote_interleaved,  │
       │                                │                           remote_channels, remote_mapped,   │
@@ -320,14 +334,16 @@ Key points:
   and a well-behaved hub sends that many channels back. But the regulator
   adopts whatever count the peer's first packet actually carries (step ⑨), and
   `map_to_output` handles any mismatch with the output width. Before that first
-  packet, the regulator has the shape the session's constructor gave it: the
-  default receive count (2). `setReceiveChannels` doesn't reconfigure it.
+  packet, the connection's regulator has the shape it was built with at
+  connect: the configured receive count and the session's `receive_fpp`. Each
+  connection builds a fresh regulator, so a reconnect adopts the new peer's
+  shape from scratch.
 - **`out_channels` is the output width**, configured by
   `configure_destination`/`build_and_connect_worklet_node` and passed into
   every `process()` call.
 - **Step ⑨'s soundness argument** (rebuilding channel-derived jitter-buffer
   state on the network thread while the audio thread may be mid-`pop`) is in
-  `Regulator::push`'s doc comment.
+  `Shared::adopt_stream_shape`'s doc comment (`regulator.rs`).
 - **Steps ⑪ and ⑫ use the exact same function**, `map_to_output`, applied to
   two different sources. That's why the mapping policy is documented once,
   below.
@@ -341,7 +357,7 @@ Key points:
 
 ## The Channel-Mapping Policy
 
-Two pure functions in `processor.rs` implement **the same four-branch
+Two pure functions in `dsp.rs` implement **the same four-branch
 policy** for reconciling a source channel count against a destination
 channel count. They differ only in memory layout (one planar, one
 interleaved), because their consumers need different layouts:
@@ -437,11 +453,13 @@ stay live.
   `output_scratch` in `worklet.rs`, sized `RENDER_QUANTUM_FRAMES *
   MAX_DEVICE_CHANNELS`). `worklet.js` reads both from the handle
   (`channel_capacity()`, `frames_per_quantum()`) rather than keeping copies.
-  The device-width buffers in `processor.rs` (`gained_buffer`,
-  `captured_interleaved`, `remote_mapped`, `monitor_mapped`) are preallocated
-  at `128 * MAX_DEVICE_CHANNELS` and the wire-width ones (`wire_conformed`,
-  `remote_interleaved`) at `128 * MAX_WIRE_CHANNELS`, so a resize never
-  allocates on the real-time render thread.
+  The device-width scratch in `SimpleMixer` (`mixer.rs`: `gained`,
+  `captured_interleaved`, `remote_mapped`, `monitor_mapped`) is preallocated
+  by `prepare` at `RENDER_QUANTUM_FRAMES * MAX_DEVICE_CHANNELS`. The
+  wire-width buffers in `processor.rs` (`remote_interleaved`, `wire_staging`)
+  are preallocated at `wire_frames_per_callback(RENDER_QUANTUM_FRAMES,
+  device_rate, wire_rate) * MAX_WIRE_CHANNELS`, so no resize allocates on the
+  real-time render thread.
 - **Two ceilings.** A device is addressed up to `MAX_DEVICE_CHANNELS` (32);
   the wire carries at most `MAX_WIRE_CHANNELS` (8) — a WebTrip choice that
   keeps packets within one unfragmented datagram. Both live in
@@ -454,14 +472,17 @@ stay live.
 
 | Concern | File |
 |---|---|
-| Session channel configuration (send/receive/input/output setters, Idle-only guard), `AudioBufferConfig` construction | `crates/web/src/session.rs` |
+| Session channel configuration (send/receive/input/output setters, network-idle and audio-stopped guards), `AudioBufferConfig` construction | `crates/web/src/session.rs` |
+| Per-connection send ring and regulator (`StreamBuffers`), built at the configured counts | `crates/web/src/connection.rs` |
 | `AudioBufferConfig` (send/receive counts handed to transports) | `crates/core/src/network/transport.rs` |
-| Atomic shared `send_channels` field | `crates/core/src/audio/params.rs` |
+| Per-connection send width (`RingBuffer::set_wire_format`/`wire_channels`) | `crates/core/src/stream/ring_buffer.rs` |
 | Pre-connect device probes (`getInputDeviceChannels`, `getOutputDeviceChannels`), `resolve_input_channels` | `crates/web/src/audio/devices.rs` |
 | `getUserMedia` constraints, capture-width clamping, destination configuration, worklet node (re)building | `crates/web/src/audio/engine.rs` |
 | Worklet ABI (planar scratch buffers, `ProcessorCallback`/`ProcessorHandle::render`) | `crates/web/src/audio/worklet.rs` |
 | Worklet JS bridge (copies each channel plane in/out of WASM memory) | `crates/web/src/audio/worklet.js` |
-| Gain, metering, planar↔interleaved conversion, channel-mapping policy, send/receive wiring | `crates/core/src/audio/processor.rs` |
+| Gain, metering, planar↔interleaved conversion, channel-mapping policy, rate conversion (`StreamResampler`) | `crates/core/src/audio/dsp.rs` |
+| Composing those into one callback's send and monitor/peer mix (`SimpleMixer`) | `crates/core/src/audio/mixer.rs` |
+| Ring/regulator pointer work, send/receive wiring | `crates/core/src/audio/processor.rs` |
 | Wire protocol header (bytes 14/15, payload sizing) | `crates/core/src/network/protocol.rs` |
 | Peer channel-count adoption (jitter buffer) | `crates/core/src/stream/regulator.rs` |
 | Per-transport packet framing at the send/receive counts | `crates/web/src/network/webrtc.rs`, `crates/web/src/network/webtransport.rs`, `crates/web/src/network/webtransport_worker.rs` |

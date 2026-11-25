@@ -84,6 +84,8 @@ pub struct AudioProcessor {
 }
 
 impl AudioProcessor {
+    /// Create a processor with no network attached: capture is metered and
+    /// monitored, nothing is sent or received.
     pub fn new(params: &'static AudioParams) -> Self {
         // No network streams, so the rates never convert anything.
         Self::with_network(

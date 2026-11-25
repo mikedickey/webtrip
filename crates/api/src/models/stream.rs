@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn stream_info_fixture_with_preserved_banner_url() {
-        // Fixture modeled after docs/api/streams.md. `bannerURL` keeps its
+        // Fixture modeled after the `api::streams` module docs. `bannerURL` keeps its
         // uppercase casing on the wire.
         let json = r#"{
           "id": "stream-1",

@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn region_fixture_known_good() {
         // Fixture modeled after the system regions endpoint described in
-        // docs/api/system.md. Region uses explicit per-field renames rather
+        // the `api::system` module docs. Region uses explicit per-field renames rather
         // than rename_all; verify those are honoured on the wire.
         let json = r#"{
           "group": "Americas",

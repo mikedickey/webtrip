@@ -132,7 +132,7 @@ impl AudioParams {
 ///
 /// Returns its address in shared WASM linear memory; every consumer rebuilds a
 /// [`SharedPtr`] from it with [`SharedPtr::from_addr`] (unsafe — see the
-/// `// SAFETY:` comment in [`with_params`]). The allocation is leaked so it
+/// `// SAFETY:` comment in `with_params`). The allocation is leaked so it
 /// outlives every agent that holds the address.
 #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = createAudioParams))]
 pub fn create_audio_params() -> usize {

@@ -54,5 +54,7 @@ export default defineConfig({
   server: {
     // The demo needs cross-origin isolation; harmless for the rest of the site.
     headers: CROSS_ORIGIN_ISOLATION_HEADERS,
+    // The docs pages import ../docs/*.md (the repo's guide) at build time.
+    fs: { allow: [".."] },
   },
 });

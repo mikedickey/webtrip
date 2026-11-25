@@ -1,7 +1,7 @@
-//! Portable JackTrip Virtual Studio API client and models.
-//!
-//! Dependency rule: nothing under this tree may depend on the audio engine, and
-//! neither `web-sys` nor `js-sys`.
+#![doc = include_str!("../README.md")]
+//
+// Dependency rule: nothing under this tree may depend on the audio engine, and
+// neither `web-sys` nor `js-sys`.
 
 // Clean API client module: a friendly, ergonomic interface to the JackTrip
 // Virtual Studio API.

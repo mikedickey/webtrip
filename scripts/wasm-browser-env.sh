@@ -12,7 +12,7 @@
 # those, where they either auto-configure the right tool or fail fast with an
 # actionable message instead of an opaque downstream error.
 #
-# See docs/WASM_TESTING.md → "Local setup (macOS)".
+# See docs/contributing/testing.md → "Local setup (macOS)".
 #
 # Usage: scripts/wasm-browser-env.sh <test|coverage> <command> [args...]
 set -euo pipefail
@@ -49,7 +49,7 @@ if [ "$mode" = "coverage" ]; then
        | clang -x c --target=wasm32-unknown-unknown -nostdlibinc -c -o /dev/null - 2>/dev/null; then
     fail "the 'clang' on PATH cannot target wasm32 (needed by minicov for coverage).
        On macOS, Apple's clang won't work — run 'brew install llvm' and it will be
-       picked up automatically here. See docs/WASM_TESTING.md."
+       picked up automatically here. See docs/contributing/testing.md."
   fi
 
   # 2. wasm-bindgen-test-runner must match the wasm-bindgen pinned in Cargo.lock.

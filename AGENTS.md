@@ -1,6 +1,6 @@
 # AGENTS.md
 
-For general project background see [README.md](README.md). For the threading model, audio data flow, browser API constraints, and transport architecture see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+For general project background see [README.md](README.md). For the threading model, audio data flow, browser API constraints, and transport architecture see [docs/architecture.md](docs/architecture.md).
 
 ## Answering Questions vs. Changing Code
 
@@ -102,7 +102,8 @@ This applies equally to test helpers, serialization utilities, fixture builders,
 - `npm run check:core` — Native `cargo check` of `webtrip-core`, `webtrip-api` and `webtrip` with no features; enforces that they never reach `web-sys`/`js-sys`
 - `npm run check` — Run `cargo check` with correct RUSTFLAGS and WASM target
 - `npm run test` — Run `cargo test` with correct RUSTFLAGS (runs native, not WASM)
-- `npm run test:wasm` — Run `wasm-bindgen-test` for browser-only modules (see [docs/WASM_TESTING.md](docs/WASM_TESTING.md) for details)
+- `npm run doc` — Build rustdoc for every crate with `-D warnings` (`doc:core` natively for core/api, `doc:web` on the wasm target for web and the `webtrip` facade); CI runs it so broken intra-doc links fail before docs.rs
+- `npm run test:wasm` — Run `wasm-bindgen-test` for browser-only modules (see [docs/contributing/testing.md](docs/contributing/testing.md) for details)
 
 **Note**: WASM tests require a properly configured browser environment. See the testing guide for requirements and troubleshooting.
 
@@ -125,7 +126,7 @@ Every test must be able to fail on a plausible bug in production logic. Before a
 - Distinct branches and edges: validation boundaries (both sides), error paths, wraparound (`u16` sequence numbers, ring indices), empty-input early returns, null-pointer guards.
 - Regression tests for fixed bugs, with a comment referencing the bug/commit.
 - Browser (wasm) tests that drive real handlers with synthetic events and assert observable contracts (callback payloads, teardown ordering, promise rejection) — not browser-provided initial states or `web_sys` echoes.
-- Exactly one trivial canary test per `tests/*.rs` wasm binary — a binary whose tests all fail to register is silently skipped (see [docs/WASM_TESTING.md](docs/WASM_TESTING.md)).
+- Exactly one trivial canary test per `tests/*.rs` wasm binary — a binary whose tests all fail to register is silently skipped (see [docs/contributing/testing.md](docs/contributing/testing.md)).
 
 When deleting or refactoring production code, delete its tests rather than porting low-value ones forward.
 
@@ -161,11 +162,12 @@ never imports `network` (both may use `stream`); `session.rs` composes them.
 - **`crates/api/src/models/`** — Typed data models with auto-generated TypeScript types via `tsify-next`
 - **`crates/web/src/lib.rs`** — WASM entry point, exports `init()` and public types to JavaScript
 - **`website/`** — React SPA for webtrip.dev (Vite, own package.json); the demo lives at the `/demo` route (`website/src/pages/demo/`) and loads the wasm-pack output at runtime from `/pkg/` (unbundled — the WebTransport worker re-imports `{origin}/pkg/webtrip.js`, see `wasm_module_url`). `website/server.js` serves the built site plus repo-root `pkg/` with the COOP/COEP headers SharedArrayBuffer needs
+- **`docs/`** — the public guide (top-level `docs/*.md`, rendered on webtrip.dev under `/docs/<slug>` by `website/src/pages/docs/`; add a new page to the `ORDER` list in `content.ts`). `docs/contributing/` is GitHub-only. API reference is rustdoc, published to docs.rs; each crate's `README.md` is its crate-level doc (`#![doc = include_str!("../README.md")]`), so README code blocks are doctests
 - **`plans/`** — planning documents for work that is in progress, already completed, or superseded; see [plans/AGENTS.md](plans/AGENTS.md). Only read files in this directory when actively working on a specific plan, or when trying to understand the original implementation of a specific feature — do not read it otherwise
 
 ## Rust/WASM Specifics
 
-- **Nightly toolchain** required (see `rust-toolchain.toml`) — needed for the unstable cargo flags `-Zbuild-std` (rebuild `std` with atomics/bulk-memory so it can link against shared memory) and `-Zno-profiler-runtime` (wasm coverage builds). The crate itself is stable Rust; no `#![feature(...)]` anywhere. See [Toolchain Requirements](README.md#toolchain-requirements) for what would have to change to drop nightly.
+- **Nightly toolchain** required (see `rust-toolchain.toml`) — needed for the unstable cargo flags `-Zbuild-std` (rebuild `std` with atomics/bulk-memory so it can link against shared memory) and `-Zno-profiler-runtime` (wasm coverage builds). The crate itself is stable Rust; no `#![feature(...)]` anywhere. See [Toolchain Requirements](docs/contributing/toolchain.md) for what would have to change to drop nightly.
 - **Target**: `wasm32-unknown-unknown`
 - **Crate type**: `cdylib` — the current build produces a WASM binary rather than an
   rlib. This is a property of today's artifact, not a design constraint; write the
@@ -178,7 +180,7 @@ never imports `network` (both may use `stream`); `session.rs` composes them.
 
 - JackTrip API base: `https://test.jacktrip.com/api`
 - OpenAPI spec: `https://test.jacktrip.com/api/redirect/openapi`
-- API docs in `docs/api/`; architecture docs in `docs/ARCHITECTURE.md`
+- API client reference lives in rustdoc on `crates/api/src/api/` (published to docs.rs); architecture docs in `docs/architecture.md`
 
 ## Environment-specific instructions
 
@@ -186,4 +188,4 @@ Only read the doc for your environment; skip the others.
 
 | Environment | Instructions |
 |-------------|--------------|
-| Cursor Cloud | Read [docs/CURSOR_CLOUD.md](docs/CURSOR_CLOUD.md) before running tests or opening the app in Chrome |
+| Cursor Cloud | Read [docs/contributing/cursor-cloud.md](docs/contributing/cursor-cloud.md) before running tests or opening the app in Chrome |

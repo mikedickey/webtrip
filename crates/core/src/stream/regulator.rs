@@ -4,8 +4,8 @@
 //! algorithm for autoregressive prediction to perform packet loss concealment.
 //!
 //! References:
-//! - http://www.emptyloop.com/technotes/A%20tutorial%20on%20Burg's%20method,%20algorithm%20and%20recursion.pdf
-//! - https://metacpan.org/source/SYP/Algorithm-Burg-0.001/README
+//! - <http://www.emptyloop.com/technotes/A%20tutorial%20on%20Burg's%20method,%20algorithm%20and%20recursion.pdf>
+//! - <https://metacpan.org/source/SYP/Algorithm-Burg-0.001/README>
 //!
 //! Original C++ implementation by Chris Chafe, CCRMA Stanford University.
 //!
@@ -17,25 +17,25 @@
 //! - **Sequence space** is the full `u16` the wire protocol carries (65536
 //!   values; see `protocol::AudioPacket`). It answers *identity and ordering*:
 //!   which packet is this, and is it newer than the one before it
-//!   ([`seq_is_newer`])?
-//! - **Slot space** is `num_slots` entries deep ([`slot_index`]), where
-//!   [`num_slots`] is chosen per stream from its adopted fpp. It answers
+//!   (`seq_is_newer`)?
+//! - **Slot space** is `num_slots` entries deep (`slot_index`), where
+//!   `num_slots` is chosen per stream from its adopted fpp. It answers
 //!   *storage*: where does this packet's audio live, and is it still there?
 //!
 //! The ring holds a constant *time horizon* rather than a constant packet
-//! count: a budget of [`SLOT_FRAME_BUDGET`] frames (4096 packets at the
+//! count: a budget of `SLOT_FRAME_BUDGET` frames (4096 packets at the
 //! reference fpp of 128, ~10.9 s at 48 kHz). `num_slots(fpp)` is the largest
-//! power of two whose slots fit that budget, capped at [`MAX_SLOTS`]:
+//! power of two whose slots fit that budget, capped at `MAX_SLOTS`:
 //!
 //! - **A power of two**, so `seq % num_slots` stays continuous across the
 //!   `u16` wrap (a non-divisor of 65536 would jump at the wrap).
 //! - **The cap** keeps the ring at or under a quarter of sequence space,
-//!   inside [`seq_is_newer`]'s half-space window.
+//!   inside `seq_is_newer`'s half-space window.
 //!
 //! Memory is therefore at most 16 MiB at 8 channels whatever the fpp, instead
 //! of growing with it (128 MiB at fpp 1024 with a fixed 4096 slots). The
 //! horizon is ~10.9 s at any fpp of 32 or more, and ~5.5 s at 16, where the cap
-//! binds. The slot array itself is allocated once at [`MAX_SLOTS`] entries
+//! binds. The slot array itself is allocated once at `MAX_SLOTS` entries
 //! with empty payloads; only the first `num_slots` are ever sized.
 //!
 //! Sequence space is at least 4x larger than the ring, so the seam between
@@ -50,11 +50,11 @@
 //!   the write pointer it has lost contact with the stream permanently — no
 //!   amount of waiting brings those packets back — and the only recovery is to
 //!   drop it and resynchronize. That is the single place the seam is handled;
-//!   see [`ConsumerState::find_best_packet`].
+//!   see `ConsumerState::find_best_packet`.
 //!
 //! Upstream JackTrip has no seam: it folds `seq_num %= NumSlots` on arrival,
 //! collapsing the two spaces into one. That makes an unretrievable span
-//! unrepresentable, but it also shrinks the window over which [`seq_is_newer`]
+//! unrepresentable, but it also shrinks the window over which `seq_is_newer`
 //! can tell a forward jump from a reordered straggler, from ~32768 packets
 //! (~87 s at fpp=128/48 kHz) down to 2048 (~5.5 s) — which is why upstream then
 //! needs a wall-clock escape hatch to unstick a pinned write pointer
@@ -663,7 +663,7 @@ struct SlotPayload {
 /// established, so every packet belonging to the stream carries exactly
 /// `fpp * channels` samples. `data` is sized to that once per stream, and is
 /// always full: a packet of any other size is rejected before it reaches a
-/// slot ([`Regulator::push`]). That leaves no partially-filled state to track
+/// slot ([`Regulator::push_at`]). That leaves no partially-filled state to track
 /// and no allocation on the audio path.
 ///
 /// # Publication
@@ -809,13 +809,13 @@ pub struct RegulatorStats {
 ///
 /// # Concurrency (SPSC)
 ///
-/// One network-side producer calls [`push`](Self::push); one audio-side consumer
-/// calls [`pop`](Self::pop). Main-thread [`stats`](Self::stats) /
+/// One network-side producer calls [`push_at`](Self::push_at); one audio-side
+/// consumer calls [`pop_frames_at`](Self::pop_frames_at) (or [`pop_at`](Self::pop_at)). Main-thread [`stats`](Self::stats) /
 /// [`depth`](Self::depth) / [`latency_ms`](Self::latency_ms) read only atomics.
 /// Every method takes `&self`, and state is split by owner so that no thread
 /// ever creates a `&mut` overlapping memory another thread can reach:
 ///
-/// - [`Shared`] is only ever borrowed `&`. It holds the configuration that is
+/// - `Shared` is only ever borrowed `&`. It holds the configuration that is
 ///   fixed at construction, the atomics (the `last_seq_in` / `last_seq_out`
 ///   pointers, the stream's adopted channel count and start time, and the
 ///   published stats snapshot), and the slot ring.
@@ -823,15 +823,15 @@ pub struct RegulatorStats {
 ///   seqlock: the producer invalidates the stamp, writes, then `Release`s the
 ///   new `seq`; the consumer trusts a copy only if an `Acquire` load of the
 ///   stamp before it and a reload after it both show the `seq` it expects
-///   ([`PacketSlot::read`]). A producer that laps the ring onto the slot the
+///   (`PacketSlot::read`). A producer that laps the ring onto the slot the
 ///   consumer is copying — a whole ring (`num_slots` packets, ~10.9 s at
 ///   fpp >= 32/48 kHz) ahead — therefore turns that copy into a concealed
 ///   packet rather than torn audio. The copy itself races the overwrite —
-///   the one data race this type tolerates; see [`PacketSlot`].
-/// - [`ConsumerState`] — tolerance, timing stats, Burg/channel state — sits
+///   the one data race this type tolerates; see `PacketSlot`.
+/// - `ConsumerState` — tolerance, timing stats, Burg/channel state — sits
 ///   behind one [`UnsafeCell`] that only `pop` borrows mutably. The producer has no non-atomic state of its own, and
 ///   takes a `&mut` only to resize slot payloads before a stream starts
-///   ([`Shared::adopt_stream_shape`]).
+///   (`Shared::adopt_stream_shape`).
 ///
 /// Calling `push` from two threads at once, or `pop` from two threads at once,
 /// breaks this and is undefined behavior.
@@ -972,10 +972,10 @@ enum PacketDecision {
     ConcealSkippedPacket { skipped: u64 },
 }
 
-/// Outcome of [`Regulator::push`].
+/// Outcome of [`Regulator::push_at`].
 ///
 /// A JackTrip stream *adopts* its channel count and frames-per-packet from the
-/// peer's first packet ([`Shared::adopt_stream_shape`]).
+/// peer's first packet (`Shared::adopt_stream_shape`).
 /// Every variant other than `Stored` means the packet was dropped before it
 /// could reach a slot or move the write pointer.
 #[must_use]
@@ -983,24 +983,45 @@ enum PacketDecision {
 pub enum PushOutcome {
     /// The packet was stored (including the first-packet adoption case).
     Stored,
-    /// `channels` was `0` or greater than [`MAX_CHANNELS`].
-    UnsupportedChannelCount { got: usize },
+    /// `channels` was `0` or greater than `MAX_CHANNELS`.
+    UnsupportedChannelCount {
+        /// The packet's channel count.
+        got: usize,
+    },
     /// `channels` differs from the count already adopted from an earlier
     /// packet in this stream. Unlike the first-packet case, this is rejected
     /// rather than re-adopted: a mid-stream change is either a peer bug or a
     /// renegotiation this regulator was never told about, and silently
     /// resizing state to match would corrupt whatever a concurrent `pop` is
-    /// reading (see [`Shared::adopt_stream_shape`]'s concurrency note).
-    ChannelCountChanged { adopted: usize, got: usize },
+    /// reading (see `Shared::adopt_stream_shape`'s concurrency note).
+    ChannelCountChanged {
+        /// The channel count adopted from the stream's first packet.
+        adopted: usize,
+        /// The packet's channel count.
+        got: usize,
+    },
     /// A stream's first packet announced a frames-per-packet outside
     /// `[MIN_FPP, MAX_FPP]`, so the stream could not be adopted.
-    UnsupportedFpp { got: usize },
+    UnsupportedFpp {
+        /// The packet's frames per packet.
+        got: usize,
+    },
     /// `fpp` differs from the value adopted from an earlier packet in this
     /// stream. Rejected rather than re-adopted, for the same reason as
     /// [`ChannelCountChanged`](Self::ChannelCountChanged).
-    FppChanged { adopted: usize, got: usize },
+    FppChanged {
+        /// The frames per packet adopted from the stream's first packet.
+        adopted: usize,
+        /// The packet's frames per packet.
+        got: usize,
+    },
     /// `samples.len()` was not exactly `channels * fpp`.
-    WrongPacketSize { expected: usize, got: usize },
+    WrongPacketSize {
+        /// `channels * fpp`.
+        expected: usize,
+        /// `samples.len()`.
+        got: usize,
+    },
 }
 
 
@@ -1009,9 +1030,8 @@ impl Regulator {
     ///
     /// # Safety
     ///
-    /// Only the single consumer thread may call this (or [`reset`](Self::reset)
-    /// once both sides are quiesced), and no reference from an earlier call
-    /// may still be live.
+    /// Only the single consumer thread may call this, and no reference from
+    /// an earlier call may still be live.
     #[allow(clippy::mut_from_ref)]
     unsafe fn consumer_mut(&self) -> &mut ConsumerState {
         &mut *self.consumer.get()
@@ -1025,7 +1045,7 @@ impl Regulator {
     /// Create a new Regulator with specific parameters.
     ///
     /// `channels` and `fpp` describe the stream until the peer's first packet
-    /// announces its own, which replaces them ([`Shared::adopt_stream_shape`]).
+    /// announces its own, which replaces them (`Shared::adopt_stream_shape`).
     pub fn with_params(channels: usize, fpp: usize, sample_rate: u32, tolerance_ms: f64) -> Self {
         let samples_per_packet = fpp * channels;
 
@@ -1214,8 +1234,9 @@ impl Regulator {
 
     /// Get the number of channels (peer-adopted).
     ///
-    /// After a [`pop`](Self::pop) that rendered a started stream, this matches
-    /// the width that pop used — the Acquire inside pop orders the adoption.
+    /// After a [`pop_frames_at`](Self::pop_frames_at) or [`pop_at`](Self::pop_at)
+    /// that rendered a started stream, this matches the width that pop used —
+    /// the Acquire inside the pop orders the adoption.
     pub fn channels(&self) -> usize {
         self.shared.channels()
     }

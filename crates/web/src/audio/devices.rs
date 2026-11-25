@@ -19,11 +19,13 @@ pub struct DeviceInfo {
 
 #[wasm_bindgen]
 impl DeviceInfo {
+    /// The browser's device ID, as passed to `getUserMedia` or `setSinkId`.
     #[wasm_bindgen(getter, js_name = deviceId)]
     pub fn device_id(&self) -> String {
         self.device_id.clone()
     }
 
+    /// The human-readable device name (browsers leave it empty until media permission is granted).
     #[wasm_bindgen(getter)]
     pub fn label(&self) -> String {
         self.label.clone()
@@ -37,8 +39,11 @@ impl DeviceInfo {
 /// discarded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioDeviceKind {
+    /// An audio input (microphone).
     Input,
+    /// An audio output (speaker).
     Output,
+    /// Any non-audio device; dropped by categorization.
     Other,
 }
 
@@ -48,8 +53,11 @@ pub enum AudioDeviceKind {
 /// can be unit-tested natively without a browser.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawDevice {
+    /// The browser's device ID.
     pub device_id: String,
+    /// The human-readable device name.
     pub label: String,
+    /// Whether the device is an input, an output, or neither.
     pub kind: AudioDeviceKind,
 }
 
@@ -456,7 +464,7 @@ mod tests {
     // Headless Chrome returns an empty device list and rejects `getUserMedia`
     // unless launched with `--use-fake-device-for-media-stream` (synthetic mic)
     // and `--use-fake-ui-for-media-stream` (auto-granted permission, no user
-    // gesture). Those flags are set in `webdriver.json`; see `docs/WASM_TESTING.md`.
+    // gesture). Those flags are set in `webdriver.json`; see `docs/contributing/testing.md`.
 
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;
@@ -566,7 +574,7 @@ mod tests {
         // Output (audiooutput) devices: their ids/labels must be well-formed when
         // present, but headless Chrome does not always expose an audio sink even
         // with the fake-device flags, so an empty output list is tolerated rather
-        // than asserted on (see the headless caveat in WEB-39 / docs/WASM_TESTING.md).
+        // than asserted on (see the headless caveat in WEB-39 / docs/contributing/testing.md).
         for value in output_devices.iter() {
             let (device_id, label) = read_device_info(&value);
             assert!(!device_id.is_empty(), "output device id must be non-empty");

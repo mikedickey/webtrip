@@ -157,6 +157,7 @@ pub struct TransportConfig {
 
 #[wasm_bindgen]
 impl TransportConfig {
+    /// The default configuration, identical to [`low_latency`](Self::low_latency).
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
         Self::default()
@@ -388,6 +389,7 @@ impl WebRtcTransport {
                                                 if channel.ready_state() == RtcDataChannelState::Open {
                                                     let array = Uint8Array::from(&self.packet_serialize_buffer[..bytes_written]);
                                                     if let Ok(()) = channel.send_with_array_buffer_view(&array) {
+                                                        ring_buffer.record_packet_sent();
                                                         self.sequence_number = self.sequence_number.wrapping_add(1);
                                                         self.timestamp += buffers.buffer_size as u64;
                                                         processed_send = true;
@@ -462,7 +464,7 @@ impl WebRtcTransport {
         self.notify_state_change();
 
         // Create a Promise that will resolve when connection is established
-        let (promise, resolve, reject) = crate::audio::make_promise();
+        let (promise, resolve, reject) = crate::js_util::make_promise();
 
         // Wrap resolve/reject in Rc for sharing with closures
         let resolve_rc = Rc::new(RefCell::new(Some(resolve)));

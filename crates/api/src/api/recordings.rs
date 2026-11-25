@@ -1,6 +1,59 @@
-//! Recordings API endpoints
+//! Recordings API: JackTrip Radio recordings, public and per-studio.
 //!
-//! JackTrip Radio recordings management.
+//! Reach it through [`ApiClient::recordings`]. The endpoints fall into three
+//! groups:
+//!
+//! - **Public recordings** (`/recordings…`, `/streams/{streamId}/recordings`) —
+//!   browse, fetch and find similar recordings. No authentication needed,
+//!   except for liking/unliking.
+//! - **Studio recordings** (`/studios/{studioId}/recordings…`) — list, edit,
+//!   delete and download a studio's recordings, set a banner image, and list
+//!   per-client stems.
+//! - **User recordings** (`/users/{userId}/recordings…`) — a user's recordings
+//!   and their recording quota.
+//!
+//! Everything outside the public group requires a bearer token
+//! ([`ApiClient::set_bearer_token`]).
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use webtrip_api::api::{ApiClient, ApiError};
+//!
+//! # async fn example() -> Result<(), ApiError> {
+//! let client = ApiClient::new();
+//!
+//! // Public: first page of recordings.
+//! let page = client.recordings().list_recordings_paginated(Some(1), Some(20), None).await?;
+//! for rec in &page.results {
+//!     println!("{:?}", rec.name);
+//! }
+//!
+//! // Downloading a studio recording needs a bearer token.
+//! client.set_bearer_token("<token>".to_string());
+//! let download = client.recordings().download_recording("studio123", "rec456").await?;
+//! if let Some(url) = download.url {
+//!     println!("download from {url}");
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! From JavaScript (package `webtrip`):
+//!
+//! ```js
+//! import init, { ApiClient } from 'webtrip';
+//! await init();
+//!
+//! const client = new ApiClient();
+//! const page = await client.recordings().listRecordingsPaginated(1, 20);
+//!
+//! client.setBearerToken(token);
+//! const { url } = await client.recordings().downloadRecording('studio123', 'rec456');
+//!
+//! const bytes = new Uint8Array(await file.arrayBuffer());
+//! await client.recordings().updateRecordingBanner('studio123', 'rec456', bytes, file.type);
+//! ```
 
 #[cfg(feature = "wasm")]
 use super::to_js_value;
@@ -37,12 +90,20 @@ fn studio_recording_path(studio_id: &str, recording_id: &str) -> String {
 }
 
 impl RecordingsApi {
-    /// List all public recordings
+    /// List all public recordings.
+    ///
+    /// `GET /recordings`. No authentication required. See also
+    /// [`list_recordings_paginated`](Self::list_recordings_paginated).
     pub async fn list_recordings(&self) -> Result<Vec<models::RecordingMetadata>, ApiError> {
         self.client.get("/recordings").await
     }
 
-    /// List recordings with pagination
+    /// List public recordings, one page at a time.
+    ///
+    /// `GET /recordings-paginated`. No authentication required. `following: Some(true)`
+    /// restricts the list to channels the authenticated user follows. `page`,
+    /// `limit` and `following` are sent as query parameters only when given;
+    /// omitted ones fall back to the server defaults.
     pub async fn list_recordings_paginated(
         &self,
         page: Option<i32>,
@@ -66,46 +127,64 @@ impl RecordingsApi {
         }
     }
 
-    /// Get a recording by ID
+    /// Get a public recording by ID.
+    ///
+    /// `GET /recordings/{recordingId}`. No authentication required. The
+    /// [`models::PersonalizedRecording`] adds the caller's `liked` and
+    /// `following` state to the recording metadata.
     pub async fn get_recording(&self, recording_id: &str) -> Result<models::PersonalizedRecording, ApiError> {
         let path = format!("/recordings/{}", urlencode(recording_id));
         self.client.get(&path).await
     }
 
-    /// Get similar recordings
+    /// Get recordings similar to the given one.
+    ///
+    /// `GET /recordings/{recordingId}/similar`. No authentication required.
     pub async fn get_similar_recordings(&self, recording_id: &str) -> Result<Vec<models::RecordingMetadata>, ApiError> {
         let path = format!("/recordings/{}/similar", urlencode(recording_id));
         self.client.get(&path).await
     }
 
-    /// Like a recording
+    /// Like a recording as the authenticated user.
+    ///
+    /// `POST /recordings/{recordingId}/likes` (empty body). Requires a bearer token.
     pub async fn like_recording(&self, recording_id: &str) -> Result<(), ApiError> {
         self.client.post_empty_no_response(&recording_like_path(recording_id)).await
     }
 
-    /// Unlike a recording
+    /// Remove the authenticated user's like from a recording.
+    ///
+    /// `DELETE /recordings/{recordingId}/likes`. Requires a bearer token.
     pub async fn unlike_recording(&self, recording_id: &str) -> Result<(), ApiError> {
         self.client.delete(&recording_like_path(recording_id)).await
     }
 
-    /// Get recordings for a stream
+    /// List the public recordings of a stream (channel).
+    ///
+    /// `GET /streams/{streamId}/recordings`. No authentication required.
     pub async fn get_stream_recordings(&self, stream_id: &str) -> Result<Vec<models::RecordingMetadata>, ApiError> {
         let path = format!("/streams/{}/recordings", urlencode(stream_id));
         self.client.get(&path).await
     }
 
-    /// Get all recordings for a studio
+    /// List all of a studio's recordings.
+    ///
+    /// `GET /studios/{studioId}/recordings`. Requires a bearer token.
     pub async fn get_studio_recordings(&self, studio_id: &str) -> Result<Vec<models::ServerRecording>, ApiError> {
         self.client.get(&studio_recordings_path(studio_id)).await
     }
 
-    /// Get paginated recordings for a studio
+    /// List a studio's recordings, one page at a time.
+    ///
+    /// `GET /studios/{studioId}/recordings-paginated`. Requires a bearer token. `page` and `limit` are sent as
+    /// query parameters only when given; omitted ones fall back to the server
+    /// defaults.
     pub async fn get_studio_recordings_paginated(
         &self,
         studio_id: &str,
         page: Option<i32>,
         limit: Option<i32>,
-    ) -> Result<models::PaginatedRecordings, ApiError> {
+    ) -> Result<models::PaginatedServerRecordings, ApiError> {
         let path = format!("{}-paginated", studio_recordings_path(studio_id));
 
         if page.is_some() || limit.is_some() {
@@ -115,7 +194,9 @@ impl RecordingsApi {
         }
     }
 
-    /// Get a specific recording for a studio
+    /// Get one of a studio's recordings.
+    ///
+    /// `GET /studios/{studioId}/recordings/{recordingId}`. Requires a bearer token.
     pub async fn get_studio_recording(
         &self,
         studio_id: &str,
@@ -124,7 +205,9 @@ impl RecordingsApi {
         self.client.get(&studio_recording_path(studio_id, recording_id)).await
     }
 
-    /// Update a recording for a studio
+    /// Update a studio recording's metadata (name, description, …).
+    ///
+    /// `PUT /studios/{studioId}/recordings/{recordingId}`. Requires a bearer token.
     pub async fn update_studio_recording(
         &self,
         studio_id: &str,
@@ -134,16 +217,24 @@ impl RecordingsApi {
         self.client.put(&studio_recording_path(studio_id, recording_id), metadata).await
     }
 
-    /// Delete a recording for a studio
+    /// Delete one of a studio's recordings.
+    ///
+    /// `DELETE /studios/{studioId}/recordings/{recordingId}`. Requires a bearer token.
     pub async fn delete_studio_recording(&self, studio_id: &str, recording_id: &str) -> Result<(), ApiError> {
         self.client.delete(&studio_recording_path(studio_id, recording_id)).await
     }
 
     /// Get a signed download URL for a studio recording.
     ///
-    /// The returned URL can be used to download the recording as a FLAC or ZIP
-    /// file. The endpoint responds `202` while the recording is still being
-    /// transcoded and `400` if it is in progress or has been deleted.
+    /// `GET /studios/{studioId}/recordings/{recordingId}/download`. Requires a bearer token.
+    /// The returned [`models::RecordingDownload::url`] downloads the recording
+    /// as a FLAC or ZIP file.
+    ///
+    /// The endpoint responds `202` while the recording is still being
+    /// transcoded and `400` if it is in progress or has been deleted. `400`
+    /// surfaces as [`ApiError::Http`]; `202` is a success status, so it does
+    /// *not* — check that `url` is present before using it, and retry later if
+    /// it is not.
     pub async fn download_recording(
         &self,
         studio_id: &str,
@@ -153,8 +244,12 @@ impl RecordingsApi {
         self.client.get(&path).await
     }
 
-    /// Update a recording's banner image. The payload is the raw image bytes;
-    /// the endpoint responds `200` with no body.
+    /// Replace a studio recording's banner image.
+    ///
+    /// `PUT /studios/{studioId}/recordings/{recordingId}/banner`. Requires a bearer token.
+    /// `image` is the raw image bytes (not multipart) and `content_type` its
+    /// MIME type, e.g. `"image/png"`, sent as the `Content-Type` header. The
+    /// endpoint responds `200` with no body.
     pub async fn update_recording_banner(
         &self,
         studio_id: &str,
@@ -166,7 +261,10 @@ impl RecordingsApi {
         self.client.put_bytes(&path, image, content_type).await
     }
 
-    /// Get the stem summary for a recording
+    /// Get the stems (the individual per-client audio tracks) of a studio
+    /// recording.
+    ///
+    /// `GET /studios/{studioId}/recordings/{recordingId}/stems`. Requires a bearer token.
     pub async fn get_recording_stems(
         &self,
         studio_id: &str,
@@ -176,19 +274,25 @@ impl RecordingsApi {
         self.client.get(&path).await
     }
 
-    /// Get all recordings for a user
+    /// List all of a user's recordings.
+    ///
+    /// `GET /users/{userId}/recordings`. Requires a bearer token.
     pub async fn get_user_recordings(&self, user_id: &str) -> Result<Vec<models::ServerRecording>, ApiError> {
         let path = format!("/users/{}/recordings", urlencode(user_id));
         self.client.get(&path).await
     }
 
-    /// Get paginated recordings for a user
+    /// List a user's recordings, one page at a time.
+    ///
+    /// `GET /users/{userId}/recordings-paginated`. Requires a bearer token. `page` and `limit` are sent as
+    /// query parameters only when given; omitted ones fall back to the server
+    /// defaults.
     pub async fn get_user_recordings_paginated(
         &self,
         user_id: &str,
         page: Option<i32>,
         limit: Option<i32>,
-    ) -> Result<models::PaginatedRecordings, ApiError> {
+    ) -> Result<models::PaginatedServerRecordings, ApiError> {
         let path = format!("/users/{}/recordings-paginated", urlencode(user_id));
 
         if page.is_some() || limit.is_some() {
@@ -198,7 +302,9 @@ impl RecordingsApi {
         }
     }
 
-    /// Get recordings quota for a user
+    /// Get a user's recording quota usage.
+    ///
+    /// `GET /users/{userId}/recordings/quota`. Requires a bearer token.
     pub async fn get_recordings_quota(&self, user_id: &str) -> Result<models::RecordingsQuota, ApiError> {
         let path = format!("/users/{}/recordings/quota", urlencode(user_id));
         self.client.get(&path).await
@@ -267,7 +373,7 @@ impl RecordingsApi {
         studio_id: String,
         page: Option<i32>,
         limit: Option<i32>,
-    ) -> Result<models::PaginatedRecordings, ApiError> {
+    ) -> Result<models::PaginatedServerRecordings, ApiError> {
         self.get_studio_recordings_paginated(&studio_id, page, limit).await
     }
 
@@ -332,7 +438,7 @@ impl RecordingsApi {
         user_id: String,
         page: Option<i32>,
         limit: Option<i32>,
-    ) -> Result<models::PaginatedRecordings, ApiError> {
+    ) -> Result<models::PaginatedServerRecordings, ApiError> {
         self.get_user_recordings_paginated(&user_id, page, limit).await
     }
 
@@ -526,7 +632,7 @@ mod tests {
             "GET",
             "/studios/st1/recordings-paginated",
             200,
-            r#"{"_meta":{"total":1,"pages":1,"current":3,"count":1,"limit":5},"results":[{"id":"rec1"}]}"#,
+            r#"{"_meta":{"total":1,"pages":1,"current":3,"count":1,"limit":5},"results":[{"id":"rec1","serverId":"st1"}]}"#,
         )
         .await;
 
@@ -535,6 +641,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.meta.current, 3);
+        // Items are `ServerRecording`s, like the unpaginated list's.
+        assert_eq!(result.results[0].server_id, Some("st1".to_string()));
         mock.assert_async().await;
     }
 
@@ -725,7 +833,7 @@ mod tests {
             "GET",
             "/users/u1/recordings-paginated",
             200,
-            r#"{"_meta":{"total":1,"pages":1,"current":1,"count":1,"limit":20},"results":[{"id":"rec1"}]}"#,
+            r#"{"_meta":{"total":1,"pages":1,"current":1,"count":1,"limit":20},"results":[{"id":"rec1","ownerId":"u1"}]}"#,
         )
         .await;
 
@@ -733,7 +841,7 @@ mod tests {
             .get_user_recordings_paginated("u1", Some(1), Some(20))
             .await
             .unwrap();
-        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].owner_id, Some("u1".to_string()));
         mock.assert_async().await;
     }
 

@@ -1,6 +1,6 @@
 //! Canary test binary proving the wasm-bindgen-test harness itself runs.
 //!
-//! Per docs/WASM_TESTING.md, every `tests/*.rs` binary needs its own
+//! Per docs/contributing/testing.md, every `tests/*.rs` binary needs its own
 //! `wasm_bindgen_test_configure!(run_in_browser)`, and a binary with no passing
 //! test is silently skipped by the runner. This deliberately trivial test
 //! exists so a broken harness (misconfigured browser, missing headers, etc.)
