@@ -9,6 +9,7 @@ pub mod network;
 mod connection;
 mod console_log;
 mod dependent_module;
+mod js_util;
 pub mod session;
 mod tick_clock;
 

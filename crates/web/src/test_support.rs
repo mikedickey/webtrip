@@ -194,7 +194,7 @@ impl MockProbe {
 /// A promise the test opens by calling the returned function, for holding a
 /// [`MockTransport`] operation pending.
 pub(crate) fn gate() -> (js_sys::Promise, js_sys::Function) {
-    let (promise, open, _reject) = crate::audio::make_promise();
+    let (promise, open, _reject) = crate::js_util::make_promise();
     (promise, open)
 }
 

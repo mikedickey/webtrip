@@ -57,7 +57,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
 use crate::connection::{check_connection_capacity, Connection, ConsumerHold, RetiredList, StreamBuffers};
-use crate::audio::{cancelled_error, named_error};
+use crate::js_util::{cancelled_error, named_error};
 use crate::audio::engine::{close_audio_context_now, resume_context, route_output_sink, AudioEngine};
 use crate::tick_clock::{TickClock, TickSource};
 use webtrip_core::audio::params::AudioParams;
@@ -128,7 +128,7 @@ struct InFlight<'a> {
 
 impl<'a> InFlight<'a> {
     fn publish(slot: &'a RefCell<Option<js_sys::Promise>>) -> Self {
-        let (promise, resolve, _reject) = crate::audio::make_promise();
+        let (promise, resolve, _reject) = crate::js_util::make_promise();
         *slot.borrow_mut() = Some(promise);
         Self { slot, resolve }
     }
@@ -658,7 +658,7 @@ impl WebTripSession {
         echo_cancellation: bool,
         noise_suppression: bool,
     ) -> Result<(), JsValue> {
-        let (abort, abort_fn, _reject) = crate::audio::make_promise();
+        let (abort, abort_fn, _reject) = crate::js_util::make_promise();
         let capture = CaptureParams { device_id, auto_gain_control, echo_cancellation, noise_suppression };
         self.start_audio_with(capture, abort, abort_fn).await
     }
@@ -1219,7 +1219,7 @@ impl WebTripSession {
         let _connect = InFlight::publish(&self.connect_in_flight);
         emit_state(&self.on_state_change, SessionState::Connecting);
 
-        let (abort, abort_fn, _reject) = crate::audio::make_promise();
+        let (abort, abort_fn, _reject) = crate::js_util::make_promise();
         *self.abort_in_flight.borrow_mut() = Some(abort_fn.clone());
         let result = self
             .bring_up(epoch, new_transport, server, port, client_name, audio, abort, abort_fn, timeout_ms)
@@ -1624,7 +1624,7 @@ impl WebTripSession {
         let cancelled = Arc::new(AtomicBool::new(false));
         let outcome: Rc<RefCell<Option<Result<AudioEngine, JsValue>>>> = Rc::new(RefCell::new(None));
         let context_slot: Rc<RefCell<Option<web_sys::AudioContext>>> = Rc::new(RefCell::new(None));
-        let (done, resolve_done, _) = crate::audio::make_promise();
+        let (done, resolve_done, _) = crate::js_util::make_promise();
 
         {
             let cancelled = Arc::clone(&cancelled);

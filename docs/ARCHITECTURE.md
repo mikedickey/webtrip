@@ -7,13 +7,14 @@ This document explains the architecture of WebTrip, including how we work around
 ## Table of Contents
 
 1. [High-Level Overview](#high-level-overview)
+   - [Crate Layout](#crate-layout)
 2. [Why This Architecture?](#why-this-architecture)
 3. [Threading Model](#threading-model)
 4. [Limitation 1: WebRTC on Main Thread Only](#limitation-1-webrtc-on-main-thread-only)
 5. [Limitation 2: AudioWorklet Thread Isolation](#limitation-2-audioworklet-thread-isolation)
 6. [Limitation 3: No Direct Thread Communication](#limitation-3-no-direct-thread-communication)
-7. [Workaround: Session-Owned Buffers](#workaround-session-owned-buffers-with-shared-pointers)
-8. [Workaround: Main Thread Tick Loop](#workaround-main-thread-tick-loop)
+7. [Workaround: Connection-Owned Buffers](#workaround-connection-owned-buffers-with-shared-pointers)
+8. [Workaround: Tick Clock](#workaround-tick-clock)
 9. [Complete Data Flow](#complete-data-flow)
 10. [Trade-offs and Alternatives](#trade-offs-and-alternatives)
 
@@ -40,11 +41,12 @@ WebTrip uses a multi-threaded architecture with WebAssembly for high-performance
 │                 WASM Layer (Rust - Main Thread)                  │
 │              webtrip-web: lib.rs, session.rs                    │
 │                                                                   │
-│  JackTripSession (High-level orchestrator)                       │
-│    • Manages WebRTC connections and data channels               │
-│    • Owns shared buffers (ring buffer, jitter buffer)           │
-│    • Runs tick() loop to bridge audio and network threads       │
-│    • Lifecycle management (connect/disconnect)                   │
+│  WebTripSession (High-level orchestrator)                        │
+│    • Audio (startAudio/stopAudio) and network                    │
+│      (connectNetwork/disconnectNetwork) run independently        │
+│    • Each Connection owns its transport and stream buffers       │
+│      (RingBuffer + Regulator), retired when it ends              │
+│    • TickClock ticks a WebRTC transport                          │
 │                                                                   │
 │  AudioEngine (Audio system manager)                              │
 │    • Manages Web Audio API AudioContext                          │
@@ -72,7 +74,7 @@ WebTrip uses a multi-threaded architecture with WebAssembly for high-performance
 │  AudioProcessor (Rust DSP engine)                                │
 │    • Real-time audio processing on 128-sample buffers            │
 │    • Writes captured audio to ring buffer                        │
-│    • Reads remote audio from jitter buffer                       │
+│    • Reads remote audio from the Regulator (jitter buffer)       │
 │    • Volume metering (RMS → dB conversion)                       │
 │    • Peak level tracking with hold and decay                     │
 │    • Input gain control and output mixing                        │
@@ -82,15 +84,29 @@ WebTrip uses a multi-threaded architecture with WebAssembly for high-performance
 ### Component Summary
 
 - **Frontend Layer** (`website/src/pages/demo/`): React demo UI that manages user interactions, device selection, and WebRTC signaling
-- **Session Layer** (`crates/web/src/session.rs`): Orchestrates network and audio, owns shared buffers, bridges WebRTC and AudioWorklet
+- **Session Layer** (`crates/web/src/session.rs`, `connection.rs`, `tick_clock.rs`): Orchestrates network and audio; each connection owns its transport and stream buffers
+- **Mixer** (`crates/core/src/audio/mixer.rs`): `MixEngine`/`SimpleMixer`, the device↔network mix, including sample-rate conversion when the device rate differs from the 48 kHz wire rate
 - **Audio Engine** (`crates/web/src/audio/engine.rs`): Manages Web Audio API, creates AudioContext and worklet nodes
 - **Audio Processor** (`crates/core/src/audio/processor.rs`): Real-time DSP processing in dedicated audio thread
 
 ### Key Data Structures
 
-- **RingBuffer**: Lock-free SPSC queue for local audio capture (AudioWorklet → Main Thread)
-- **JitterBuffer**: Lock-free MPSC queue with packet reordering for network audio (Main Thread → AudioWorklet)
-- **AudioParams**: Atomic values for sharing state (volumes, gains) between threads
+- **RingBuffer**: Lock-free SPSC queue for local audio capture (AudioWorklet → transport); also carries the connection's send width
+- **Regulator**: Lock-free SPSC jitter buffer with Burg packet-loss concealment for network audio (transport → AudioWorklet). Adopts the peer's channel count and frames-per-packet from its first packet, and serves the audio callback a frame at a time, so callback size and packet size are independent
+- **AudioParams**: Atomic values for sharing device and metering state (volumes, gains, peaks) between threads
+
+## Crate Layout
+
+A Cargo workspace of four crates. Portable logic and its browser host are separate crates, and the split is compiler-enforced: `npm run check:core` builds every crate but `webtrip-web` natively, and fails if one reaches `web-sys`/`js-sys`.
+
+| Crate | Directory | Contents |
+|---|---|---|
+| `webtrip-core` | `crates/core` | Portable: `limits.rs`, `audio/` (processor, params, dsp, mixer), `network/` (protocol, transport trait, signaling messages), `stream/` (shared_ptr, ring_buffer, regulator), `lifecycle.rs`, `session_stats.rs` |
+| `webtrip-api` | `crates/api` | Portable: the JackTrip Virtual Studio REST client and models |
+| `webtrip-web` | `crates/web` | The browser host, built as `pkg/webtrip.js`: `audio/` (devices, engine, worklet), `network/` (webrtc, webtransport, signaling), `session.rs`, `connection.rs`, `tick_clock.rs` |
+| `webtrip` | `crates/webtrip` | Facade: re-exports `webtrip::core`, `webtrip::api`, and `webtrip::web` behind the off-by-default `web` feature |
+
+Within each crate, `network` never imports `audio` and `audio` never imports `network` (both may use `stream`); `session.rs` composes them. Core never reads a clock or a console: it logs through `log` (the web crate installs a console backend) and takes `now_ms` from its caller. JS exports on portable types are `#[cfg_attr(feature = "wasm", wasm_bindgen)]`, which only `webtrip-web` turns on, so the crate layout is invisible from TypeScript.
 
 ---
 
@@ -257,266 +273,62 @@ Each connection has its own `RingBuffer` and `Regulator`. A worklet node's strea
 
 A WebRTC transport is ticked by `TickClock`: from the audio callback (`Atomics.waitAsync` on the send ring's flag) while audio runs, and on a fixed interval otherwise, because only the worklet sets that flag. WebTransport's worker drives itself and needs no clock.
 
-## Workaround: Session-Owned Buffers with Shared Pointers
+## Workaround: Connection-Owned Buffers with Shared Pointers
 
 ### The Solution
 
-**Buffers are owned by JackTripSession** (main thread) but **accessed by both threads via raw pointers**.
-
-The key insight: WebAssembly linear memory is **shared across all threads** in the same module instance. We don't need global statics - we just need to ensure the buffers stay alive while being accessed.
-
-### Implementation
+**Each connection owns its stream buffers** (main thread), and **the other agents reach them through pointers** into the shared WebAssembly linear memory. No global statics are involved: linear memory is shared by every agent in the module instance, so all that matters is that the buffers stay alive, and at a fixed address, while anyone can still touch them.
 
 ```rust
-// session.rs
-pub struct JackTripSession {
-    // Session owns the buffers (allocated in WebAssembly linear memory)
-    local_to_network_buffer: Box<RingBuffer>,
-    network_to_local_buffer: Box<LockFreeJitterBuffer>,
-    
-    audio_engine: Option<AudioEngine>,
-    // ...
-}
-
-impl JackTripSession {
-    pub fn new() -> Self {
-        Self {
-            // Buffers are created here, owned by Session
-            local_to_network_buffer: Box::new(RingBuffer::new()),
-            network_to_local_buffer: Box::new(LockFreeJitterBuffer::new()),
-            audio_engine: None,
-        }
-    }
-    
-    pub async fn start_capture(&mut self) -> Result<(), JsValue> {
-        // Get raw pointers to owned buffers
-        let local_to_network_ptr = &mut *self.local_to_network_buffer as *mut RingBuffer;
-        let network_to_local_ptr = &*self.network_to_local_buffer as *const LockFreeJitterBuffer;
-        
-        // Pass pointers to AudioEngine (and eventually to AudioWorklet)
-        let engine = AudioEngine::create_with_network(
-            self.audio_params_ptr,
-            local_to_network_ptr,
-            network_to_local_ptr,
-        ).await?;
-        
-        self.audio_engine = Some(engine);
-        Ok(())
-    }
+// crates/web/src/connection.rs
+pub(crate) struct StreamBuffers {
+    pub(crate) ring: Box<RingBuffer>,       // worklet → transport
+    pub(crate) regulator: Box<Regulator>,   // transport → worklet
 }
 ```
+
+`StreamBuffers::new` is the one allocation site. It declares the send width on the ring (`RingBuffer::set_wire_format`) and builds the regulator at the configured receive geometry, sized for the largest callback and packet it may ever serve, so nothing allocates on the render thread. The boxes keep the addresses stable.
 
 ### How It Works
 
-1. **Session creates and owns** the buffers in WebAssembly linear memory:
-   ```rust
-   let session = JackTripSession::new();
-   // Buffers are at addresses 0x12345678 and 0x23456789 (examples)
-   ```
+1. **Connecting builds a fresh `StreamBuffers`**, never a reused one, so the regulator stays strictly single-producer/single-consumer with no reset protocol. A reconnect adopts the new peer's channel count and frames-per-packet simply by starting from a fresh regulator.
+2. **The pointers cross agents as `SharedPtr`** (`crates/core/src/stream/shared_ptr.rs`), which carries the `Send`/`Sync` assertion once, in an audited place. The transport gets them for its send and receive paths (for WebTransport, its worker).
+3. **The worklet node is built against them.** A node's stream list is fixed for its life: `AudioEngine::attach_network(ring, regulator)` rebuilds the node to attach or (with null pointers) detach a connection, the same path an output-device change uses. With no connection, the processor runs with no network streams and just monitors the input.
+4. **Both sides then use the buffers' `&self` lock-free APIs:** the worklet writes the ring and pops the regulator, and the transport reads the ring and pushes the regulator.
 
-2. **Get raw pointers** (just memory addresses, not Rust object references):
-   ```rust
-   let ptr = &mut *self.local_to_network_buffer as *mut RingBuffer;
-   // ptr = 0x12345678
-   ```
+### Lifetime Management: Retirement
 
-3. **Pass pointers** to AudioWorklet (pointers are just numbers):
-   ```rust
-   AudioEngine::create_with_network(params_ptr, local_to_network_ptr, network_to_local_ptr)
-   ```
+**The buffers must outlive every pointer to them.** When a connection ends, the transport is closed first, which quiesces the producer. The node is then rebuilt without the connection, and the connection's buffers are **retired**, not freed:
 
-4. **Both threads access the same memory**:
-   ```rust
-   // Main thread (Session)
-   self.local_to_network_buffer.read(&mut audio)
-   
-   // AudioWorklet thread (via pointer)
-   unsafe { (*ptr).write(samples) }
-   ```
-
-### Memory Layout
-
-```
-WebAssembly Linear Memory (shared between all threads)
-┌─────────────────────────────────────────────────┐
-│  Address 0x1000: RingBuffer                     │
-│    - buffer: [f32; 4096]                        │
-│    - write_pos: AtomicU32                       │
-│    - read_pos: AtomicU32                        │
-│    - ...                                        │
-│                                                  │
-│  Address 0x5000: JitterBuffer                   │
-│    - slots: [PacketSlot; 64]                    │
-│    - read_sequence: AtomicU64                   │
-│    - ...                                        │
-└─────────────────────────────────────────────────┘
-         ↑                              ↑
-         │                              │
-    Main Thread                    AudioWorklet
-    (via pointer)                  (via same pointer)
-```
-
-### Thread Safety
-
-We use **atomics** for synchronization:
-
-```rust
-pub struct RingBuffer {
-    buffer: Vec<f32>,
-    write_pos: AtomicU32,  // Lock-free atomic operations
-    read_pos: AtomicU32,
-    // ...
-}
-
-// Worklet writes
-impl RingBuffer {
-    pub fn write(&mut self, samples: &[f32]) -> bool {
-        let write_pos = self.write_pos.load(Ordering::Acquire);
-        let read_pos = self.read_pos.load(Ordering::Acquire);
-        // ... write data ...
-        self.write_pos.store(new_pos, Ordering::Release);
-    }
-}
-
-// Main thread reads
-impl RingBuffer {
-    pub fn read(&mut self, output: &mut [f32]) -> bool {
-        let write_pos = self.write_pos.load(Ordering::Acquire);
-        // ... read data ...
-        self.read_pos.store(new_pos, Ordering::Release);
-    }
-}
-```
-
-### Lifetime Management
-
-**Critical**: The buffers must outlive any pointer usage. We ensure this with careful Drop ordering:
-
-```rust
-impl Drop for JackTripSession {
-    fn drop(&mut self) {
-        // MUST stop AudioWorklet BEFORE dropping buffers
-        self.stop_capture();  // Stops worklet, no more pointer access
-        // Now it's safe to drop buffers
-    }
-}
-
-impl JackTripSession {
-    pub fn stop_capture(&mut self) {
-        // Stop AudioEngine (disconnects AudioWorklet)
-        if let Some(ref mut engine) = self.audio_engine {
-            engine.stop_capture();
-        }
-        self.audio_engine = None;
-        // AudioWorklet is now stopped, won't access buffer pointers anymore
-        // Buffers remain valid (owned by Session) but no longer accessed
-    }
-}
-```
+- `worklet.js`'s `'stop'` handler runs on the render thread, where it cannot overlap `process()`. It sets a flag that `process()` checks before touching any pointer, and posts `'stopped'` back. Receiving that acknowledgement on the main thread proves the replaced node will never touch the buffers again, so the retired entry is freed then.
+- A fulfilled `AudioContext.close` (`stopAudio`, or the session's `Drop`) also frees the entries its own engine's nodes read.
+- If neither proof ever arrives (for example, the close times out), the entry stays alive. It is leaked rather than freed under a possibly live reader, and the leak is bounded to one buffer pair per missing acknowledgement.
 
 ### Why Not Global Statics?
 
-**We considered global statics** (like `static mut RING_BUFFER: Option<RingBuffer>`) but that approach has significant downsides:
-
-1. ❌ **Global mutable state** - Goes against Rust idioms
-2. ❌ **Only one session** - Can't have multiple instances
-3. ❌ **Unclear ownership** - Who's responsible for cleanup?
-4. ❌ **Unsafe throughout** - More `unsafe` blocks everywhere
-
-**Session-owned buffers are better:**
-
-✅ **Clear ownership** - Session owns buffers, controls lifetime  
-✅ **Multiple sessions** - Could create multiple JackTripSession instances  
-✅ **Safer** - Only `unsafe` at the boundary where pointers are created/used  
-✅ **Standard Rust patterns** - Follows normal RAII and Drop semantics
+Global statics would mean global mutable state, unclear ownership, and a single stream per page. Per-connection buffers have one owner with a defined lifetime, and they are the groundwork for more than one connection (`limits::MAX_CONNECTIONS`, currently 1).
 
 ---
 
-## Workaround: Main Thread Tick Loop
+## Workaround: Tick Clock
 
 ### The Problem
 
-Since WebRTC APIs are only available on the main thread, we need a **polling loop** to bridge the gap between audio and network.
+WebRTC APIs exist only on the main thread, and the AudioWorklet cannot call them. Something on the main thread has to move audio between the send ring, the data channel and the regulator: that is `Transport::tick`.
 
 ### The Solution
 
-Run a high-frequency interval on the main thread that:
-1. Reads audio from the RingBuffer (written by AudioWorklet)
-2. Sends audio via WebRTC data channel
-3. Receives audio from WebRTC data channel
-4. Writes audio to JitterBuffer (read by AudioWorklet)
+The session owns a `TickClock` (`crates/web/src/tick_clock.rs`) that ticks the published connection's transport:
 
-### Implementation
+- **While audio runs: `Atomics`.** An `AudioCallbackLoop` sleeps with `Atomics.waitAsync` on the send ring's has-data flag, which `RingBuffer::write` sets from the worklet, so the transport ticks once per audio callback.
+- **While audio is stopped: `Interval`.** Only the worklet sets that flag, so with no audio nothing would ever tick, and a WebRTC connection could not even receive. An `IntervalTickLoop` ticks every `INTERVAL_TICK_PERIOD_MS` (4 ms) instead. It is also the fallback when `Atomics.waitAsync` is unavailable.
+- **WebTransport: none.** Its worker drives its own send and receive loops.
 
-```rust
-// session.rs
-fn start_network_loop(&mut self) {
-    let window = web_sys::window().expect("no global window");
-    
-    let session_ptr = self as *mut JackTripSession;
-    let closure = Closure::wrap(Box::new(move || {
-        unsafe { (*session_ptr).tick(); }
-    }) as Box<dyn FnMut()>);
-    
-    // Run every 5ms (200 times per second)
-    let handle = window.set_interval_with_callback_and_timeout_and_arguments_0(
-        closure.as_ref().unchecked_ref(),
-        5,
-    ).expect("failed to set interval");
-    
-    closure.forget();
-    self.interval_handle = Some(handle);
-}
-
-pub fn tick(&mut self) {
-    // === SEND PATH: local audio → network ===
-    if !self.local_to_network_buffer_ptr.is_null() {
-        let buffer = unsafe { &mut *self.local_to_network_buffer_ptr };
-        if buffer.available() >= self.buffer_size as u32 {
-            if buffer.read(&mut self.audio_to_send_buffer) {
-                self.client.send_audio(&self.audio_to_send_buffer)?;
-            }
-        }
-    }
-
-    // === RECEIVE PATH: network → local audio ===
-    if let Ok(samples) = self.client.receive_audio() {
-        if !samples.is_empty() {
-            let buffer = unsafe { &*self.network_to_local_buffer_ptr };
-            buffer.push(self.sequence_number, &samples);
-            self.sequence_number += 1;
-        }
-    }
-}
-```
-
-### Why 5ms Interval?
-
-- **Audio buffer size**: 128 samples at 48kHz = ~2.67ms per process() call
-- **Tick rate**: 5ms = 200Hz
-- **Trade-off**: Fast enough to handle audio in real-time, but not so fast that it overwhelms the main thread
+The pure choice is `tick_kind(audio_running, connection_needs_tick, atomics_available)`. The clock is rebuilt whenever audio starts or stops or the connection changes. Each loop stops itself when dropped.
 
 ### Why Can't AudioWorklet Call tick()?
 
-```rust
-// ❌ Would be nice, but impossible
-impl AudioProcessor {
-    pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> bool {
-        // Write local audio
-        self.send_local_to_network();
-        
-        // ❌ Can't call WebRTC from here!
-        webrtc_data_channel.send(audio);  // RTCDataChannel doesn't exist in worklet!
-        
-        // Read remote audio
-        self.receive_from_network();
-        
-        true
-    }
-}
-```
-
-The tick() loop is the **only way** to access WebRTC APIs while the AudioWorklet handles real-time processing.
+`RTCDataChannel` does not exist in the AudioWorklet global scope, and network I/O must never block the render thread. The worklet therefore only writes the ring and pops the regulator, and the main thread (or the WebTransport worker) does all network I/O.
 
 ---
 
@@ -525,61 +337,61 @@ The tick() loop is the **only way** to access WebRTC APIs while the AudioWorklet
 ### Send Path: Microphone → Network
 
 ```
-Audio Device                AudioWorklet Thread              Main Thread
+Audio Device                AudioWorklet Thread              Main Thread / Worker
     │                              │                             │
     │ ① PCM samples                │                             │
     ├──────────────────────────────>                             │
     │                              │                             │
-    │                        ② Apply gain                        │
-    │                        ③ Volume metering                   │
+    │                        ② Apply gain, meter                 │
+    │                        ③ Conform to wire width;            │
+    │                          resample to the wire rate         │
+    │                          if the device rate differs        │
+    │                          (SimpleMixer)                     │
     │                              │                             │
-    │                        ④ Write to RingBuffer               │
-    │                        ring_buffer.write()                 │
-    │                              │                             │
+    │                        ④ ring_buffer.write()               │
     │                              │    (shared memory)          │
     │                              │ ────────────────────────>   │
     │                              │                             │
-    │                              │                      ⑤ tick() reads
-    │                              │                   ring_buffer.read()
+    │                              │              ⑤ tick() (WebRTC) or
+    │                              │                send_loop (WebTransport)
+    │                              │                reads one packet's worth
     │                              │                             │
-    │                              │                   ⑥ Send via WebRTC
-    │                              │                   dataChannel.send()
-    │                              │                             │
+    │                              │              ⑥ Serialize and send
     │                              │                             ├─> Internet
 ```
 
 ### Receive Path: Network → Speakers
 
 ```
-Internet                    Main Thread              AudioWorklet Thread        Audio Device
+Internet                 Main Thread / Worker           AudioWorklet Thread        Audio Device
     │                              │                             │                    │
     ├────> ⑦ Receive packet        │                             │                    │
-    │   dataChannel.onmessage      │                             │                    │
     │                              │                             │                    │
-    │               ⑧ Push to JitterBuffer                       │                    │
-    │            jitter_buffer.push()                            │                    │
-    │                              │                             │                    │
+    │      ⑧ deliver_received_packet → regulator.push_at()       │                    │
+    │        (adopts the peer's channels and fpp                 │                    │
+    │         from its first packet)                             │                    │
     │                              │      (shared memory)        │                    │
     │                              │ <───────────────────────────│                    │
     │                              │                             │                    │
-    │                              │                  ⑨ Read from JitterBuffer       │
-    │                              │               jitter_buffer.pop()               │
+    │                              │        ⑨ regulator.pop_frames_at()               │
+    │                              │          (exactly the wire frames this           │
+    │                              │           callback spans; conceals losses)       │
     │                              │                             │                    │
-    │                              │                ⑩ Mix with monitor               │
-    │                              │                ⑪ Apply output volume            │
-    │                              │                             │                    │
-    │                              │                             │  ⑫ PCM samples    │
+    │                              │        ⑩ Resample to the device rate             │
+    │                              │          (if it differs), map to the             │
+    │                              │          output's channels, mix with             │
+    │                              │          monitor, apply output volume            │
+    │                              │                             │  ⑪ PCM samples    │
     │                              │                             ├───────────────────>│
 ```
 
 ### Key Points
 
-- **Steps ①-④**: Happen in real-time in AudioWorklet.process() (~2.7ms intervals)
-- **Steps ⑤-⑥**: Happen in main thread tick() loop (5ms intervals)
-- **Steps ⑦-⑧**: Happen asynchronously when packets arrive (unpredictable timing)
-- **Steps ⑨-⑫**: Happen in real-time in AudioWorklet.process()
-- **RingBuffer**: Decouples AudioWorklet write rate from network send rate
-- **JitterBuffer**: Decouples network receive rate from AudioWorklet read rate
+- **Steps ①-④ and ⑨-⑪** happen in real time in `AudioWorklet.process()` (one 128-frame render quantum per call).
+- **Steps ⑤-⑥** happen when the tick clock fires (WebRTC) or in the worker's send loop (WebTransport).
+- **Steps ⑦-⑧** happen asynchronously when packets arrive.
+- **RingBuffer** decouples the worklet's write rate from the network send rate.
+- **Regulator** decouples the network receive rate, and the peer's packet size, from the audio callback.
 
 ---
 
@@ -593,7 +405,7 @@ The WebRTC transport runs on the main thread using RTCDataChannel:
 
 ```
 AudioWorklet → RingBuffer → Main Thread tick() → RTCDataChannel → Network
-Network → RTCDataChannel → Main Thread tick() → JitterBuffer → AudioWorklet
+Network → RTCDataChannel → Main Thread tick() → Regulator → AudioWorklet
 ```
 
 **Pros:**
@@ -603,7 +415,7 @@ Network → RTCDataChannel → Main Thread tick() → JitterBuffer → AudioWork
 
 **Cons:**
 - ⚠️ Network I/O blocks main thread (can affect UI responsiveness)
-- ⚠️ Requires periodic tick() polling loop (5ms intervals)
+- ⚠️ Requires the main-thread tick clock (once per audio callback, or every 4 ms with audio stopped)
 - ⚠️ More complex setup (SDP negotiation, ICE candidates)
 
 ### WebTransport Worker
@@ -673,7 +485,7 @@ This follows the **same pattern as AudioWorklet** (`crates/web/src/audio/worklet
 
 ## Trade-offs and Alternatives
 
-### Current Approach: Session-Owned Buffers + Tick Loop
+### Current Approach: Connection-Owned Buffers + Tick Clock
 
 **Pros:**
 - ✅ Works within browser constraints
@@ -682,12 +494,13 @@ This follows the **same pattern as AudioWorklet** (`crates/web/src/audio/worklet
 - ✅ Predictable real-time behavior in AudioWorklet
 - ✅ Clear ownership and lifetime management
 - ✅ Standard Rust RAII patterns
-- ✅ Could support multiple sessions
+- ✅ Groundwork for more than one connection
 
 **Cons:**
-- ⚠️ Requires careful Drop ordering (AudioWorklet must stop before buffers drop)
-- ⚠️ Unsafe raw pointer usage at thread boundaries
-- ❌ Main thread polling adds CPU overhead
+- ⚠️ Buffers are freed only on proof the worklet let go of them (retirement); without that proof they are leaked rather than freed
+- ⚠️ Raw pointers at agent boundaries (confined to `SharedPtr`)
+- ⚠️ Attaching or detaching a connection while audio runs rebuilds the worklet node (a brief glitch)
+- ❌ With audio stopped, a WebRTC connection is ticked on a timer, which adds main-thread wakeups
 
 ### Alternative 1: Manual SharedArrayBuffer
 
@@ -700,7 +513,7 @@ Use `SharedArrayBuffer` directly from JavaScript:
 - Lose Rust type safety
 - Manual atomic operations in JavaScript
 - More complex, error-prone code
-- Still need tick() loop
+- Still need a main-thread tick
 
 ### Alternative 2: AudioWorkletProcessor MessagePort
 
@@ -714,9 +527,9 @@ Use MessagePort for communication:
 - ❌ **Asynchronous**: Messages don't arrive during process()
 - ❌ **Unpredictable timing**: Can't guarantee real-time behavior
 - ❌ **Fundamental limitation**: Still can't call WebRTC from worklet
-- Still need tick() loop on main thread
+- Still need a main-thread tick
 
-**Note:** WebTrip uses MessagePort as a **notification fallback only** for browsers that support SharedArrayBuffer but not `Atomics.waitAsync` (primarily Safari 15.2-16.3). The actual buffer data still requires SharedArrayBuffer - MessagePort only replaces the event notification mechanism.
+**Note:** WebTrip uses the worklet's MessagePort only for lifecycle messages (`'stop'` / `'stopped'`, the retirement proof), never for audio data or tick notification.
 
 ### Alternative 3: Redesigned WebRTC API
 
@@ -740,12 +553,12 @@ class AudioWorkletProcessor {
 
 The current architecture uses:
 
-1. **Session-owned buffers** - Buffers allocated in WebAssembly linear memory, owned by Session, accessed via pointers
-2. **Main thread tick loop** - Required because WebRTC APIs only work on the main thread
+1. **Connection-owned buffers** - Allocated in WebAssembly linear memory per connection, accessed by other agents via `SharedPtr`
+2. **Main-thread tick clock** - Required because WebRTC APIs only work on the main thread
 3. **Lock-free ring buffers** - Efficient, wait-free communication without blocking
-4. **Jitter buffer with atomics** - Thread-safe packet reordering and loss concealment
-5. **Careful lifetime management** - AudioWorklet must stop before buffers are dropped
-6. **Event notification with fallback** - Uses `Atomics.waitAsync()` when available, falls back to `postMessage` for older Safari
+4. **Regulator (jitter buffer) with atomics** - Thread-safe packet reordering and loss concealment
+5. **Retirement** - A connection's buffers are freed only after the worklet acknowledges `'stopped'` or its `AudioContext` closes
+6. **Event notification with fallback** - Ticks from `Atomics.waitAsync()` when available, and on a 4 ms interval otherwise
 
 These are **not design choices** but **necessary workarounds** for fundamental browser API limitations. Until browsers provide:
 - WebRTC access from AudioWorklet, or
@@ -756,12 +569,12 @@ These are **not design choices** but **necessary workarounds** for fundamental b
 
 ### SharedArrayBuffer Requirement
 
-**Important:** SharedArrayBuffer is **absolutely required** for WebTrip to function. The `postMessage` fallback mentioned in point #6 above only affects the *event notification mechanism*, not the underlying buffer access. Both communication modes require:
+**Important:** SharedArrayBuffer is **absolutely required** for WebTrip to function. The interval fallback in point #6 above only affects *when the transport ticks*, not the underlying buffer access. Both modes require:
 - WASM linear memory backed by SharedArrayBuffer
 - Atomic operations for thread-safe buffer synchronization
 - Cross-origin isolation (COOP/COEP headers)
 
-The postMessage fallback provides compatibility for Safari 15.2-16.3 (a 15-month window from Dec 2021 - Mar 2023) where SharedArrayBuffer was available but `Atomics.waitAsync()` was not yet implemented.
+The interval fallback covers browsers where SharedArrayBuffer is available but `Atomics.waitAsync()` is not (for example Safari 15.2-16.3, Dec 2021 - Mar 2023).
 
 The good news: It works well! The use of atomics ensures:
 - **Lock-free**: No blocking in the real-time audio thread

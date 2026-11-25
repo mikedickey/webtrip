@@ -485,7 +485,7 @@ impl WebTransportImpl {
         let worker = self.worker.borrow().clone().ok_or("Worker not created")?;
 
         // Create a promise that will be resolved by the message handler
-        let (promise, resolve, reject) = crate::audio::make_promise();
+        let (promise, resolve, reject) = crate::js_util::make_promise();
 
         // Store resolve/reject for message handler
         *self.connection_promise_resolve.borrow_mut() = Some(resolve);
@@ -529,7 +529,7 @@ impl WebTransportImpl {
         self.init_worker()?;
 
         // Wait for worker to signal it is ready (WASM loaded and initialized)
-        let (ready_promise, ready_resolve, ready_reject) = crate::audio::make_promise();
+        let (ready_promise, ready_resolve, ready_reject) = crate::js_util::make_promise();
         *self.worker_ready_resolve.borrow_mut() = Some(ready_resolve);
         *self.worker_ready_reject.borrow_mut() = Some(ready_reject);
         if let Err(e) = JsFuture::from(ready_promise).await {
@@ -965,9 +965,9 @@ mod tests {
         transport.create_worker().expect("create_worker should build the worker");
 
         // Stash pending startup promises exactly as `connect_to_server` would.
-        let (ready_promise, _ready_resolve, ready_reject) = crate::audio::make_promise();
+        let (ready_promise, _ready_resolve, ready_reject) = crate::js_util::make_promise();
         *transport.worker_ready_reject.borrow_mut() = Some(ready_reject);
-        let (conn_promise, _conn_resolve, conn_reject) = crate::audio::make_promise();
+        let (conn_promise, _conn_resolve, conn_reject) = crate::js_util::make_promise();
         *transport.connection_promise_reject.borrow_mut() = Some(conn_reject);
 
         // Deliver the synthetic worker error to the real (registered) handler.
@@ -1008,9 +1008,9 @@ mod tests {
 
         transport.create_worker().expect("create_worker should build the worker");
 
-        let (ready_promise, _ready_resolve, ready_reject) = crate::audio::make_promise();
+        let (ready_promise, _ready_resolve, ready_reject) = crate::js_util::make_promise();
         *transport.worker_ready_reject.borrow_mut() = Some(ready_reject);
-        let (conn_promise, _conn_resolve, conn_reject) = crate::audio::make_promise();
+        let (conn_promise, _conn_resolve, conn_reject) = crate::js_util::make_promise();
         *transport.connection_promise_reject.borrow_mut() = Some(conn_reject);
 
         // Fire a real ErrorEvent carrying a message at the registered onerror.
@@ -1093,7 +1093,7 @@ mod tests {
         transport.create_worker().expect("create_worker should build the worker");
 
         // Stash a pending close() resolver as Transport::close would.
-        let (close_promise, close_resolve, _close_reject) = crate::audio::make_promise();
+        let (close_promise, close_resolve, _close_reject) = crate::js_util::make_promise();
         *transport.close_promise_resolve.borrow_mut() = Some(close_resolve);
 
         let worker = transport.worker.borrow().clone().expect("worker present");
@@ -1130,9 +1130,9 @@ mod tests {
         transport.create_worker().expect("create_worker should build the worker");
 
         // Stash both startup promises exactly as `connect_to_server` would.
-        let (ready_promise, ready_resolve, _ready_reject) = crate::audio::make_promise();
+        let (ready_promise, ready_resolve, _ready_reject) = crate::js_util::make_promise();
         *transport.worker_ready_resolve.borrow_mut() = Some(ready_resolve);
-        let (_conn_promise, conn_resolve, _conn_reject) = crate::audio::make_promise();
+        let (_conn_promise, conn_resolve, _conn_reject) = crate::js_util::make_promise();
         *transport.connection_promise_resolve.borrow_mut() = Some(conn_resolve);
 
         let worker = transport.worker.borrow().clone().expect("worker present");
@@ -1166,7 +1166,7 @@ mod tests {
         transport.set_on_state_change(cb);
         transport.create_worker().expect("create_worker should build the worker");
 
-        let (conn_promise, conn_resolve, _conn_reject) = crate::audio::make_promise();
+        let (conn_promise, conn_resolve, _conn_reject) = crate::js_util::make_promise();
         *transport.connection_promise_resolve.borrow_mut() = Some(conn_resolve);
 
         let worker = transport.worker.borrow().clone().expect("worker present");
@@ -1194,13 +1194,13 @@ mod tests {
         transport.set_on_state_change(cb);
         transport.create_worker().expect("create_worker should build the worker");
 
-        let (_ready_promise, ready_resolve, ready_reject) = crate::audio::make_promise();
+        let (_ready_promise, ready_resolve, ready_reject) = crate::js_util::make_promise();
         *transport.worker_ready_resolve.borrow_mut() = Some(ready_resolve);
         *transport.worker_ready_reject.borrow_mut() = Some(ready_reject);
-        let (_conn_promise, conn_resolve, conn_reject) = crate::audio::make_promise();
+        let (_conn_promise, conn_resolve, conn_reject) = crate::js_util::make_promise();
         *transport.connection_promise_resolve.borrow_mut() = Some(conn_resolve);
         *transport.connection_promise_reject.borrow_mut() = Some(conn_reject);
-        let (_close_promise, close_resolve, _close_reject) = crate::audio::make_promise();
+        let (_close_promise, close_resolve, _close_reject) = crate::js_util::make_promise();
         *transport.close_promise_resolve.borrow_mut() = Some(close_resolve);
 
         let stats_msg = Object::new();

@@ -117,12 +117,16 @@ crates/core/src/                  package `webtrip-core`; portable; no web-sys /
             signaling_message (SignalingMessage, HubConnectionState,
             parse_ice_candidate_json)
   stream/   shared_ptr, ring_buffer, regulator   (the bridge primitives)
-  lifecycle.rs, session_stats.rs (SessionStats, build_session_stats, tick_decision)
+  lifecycle.rs (Lifecycle, AudioLifecycle, aggregate_network_state),
+  session_stats.rs (SessionStats/ConnectionStats, build_connection_stats,
+                    aggregate_session_stats, tick_decision)
 crates/api/src/                   package `webtrip-api`; portable; today's api/ + models/
 crates/web/src/                   package `webtrip-web`; the cdylib (built as pkg/webtrip.js);
                                   the only crate that touches the browser
-  lib.rs, session.rs, dependent_module.rs, test_support.rs (browser-test harness)
-  audio/    devices, engine, worklet(+js), audio_callback_loop
+  lib.rs, session.rs, connection.rs, tick_clock.rs, console_log.rs (`log` backend),
+  dependent_module.rs, test_support.rs (browser-test harness)
+  audio/    devices, engine, worklet(+js), audio_callback_loop (AudioCallbackLoop,
+            IntervalTickLoop)
   network/  webrtc, webtransport, webtransport_worker(+js), signaling (WebSocket wiring)
 ```
 
@@ -280,8 +284,9 @@ step.
 #### Phase 0b — Separate core from the browser (real refactor, still one crate)
 
 - **Logging:** route every log call under `src/webtrip_core/` and `src/webtrip_api/`
-  through `log`. Add a console `log` backend in web (a maintained crate, or
-  ~20 lines in web if none fits) and install it in `init()`. Drop the
+  through `log`. A small console `log` backend in web (`console_log.rs`, a
+  zero-sized static logger, so every agent sharing the WASM memory sees it)
+  is installed once in `init()`. Drop the
   `cfg(target_arch = "wasm32")` around core logs (`transport.rs:21,43`,
   `protocol.rs:272-317`): the throttling logic then runs, and is testable,
   natively.
@@ -525,22 +530,24 @@ that small cannot be honoured at that callback size.
 **Startup and width.** `pop_frames_at` takes one Acquire per call; the stream's
 width is fixed for every packet pulled in it. Before the stream starts it
 fills the FIFO with the startup silence `pull_packet` would give (at the
-regulator's initial width). When the adopted width differs from the FIFO's, the
-FIFO (at the old stride) is flushed. `reset()` flushes it too, so audio pulled
-for one stream never plays in the next.
+regulator's initial width). When the adopted width or fpp differs from the
+FIFO's, the FIFO (at the old stride/packet size) is flushed, so audio pulled at
+one shape never plays at another.
 
 **Sizing.** `Regulator::with_callback_capacity(frames)` preallocates the FIFO
-at `(frames + fpp) * MAX_CHANNELS` samples (~200 KB) and the pull target at
-`fpp * MAX_CHANNELS`, once, before the regulator is shared; `pop_frames_at`
-never allocates, and a call asking for more than the capacity is a
-`debug_assert` and returns `0` (silence). The session builds the regulator with
+and the pull target for the largest packet a peer may announce (`MAX_FPP`), not
+the construction-time fpp, so an adopted peer fpp flows through
+`pop_frames_at` with no render-thread allocation. It runs once, before the
+regulator is shared; `pop_frames_at` never allocates, and a call asking for
+more than the capacity (`Regulator::callback_capacity()`) returns `0`
+(silence). The session builds the regulator with
 `RENDER_QUANTUM_FRAMES`, which lives in core's `limits.rs` (`worklet.rs`
 re-exports it). `AudioProcessor::with_network` takes `max_callback_frames` and
 sizes `MixLayout` and `remote_interleaved` / `wire_staging` at
 `max_callback_frames * MAX_WIRE_CHANNELS`. A callback never exceeds the
 maximum; if one ever did, `ensure_len` degrades to a single allocation rather
-than a panic on the render thread. `fpp` is fixed at
-construction until Phase 5 (see there).
+than a panic on the render thread. Phase 5 adds peer-fpp
+adoption on top of this.
 
 **Latency.** The frames sitting in the FIFO are published with the regulator's
 other snapshot atomics (`pub_queued_frames`) and counted by `latency_ms()`
@@ -567,8 +574,8 @@ wire supplies" accounts for the ratio.
   `AudioContext.sampleRate` when the worklet node is built and passed, with the
   wire rate, to `AudioProcessor::with_network` and on into `MixLayout`
   (`device_rate`, `wire_rate`). The regulator's `sample_rate` stays the **wire**
-  rate and never sees the device rate; `with_network` asserts this
-  (`Regulator::sample_rate()`).
+  rate and never sees the device rate; `with_network` checks this
+  (`Regulator::sample_rate()`) and returns `MixError::RegulatorRate` otherwise.
 - **Where the conversion lives: both (decided).** The `AudioContext` is created
   with `sampleRate: 48000` (retried without it if the browser throws), and our
   own conversion engages whenever the actual rate differs. Where the browser
@@ -607,9 +614,14 @@ wire supplies" accounts for the ratio.
   `limits::MAX_WIRE_FRAMES_PER_CALLBACK` (769).
 - **Fail loudly.** `MixLayout` is refused with `MixError::UnsupportedRates`
   (naming both rates) when either rate is zero, the device rate is outside the
-  supported range, or the resampler cannot be built. `AudioProcessor::with_network`
-  returns it, `build_and_connect_worklet_node` turns it into a JS error, and
-  `connect` fails with it. Conversion is always available, so a mismatch itself
+  supported range, or the resampler cannot be built. `MixError` also carries
+  `EmptyLayout` (a zero layout dimension) and the two setup checks
+  `AudioProcessor::with_network` makes against its regulator:
+  `RegulatorCapacity` (the regulator's `callback_capacity()` is below
+  `wire_frames_per_callback`, so every pop would silently return 0) and
+  `RegulatorRate` (above). `with_network` returns these,
+  `build_and_connect_worklet_node` turns them into a JS error, and the audio
+  start fails with it. Conversion is always available, so a mismatch itself
   is never an error, only a rate that cannot be converted.
 - **Clock drift needs no special handling.** The device clock and the peer's
   clock are separate oscillators, so even at identical nominal rates they
@@ -696,8 +708,8 @@ soundly. Channel adoption (`Shared::adopt_channel_count`) already solves the
 same problem: it runs on the producer only while `last_seq_in == SEQ_NONE`,
 writes slot payloads and the relaxed `num_channels` before the Release of
 `last_seq_in`, and the consumer picks the width up after its Acquire, against
-state that is clean because it is fresh or was cleared by a quiesced
-`reset()`. fpp follows the same path:
+state that is clean because the regulator is fresh (every connection builds its
+own, Phase 6). fpp follows the same path:
 
 - **Where the value comes from.** `deliver_received_packet` (`transport.rs`)
   passes `header.buffer_size`. `Regulator::push_at(seq, channels, fpp, samples, now_ms)` gains an `fpp` parameter.
@@ -723,7 +735,7 @@ state that is clean because it is fresh or was cleared by a quiesced
     `configure_fpp(fpp)`. That recomputes `packets_in_past`, `up_to_now` and
     `beyond_now`, refills the fade prefixes, sets the Burg size and both
     `TimingStats` windows, reconfigures every `ChannelState`, resets the
-    auto-mode initial tolerance (`fpp × AUTO_INIT_VAL_FACTOR`, as `reset()`
+    auto-mode initial tolerance (`fpp × AUTO_INIT_VAL_FACTOR`, as construction
     computes it), and flushes the FIFO (which is at the old packet size).
   - All of that stays inside capacity preallocated at construction, so the
     consumer never allocates.
@@ -734,8 +746,7 @@ state that is clean because it is fresh or was cleared by a quiesced
   also works as a diagnostic.
 
 No new concurrency argument is needed: adoption only happens at a stream's
-start, and `reset()`'s quiescence contract (below) already governs getting back
-there.
+start, and a stream starts only on a freshly constructed regulator.
 
 **Preallocation, independent of fpp.**
 
@@ -782,18 +793,6 @@ there.
 **Mirrors.** The regulator keeps its "no `crate::` imports" rule. `MIN_FPP` and
 `MAX_FPP` are local `pub(crate)` mirrors, pinned against `limits.rs` by the same
 native test that pins `MAX_CHANNELS == MAX_WIRE_CHANNELS`.
-
-`reset()` (`regulator.rs:1068`) is sound only because the session quiesces
-both halves first: `release` awaits `AudioContext.close` and skips the reset
-if that times out (`session.rs:1017-1045`, WEB-53 Bug 7 / WEB-66). Any new
-adoption path must keep that requirement.
-
-**Frame FIFO sizing uses `MAX_FPP`.** The regulator's frame FIFO and pull
-target are preallocated for the largest fpp a peer may announce, not the
-construction-time `fpp`: `with_callback_capacity` sizes them from `MAX_FPP`.
-That is what lets an adopted peer fpp (any value up to `MAX_FPP`) flow through
-`pop_frames_at` with no render-thread allocation. Adoption flushes the FIFO,
-which is at the old stride/packet size.
 
 **Ring-buffer invariant:** `RING_BUFFER_SIZE = 4096` (`ring_buffer.rs:15`) is a
 hard ceiling on `fpp × send_channels`, not a sizing nit — `write` rejects
@@ -863,11 +862,9 @@ promise that settles on that acknowledgement, and
   `build_and_connect_worklet_node` (`engine.rs:343`), exposed as
   `AudioEngine::attach_network(ring, regulator)` (null pointers detach). The
   output-device change already uses and exercises that path.
-  - In this phase connect still brings the engine up after the dial, so the
-    first node is simply built against the new connection's buffers. The
-    session does not yet call `attach_network` or `retire_until_stopped`
-    (both carry `#[cfg_attr(not(test), allow(dead_code))]`); browser tests
-    exercise them, and they become the hot path in Phase 7.
+  - Phase 7 makes this the hot path: attaching or detaching a connection
+    while audio runs goes through `attach_network`, and the replaced node's
+    buffers through `retire_until_stopped`.
 - **Retirement.**
   - On disconnect, the transport is closed first, so the producer is
     quiesced.
@@ -889,16 +886,13 @@ promise that settles on that acknowledgement, and
     acknowledgement.
   - The session `Drop` path uses the same retirement rule.
   - `WebTransportImpl::close`'s 2 s force-terminate fallback (WEB-67) can
-    leave a worker `push` in flight. It used to race a live `reset`; it now
-    races freeing the buffers. The fallback is a bounded-hang escape hatch
+    leave a worker `push` in flight that races freeing the buffers. The fallback is a bounded-hang escape hatch
     and is unchanged.
 - **Delete `Regulator::reset`** with its `Shared::reset` / `ConsumerState::reset`
   helpers and its `unsafe` contract.
   - Re-adoption after a reconnect is now construction, since a fresh
     regulator starts at `SEQ_NONE`.
-  - Delete the reset-specific tests (scrubbing, re-adoption after `reset()`,
-    the Phase 3 FIFO-flush-on-reset case, the Phase 5 "re-adoption of a
-    different fpp after `reset()`" case). Don't port them.
+  - Its tests are deleted, not ported; the reconnect tests replace them.
   - Update the doc comments and module header that cite the reset/quiescence
     contract (WEB-53 Bug 7 / WEB-66) to describe retirement.
   - `release` no longer resets anything. Its `AudioContext.close` timeout
@@ -997,8 +991,8 @@ later phases create new files in their final crate.
   Phase 4 is independent of 5 in either order.
 - 6 before 7: a network-only disconnect needs retirement, because nothing can
   prove the consumer quiescent while the worklet keeps running.
-- 6 after 5: it deletes `reset()`, so Phase 5's reset-based re-adoption test
-  never needs porting.
+- 6 after 5: it builds a fresh regulator per connection, which is what makes
+  Phase 5's first-packet adoption repeat on every reconnect.
 - Phase 1 is otherwise independent and can ship at any point after 0d.
 
 ## Testing
@@ -1020,17 +1014,13 @@ Genuinely new tests, each able to fail on a plausible bug:
   a non-divisor) the pull statistics see exactly one tick per callback at the
   callback interval, and a steady peer's auto tolerance stays near the slower
   of the two clocks.
-- Latency and reset: frames queued in the FIFO reach `latency_ms()`, and
-  `reset()` discards them. (The reset half is deleted with `reset()` in
-  Phase 6.)
+- Latency: frames queued in the FIFO reach `latency_ms()`.
 - `fit_fpp` boundary matrix including its `limited_by` reason.
 - Peer-fpp adoption, extending the regulator's adoption/rejection test:
   - first-packet adoption across `{MIN_FPP, 64, 128, 256, MAX_FPP}` ×
     channels, with `fpp()` and `latency_ms()` reflecting the adopted value;
   - both sides of `MIN_FPP` and `MAX_FPP` (`UnsupportedFpp`);
-  - a mid-stream `FppChanged`;
-  - re-adoption of a different fpp after `reset()` (deleted with `reset()` in
-    Phase 6; the reconnect test there replaces it).
+  - a mid-stream `FppChanged`.
 
   The `pop_frames_at` continuity matrix gains an adopted fpp that differs from
   the construction fpp, including 1024 against a 128-frame callback.
@@ -1043,12 +1033,14 @@ Genuinely new tests, each able to fail on a plausible bug:
 - `test_deserialize_buffer_size_boundaries` retargets to `MIN_FPP - 1`,
   `MIN_FPP`, `MAX_FPP` and `MAX_FPP + 1`. Protocol tests that use
   out-of-range sizes (e.g. `buffer_size = 4`) move into range.
-- Rate-mismatch matrix (device rate × wire rate, e.g. 48/48, 96/48, 44.1/48):
-  per callback the pop count and the converted frame count are right, a known
-  tone survives conversion at the right pitch in both directions, and — the
-  regression this phase exists for — a steady stream at a 2:1 rate ratio
-  produces **no** concealment and leaves tolerance/headroom unchanged. Plus a
-  test that unconverted mismatched rates make `connect` fail with both rates
+- Rate conversion (device rate × wire rate, e.g. 48/48, 96/48, 44.1/48):
+  `wire_frames_per_callback` bounds every call at every supported rate; a known
+  tone survives the mixer's conversion at the right pitch, level and channel
+  identity in both directions; and — the regression this phase exists for — a
+  96 kHz device on the 48 kHz link pulls half as many wire frames per callback,
+  so the peer's tone plays at its own pitch (a device-sized pull plays it at
+  double speed and conceals half of every pop). `SimpleMixer::prepare` and
+  `AudioProcessor::with_network` reject unconvertible rates with both rates
   named.
 - A browser test that a connect-only session with no worklet still ticks a
   `MockTransport` — the exact bug the WebRTC clock asymmetry causes.
@@ -1101,9 +1093,9 @@ Tests extracted in 0b move with their code.
   frames and stays at 256, so smaller packets mean smaller gaps against
   undiminished history. It costs ~4.5× more Burg CPU/sec at a constant
   per-packet loss rate. CPU and quality move in opposite directions.
-- `webrtc.rs:339` and `:1140` allocate `16 + samples*4` while
-  `webtransport_worker.rs:397` uses `HEADER_SIZE + samples*2` for the same
-  16-bit format; the WebRTC one also hardcodes `16` instead of `HEADER_SIZE`.
+- WebRTC sizes its serialize buffer with `packet_bytes(…, MAX_BIT_DEPTH)`
+  (4 bytes/sample) while the WebTransport worker uses `DEFAULT_BIT_DEPTH`
+  (2 bytes/sample) for the same 16-bit format.
 - `tests/integration/run.mjs:159` maps `mock: m.TransportType.Mock`, a variant
   removed in `260231e`; `ttByName.mock` is `undefined` so a `mock` run throws.
 

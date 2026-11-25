@@ -663,7 +663,7 @@ struct SlotPayload {
 /// established, so every packet belonging to the stream carries exactly
 /// `fpp * channels` samples. `data` is sized to that once per stream, and is
 /// always full: a packet of any other size is rejected before it reaches a
-/// slot ([`Regulator::push`]). That leaves no partially-filled state to track
+/// slot ([`Regulator::push_at`]). That leaves no partially-filled state to track
 /// and no allocation on the audio path.
 ///
 /// # Publication
@@ -809,8 +809,8 @@ pub struct RegulatorStats {
 ///
 /// # Concurrency (SPSC)
 ///
-/// One network-side producer calls [`push`](Self::push); one audio-side consumer
-/// calls [`pop`](Self::pop). Main-thread [`stats`](Self::stats) /
+/// One network-side producer calls [`push_at`](Self::push_at); one audio-side
+/// consumer calls [`pop_frames_at`](Self::pop_frames_at) (or [`pop_at`](Self::pop_at)). Main-thread [`stats`](Self::stats) /
 /// [`depth`](Self::depth) / [`latency_ms`](Self::latency_ms) read only atomics.
 /// Every method takes `&self`, and state is split by owner so that no thread
 /// ever creates a `&mut` overlapping memory another thread can reach:
@@ -1009,9 +1009,8 @@ impl Regulator {
     ///
     /// # Safety
     ///
-    /// Only the single consumer thread may call this (or [`reset`](Self::reset)
-    /// once both sides are quiesced), and no reference from an earlier call
-    /// may still be live.
+    /// Only the single consumer thread may call this, and no reference from
+    /// an earlier call may still be live.
     #[allow(clippy::mut_from_ref)]
     unsafe fn consumer_mut(&self) -> &mut ConsumerState {
         &mut *self.consumer.get()
@@ -1214,8 +1213,9 @@ impl Regulator {
 
     /// Get the number of channels (peer-adopted).
     ///
-    /// After a [`pop`](Self::pop) that rendered a started stream, this matches
-    /// the width that pop used — the Acquire inside pop orders the adoption.
+    /// After a [`pop_frames_at`](Self::pop_frames_at) or [`pop_at`](Self::pop_at)
+    /// that rendered a started stream, this matches the width that pop used —
+    /// the Acquire inside the pop orders the adoption.
     pub fn channels(&self) -> usize {
         self.shared.channels()
     }
