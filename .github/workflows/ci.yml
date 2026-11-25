@@ -94,6 +94,8 @@ jobs:
       - run: npm ci
       # Platform rule: webtrip-core/webtrip-api must build natively without web-sys/js-sys.
       - run: npm run check:core
+      # Rustdoc with -D warnings: broken intra-doc links fail CI before docs.rs sees them.
+      - run: npm run doc
       - run: npm run build
       # The production-image job COPYs these; upload now, before the coverage
       # runs below rebuild pkg/ with instrumentation.

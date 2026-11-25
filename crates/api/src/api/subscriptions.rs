@@ -1,9 +1,34 @@
-//! Studio subscriptions (memberships) API endpoints
+//! Studio memberships.
 //!
-//! A "subscription" here is **not** a billing plan (see `billing.rs` for that) —
-//! it represents a user's membership of a studio. These endpoints span two URL
-//! roots (`/users/{userId}/subscriptions` and `/studios/{studioId}/subscriptions*`)
-//! but model the single membership concept, so they live together here.
+//! Reached through [`ApiClient::subscriptions`]. Every endpoint requires
+//! authentication. A "subscription" here is **not** a billing plan (see
+//! [`billing`](super::billing)): it is a user's membership of a studio, modelled
+//! by [`models::Subscription`]. The endpoints span two URL roots
+//! (`/users/{userId}/subscriptions` and `/studios/{studioId}/subscriptions*`)
+//! but describe the one membership concept, so they live together here.
+//!
+//! ```rust,no_run
+//! use webtrip_api::{api::{ApiClient, ApiError}, models::CreateSubscriptionRequest};
+//!
+//! # async fn run(client: &ApiClient) -> Result<(), ApiError> {
+//! let request = CreateSubscriptionRequest {
+//!     user_id: Some("user456".to_string()),
+//!     invite_key: Some("abc123".to_string()), // private studios only
+//!     ..Default::default()
+//! };
+//! client.subscriptions().create_subscription("studio123", &request).await?;
+//! let members = client.subscriptions().list_studio_subscriptions("studio123").await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ```js
+//! await client.subscriptions().createSubscription('studio123', {
+//!   userId: 'user456',
+//!   inviteKey: 'abc123',
+//! });
+//! const members = await client.subscriptions().listStudioSubscriptions('studio123');
+//! ```
 
 #[cfg(feature = "wasm")]
 use super::to_js_value;
@@ -23,7 +48,7 @@ api_module_struct!(SubscriptionsApi);
 // =============================================================================
 
 impl SubscriptionsApi {
-    /// List the studios a user is a member of.
+    /// List the studios a user is a member of (`GET /users/{userId}/subscriptions`).
     pub async fn list_user_subscriptions(
         &self,
         user_id: &str,
@@ -32,7 +57,7 @@ impl SubscriptionsApi {
         self.client.get(&path).await
     }
 
-    /// List a studio's members.
+    /// List a studio's members (`GET /studios/{studioId}/subscriptions`).
     pub async fn list_studio_subscriptions(
         &self,
         studio_id: &str,
@@ -41,7 +66,9 @@ impl SubscriptionsApi {
         self.client.get(&path).await
     }
 
-    /// Add a member to a studio (create a membership).
+    /// Add a member to a studio (`POST /studios/{studioId}/subscriptions`).
+    ///
+    /// `invite_key` is only required when the studio is private.
     pub async fn create_subscription(
         &self,
         studio_id: &str,
@@ -51,7 +78,8 @@ impl SubscriptionsApi {
         self.client.post(&path, request).await
     }
 
-    /// Describe a single membership between a studio and a user.
+    /// Describe a single membership between a studio and a user
+    /// (`GET /studios/{studioId}/subscriptions/{userId}`).
     pub async fn get_subscription(
         &self,
         studio_id: &str,
@@ -65,8 +93,11 @@ impl SubscriptionsApi {
         self.client.get(&path).await
     }
 
-    /// Update a membership (e.g. admin flag / status). The updated membership is
-    /// sent as the request body, mirroring the studio/device update endpoints.
+    /// Update a membership, e.g. its admin flag or status
+    /// (`PUT /studios/{studioId}/subscriptions/{userId}`).
+    ///
+    /// The whole updated membership is sent as the request body, mirroring the
+    /// studio/device update endpoints.
     pub async fn update_subscription(
         &self,
         studio_id: &str,
@@ -81,7 +112,8 @@ impl SubscriptionsApi {
         self.client.put(&path, subscription).await
     }
 
-    /// Remove a member from a studio.
+    /// Remove a member from a studio
+    /// (`DELETE /studios/{studioId}/subscriptions/{userId}`).
     pub async fn delete_subscription(
         &self,
         studio_id: &str,

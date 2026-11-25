@@ -23,13 +23,28 @@ pub enum MixError {
     /// The device and wire rates cannot be converted between: a rate is zero
     /// or the device rate is outside the supported range. Names both so the
     /// failure is diagnosable, never a stream silently played at the wrong speed.
-    UnsupportedRates { device_rate: u32, wire_rate: u32 },
+    UnsupportedRates {
+        /// The device rate in Hz.
+        device_rate: u32,
+        /// The wire rate in Hz.
+        wire_rate: u32,
+    },
     /// The regulator cannot serve the callbacks it is attached to: it would
     /// return 0 from every pop (a silent peer, nothing logged).
-    RegulatorCapacity { capacity: usize, needed: usize },
+    RegulatorCapacity {
+        /// Wire frames the regulator can return from one pop.
+        capacity: usize,
+        /// Wire frames one callback can need.
+        needed: usize,
+    },
     /// The regulator runs at a different rate than the wire stream; it never
     /// sees the device rate, so every conversion would be wrong.
-    RegulatorRate { regulator_rate: u32, wire_rate: u32 },
+    RegulatorRate {
+        /// The regulator's rate in Hz.
+        regulator_rate: u32,
+        /// The wire rate in Hz.
+        wire_rate: u32,
+    },
 }
 
 impl std::fmt::Display for MixError {
@@ -91,13 +106,17 @@ pub struct MixMeters {
 
 /// A captured device stream, planar: `planar[ch * frames + frame]`.
 pub struct DeviceIn<'a> {
+    /// `channels` blocks of equal length, one per channel.
     pub planar: &'a [f32],
+    /// Channel count of `planar`.
     pub channels: usize,
 }
 
 /// A playback device stream, planar like [`DeviceIn`].
 pub struct DeviceOut<'a> {
+    /// `channels` blocks of equal length, one per channel; overwritten by `render`.
     pub planar: &'a mut [f32],
+    /// Channel count of `planar`.
     pub channels: usize,
 }
 
@@ -106,16 +125,20 @@ pub struct DeviceOut<'a> {
 /// [`MixEngine::net_in_frames_needed`] frames. `channels == 0` means no audio
 /// has arrived yet and counts as silence.
 pub struct NetIn<'a> {
+    /// Received samples, interleaved at `channels`.
     pub interleaved: &'a [f32],
+    /// Channels per frame; 0 before any audio has arrived.
     pub channels: usize,
 }
 
 /// A network stream to send, interleaved at the **wire** rate. The caller
 /// sizes `interleaved` for the most wire frames one callback can yield
-/// ([`wire_frames_per_callback`]); `render` fills a prefix and reports its
+/// ([`wire_frames_per_callback`](crate::limits::wire_frames_per_callback)); `render` fills a prefix and reports its
 /// length in `frames`. With a rate conversion the count varies per call.
 pub struct NetOut<'a> {
+    /// Destination for the send stream, interleaved at `channels`.
     pub interleaved: &'a mut [f32],
+    /// Channels per frame to send.
     pub channels: usize,
     /// Set by `render`: wire frames written to `interleaved`.
     pub frames: usize,
@@ -123,12 +146,20 @@ pub struct NetOut<'a> {
 
 /// Every stream one `render` call reads or writes.
 pub struct MixIo<'a, 'b> {
+    /// Capture streams.
     pub device_in: &'a [DeviceIn<'b>],
+    /// Playback streams.
     pub device_out: &'a mut [DeviceOut<'b>],
+    /// Received network streams; empty for silence.
     pub net_in: &'a [NetIn<'b>],
+    /// Network streams to send; empty to send nothing.
     pub net_out: &'a mut [NetOut<'b>],
 }
 
+/// Mixes device and network streams each audio callback.
+///
+/// Call [`prepare`](Self::prepare) once off the real-time thread, then
+/// [`render`](Self::render) once per callback.
 pub trait MixEngine: Send {
     /// Off the RT thread. Sizes every scratch buffer. The only place it allocates.
     fn prepare(&mut self, layout: &MixLayout) -> Result<(), MixError>;
@@ -166,6 +197,7 @@ pub struct SimpleMixer {
 }
 
 impl SimpleMixer {
+    /// An unprepared mixer; call [`MixEngine::prepare`] before rendering.
     pub fn new() -> Self {
         Self::default()
     }

@@ -43,7 +43,7 @@
 //!
 //! Every connection allocates its own stream buffers and never reuses them. At
 //! teardown they are *retired*, not reset: freed only once the render thread
-//! can no longer reach them (see [`crate::connection`]).
+//! can no longer reach them (see the `connection` module).
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -781,7 +781,7 @@ impl WebTripSession {
     /// the teardown is fully synchronous. The 2s WebTransport
     /// force-terminate fallback is a residual race — see
     /// `WebTransportImpl::close`. The buffers are then freed only once the
-    /// audio side is quiescent too (see [`crate::connection`]). A connect
+    /// audio side is quiescent too (see the `connection` module). A connect
     /// issued meanwhile waits for this to finish.
     pub async fn disconnect(&self) {
         self.disconnect_with(true).await;

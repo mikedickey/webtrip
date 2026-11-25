@@ -253,7 +253,7 @@ impl Drop for IntervalTickLoop {
 // These exercise the shared-memory build: T17 established that the
 // `wasm-pack`/`wasm-bindgen-test` harness serves a cross-origin-isolated
 // page with an imported shared `WebAssembly.Memory{shared:true}` (see the
-// flag-parity section of docs/WASM_TESTING.md), so `SharedArrayBuffer` and
+// flag-parity section of docs/contributing/testing.md), so `SharedArrayBuffer` and
 // `Atomics.notify` are available here without extra setup. The module is gated
 // on `wasm32` because there is no native-testable logic here.
 #[cfg(all(test, target_arch = "wasm32"))]

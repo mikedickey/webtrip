@@ -1,6 +1,44 @@
-//! System API endpoints
+//! System API endpoints.
 //!
-//! Health checks, region information, analytics, and other system-level operations.
+//! Health checks, URL-shortener redirects, cloud region information, and
+//! analytics collection. Obtain a [`SystemApi`] with [`ApiClient::system`].
+//!
+//! **Authentication:** none of these endpoints require a bearer token, so they
+//! work on a freshly constructed [`ApiClient`].
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use webtrip_api::api::{ApiClient, ApiError};
+//!
+//! # async fn run() -> Result<(), ApiError> {
+//! let client = ApiClient::new();
+//!
+//! let ping = client.system().ping().await?;
+//! println!("API version: {:?}", ping.version);
+//!
+//! // Keyed by region identifier, e.g. "us-west-1".
+//! let regions = client.system().list_regions().await?;
+//! for (id, region) in &regions {
+//!     println!("{id}: {:?}", region.label);
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! From JavaScript (the `webtrip` package):
+//!
+//! ```js
+//! import init, { ApiClient } from 'webtrip';
+//!
+//! await init();
+//! const client = new ApiClient();
+//!
+//! const ping = await client.system().ping();
+//! const ip = await client.system().getMyIp();     // e.g. "203.0.113.1"
+//! const regions = await client.system().listRegions(); // { [id]: Region }
+//! for (const [id, region] of Object.entries(regions)) console.log(id, region.label);
+//! ```
 
 #[cfg(feature = "wasm")]
 use super::to_js_value;
@@ -21,13 +59,14 @@ api_module_struct!(SystemApi);
 // =============================================================================
 
 impl SystemApi {
-    /// Check system health
+    /// Check API health and version (`GET /ping`).
     pub async fn ping(&self) -> Result<models::Ping, ApiError> {
         self.client.get("/ping").await
     }
 
     /// Resolve a URL-shortened redirect for a destination identifier
-    /// (`GET /redirect/{destination}`).
+    /// (`GET /redirect/{destination}`), e.g. `"openapi"` resolves to the
+    /// OpenAPI spec URL.
     pub async fn get_redirect(&self, destination: &str) -> Result<models::Redirect, ApiError> {
         let path = format!("/redirect/{}", urlencode(destination));
         self.client.get(&path).await
@@ -44,25 +83,27 @@ impl SystemApi {
         self.client.get(&path).await
     }
 
-    /// Get the client's public IP address
+    /// Get the client's public IP address as seen by the server
+    /// (`GET /getmyip`), e.g. `"203.0.113.1"`.
     pub async fn get_my_ip(&self) -> Result<String, ApiError> {
         self.client.get("/getmyip").await
     }
 
-    /// List all available cloud regions
+    /// List all cloud regions available for hosting studios.
     ///
-    /// `GET /regions` returns a map of region identifier → [`models::Region`].
+    /// `GET /regions` returns a map of region identifier → [`models::Region`]
+    /// (not a list); the identifier is the map key, not a field of the region.
     pub async fn list_regions(&self) -> Result<HashMap<String, models::Region>, ApiError> {
         self.client.get("/regions").await
     }
 
-    /// Get details for a specific region
+    /// Get details for a single region by identifier (`GET /regions/{region}`).
     pub async fn get_region(&self, region: &str) -> Result<models::Region, ApiError> {
         let path = format!("/regions/{}", urlencode(region));
         self.client.get(&path).await
     }
 
-    /// Submit an analytics event
+    /// Submit an analytics event (`POST /collect`). The server returns no body.
     pub async fn collect_analytics(&self, event: &models::AnalyticsEvent) -> Result<(), ApiError> {
         self.client.post_no_response("/collect", event).await
     }
@@ -103,7 +144,8 @@ impl SystemApi {
         self.get_my_ip().await
     }
 
-    /// List all available cloud regions
+    /// List all cloud regions. Resolves to a plain object mapping region
+    /// identifier → `Region`; see [`SystemApi::list_regions`].
     #[wasm_bindgen(js_name = listRegions)]
     pub async fn list_regions_js(&self) -> Result<JsValue, ApiError> {
         let regions = self.list_regions().await?;

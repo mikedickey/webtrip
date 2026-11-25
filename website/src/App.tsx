@@ -1,7 +1,12 @@
-import { Link, NavLink, Route, Routes } from "react-router-dom";
+import { lazy, Suspense } from "react";
+import { Link, NavLink, Navigate, Route, Routes } from "react-router-dom";
 import Home from "./pages/Home";
-import Docs from "./pages/Docs";
+import NotFound from "./pages/NotFound";
 import Demo from "./pages/demo/Demo";
+
+// The docs bundle (Markdown + highlighter) loads only when /docs is visited.
+const DocsLayout = lazy(() => import("./pages/docs/DocsLayout"));
+const DocPage = lazy(() => import("./pages/docs/DocPage"));
 
 const GITHUB_URL = "https://github.com/mikedickey/webtrip";
 
@@ -36,20 +41,19 @@ export default function App() {
       <main className="site-main">
         <Routes>
           <Route path="/" element={<Home />} />
-          <Route path="/docs" element={<Docs />} />
-          <Route path="/demo" element={<Demo />} />
           <Route
-            path="*"
+            path="/docs"
             element={
-              <section className="page">
-                <h1>Page not found</h1>
-                <p className="lede">
-                  There&rsquo;s nothing at this address. Try the{" "}
-                  <Link to="/">home page</Link>.
-                </p>
-              </section>
+              <Suspense fallback={null}>
+                <DocsLayout />
+              </Suspense>
             }
-          />
+          >
+            <Route index element={<Navigate to="/docs/getting-started" replace />} />
+            <Route path=":slug" element={<DocPage />} />
+          </Route>
+          <Route path="/demo" element={<Demo />} />
+          <Route path="*" element={<NotFound />} />
         </Routes>
       </main>
 

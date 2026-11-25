@@ -7,5 +7,7 @@ members = ["crates/core", "crates/api", "crates/web", "crates/webtrip"]
 [workspace.package]
 authors = ["Mike Dickey"]
 edition = "2021"
-publish = false
-version = "0.1.0"
+version = "0.2.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mikedickey/webtrip"
+homepage = "https://webtrip.dev"

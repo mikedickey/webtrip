@@ -5,8 +5,11 @@
 //! Dependency rule: `audio` never imports `network` (and vice versa);
 //! `session.rs` composes them.
 
+/// Audio input/output device enumeration and permission prompts.
 pub mod devices;
+/// The AudioWorklet node and the processor the render thread drives.
 pub mod worklet;
+/// The audio engine: capture, playback and the worklet graph around them.
 pub mod engine;
 pub mod audio_callback_loop;
 

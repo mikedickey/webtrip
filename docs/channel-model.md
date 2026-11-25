@@ -10,7 +10,7 @@ output device.
 
 For the broader threading model (why there's an AudioWorklet thread, a main
 thread, and sometimes a WebTransport worker thread, and how they share
-memory) see [ARCHITECTURE.md](ARCHITECTURE.md) — this document assumes that
+memory) see [architecture.md](architecture.md) — this document assumes that
 context and focuses specifically on channels. For design rationale see
 [`plans/channel-config.md`](../plans/channel-config.md) (and the earlier
 [`plans/channel-model.md`](../plans/channel-model.md)) — but treat those as
@@ -276,7 +276,7 @@ Key points:
   captured channels are averaged into one sent channel, and how a mono capture
   against a stereo send is duplicated rather than mis-framed.
 - **Step ⑦ happens on the main thread (WebRTC) or a dedicated worker
-  (WebTransport).** See [ARCHITECTURE.md](ARCHITECTURE.md) for why network I/O
+  (WebTransport).** See [architecture.md](architecture.md) for why network I/O
   can't run on the AudioWorklet thread. Both header channel fields come from
   `AudioBufferConfig`, never from what the worklet actually captured.
 

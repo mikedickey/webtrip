@@ -1,6 +1,49 @@
-//! Devices API endpoints
+//! Devices API endpoints.
 //!
-//! JackTrip device management and configuration.
+//! Register and manage JackTrip hardware devices, report device heartbeats,
+//! and control devices connected to a studio. Obtain a [`DevicesApi`] with
+//! [`ApiClient::devices`].
+//!
+//! **Authentication:** every endpoint requires a bearer token
+//! ([`ApiClient::set_bearer_token`]); see [`DevicesApi::send_heartbeat`] for
+//! device-side credentials.
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use webtrip_api::api::{ApiClient, ApiError};
+//! use webtrip_api::models::Device;
+//!
+//! # async fn run() -> Result<(), ApiError> {
+//! let client = ApiClient::new();
+//! client.set_bearer_token("your-jwt-token".to_string());
+//!
+//! let device = Device {
+//!     name: Some("My JackTrip".into()),
+//!     mac: Some("00:11:22:33:44:55".into()),
+//!     ..Default::default()
+//! };
+//! let device = client.devices().register_device(&device).await?;
+//! println!("registered {:?}", device.id);
+//!
+//! // Set the capture-volume range for every device in a studio.
+//! client.devices().update_capture_volume("studio123", Some(0), Some(100)).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! From JavaScript (the `webtrip` package):
+//!
+//! ```js
+//! import init, { ApiClient } from 'webtrip';
+//!
+//! await init();
+//! const client = new ApiClient();
+//! client.setBearerToken('your-jwt-token');
+//!
+//! const devices = await client.devices().listDevices();
+//! await client.devices().updateCaptureVolume('studio123', 0, 100);
+//! ```
 
 #[cfg(feature = "wasm")]
 use super::to_js_value;
@@ -21,35 +64,40 @@ api_module_struct!(DevicesApi);
 // =============================================================================
 
 impl DevicesApi {
-    /// List all devices in the account
+    /// List all devices in the account (`GET /devices`).
     pub async fn list_devices(&self) -> Result<Vec<models::Device>, ApiError> {
         self.client.get("/devices").await
     }
 
-    /// Register a new device
+    /// Register a new device (`POST /devices`), returning the stored device.
     pub async fn register_device(&self, device: &models::Device) -> Result<models::Device, ApiError> {
         self.client.post("/devices", device).await
     }
 
-    /// Get a device by ID
+    /// Get a device by ID (`GET /devices/{device_id}`).
     pub async fn get_device(&self, device_id: &str) -> Result<models::Device, ApiError> {
         let path = format!("/devices/{}", urlencode(device_id));
         self.client.get(&path).await
     }
 
-    /// Update a device's configuration
+    /// Update a device's configuration (`PUT /devices/{device_id}`).
     pub async fn update_device(&self, device_id: &str, device: &models::Device) -> Result<models::Device, ApiError> {
         let path = format!("/devices/{}", urlencode(device_id));
         self.client.put(&path, device).await
     }
 
-    /// Delete a device
+    /// Delete a device (`DELETE /devices/{device_id}`).
     pub async fn delete_device(&self, device_id: &str) -> Result<(), ApiError> {
         let path = format!("/devices/{}", urlencode(device_id));
         self.client.delete(&path).await
     }
 
-    /// Send a device heartbeat
+    /// Send a device heartbeat (`POST /devices/{device_id}/heartbeat`).
+    ///
+    /// Used by JackTrip device agents to report their version and network/RTT
+    /// statistics ([`models::DeviceNetworkStats`], flattened into the body).
+    /// The body may carry the device's API key (`api_prefix`/`api_secret`).
+    /// The response is the [`models::DeviceAgentConfig`] the device should apply.
     pub async fn send_heartbeat(
         &self,
         device_id: &str,
@@ -59,13 +107,17 @@ impl DevicesApi {
         self.client.post(&path, heartbeat).await
     }
 
-    /// List devices connected to a studio
+    /// List devices connected to a studio (`GET /studios/{studio_id}/devices`).
     pub async fn list_studio_devices(&self, studio_id: &str) -> Result<Vec<models::Device>, ApiError> {
         let path = format!("/studios/{}/devices", urlencode(studio_id));
         self.client.get(&path).await
     }
 
-    /// Update capture volume for all devices in a studio
+    /// Update the capture volume range for all devices in a studio
+    /// (`PUT /studios/{studio_id}/captureVolume`).
+    ///
+    /// `min` and `max` are sent as query parameters (not a JSON body), each
+    /// only when set. The server returns no body.
     pub async fn update_capture_volume(
         &self,
         studio_id: &str,

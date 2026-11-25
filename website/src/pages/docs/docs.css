@@ -1,0 +1,218 @@
+/* Docs: sidebar + rendered Markdown, on the site's palette (styles.css). */
+.docs {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 48px;
+  align-items: start;
+}
+
+.docs-nav {
+  position: sticky;
+  top: 24px;
+}
+
+.docs-nav ul {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.docs-nav a {
+  display: block;
+  padding: 6px 12px;
+  border-left: 2px solid transparent;
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: 15px;
+}
+
+.docs-nav a:hover {
+  color: var(--text-primary);
+}
+
+.docs-nav a.active {
+  color: var(--accent);
+  border-left-color: var(--accent);
+}
+
+.prose {
+  max-width: 760px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+  font-size: 16px;
+}
+
+.prose h1,
+.prose h2,
+.prose h3,
+.prose h4 {
+  color: var(--text-primary);
+  font-weight: 600;
+  line-height: 1.3;
+  scroll-margin-top: 24px;
+}
+
+.prose h1 {
+  font-size: 32px;
+  letter-spacing: -0.5px;
+  margin-bottom: 24px;
+}
+
+.prose h2 {
+  font-size: 24px;
+  margin: 48px 0 16px;
+  padding-top: 24px;
+  border-top: 1px solid var(--border-color);
+}
+
+.prose h3 {
+  font-size: 19px;
+  margin: 32px 0 12px;
+}
+
+.prose h4 {
+  font-size: 16px;
+  margin: 24px 0 8px;
+}
+
+.prose p,
+.prose ul,
+.prose ol,
+.prose pre,
+.prose blockquote,
+.prose .docs-table {
+  margin: 0 0 16px;
+}
+
+.prose ul,
+.prose ol {
+  padding-left: 24px;
+}
+
+.prose li + li {
+  margin-top: 4px;
+}
+
+.prose strong {
+  color: var(--text-primary);
+}
+
+.prose a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.prose a:hover {
+  text-decoration: underline;
+}
+
+.prose hr {
+  border: 0;
+  border-top: 1px solid var(--border-color);
+  margin: 32px 0;
+}
+
+.prose blockquote {
+  padding: 4px 16px;
+  border-left: 3px solid var(--accent);
+  color: var(--text-secondary);
+}
+
+.prose code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88em;
+}
+
+.prose :not(pre) > code {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.prose pre {
+  padding: 16px;
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  overflow-x: auto;
+  line-height: 1.5;
+}
+
+.prose pre code {
+  color: var(--text-primary);
+}
+
+.docs-table {
+  overflow-x: auto;
+}
+
+.prose table {
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.prose th,
+.prose td {
+  padding: 8px 12px;
+  border: 1px solid var(--border-color);
+  text-align: left;
+  vertical-align: top;
+}
+
+.prose th {
+  color: var(--text-primary);
+  background: var(--bg-card);
+}
+
+/* Syntax highlighting (rehype-highlight emits highlight.js classes). */
+.hljs-keyword,
+.hljs-built_in,
+.hljs-literal {
+  color: var(--accent);
+}
+
+.hljs-string,
+.hljs-attr {
+  color: var(--accent-2);
+}
+
+.hljs-comment {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.hljs-number,
+.hljs-title {
+  color: #a9b8ff;
+}
+
+@media (max-width: 760px) {
+  .docs {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 24px;
+  }
+
+  .docs-nav {
+    position: static;
+  }
+
+  .docs-nav ul {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  .docs-nav a {
+    border-left: 0;
+    border-bottom: 2px solid transparent;
+    padding: 6px 10px;
+  }
+
+  .docs-nav a.active {
+    border-bottom-color: var(--accent);
+  }
+}

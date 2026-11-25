@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn public_upcoming_event_fixture_known_good() {
-        // Fixture modeled after docs/api/events.md.
+        // Fixture modeled after the `api::events` module docs.
         let json = r#"{
           "id": "evt-1",
           "title": "Friday Night Jam",

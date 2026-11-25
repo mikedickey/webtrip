@@ -9,7 +9,7 @@ use tsify_next::Tsify;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-use super::{BackingTrack, PublicUpcomingEvent, RecordingMetadata, StreamInfo, StreamInfoSearchResult};
+use super::{BackingTrack, PublicUpcomingEvent, RecordingMetadata, ServerRecording, StreamInfo, StreamInfoSearchResult};
 
 /// Pagination metadata returned in the `_meta` field of every paginated response.
 ///
@@ -88,6 +88,26 @@ pub struct PaginatedRecordings {
 
     /// Recordings on the current page
     pub results: Vec<RecordingMetadata>,
+}
+
+/// Paginated studio or user recordings response: the paginated form of the
+/// [`ServerRecording`] lists (`/studios/{id}/recordings`,
+/// `/users/{id}/recordings`).
+///
+/// The OpenAPI spec types these pages' items as `RecordingMetadata`, but
+/// `ServerRecording` is that plus optional fields, so decoding them as
+/// `ServerRecording` loses nothing and keeps each endpoint's paginated and
+/// unpaginated forms the same item type.
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
+pub struct PaginatedServerRecordings {
+    /// Pagination metadata
+    #[serde(rename = "_meta")]
+    pub meta: PaginationMeta,
+
+    /// Recordings on the current page
+    pub results: Vec<ServerRecording>,
 }
 
 /// Paginated stream search results response

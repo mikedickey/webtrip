@@ -487,11 +487,17 @@ thread_local! {
 #[wasm_bindgen]
 #[derive(Debug, Clone, Default)]
 pub struct WebTransportWorkerStats {
+    /// Datagrams written successfully.
     pub packets_sent: u64,
+    /// Datagrams read, whether or not they decoded.
     pub packets_received: u64,
+    /// Bytes in the datagrams written successfully.
     pub bytes_sent: u64,
+    /// Bytes in every datagram read.
     pub bytes_received: u64,
+    /// Datagram writes that failed.
     pub send_errors: u64,
+    /// Received datagrams that failed to decode as audio packets.
     pub receive_errors: u64,
 }
 
@@ -631,7 +637,7 @@ fn fpp_message(fpp: usize, max_datagram_size: usize) -> JsValue {
 /// ring-buffer's has_data flag so the send loop notices immediately
 /// (µs-scale) without relying on a polling timeout.
 ///
-/// `"disconnected"` is posted later by [`maybe_post_disconnected`] once
+/// `"disconnected"` is posted later by `maybe_post_disconnected` once
 /// **both** loops have exited (send flushes JackTrip exit packets first).
 #[wasm_bindgen(js_name = workerDisconnect)]
 pub fn worker_disconnect() {
@@ -788,6 +794,13 @@ async fn send_loop_body(
             // Send as unreliable datagram using browser API
             match JsFuture::from(writer.write_with_chunk(&data)).await {
                 Ok(_) => {
+                    // The session's stats read this counter; the worker-local
+                    // STATS below only reach the worker's own reports.
+                    WORKER_STATE.with(|state| {
+                        if let Some(ring) = state.borrow().ring_buffer_ptr.as_ref() {
+                            ring.record_packet_sent();
+                        }
+                    });
                     STATS.with(|stats| {
                         let mut s = stats.borrow_mut();
                         s.packets_sent += 1;

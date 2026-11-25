@@ -65,6 +65,7 @@ impl StreamBuffers {
             self.ring.writes(),
             self.ring.samples_written(),
             self.ring.overruns(),
+            self.ring.packets_sent(),
         )
     }
 }

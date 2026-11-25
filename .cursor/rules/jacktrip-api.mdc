@@ -1,5 +1,5 @@
 ---
-globs: src/api/**,src/models/**,docs/api/**
+globs: crates/api/src/**
 alwaysApply: false
 ---
 # JackTrip API Development Guidelines
@@ -8,9 +8,8 @@ alwaysApply: false
 
 When working on files in the following directories, always reference the latest JackTrip Virtual Studio OpenAPI specification:
 
-- `src/api/` - API client implementation
-- `src/models/` - Data models and types
-- `docs/api/` - API documentation
+- `crates/api/src/api/` - API client implementation (and its rustdoc reference)
+- `crates/api/src/models/` - Data models and types
 
 ### Accessing the OpenAPI Spec
 
@@ -67,4 +66,4 @@ Always verify enum values match the spec:
 2. Ensure all model fields match the spec's schema properties
 3. Use proper serde attributes for camelCase serialization
 4. Include proper TypeScript type generation via tsify
-5. Update documentation in `docs/api/` when changing API methods
+5. Update the rustdoc (`//!` module docs and `///` method docs) when changing API methods

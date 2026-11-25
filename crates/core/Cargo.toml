@@ -3,8 +3,13 @@ name = "webtrip-core"
 description = "Portable WebTrip core: audio processing, wire protocol, jitter buffer"
 authors.workspace = true
 edition.workspace = true
-publish.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["audio", "jacktrip", "jitter-buffer", "networking", "realtime"]
+categories = ["multimedia::audio", "network-programming", "wasm"]
 
 # Platform rule: this crate never depends on web-sys or js-sys. `npm run
 # check:core` builds it natively with no features to enforce that.

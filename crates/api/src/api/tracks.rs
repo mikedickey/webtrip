@@ -1,7 +1,28 @@
-//! Backing tracks API endpoints
+//! Backing tracks stored for a studio.
 //!
-//! Upload, list, and manage backing track audio files stored for a studio
-//! (`/studios/{studioId}/tracks*`).
+//! Reached through [`ApiClient::tracks`]. Every endpoint requires
+//! authentication. Upload, list, and manage the backing-track audio files of a
+//! studio (`/studios/{studioId}/tracks*`), modelled by
+//! [`models::BackingTrack`].
+//!
+//! ```rust,no_run
+//! use webtrip_api::{api::{ApiClient, ApiError}, models::TrackUpdateRequest};
+//!
+//! # async fn run(client: &ApiClient, wav_bytes: Vec<u8>) -> Result<(), ApiError> {
+//! let track = client.tracks().upload_track("studio123", "bassline.wav", wav_bytes).await?;
+//! if let Some(id) = &track.id {
+//!     let update = TrackUpdateRequest { volume: Some(80), ..Default::default() };
+//!     client.tracks().update_track("studio123", id, &update).await?;
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ```js
+//! const track = await client.tracks().uploadTrack('studio123', 'bassline.wav', wavBytes); // Uint8Array
+//! await client.tracks().updateTrack('studio123', track.id, { volume: 80 });
+//! const { results } = await client.tracks().listTracks('studio123', 1, 20);
+//! ```
 //!
 //! The `GET /studios/{studioId}/tracks/{trackId}/download` route is intentionally
 //! omitted: per the OpenAPI spec it is authenticated with VS-agent
@@ -33,7 +54,10 @@ fn track_path(studio_id: &str, track_id: &str) -> String {
 }
 
 impl TracksApi {
-    /// List backing tracks for a studio (paginated)
+    /// List backing tracks for a studio (`GET /studios/{studioId}/tracks`).
+    ///
+    /// `page` and `limit` are sent only when given; the server applies its own
+    /// defaults otherwise.
     pub async fn list_tracks(
         &self,
         studio_id: &str,
@@ -49,7 +73,10 @@ impl TracksApi {
         }
     }
 
-    /// Upload a new backing track (WAV, MP3, or FLAC) for a studio
+    /// Upload a new backing track (`POST /studios/{studioId}/tracks`).
+    ///
+    /// `data` is the raw WAV, MP3, or FLAC file, sent as the `file` part of a
+    /// `multipart/form-data` body under `file_name`.
     pub async fn upload_track(
         &self,
         studio_id: &str,
@@ -61,12 +88,15 @@ impl TracksApi {
         self.client.post_multipart(&tracks_path(studio_id), form).await
     }
 
-    /// Get a backing track by ID
+    /// Get a backing track by ID (`GET /studios/{studioId}/tracks/{trackId}`).
     pub async fn get_track(&self, studio_id: &str, track_id: &str) -> Result<models::BackingTrack, ApiError> {
         self.client.get(&track_path(studio_id, track_id)).await
     }
 
-    /// Update a backing track's metadata
+    /// Update a backing track's name and mix settings
+    /// (`PUT /studios/{studioId}/tracks/{trackId}`).
+    ///
+    /// Only the fields set in `update` are sent.
     pub async fn update_track(
         &self,
         studio_id: &str,
@@ -76,7 +106,7 @@ impl TracksApi {
         self.client.put(&track_path(studio_id, track_id), update).await
     }
 
-    /// Delete a backing track
+    /// Delete a backing track (`DELETE /studios/{studioId}/tracks/{trackId}`).
     pub async fn delete_track(&self, studio_id: &str, track_id: &str) -> Result<(), ApiError> {
         self.client.delete(&track_path(studio_id, track_id)).await
     }

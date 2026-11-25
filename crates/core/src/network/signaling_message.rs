@@ -39,6 +39,7 @@ pub enum SignalingMessageType {
 /// A signaling message
 #[derive(Debug, Clone)]
 pub struct SignalingMessage {
+    /// What kind of message this is; decides which other fields are set.
     pub msg_type: SignalingMessageType,
     /// SDP content for Offer/Answer
     pub sdp: Option<String>,
@@ -312,8 +313,11 @@ pub enum HubConnectionState {
 /// `{"candidate":"...","sdpMid":"audio","sdpMLineIndex":0}`
 #[derive(Debug, PartialEq, Eq)]
 pub struct ParsedIceCandidate {
+    /// The `candidate` string (SDP `a=candidate` line).
     pub candidate: String,
+    /// The `sdpMid` media ID, if present.
     pub sdp_mid: Option<String>,
+    /// The `sdpMLineIndex` media line index, if present.
     pub sdp_m_line_index: Option<u16>,
 }
 

@@ -21,7 +21,7 @@
 #   /certs/server.crt  (full chain)
 #   /certs/server.key
 #
-# See docs/CONTAINER.md for run examples and pitfalls.
+# See docs/contributing/containers.md for run examples and pitfalls.
 ARG NODE_MAJOR=22
 FROM node:${NODE_MAJOR}-slim
 

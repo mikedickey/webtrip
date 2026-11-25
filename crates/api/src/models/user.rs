@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn user_fixture_matches_wire_format() {
-        // Fixture modeled after docs/api/users.md (auth0-style user). Note
+        // Fixture modeled after the `api::users` module docs (auth0-style user). Note
         // user_id / user_metadata / app_metadata are snake_case on the wire
         // even though the rest of the struct is camelCase.
         let json = r#"{

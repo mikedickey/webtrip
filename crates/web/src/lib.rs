@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 // Linked so the API's `#[wasm_bindgen]` exports reach the generated package
 pub use webtrip_api::{api, models};
 

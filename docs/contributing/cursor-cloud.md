@@ -1,10 +1,10 @@
 # Cursor Cloud Agent Instructions
 
-**Audience:** Cursor Cloud agents only. Local IDE agents and other tooling should not read this file — general project guidance lives in [AGENTS.md](../AGENTS.md).
+**Audience:** Cursor Cloud agents only. Local IDE agents and other tooling should not read this file — general project guidance lives in [AGENTS.md](../../AGENTS.md).
 
 This is a single web app (the WebTrip Demo). The standard commands (`npm run build`,
 `npm run check`, `npm run test`, `npm run test:wasm`, `npm run serve`) are documented
-in [AGENTS.md](../AGENTS.md), [README.md](../README.md), and [WASM_TESTING.md](WASM_TESTING.md). The toolchain (Rust nightly,
+in [AGENTS.md](../../AGENTS.md), [README.md](../../README.md), and [testing.md](testing.md). The toolchain (Rust nightly,
 `wasm-pack`, version-matched `wasm-bindgen-cli`, `cargo-llvm-cov` + the
 `llvm-tools-preview` component, `clang`, Node, a Chrome-matched `chromedriver`)
 is pre-installed in the VM image; the startup update script only runs `npm install`.

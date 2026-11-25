@@ -94,9 +94,11 @@ pub enum FppLimit {
 /// A frames-per-packet choice for a send stream. See [`fit_fpp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FppFit {
+    /// Chosen frames per packet: a power of two in `[MIN_FPP, MAX_FPP]`.
     pub fpp: usize,
     /// Wire size of one packet at `fpp`, header included.
     pub packet_bytes: usize,
+    /// Why `fpp` is below the preferred value, if it is.
     pub limited_by: FppLimit,
 }
 
@@ -131,16 +133,25 @@ pub fn fit_fpp(max_bytes: usize, channels: u8, bit_depth: u8, preferred: usize) 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SampleRateCode {
+    /// 22050 Hz; wire byte `0`.
     Sr22050 = 0,
+    /// 32000 Hz; wire byte `1`.
     Sr32000 = 1,
+    /// 44100 Hz; wire byte `2`.
     Sr44100 = 2,
+    /// 48000 Hz; wire byte `3`.
     Sr48000 = 3,
+    /// 88200 Hz; wire byte `4`.
     Sr88200 = 4,
+    /// 96000 Hz; wire byte `5`.
     Sr96000 = 5,
+    /// 192000 Hz; wire byte `6`.
     Sr192000 = 6,
 }
 
 impl SampleRateCode {
+    /// Code for a rate in Hz. A rate JackTrip cannot encode maps to
+    /// [`Sr48000`](Self::Sr48000).
     pub fn from_hz(hz: u32) -> Self {
         match hz {
             22050 => Self::Sr22050,
@@ -154,6 +165,7 @@ impl SampleRateCode {
         }
     }
 
+    /// The rate in Hz.
     pub fn to_hz(self) -> u32 {
         match self {
             Self::Sr22050 => 22050,
@@ -166,6 +178,8 @@ impl SampleRateCode {
         }
     }
 
+    /// Decode the 1-byte wire value; an unknown byte maps to
+    /// [`Sr48000`](Self::Sr48000).
     pub fn from_byte(b: u8) -> Self {
         match b {
             0 => Self::Sr22050,
@@ -402,6 +416,7 @@ fn wire_idx(i: usize, channels: usize, buf_size: usize) -> usize {
 /// A complete JackTrip audio packet
 #[derive(Debug, Clone)]
 pub struct AudioPacket {
+    /// The 16-byte header that precedes the samples on the wire.
     pub header: PacketHeader,
     /// Audio samples as 32-bit floats (interleaved for stereo)
     pub samples: Vec<f32>,
@@ -635,12 +650,16 @@ impl AudioPacket {
 /// Protocol errors
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolError {
+    /// The byte buffer is shorter than the header, or than the header plus
+    /// the audio payload it describes.
     BufferTooSmall,
+    /// The incoming channel count is 0 or above `MAX_WIRE_CHANNELS`, or the
+    /// decoded outgoing count is above `MAX_WIRE_CHANNELS`.
     InvalidChannelCount,
+    /// The bit depth is not 8, 16, 24 or 32.
     InvalidBitDepth,
+    /// The header's frames per packet is outside `[MIN_FPP, MAX_FPP]`.
     InvalidBufferSize,
-    InvalidPacket,
-    SequenceGap,
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -650,8 +669,6 @@ impl std::fmt::Display for ProtocolError {
             ProtocolError::InvalidChannelCount => write!(f, "Invalid channel count"),
             ProtocolError::InvalidBitDepth => write!(f, "Invalid bit depth"),
             ProtocolError::InvalidBufferSize => write!(f, "Invalid buffer size"),
-            ProtocolError::InvalidPacket => write!(f, "Invalid packet"),
-            ProtocolError::SequenceGap => write!(f, "Sequence gap detected"),
         }
     }
 }
@@ -676,6 +693,7 @@ pub struct StreamStats {
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 impl StreamStats {
+    /// All counters zero.
     #[cfg_attr(feature = "wasm", wasm_bindgen(constructor))]
     pub fn new() -> Self {
         Self::default()
@@ -695,9 +713,13 @@ impl StreamStats {
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(Debug, Clone, Copy)]
 pub struct AudioFormat {
+    /// Sample rate in Hz.
     pub sample_rate: u32,
+    /// Channels per frame.
     pub channels: u8,
+    /// Frames per packet.
     pub buffer_size: u16,
+    /// Bits per sample on the wire: 8, 16, 24 or 32.
     pub bit_depth: u8,
 }
 
@@ -709,6 +731,7 @@ impl AudioFormat {
         Self::mono()
     }
 
+    /// One channel at the wire rate with the default buffer size and bit depth.
     pub fn mono() -> Self {
         Self {
             sample_rate: WIRE_SAMPLE_RATE,
@@ -718,6 +741,7 @@ impl AudioFormat {
         }
     }
 
+    /// Two channels at the wire rate with the default buffer size and bit depth.
     pub fn stereo() -> Self {
         Self {
             sample_rate: WIRE_SAMPLE_RATE,

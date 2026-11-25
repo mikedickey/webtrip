@@ -1,6 +1,58 @@
-//! Streams API endpoints
+//! Streams API: JackTrip Radio broadcasts, channels, chat, and studio stream
+//! management.
 //!
-//! JackTrip Radio live streams and channel management.
+//! Reach it through [`ApiClient::streams`]. The endpoints fall into four groups:
+//!
+//! - **Discovery** — list, search and fetch public broadcasts and channels.
+//!   No authentication needed.
+//! - **Following** — follow or unfollow a broadcast.
+//! - **Chat and conversations** — a broadcast's chat session and the per-user
+//!   conversations attached to a stream.
+//! - **Studio streams** — configure, activate, and simulcast the live stream
+//!   that a studio broadcasts.
+//!
+//! Everything except discovery requires a bearer token
+//! ([`ApiClient::set_bearer_token`]).
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use webtrip_api::api::{ApiClient, ApiError};
+//! use webtrip_api::models::{ActivationRequestOpts, StreamSearchQuery};
+//!
+//! # async fn example() -> Result<(), ApiError> {
+//! let client = ApiClient::new();
+//!
+//! // Public search; unset filters are omitted from the query string.
+//! let query = StreamSearchQuery { q: Some("jazz".into()), ..Default::default() };
+//! let found = client.streams().search_streams(&query).await?;
+//! println!("{} matching broadcasts", found.meta.total);
+//!
+//! // Going live from a studio needs a bearer token.
+//! client.set_bearer_token("<token>".to_string());
+//! let opts = ActivationRequestOpts { active: Some(true) };
+//! let stream = client.streams().activate_studio_stream("studio123", &opts).await?;
+//! println!("HLS: {:?}", stream.hls_url);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! From JavaScript (package `webtrip`):
+//!
+//! ```js
+//! import init, { ApiClient } from 'webtrip';
+//! await init();
+//!
+//! const client = new ApiClient();
+//! const found = await client.streams().searchStreams({ q: 'jazz', page: 1, limit: 20 });
+//! found.results.forEach((s) => console.log(s.name));
+//!
+//! client.setBearerToken(token);
+//! await client.streams().updateSimulcastDestination('studio123', 'youtube', {
+//!   rtmpUrl: 'rtmp://a.rtmp.youtube.com/live2',
+//!   streamKey: '<key>',
+//! });
+//! ```
 
 #[cfg(feature = "wasm")]
 use super::to_js_value;
@@ -44,14 +96,16 @@ fn conversation_message_path(stream_id: &str, user_id: &str, message_id: &str) -
 }
 
 impl StreamsApi {
-    /// List all public, active broadcasts
+    /// List all public, currently active broadcasts.
+    ///
+    /// `GET /streams`. No authentication required.
     pub async fn list_streams(&self) -> Result<Vec<models::StreamInfo>, ApiError> {
         self.client.get("/streams").await
     }
 
     /// Search for broadcasts.
     ///
-    /// Accepts the full [`models::StreamSearchQuery`] contract (`q`, `lookingFor`,
+    /// `GET /streams/search`. No authentication required. Accepts the full [`models::StreamSearchQuery`] contract (`q`, `lookingFor`,
     /// `skillLevel`, `instrument`, `genre`, `region`, `page`, `limit`) and returns
     /// the paginated `{ _meta, results }` envelope whose items carry
     /// search-specific fields ([`models::StreamInfoSearchResult`]).
@@ -62,28 +116,41 @@ impl StreamsApi {
         self.client.get_with_query("/streams/search", query).await
     }
 
-    /// Get a broadcast by ID
+    /// Get a broadcast by ID, with engagement data.
+    ///
+    /// `GET /streams/{streamId}`. No authentication required.
     pub async fn get_stream(&self, stream_id: &str) -> Result<models::StreamInfoWithEngagement, ApiError> {
         let path = format!("/streams/{}", urlencode(stream_id));
         self.client.get(&path).await
     }
 
-    /// Follow a broadcast
+    /// Follow a broadcast as the authenticated user.
+    ///
+    /// `POST /streams/{streamId}/follow` (empty body). Requires a bearer token.
     pub async fn follow_stream(&self, stream_id: &str) -> Result<(), ApiError> {
         self.client.post_empty_no_response(&stream_follow_path(stream_id)).await
     }
 
-    /// Unfollow a broadcast
+    /// Unfollow a broadcast as the authenticated user.
+    ///
+    /// `DELETE /streams/{streamId}/follow`. Requires a bearer token.
     pub async fn unfollow_stream(&self, stream_id: &str) -> Result<(), ApiError> {
         self.client.delete(&stream_follow_path(stream_id)).await
     }
 
-    /// List all public channels
+    /// List all public channels.
+    ///
+    /// `GET /channels`. No authentication required. See also
+    /// [`list_channels_paginated`](Self::list_channels_paginated).
     pub async fn list_channels(&self) -> Result<Vec<models::StreamInfo>, ApiError> {
         self.client.get("/channels").await
     }
 
-    /// List channels with pagination
+    /// List public channels, one page at a time.
+    ///
+    /// `GET /channels-paginated`. No authentication required. `page` and `limit` are sent as
+    /// query parameters only when given; omitted ones fall back to the server
+    /// defaults.
     pub async fn list_channels_paginated(
         &self,
         page: Option<i32>,
@@ -96,19 +163,25 @@ impl StreamsApi {
         }
     }
 
-    /// Get chat session for a broadcast
+    /// Get a chat session for a broadcast.
+    ///
+    /// `GET /streams/{streamId}/chat/{chatId}`. Requires a bearer token.
     pub async fn get_stream_chat(&self, stream_id: &str, chat_id: &str) -> Result<models::ChatSession, ApiError> {
         let path = format!("/streams/{}/chat/{}", urlencode(stream_id), urlencode(chat_id));
         self.client.get(&path).await
     }
 
-    /// Get all conversations for a stream
+    /// List the conversations attached to a stream.
+    ///
+    /// `GET /streams/{streamId}/conversations`. Requires a bearer token.
     pub async fn get_stream_conversations(&self, stream_id: &str) -> Result<Vec<models::Conversation>, ApiError> {
         let path = format!("/streams/{}/conversations", urlencode(stream_id));
         self.client.get(&path).await
     }
 
-    /// Get a specific conversation
+    /// Get the conversation with one user on a stream.
+    ///
+    /// `GET /streams/{streamId}/conversations/{userId}`. Requires a bearer token.
     pub async fn get_stream_conversation(
         &self,
         stream_id: &str,
@@ -119,7 +192,9 @@ impl StreamsApi {
 
     /// Mark messages as read in a conversation.
     ///
-    /// Updates the last-read message position for the authenticated user.
+    /// `POST /streams/{streamId}/conversations/{userId}/last`. Requires a bearer token.
+    /// Sets the authenticated user's last-read position to
+    /// [`models::MarkReadRequest::message_id`].
     pub async fn mark_conversation_read(
         &self,
         stream_id: &str,
@@ -130,7 +205,9 @@ impl StreamsApi {
         self.client.post_no_response(&path, req).await
     }
 
-    /// Get messages in a conversation
+    /// List the messages in a conversation.
+    ///
+    /// `GET /streams/{streamId}/conversations/{userId}/messages`. Requires a bearer token.
     pub async fn get_conversation_messages(
         &self,
         stream_id: &str,
@@ -139,7 +216,9 @@ impl StreamsApi {
         self.client.get(&conversation_messages_path(stream_id, user_id)).await
     }
 
-    /// Send a message in a conversation
+    /// Send a message in a conversation.
+    ///
+    /// `POST /streams/{streamId}/conversations/{userId}/messages`. Requires a bearer token.
     pub async fn send_message(
         &self,
         stream_id: &str,
@@ -149,7 +228,10 @@ impl StreamsApi {
         self.client.post(&conversation_messages_path(stream_id, user_id), message).await
     }
 
-    /// Get a specific message in a conversation
+    /// Get one message in a conversation.
+    ///
+    /// `GET /streams/{streamId}/conversations/{userId}/messages/{messageId}`.
+    /// Requires a bearer token.
     pub async fn get_conversation_message(
         &self,
         stream_id: &str,
@@ -163,7 +245,9 @@ impl StreamsApi {
 
     /// Update an existing message in a conversation.
     ///
-    /// Only the message status may be changed; the text is immutable.
+    /// `PUT /streams/{streamId}/conversations/{userId}/messages/{messageId}`.
+    /// Requires a bearer token. Only the message status may be changed (see
+    /// [`models::UpdateMessageRequest`]); the text is immutable.
     pub async fn update_conversation_message(
         &self,
         stream_id: &str,
@@ -176,13 +260,17 @@ impl StreamsApi {
             .await
     }
 
-    /// Get the stream for a studio
+    /// Get a studio's live stream configuration.
+    ///
+    /// `GET /studios/{studioId}/stream`. Requires a bearer token.
     pub async fn get_studio_stream(&self, studio_id: &str) -> Result<models::LiveStream, ApiError> {
         let path = format!("/studios/{}/stream", urlencode(studio_id));
         self.client.get(&path).await
     }
 
-    /// Create or reset a stream for a studio
+    /// Create a studio's live stream, or reset an existing one.
+    ///
+    /// `POST /studios/{studioId}/stream`. Requires a bearer token.
     pub async fn create_studio_stream(
         &self,
         studio_id: &str,
@@ -192,7 +280,9 @@ impl StreamsApi {
         self.client.post(&path, stream).await
     }
 
-    /// Update a studio's stream
+    /// Update a studio's live stream configuration.
+    ///
+    /// `PUT /studios/{studioId}/stream`. Requires a bearer token.
     pub async fn update_studio_stream(
         &self,
         studio_id: &str,
@@ -202,7 +292,11 @@ impl StreamsApi {
         self.client.put(&path, stream).await
     }
 
-    /// Activate or deactivate a studio stream
+    /// Start or stop a studio's live stream.
+    ///
+    /// `POST /studios/{studioId}/stream/activate`. Requires a bearer token. Set
+    /// [`models::ActivationRequestOpts::active`] to `true` to go live or `false`
+    /// to stop; returns the updated [`models::LiveStream`].
     pub async fn activate_studio_stream(
         &self,
         studio_id: &str,
@@ -212,13 +306,20 @@ impl StreamsApi {
         self.client.post(&path, opts).await
     }
 
-    /// Get simulcast destinations for a studio
+    /// List a studio's simulcast destinations (external RTMP targets that
+    /// receive a copy of the stream).
+    ///
+    /// `GET /studios/{studioId}/simulcast`. Requires a bearer token.
     pub async fn get_simulcast_destinations(&self, studio_id: &str) -> Result<Vec<models::SimulcastDestination>, ApiError> {
         let path = format!("/studios/{}/simulcast", urlencode(studio_id));
         self.client.get(&path).await
     }
 
-    /// Add or update a simulcast destination
+    /// Add or update a simulcast destination.
+    ///
+    /// `PUT /studios/{studioId}/simulcast/{destination}`. Requires a bearer token. `destination`
+    /// is the destination's name in the path (e.g. `"youtube"`); the
+    /// destination is added if it does not exist yet, otherwise updated.
     pub async fn update_simulcast_destination(
         &self,
         studio_id: &str,
@@ -229,7 +330,9 @@ impl StreamsApi {
         self.client.put(&path, config_data).await
     }
 
-    /// Remove a simulcast destination
+    /// Remove a simulcast destination.
+    ///
+    /// `DELETE /studios/{studioId}/simulcast/{destination}`. Requires a bearer token.
     pub async fn delete_simulcast_destination(&self, studio_id: &str, destination: &str) -> Result<(), ApiError> {
         let path = format!("/studios/{}/simulcast/{}", urlencode(studio_id), urlencode(destination));
         self.client.delete(&path).await

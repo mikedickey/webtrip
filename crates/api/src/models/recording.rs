@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn recording_metadata_fixture_known_good() {
-        // Fixture modeled after docs/api/recordings.md.
+        // Fixture modeled after the `api::recordings` module docs.
         let json = r#"{
           "id": "rec-1",
           "name": "Last Night's Show",

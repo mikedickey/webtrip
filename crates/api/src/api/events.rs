@@ -1,6 +1,49 @@
-//! Events API endpoints
+//! Events API: JackTrip Radio upcoming events and broadcasts.
 //!
-//! JackTrip Radio upcoming events and broadcasts.
+//! Reach it through [`ApiClient::events`]. Two groups of endpoints live here:
+//!
+//! - **Public events** (`/events…`) — browse upcoming events, their radio
+//!   channel, similar events, and the live stream URL. No authentication needed.
+//! - **Studio events** (`/studios/{studioId}/events…`) — create, read, update
+//!   and delete the events a studio schedules. These require a bearer token
+//!   ([`ApiClient::set_bearer_token`]).
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use webtrip_api::api::{ApiClient, ApiError};
+//!
+//! # async fn example() -> Result<(), ApiError> {
+//! let client = ApiClient::new();
+//!
+//! // Public: no token needed.
+//! let page = client.events().list_events_paginated(Some(1), Some(20)).await?;
+//! for event in &page.results {
+//!     println!("{:?}", event.core.title);
+//! }
+//!
+//! // Studio events need a bearer token.
+//! client.set_bearer_token("<token>".to_string());
+//! let scheduled = client.events().list_studio_events("studio123").await?;
+//! # let _ = scheduled;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! From JavaScript (package `webtrip`):
+//!
+//! ```js
+//! import init, { ApiClient } from 'webtrip';
+//! await init();
+//!
+//! const client = new ApiClient();
+//! const page = await client.events().listEventsPaginated(1, 20);
+//!
+//! client.setBearerToken(token);
+//! const event = await client.events().createStudioEvent('studio123', {
+//!   title: 'Live Session',
+//! });
+//! ```
 
 #[cfg(feature = "wasm")]
 use super::to_js_value;
@@ -20,12 +63,20 @@ api_module_struct!(EventsApi);
 // =============================================================================
 
 impl EventsApi {
-    /// List all public upcoming events
+    /// List all public upcoming events.
+    ///
+    /// `GET /events`. No authentication required. See also
+    /// [`list_events_paginated`](Self::list_events_paginated).
     pub async fn list_events(&self) -> Result<Vec<models::PublicUpcomingEvent>, ApiError> {
         self.client.get("/events").await
     }
 
-    /// List events with pagination
+    /// List public upcoming events, one page at a time.
+    ///
+    /// `GET /events-paginated`. No authentication required. `page` and `limit`
+    /// are sent as query parameters only when given; omitted ones fall back to
+    /// the server defaults. The [`models::PaginatedEvents`] envelope carries the
+    /// page metadata in `meta` (`_meta` on the wire).
     pub async fn list_events_paginated(
         &self,
         page: Option<i32>,
@@ -38,19 +89,26 @@ impl EventsApi {
         }
     }
 
-    /// Get a public event by ID
+    /// Get a public event by ID.
+    ///
+    /// `GET /events/{eventId}`. No authentication required. Note that the API
+    /// returns an *array* of [`models::PublicUpcomingEvent`], not a single object.
     pub async fn get_event(&self, event_id: &str) -> Result<Vec<models::PublicUpcomingEvent>, ApiError> {
         let path = format!("/events/{}", urlencode(event_id));
         self.client.get(&path).await
     }
 
-    /// Get the radio channel for an event
+    /// Get the radio channel an event broadcasts on.
+    ///
+    /// `GET /events/{eventId}/channel`. No authentication required.
     pub async fn get_event_channel(&self, event_id: &str) -> Result<models::StreamInfo, ApiError> {
         let path = format!("/events/{}/channel", urlencode(event_id));
         self.client.get(&path).await
     }
 
-    /// Get similar events
+    /// Get events similar to the given one.
+    ///
+    /// `GET /events/{eventId}/similar`. No authentication required.
     pub async fn get_similar_events(&self, event_id: &str) -> Result<Vec<models::PublicUpcomingEvent>, ApiError> {
         let path = format!("/events/{}/similar", urlencode(event_id));
         self.client.get(&path).await
@@ -58,26 +116,35 @@ impl EventsApi {
 
     /// Get the live stream URL for an active event.
     ///
-    /// Returns the active broadcast URL (`{ "redirect": "..." }`). The server
-    /// returns 400 when the event is not currently active.
+    /// `GET /events/{eventId}/live`. No authentication required. Returns the
+    /// active broadcast URL in [`models::Redirect::redirect`]. The server
+    /// responds `400` (surfaced as [`ApiError::Http`]) when the event is not
+    /// currently active, i.e. before its start time or after its end time.
     pub async fn get_event_live(&self, event_id: &str) -> Result<models::Redirect, ApiError> {
         let path = format!("/events/{}/live", urlencode(event_id));
         self.client.get(&path).await
     }
 
-    /// List events for a studio
+    /// List the events scheduled by a studio.
+    ///
+    /// `GET /studios/{studioId}/events`. Requires a bearer token.
     pub async fn list_studio_events(&self, studio_id: &str) -> Result<Vec<models::UpcomingEvent>, ApiError> {
         let path = format!("/studios/{}/events", urlencode(studio_id));
         self.client.get(&path).await
     }
 
-    /// Get a specific event for a studio
+    /// Get one of a studio's events.
+    ///
+    /// `GET /studios/{studioId}/events/{eventId}`. Requires a bearer token.
     pub async fn get_studio_event(&self, studio_id: &str, event_id: &str) -> Result<models::UpcomingEvent, ApiError> {
         let path = format!("/studios/{}/events/{}", urlencode(studio_id), urlencode(event_id));
         self.client.get(&path).await
     }
 
-    /// Create a new event for a studio
+    /// Create a new event for a studio.
+    ///
+    /// `POST /studios/{studioId}/events`. Requires a bearer token. Returns the
+    /// event as created by the server.
     pub async fn create_studio_event(
         &self,
         studio_id: &str,
@@ -87,7 +154,9 @@ impl EventsApi {
         self.client.post(&path, event).await
     }
 
-    /// Update an event for a studio
+    /// Update one of a studio's events.
+    ///
+    /// `PUT /studios/{studioId}/events/{eventId}`. Requires a bearer token.
     pub async fn update_studio_event(
         &self,
         studio_id: &str,
@@ -98,7 +167,9 @@ impl EventsApi {
         self.client.put(&path, event).await
     }
 
-    /// Delete an event for a studio
+    /// Delete one of a studio's events.
+    ///
+    /// `DELETE /studios/{studioId}/events/{eventId}`. Requires a bearer token.
     pub async fn delete_studio_event(&self, studio_id: &str, event_id: &str) -> Result<(), ApiError> {
         let path = format!("/studios/{}/events/{}", urlencode(studio_id), urlencode(event_id));
         self.client.delete(&path).await

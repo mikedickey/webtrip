@@ -1,9 +1,36 @@
-//! Billing API endpoints
+//! Stripe billing, plan pricing, coupon redemption, and usage.
 //!
-//! Stripe-backed billing. Plan changes (upgrade/downgrade/cancel/reactivate)
-//! happen via the Stripe-hosted billing portal, so this module exposes the
-//! billing-info lookup, plan-pricing lookup, portal/checkout redirect surfaces,
-//! coupon redemption, and studio usage.
+//! Reached through [`ApiClient::billing`]. Every endpoint requires
+//! authentication. Plan changes (upgrade, downgrade, cancel, reactivate) are
+//! not API calls: they happen in the Stripe-hosted billing portal, so this
+//! module only looks up billing state and prices and hands out portal/checkout
+//! redirect URLs. Studio *memberships* are a separate concept; see
+//! [`subscriptions`](super::subscriptions).
+//!
+//! ```rust,no_run
+//! use webtrip_api::{api::{ApiClient, ApiError}, models::CheckoutRequest};
+//!
+//! # async fn run(client: &ApiClient) -> Result<(), ApiError> {
+//! let request = CheckoutRequest {
+//!     plan: "pro".to_string(),
+//!     callback_url: "https://app.example.com/done".to_string(),
+//!     pricing_mode: Some("yearly".to_string()),
+//!     ..Default::default()
+//! };
+//! let checkout = client.billing().create_checkout("user123", &request).await?;
+//! // Send the user to `checkout.redirect`.
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ```js
+//! const { redirect } = await client.billing().createCheckout('user123', {
+//!   plan: 'pro',
+//!   pricingMode: 'yearly',
+//!   callbackURL: 'https://app.example.com/done',
+//! });
+//! window.location.href = redirect;
+//! ```
 
 use super::{ApiClient, ApiError, urlencode};
 use crate::models;
@@ -58,6 +85,10 @@ impl BillingApi {
 
     /// Create a Stripe billing-portal session and return its redirect URL
     /// (`POST /users/{userId}/billing`).
+    ///
+    /// Same path as [`get_billing`](Self::get_billing) but `POST`. Redirect the
+    /// user to the returned URL; Stripe sends them back to the request's
+    /// `callback_url` when they leave the portal.
     pub async fn get_portal(
         &self,
         user_id: &str,
@@ -69,6 +100,9 @@ impl BillingApi {
 
     /// Create a Stripe checkout session and return its redirect URL
     /// (`POST /users/{userId}/checkout`).
+    ///
+    /// `plan` and `callback_url` are required; the user returns to
+    /// `callback_url` once checkout completes.
     pub async fn create_checkout(
         &self,
         user_id: &str,
@@ -364,7 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bearer_token_sent_on_billing_request() {
-        let (mut server, mut client) = mock_api().await;
+        let (mut server, client) = mock_api().await;
         client.set_bearer_token("secret-token".to_string());
         let mock = server
             .mock("GET", "/users/u1/billing")

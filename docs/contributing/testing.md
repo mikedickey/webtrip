@@ -103,7 +103,7 @@ tests assert on the input list and only validate outputs when present.
 test binary**. To avoid duplicating it across modules (DRY, per AGENTS.md):
 
 - **Library unit-test binary** (everything under `src/`): the single invocation
-  lives in [`crates/web/src/test_support.rs`](../crates/web/src/test_support.rs). Individual modules
+  lives in [`crates/web/src/test_support.rs`](../../crates/web/src/test_support.rs). Individual modules
   (`ring_buffer`, `webrtc`, future `engine`, …) only `use
   wasm_bindgen_test::wasm_bindgen_test;` and add `#[wasm_bindgen_test]`
   functions — they must **not** repeat the configure call. `test_support` also
@@ -342,7 +342,7 @@ the LLVM tools on `PATH` (`brew install llvm`); see [Local setup](#local-setup-m
 CI runs everything inside the toolchain container, which already has the tools
 below. On a local macOS checkout, `npm run test:wasm` and `npm run coverage:wasm`
 need three things the system doesn't provide by default. Both scripts route
-through [`scripts/wasm-browser-env.sh`](../scripts/wasm-browser-env.sh), which
+through [`scripts/wasm-browser-env.sh`](../../scripts/wasm-browser-env.sh), which
 auto-configures what it can and otherwise **fails fast with the exact fix** — so
 in practice you only act when it tells you to. The wrapper is a no-op in CI (the
 container already satisfies every check). What it handles:
