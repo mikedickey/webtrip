@@ -60,27 +60,30 @@ function loadMermaid() {
 export default function Mermaid({ chart }: { chart: string }) {
   // useId() contains colons, which aren't valid in the id Mermaid gives the SVG.
   const id = `mermaid-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
-  const [svg, setSvg] = useState<string>();
-  const [failed, setFailed] = useState(false);
+  // The outcome is tagged with the chart it belongs to, so when React reuses
+  // this instance for a different chart (DocPage stays mounted across docs),
+  // neither the old SVG nor an old failure outlives its chart.
+  const [result, setResult] = useState<{ chart: string; svg?: string }>();
 
   useEffect(() => {
     let cancelled = false;
     loadMermaid()
       .then((mermaid) => mermaid.render(id, chart))
       .then(({ svg }) => {
-        if (!cancelled) setSvg(svg);
+        if (!cancelled) setResult({ chart, svg });
       })
       .catch((err) => {
         console.warn("Mermaid diagram failed to render", err);
-        if (!cancelled) setFailed(true);
+        if (!cancelled) setResult({ chart });
       });
     return () => {
       cancelled = true;
     };
   }, [id, chart]);
 
-  // Until it renders (or if it can't), show the diagram source.
-  if (!svg || failed) {
+  // Until this chart renders (or if it can't), show the diagram source.
+  const svg = result?.chart === chart ? result.svg : undefined;
+  if (!svg) {
     return (
       <pre>
         <code>{chart}</code>
