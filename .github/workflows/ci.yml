@@ -74,15 +74,17 @@ jobs:
             ${{ env.IMAGE }}:latest
 
   # ──────────────────────────────────────────────────────────────────────────
-  # Build WASM + TypeScript inside the build container.
+  # Check, build and coverage run as parallel jobs in the build container. They
+  # share almost no compiled output (native vs release wasm vs instrumented), so
+  # one job would only serialize them; cargo already uses every core of a runner.
   # ──────────────────────────────────────────────────────────────────────────
-  build:
-    name: Build
+  check:
+    name: Check + docs
     needs: container
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    container:
+    container: &builder
       image: ${{ needs.container.outputs.image }}
       credentials:
         username: ${{ github.actor }}
@@ -94,9 +96,19 @@ jobs:
       - run: npm run check:core
       # Rustdoc with -D warnings: broken intra-doc links fail CI before docs.rs sees them.
       - run: npm run doc
+
+  build:
+    name: Build
+    needs: container
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container: *builder
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - run: npm ci
       - run: npm run build
-      # The production-image job COPYs these; upload now, before the coverage
-      # runs below rebuild pkg/ with instrumentation.
+      # The production-image job COPYs these.
       - name: Upload site artifacts for the production image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -105,18 +117,34 @@ jobs:
           path: |
             pkg/
             website/dist/
-      # Each coverage run also *runs* the corresponding test suite, so it doubles
-      # as the test gate — no separate `npm run test` / `npm run test:wasm` step.
-      - run: npm run coverage        # native tests   → coverage/lcov.info
-      - run: npm run coverage:wasm   # browser tests  → coverage/lcov.wasm.info
-      # Upload both reports; Codecov unions them by file:line, so a line covered
-      # by either the native or the WASM run counts as covered. Together they
-      # span the whole Rust surface, including #[cfg(target_arch = "wasm32")]
-      # code that the native build compiles out.
+
+  # Each coverage run also *runs* the corresponding test suite, so it doubles
+  # as the test gate — no separate `npm run test` / `npm run test:wasm` step.
+  # Both upload under the `unit` flag; Codecov unions them by file:line, so a
+  # line covered by either the native or the WASM run counts as covered.
+  # Together they span the whole Rust surface, including
+  # #[cfg(target_arch = "wasm32")] code that the native build compiles out.
+  coverage:
+    name: Coverage (${{ matrix.suite.name }})
+    needs: container
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container: *builder
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - { name: native, script: coverage,      report: coverage/lcov.info }
+          - { name: wasm,   script: "coverage:wasm", report: coverage/lcov.wasm.info }
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - run: npm ci
+      - run: npm run ${{ matrix.suite.script }}
       - uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: coverage/lcov.info,coverage/lcov.wasm.info
+          files: ${{ matrix.suite.report }}
           flags: unit
           fail_ci_if_error: true
 
@@ -256,12 +284,12 @@ jobs:
 
   # ──────────────────────────────────────────────────────────────────────────
   # Build the production image (containers/webtrip: node static server + the
-  # site artifacts built by the build job) and push it to GHCR — only on main,
-  # and only after the test gates pass.
+  # site artifacts built by the build job) and push it to GHCR — only on pushes
+  # to main (never PRs), and only after every check and test job passes.
   # ──────────────────────────────────────────────────────────────────────────
   webtrip-image:
     name: Production image
-    needs: [build, integration]
+    needs: [check, build, coverage, integration]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
