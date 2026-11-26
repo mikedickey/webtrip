@@ -36,13 +36,11 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      # Files that, when changed, require a new container image.
+      # Tag = hash of the files that, when changed, require a new container image.
       - name: Compute container fingerprint
         id: fingerprint
         run: |
-          tag=sha-$(cat containers/builder/Containerfile Cargo.toml crates/*/Cargo.toml Cargo.lock package.json \
-                    website/package.json website/package-lock.json \
-                    | sha256sum | cut -c1-16)
+          tag=$(scripts/container-fingerprint.sh)
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "ref=${{ env.IMAGE }}:$tag" >> "$GITHUB_OUTPUT"
 

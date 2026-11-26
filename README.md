@@ -14,7 +14,8 @@ WebTrip is inspired by the popular open-source [JackTrip project](https://github
   [channel model](docs/channel-model.md), [browser support](docs/browser-support.md)
 - **[docs.rs/webtrip](https://docs.rs/webtrip)** — API reference for every crate
 - **[docs/contributing/](docs/contributing/)** — [toolchain](docs/contributing/toolchain.md),
-  [testing](docs/contributing/testing.md), [containers](docs/contributing/containers.md)
+  [testing](docs/contributing/testing.md), [containers](docs/contributing/containers.md),
+  [releasing](docs/contributing/releasing.md)
 
 ## Crates
 
