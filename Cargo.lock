@@ -1896,7 +1896,7 @@ dependencies = [
 
 [[package]]
 name = "webtrip"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "webtrip-api",
  "webtrip-core",
@@ -1905,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "webtrip-api"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "mockito",
  "reqwest",
@@ -1922,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "webtrip-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "log",
  "rubato",
@@ -1932,7 +1932,7 @@ dependencies = [
 
 [[package]]
 name = "webtrip-web"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
