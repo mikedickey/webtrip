@@ -108,22 +108,6 @@ fn build_connection_url(server: &str, port: u16, client_name: &str) -> String {
     }
 }
 
-/// Compute the absolute URL of the WASM module (`pkg/webtrip.js`) from the
-/// current page's `origin` and `pathname`.
-///
-/// The worker imports the WASM glue from a `blob:` context where relative paths
-/// don't resolve, so we resolve it against the directory of the current page
-/// (everything up to and including the last `/` in `pathname`). Extracted as a
-/// pure function so the path math can be tested without a browser.
-fn wasm_module_url(origin: &str, pathname: &str) -> String {
-    let base_path = if let Some(last_slash) = pathname.rfind('/') {
-        &pathname[..=last_slash]
-    } else {
-        "/"
-    };
-    format!("{}{}pkg/webtrip.js", origin, base_path)
-}
-
 /// Assemble a human-readable error string from a worker `ErrorEvent`.
 ///
 /// `ErrorEvent` properties may be undefined, null, empty, or (for a synthetic
@@ -176,8 +160,8 @@ fn assemble_error_event_message(event: &JsValue) -> String {
 /// configuration.
 ///
 /// Carries only the data that can be represented as plain JSON (the message
-/// type plus buffer pointers and audio config). The browser-only fields
-/// (`wasmMemory`, `wasmUrl`) are attached separately in [`WebTransportImpl::init_worker`].
+/// type plus buffer pointers and audio config). The browser-only field
+/// (`wasmMemory`) is attached separately in [`WebTransportImpl::init_worker`].
 /// Pointer/config values are stored as `f64` to match the numeric type the
 /// worker reads on the JS side. Extracted so field presence and values can be
 /// asserted natively without constructing a real `Worker`.
@@ -436,11 +420,9 @@ impl WebTransportImpl {
     /// Assemble the `init` message that gets posted to the worker.
     ///
     /// Merges the plain-JSON buffer config (from [`build_worker_init_message`])
-    /// with the two browser-only fields that can't be represented in JSON:
-    /// `wasmMemory` (for SharedArrayBuffer access) and `wasmUrl` (the absolute
-    /// URL the blob: worker imports the WASM glue from). Split out from
-    /// [`init_worker`] so the assembled message — including those two
-    /// browser-only fields — can be inspected in tests without posting to (or
+    /// with the browser-only `wasmMemory` field (for SharedArrayBuffer access),
+    /// which can't be represented in JSON. Split out from [`init_worker`] so
+    /// the assembled message — including that field — can be inspected in tests without posting to (or
     /// even creating) a real worker.
     fn build_init_message(&self) -> Result<Object, JsValue> {
         let buffers = self.audio_buffers.ok_or("Audio buffers not configured")?;
@@ -455,19 +437,10 @@ impl WebTransportImpl {
             .map_err(|e| JsValue::from_str(&format!("Failed to serialize init message: {e}")))?
             .unchecked_into();
 
-        // Browser-only fields that can't be represented in plain JSON:
-
-        // Pass WASM memory for SharedArrayBuffer access.
+        // Browser-only field that can't be represented in plain JSON: the WASM
+        // memory, for SharedArrayBuffer access. (The worker finds the glue via
+        // the `import.meta.url` header `dependent_module!` prepends.)
         Reflect::set(&msg, &"wasmMemory".into(), &wasm_bindgen::memory())?;
-
-        // Pass the absolute URL to the WASM module (needed for import from blob: worker context).
-        // Construct it relative to the current page location.
-        let window = web_sys::window().ok_or("No window")?;
-        let location = window.location();
-        let origin = location.origin().map_err(|_| "Failed to get origin")?;
-        let pathname = location.pathname().map_err(|_| "Failed to get pathname")?;
-        let wasm_url = wasm_module_url(&origin, &pathname);
-        Reflect::set(&msg, &"wasmUrl".into(), &JsValue::from_str(&wasm_url))?;
 
         Ok(msg)
     }
@@ -827,12 +800,11 @@ mod tests {
         teardown_worker(&transport);
     }
 
-    /// The init message that `init_worker()` posts must carry the two
-    /// browser-only fields layered on top of the plain-JSON buffer config:
-    /// `wasmMemory` (the module's `WebAssembly.Memory`) and `wasmUrl` (resolving
-    /// to the bindgen glue). Asserting the assembled message directly via
-    /// [`WebTransportImpl::build_init_message`] catches a typo in either
-    /// `Reflect::set` key — which a no-panic-only smoke test would miss — and
+    /// The init message that `init_worker()` posts must carry the
+    /// browser-only `wasmMemory` field (the module's `WebAssembly.Memory`)
+    /// layered on top of the plain-JSON buffer config. Asserting the assembled
+    /// message directly via [`WebTransportImpl::build_init_message`] catches a
+    /// typo in the `Reflect::set` key — which a no-panic-only smoke test would miss — and
     /// avoids posting to (or creating) a real worker, so no buffer pointers are
     /// ever dereferenced. The plain-JSON fields themselves are covered natively
     /// by `worker_init_message_has_expected_fields`.
@@ -862,21 +834,11 @@ mod tests {
             Some("init")
         );
 
-        // Browser-only field 1: wasmMemory must be the module's WebAssembly.Memory.
+        // Browser-only field: wasmMemory must be the module's WebAssembly.Memory.
         let wasm_memory = Reflect::get(&msg, &"wasmMemory".into()).unwrap();
         assert!(
             wasm_memory.is_instance_of::<js_sys::WebAssembly::Memory>(),
             "wasmMemory must be a WebAssembly.Memory instance"
-        );
-
-        // Browser-only field 2: wasmUrl must resolve to the bindgen glue module.
-        let wasm_url = Reflect::get(&msg, &"wasmUrl".into())
-            .unwrap()
-            .as_string()
-            .unwrap_or_default();
-        assert!(
-            wasm_url.ends_with("pkg/webtrip.js"),
-            "wasmUrl must point at the bindgen glue, got: {wasm_url}"
         );
     }
 
@@ -1273,25 +1235,6 @@ mod tests {
         assert_eq!(
             build_connection_url("hub.example.com", 4464, "Alice & Bob"),
             "https://hub.example.com:4464/webtransport?name=Alice%20%26%20Bob"
-        );
-    }
-
-    // --- wasm_module_url ---
-
-    #[test]
-    fn wasm_module_url_with_directory_path() {
-        assert_eq!(
-            wasm_module_url("https://example.com", "/app/index.html"),
-            "https://example.com/app/pkg/webtrip.js"
-        );
-    }
-
-    #[test]
-    fn wasm_module_url_without_slash_uses_root() {
-        // Defensive: a pathname with no slash falls back to "/".
-        assert_eq!(
-            wasm_module_url("https://example.com", "index.html"),
-            "https://example.com/pkg/webtrip.js"
         );
     }
 

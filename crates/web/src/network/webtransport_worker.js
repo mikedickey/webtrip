@@ -9,12 +9,12 @@
 
 let wasm = null;
 
-// Initialize WASM module with shared memory
-// wasmUrl is passed from main thread as an absolute URL
-async function initWasm(wasmUrl, memory) {
-    const wasmModule = await import(wasmUrl);
-    await wasmModule.default(undefined, memory);
-    wasm = wasmModule;
+// Initialize WASM module with shared memory. `init` and `bindgen` come from the
+// header `dependent_module!` prepends, which imports the bindgen glue from its
+// own `import.meta.url` — so this works wherever the glue is served from.
+async function initWasm(memory) {
+    await init({ memory });
+    wasm = bindgen;
     return wasm;
 }
 
@@ -25,7 +25,7 @@ self.onmessage = async (event) => {
         
         // Special handling for init message - must load WASM first
         if (msg.type === 'init') {
-            await initWasm(msg.wasmUrl, msg.wasmMemory);
+            await initWasm(msg.wasmMemory);
         }
         
         // Forward to Rust message handler (all logic is in Rust)

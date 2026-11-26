@@ -6,8 +6,8 @@ audio in a web page.
 This crate wires [`webtrip-core`](https://docs.rs/webtrip-core) to browser APIs: an
 AudioWorklet audio engine, WebRTC data-channel and WebTransport (QUIC datagram)
 transports, and hub signaling. [`WebTripSession`](session::WebTripSession) composes
-them. It is built with wasm-pack into the JavaScript package that the
-[demo](https://webtrip.dev/demo) uses.
+them. It is built with wasm-pack into the [`webtrip`](https://www.npmjs.com/package/webtrip)
+npm package, which the [demo](https://webtrip.dev/demo) also uses.
 
 It only builds for `wasm32-unknown-unknown`, with threads enabled
 (`-Ctarget-feature=+atomics`, shared memory, `-Zbuild-std`) and
@@ -16,8 +16,14 @@ It only builds for `wasm32-unknown-unknown`, with threads enabled
 
 ## Using it from JavaScript
 
+```bash
+npm install webtrip
+```
+
 ```js
-const webtrip = await import("/pkg/webtrip.js");
+// A dynamic import keeps the package in its own chunk, which its AudioWorklet
+// and worker re-import by URL. See getting started for bundler notes.
+const webtrip = await import("webtrip");
 await webtrip.default();
 webtrip.init();
 

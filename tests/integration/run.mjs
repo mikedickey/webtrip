@@ -1,10 +1,9 @@
 // Integration test harness: drive the real WASM client against a live JackTrip
 // server, for BOTH the WebRTC and WebTransport transports.
 //
-// Why a served-app + browser-driver harness (not `wasm-bindgen-test`): the
-// WebTransport worker loads the wasm module from `{origin}/pkg/webtrip.js`
-// (see `crates/web/src/network/webtransport.rs::wasm_module_url`), which only resolves when
-// the page is served at the site root with `pkg/` present. So we serve the real
+// Why a served-app + browser-driver harness (not `wasm-bindgen-test`): these
+// exercise the shipped `pkg/` build exactly as a page loads it, against a live
+// server, rather than a test binary. So we serve the real
 // app via `website/server.js`, point a headless browser at it, and run each transport
 // through the actual exported session API
 // (`createAudioParams` → `WebTripSession` → `connect`).
