@@ -102,6 +102,7 @@ This applies equally to test helpers, serialization utilities, fixture builders,
 - `npm run check:core` — Native `cargo check` of `webtrip-core`, `webtrip-api` and `webtrip` with no features; enforces that they never reach `web-sys`/`js-sys`
 - `npm run check` — Run `cargo check` with correct RUSTFLAGS and WASM target
 - `npm run test` — Run `cargo test` with correct RUSTFLAGS (runs native, not WASM)
+- `npm run publish:crates` — `cargo publish --workspace` on the wasm target with the threading flags; the release workflow runs it on tag push (see [docs/contributing/releasing.md](docs/contributing/releasing.md)). Append `-- --dry-run` to package and verify without uploading
 - `npm run doc` — Build rustdoc for every crate with `-D warnings` (`doc:core` natively for core/api, `doc:web` on the wasm target for web and the `webtrip` facade); CI runs it so broken intra-doc links fail before docs.rs
 - `npm run test:wasm` — Run `wasm-bindgen-test` for browser-only modules (see [docs/contributing/testing.md](docs/contributing/testing.md) for details)
 

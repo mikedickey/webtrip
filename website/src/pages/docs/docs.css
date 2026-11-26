@@ -81,7 +81,8 @@
 .prose ol,
 .prose pre,
 .prose blockquote,
-.prose .docs-table {
+.prose .docs-table,
+.prose .docs-mermaid {
   margin: 0 0 16px;
 }
 
@@ -215,4 +216,18 @@
   .docs-nav a.active {
     border-bottom-color: var(--accent);
   }
+}
+
+.docs-mermaid {
+  padding: 16px;
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  overflow-x: auto;
+}
+
+.docs-mermaid svg {
+  display: block;
+  margin: 0 auto;
+  height: auto;
 }

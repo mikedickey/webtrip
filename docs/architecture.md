@@ -24,61 +24,27 @@ This document explains the architecture of WebTrip, including how we work around
 
 WebTrip uses a multi-threaded architecture with WebAssembly for high-performance audio processing:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Main Thread (TypeScript)                     │
-│                   website/src (React demo UI)                    │
-│                                                                   │
-│  • UI rendering and interaction                                  │
-│  • Device selection and configuration                            │
-│  • Volume meter visualization                                    │
-│  • WebRTC signaling and data channel management                 │
-│  • Communicates with WASM via JavaScript bindings               │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                 WASM Layer (Rust - Main Thread)                  │
-│              webtrip-web: lib.rs, session.rs                    │
-│                                                                   │
-│  WebTripSession (High-level orchestrator)                        │
-│    • Audio (startAudio/stopAudio) and network                    │
-│      (connectNetwork/disconnectNetwork) run independently        │
-│    • Each Connection owns its transport and stream buffers       │
-│      (RingBuffer + Regulator), retired when it ends              │
-│    • TickClock ticks a WebRTC transport                          │
-│                                                                   │
-│  AudioEngine (Audio system manager)                              │
-│    • Manages Web Audio API AudioContext                          │
-│    • Handles device enumeration (MediaDevices API)               │
-│    • Creates and connects audio nodes                            │
-│    • Wraps AudioProcessor in AudioWorkletNode                    │
-│                                                                   │
-│  AudioParams (Shared state)                                      │
-│    • Lock-free atomic values for thread-safe communication       │
-│    • Volumes, gains, dB levels, peak tracking                    │
-│    • Shared between main thread and audio worklet thread         │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│            Audio Worklet Thread (JavaScript + WASM)              │
-│                  webtrip-web: audio/worklet.js (bridge)         │
-│                  webtrip-core: audio/processor.rs (core)        │
-│                                                                   │
-│  WasmAudioProcessor (JS bridge)                                  │
-│    • AudioWorkletProcessor implementation                        │
-│    • Calls into WASM for each audio buffer                       │
-│    • Bridges Web Audio API and Rust audio processing            │
-│                                                                   │
-│  AudioProcessor (Rust DSP engine)                                │
-│    • Real-time audio processing on 128-sample buffers            │
-│    • Writes captured audio to ring buffer                        │
-│    • Reads remote audio from the Regulator (jitter buffer)       │
-│    • Volume metering (RMS → dB conversion)                       │
-│    • Peak level tracking with hold and decay                     │
-│    • Input gain control and output mixing                        │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph TS["Main thread: TypeScript (website/src, React demo UI)"]
+        UI["UI rendering and interaction<br/>Device selection and configuration<br/>Volume meter visualization<br/>WebRTC signaling and data channels<br/>Calls WASM via JavaScript bindings"]
+    end
+    subgraph WASM["Main thread: Rust/WASM (webtrip-web: lib.rs, session.rs)"]
+        SESSION["<b>WebTripSession</b><br/>high-level orchestrator<br/>Audio (startAudio/stopAudio)<br/>and network (connectNetwork/<br/>disconnectNetwork) run<br/>independently<br/>Each Connection owns its<br/>transport and stream buffers<br/>(RingBuffer + Regulator),<br/>retired when it ends<br/>TickClock ticks a WebRTC<br/>transport"]
+        ENGINE["<b>AudioEngine</b><br/>audio system manager<br/>Manages the Web Audio<br/>AudioContext<br/>Device enumeration<br/>(MediaDevices API)<br/>Creates and connects<br/>audio nodes<br/>Wraps AudioProcessor in<br/>an AudioWorkletNode"]
+        PARAMS["<b>AudioParams</b><br/>shared state<br/>Lock-free atomic values<br/>for thread-safe<br/>communication<br/>Volumes, gains, dB levels,<br/>peak tracking<br/>Shared between main thread<br/>and audio worklet thread"]
+    end
+    subgraph AW["AudioWorklet thread: JavaScript + WASM"]
+        BRIDGE["<b>WasmAudioProcessor</b><br/>JS bridge (webtrip-web:<br/>audio/worklet.js)<br/>AudioWorkletProcessor<br/>implementation<br/>Calls into WASM for<br/>each audio buffer<br/>Bridges the Web Audio API<br/>and Rust audio processing"]
+        PROC["<b>AudioProcessor</b><br/>Rust DSP engine (webtrip-core:<br/>audio/processor.rs)<br/>Real-time processing on<br/>128-sample buffers<br/>Writes captured audio to<br/>the ring buffer<br/>Reads remote audio from the<br/>Regulator (jitter buffer)<br/>Volume metering (RMS → dB)<br/>Peak tracking with hold<br/>and decay<br/>Input gain, output mixing"]
+    end
+    UI -->|JS bindings| SESSION
+    UI --> ENGINE
+    UI -->|volumes, meters| PARAMS
+    SESSION -->|stream buffers| PROC
+    ENGINE -->|creates node| BRIDGE
+    BRIDGE --> PROC
+    PARAMS <-->|atomics| PROC
 ```
 
 ### Component Summary
@@ -131,27 +97,14 @@ The following sections explain the constraints imposed by browser APIs and how w
 
 The browser provides multiple execution contexts with strict boundaries:
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Main Browser Thread                       │
-│  - All WebRTC APIs (RTCPeerConnection, RTCDataChannel)      │
-│  - DOM manipulation                                          │
-│  - WebSocket, fetch, all network APIs                       │
-│  - JavaScript execution                                      │
-│  - WebAssembly module instantiation                          │
-└─────────────────────────────────────────────────────────────┘
-                            │
-                            │ MessagePort (limited)
-                            │
-┌─────────────────────────────────────────────────────────────┐
-│                   AudioWorklet Thread                        │
-│  - Real-time audio processing (process() callback)          │
-│  - Runs at audio sample rate (~128 samples every 2.67ms)   │
-│  - CANNOT access: WebRTC, DOM, most browser APIs            │
-│  - CAN access: SharedArrayBuffer, atomics, AudioParams      │
-└─────────────────────────────────────────────────────────────┘
-
-        Both threads share WebAssembly linear memory
+```mermaid
+flowchart TB
+    MAIN["<b>Main browser thread</b><br/>All WebRTC APIs<br/>(RTCPeerConnection, RTCDataChannel)<br/>DOM manipulation<br/>WebSocket, fetch, all network APIs<br/>JavaScript execution<br/>WebAssembly module instantiation"]
+    WORKLET["<b>AudioWorklet thread</b><br/>Real-time audio processing<br/>(process() callback)<br/>Runs at the audio sample rate<br/>(~128 samples every 2.67ms)<br/>CANNOT access: WebRTC, DOM,<br/>most browser APIs<br/>CAN access: SharedArrayBuffer,<br/>atomics, AudioParams"]
+    MEM[("Shared WebAssembly<br/>linear memory")]
+    MAIN <-->|"MessagePort (limited)"| WORKLET
+    MAIN --- MEM
+    WORKLET --- MEM
 ```
 
 ---
@@ -336,53 +289,37 @@ The pure choice is `tick_kind(audio_running, connection_needs_tick, atomics_avai
 
 ### Send Path: Microphone → Network
 
-```
-Audio Device                AudioWorklet Thread              Main Thread / Worker
-    │                              │                             │
-    │ ① PCM samples                │                             │
-    ├──────────────────────────────>                             │
-    │                              │                             │
-    │                        ② Apply gain, meter                 │
-    │                        ③ Conform to wire width;            │
-    │                          resample to the wire rate         │
-    │                          if the device rate differs        │
-    │                          (SimpleMixer)                     │
-    │                              │                             │
-    │                        ④ ring_buffer.write()               │
-    │                              │    (shared memory)          │
-    │                              │ ────────────────────────>   │
-    │                              │                             │
-    │                              │              ⑤ tick() (WebRTC) or
-    │                              │                send_loop (WebTransport)
-    │                              │                reads one packet's worth
-    │                              │                             │
-    │                              │              ⑥ Serialize and send
-    │                              │                             ├─> Internet
+```mermaid
+sequenceDiagram
+    participant DEV as Audio device
+    participant AW as AudioWorklet thread
+    participant NET as Main thread / Worker
+    participant INET as Internet
+
+    DEV->>AW: ① PCM samples
+    Note over AW: ② Apply gain, meter
+    Note over AW: ③ Conform to wire width,<br/>resample to the wire rate<br/>if the device rate differs<br/>(SimpleMixer)
+    Note over AW: ④ ring_buffer.write()
+    AW-->>NET: RingBuffer<br/>(shared memory)
+    Note over NET: ⑤ tick() (WebRTC) or<br/>send_loop (WebTransport)<br/>reads one packet's worth
+    NET->>INET: ⑥ Serialize and send
 ```
 
 ### Receive Path: Network → Speakers
 
-```
-Internet                 Main Thread / Worker           AudioWorklet Thread        Audio Device
-    │                              │                             │                    │
-    ├────> ⑦ Receive packet        │                             │                    │
-    │                              │                             │                    │
-    │      ⑧ deliver_received_packet → regulator.push_at()       │                    │
-    │        (adopts the peer's channels and fpp                 │                    │
-    │         from its first packet)                             │                    │
-    │                              │      (shared memory)        │                    │
-    │                              │ <───────────────────────────│                    │
-    │                              │                             │                    │
-    │                              │        ⑨ regulator.pop_frames_at()               │
-    │                              │          (exactly the wire frames this           │
-    │                              │           callback spans; conceals losses)       │
-    │                              │                             │                    │
-    │                              │        ⑩ Resample to the device rate             │
-    │                              │          (if it differs), map to the             │
-    │                              │          output's channels, mix with             │
-    │                              │          monitor, apply output volume            │
-    │                              │                             │  ⑪ PCM samples    │
-    │                              │                             ├───────────────────>│
+```mermaid
+sequenceDiagram
+    participant INET as Internet
+    participant NET as Main thread / Worker
+    participant AW as AudioWorklet thread
+    participant DEV as Audio device
+
+    INET->>NET: ⑦ Receive packet
+    Note over NET: ⑧ deliver_received_packet<br/>→ regulator.push_at()<br/>(adopts the peer's channels<br/>and fpp from its first packet)
+    NET-->>AW: Regulator<br/>(shared memory)
+    Note over AW: ⑨ regulator.pop_frames_at()<br/>(exactly the wire frames this<br/>callback spans, conceals losses)
+    Note over AW: ⑩ Resample to the device<br/>rate (if it differs), map to<br/>the output's channels, mix<br/>with monitor, apply output<br/>volume
+    AW->>DEV: ⑪ PCM samples
 ```
 
 ### Key Points
@@ -399,13 +336,14 @@ Internet                 Main Thread / Worker           AudioWorklet Thread     
 
 WebTrip supports two transport mechanisms for streaming audio packets: **WebRTC Data Channels** (main thread) and **WebTransport** (dedicated worker thread). Both share the same buffer infrastructure but differ in their threading model and browser support.
 
-### WebRTC Transport (Default)
+### WebRTC Transport
 
 The WebRTC transport runs on the main thread using RTCDataChannel:
 
-```
-AudioWorklet → RingBuffer → Main Thread tick() → RTCDataChannel → Network
-Network → RTCDataChannel → Main Thread tick() → Regulator → AudioWorklet
+```mermaid
+flowchart TB
+    W1[AudioWorklet] -->|send| RB[RingBuffer] --> T1["Main thread tick()"] --> DC1[RTCDataChannel] --> N1[Network]
+    N2[Network] -->|receive| DC2[RTCDataChannel] --> T2["Main thread tick()"] --> REG[Regulator] --> W2[AudioWorklet]
 ```
 
 **Pros:**
@@ -422,34 +360,13 @@ Network → RTCDataChannel → Main Thread tick() → Regulator → AudioWorklet
 
 The WebTransport transport offloads network I/O to a dedicated Web Worker:
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│ Main Thread (Rust/WASM)                                     │
-│  ├─ session.rs: Selects WebTransport transport              │
-│  ├─ webtransport.rs: Creates Worker, sends messages         │
-│  └─ Creates SharedArrayBuffer for RingBuffer & Regulator    │
-└─────────────────────────────────────────────────────────────┘
-                           │
-                           │ postMessage({ type: 'init', ... })
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Worker Thread (minimal JS bootstrap)                        │
-│  webtrip-web: network/webtransport_worker.js (~40 lines, bundled)│
-│    1. Loads WASM module via dependent_module! macro         │
-│    2. Initializes with shared memory from main thread       │
-│    3. Forwards all messages to Rust handler                 │
-└─────────────────────────────────────────────────────────────┘
-                           │
-                           │ handleWorkerMessage(msg)
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Worker Thread (Rust/WASM)                                   │
-│  webtransport_worker.rs (100% Rust logic)                   │
-│    ├─ worker_connect(): Establish WebTransport session      │
-│    ├─ send_loop(): Read RingBuffer → QUIC datagrams         │
-│    ├─ receive_loop(): QUIC datagrams → Regulator            │
-│    └─ worker_disconnect(): Clean shutdown                   │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    MAIN["<b>Main thread (Rust/WASM)</b><br/>session.rs: selects the WebTransport transport<br/>webtransport.rs: creates the Worker, sends messages<br/>Creates SharedArrayBuffer for RingBuffer and Regulator"]
+    BOOT["<b>Worker thread (minimal JS bootstrap)</b><br/>webtrip-web: network/webtransport_worker.js<br/>(~40 lines, bundled)<br/>1. Loads the WASM module via dependent_module!<br/>2. Initializes with shared memory from the main thread<br/>3. Forwards all messages to the Rust handler"]
+    RUST["<b>Worker thread (Rust/WASM)</b><br/>webtransport_worker.rs (100% Rust logic)<br/>worker_connect(): establish the WebTransport session<br/>send_loop(): read RingBuffer → QUIC datagrams<br/>receive_loop(): QUIC datagrams → Regulator<br/>worker_disconnect(): clean shutdown"]
+    MAIN -->|"postMessage({ type: 'init', ... })"| BOOT
+    BOOT -->|"handleWorkerMessage(msg)"| RUST
 ```
 
 **Pros:**

@@ -13,6 +13,7 @@
     "build:container:webtrip": "docker build -t webtrip/webtrip -f containers/webtrip/Containerfile .",
     "check:core": "cargo check -p webtrip-core -p webtrip-api -p webtrip --no-default-features",
     "check": "RUSTFLAGS=\"$npm_package_config_web_sys_cfg $npm_package_config_wasm_rustflags\" cargo check --target wasm32-unknown-unknown -Zbuild-std=std,panic_abort",
+    "publish:crates": "RUSTFLAGS=\"$npm_package_config_web_sys_cfg $npm_package_config_wasm_rustflags\" cargo publish --workspace --target wasm32-unknown-unknown -Zbuild-std=std,panic_abort",
     "doc": "npm run doc:core && npm run doc:web",
     "doc:core": "RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps -p webtrip-core -p webtrip-api",
     "doc:web": "RUSTFLAGS=\"$npm_package_config_web_sys_cfg $npm_package_config_wasm_rustflags\" RUSTDOCFLAGS=\"-D warnings $npm_package_config_web_sys_cfg\" cargo doc --no-deps -p webtrip-web -p webtrip --features webtrip/web --target wasm32-unknown-unknown -Zbuild-std=std,panic_abort",

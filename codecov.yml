@@ -2,7 +2,7 @@
 #
 # Coverage arrives from two CI sources, each tagged with a flag so Codecov keeps
 # them straight:
-#   - `unit`        — native + wasm-bindgen-test reports (build job), every push/PR.
+#   - `unit`        — native + wasm-bindgen-test reports (coverage jobs), every push/PR.
 #   - `integration` — live-JackTrip-server browser run (integration job). This job
 #                     needs the MIKED_TLS_* secrets, which GitHub withholds from
 #                     fork PRs, so it does NOT run on forks.
