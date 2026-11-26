@@ -383,7 +383,7 @@ flowchart TB
 **Why JavaScript Glue is Needed:**
 
 Web Workers must be created from a JavaScript file—browsers don't support loading WASM directly as workers. The JavaScript bootstrap:
-- Dynamically imports the WASM module: `import('./pkg/webtrip.js')`
+- Imports the WASM glue from its own `import.meta.url`, via the header `dependent_module!` prepends to the Blob
 - Initializes it with SharedArrayBuffer memory from the main thread
 - Forwards all messages to Rust's `handleWorkerMessage()` function
 

@@ -2,7 +2,7 @@ name: Release
 
 # Pushing a vX.Y.Z tag releases that commit: the production image main CI
 # already built for it gets version tags, then the crates go to crates.io
-# (which makes docs.rs build their docs). See docs/contributing/releasing.md.
+# (which makes docs.rs build their docs) and pkg/ goes to npm. See docs/contributing/releasing.md.
 on:
   push:
     tags: ['v*']
@@ -128,3 +128,35 @@ jobs:
       - run: npm run publish:crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Publish the wasm-pack output (pkg/) to npm as `webtrip`. Trusted
+  # publishing again (OIDC, no stored token), which also attaches provenance.
+  # It needs npm >= 11.5.1; the builder's Node 22 ships npm 10, hence the
+  # pinned npx. Pre-releases go to the `next` dist-tag so `latest` stays stable.
+  # ──────────────────────────────────────────────────────────────────────────
+  npm:
+    name: Publish npm package
+    needs: [verify, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    container:
+      image: ${{ needs.verify.outputs.builder }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - run: npm ci
+      - run: npm run build:wasm
+      - name: Publish
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          tag=latest
+          case "$VERSION" in *-*) tag=next ;; esac
+          npx --yes npm@11.6.2 publish ./pkg --tag "$tag"

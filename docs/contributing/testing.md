@@ -181,11 +181,9 @@ npm run test:integration:run   # inner-loop: skip the build, reuse existing pkg/
 
 ### How it works (served-app + browser driver)
 
-Unlike the unit tests, these do **not** use `wasm-bindgen-test`. The WebTransport
-worker loads the wasm module from `{origin}/pkg/webtrip.js`
-(`crates/web/src/network/webtransport.rs::wasm_module_url`), which only resolves when the page
-is served at the site root with `pkg/` present — something the
-`wasm-bindgen-test` harness origin does not do. So `tests/integration/run.mjs`:
+Unlike the unit tests, these do **not** use `wasm-bindgen-test`: they exercise the
+shipped `pkg/` build exactly as a page loads it, rather than a test binary. So
+`tests/integration/run.mjs`:
 
 1. serves the real app via `website/server.js` over plain HTTP on `localhost` (a secure
    context, so its COOP/COEP headers still yield `crossOriginIsolated` +
@@ -476,7 +474,7 @@ The test requires threading support. Either:
   a `web_sys::Worker` via the `dependent_module!` Blob-URL flow and registers the
   `onmessage`/`onerror` closures; `build_init_message` (the assembly behind
   `init_worker`) layers the browser-only `wasmMemory` (a `WebAssembly.Memory`)
-  and `wasmUrl` (the bindgen glue URL) onto the plain-JSON buffer config (live
+  onto the plain-JSON buffer config (live
   `connect()` needs an HTTP/3 server — skipped)
 - `crates/web/src/network/webtransport_worker.rs`: worker-side `#[wasm_bindgen]` entry points
   called directly — `worker_init`+`worker_get_stats` (zeroed stats prove init

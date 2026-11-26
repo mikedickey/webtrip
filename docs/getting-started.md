@@ -1,8 +1,32 @@
 # Getting Started
 
-WebTrip ships as a browser package (`pkg/`, produced by wasm-pack) and as a set of
-Rust crates. This page covers building from source, running the demo, and the
-shape of a minimal session in JavaScript.
+WebTrip ships as an npm package ([`webtrip`](https://www.npmjs.com/package/webtrip),
+the wasm-pack output in `pkg/`) and as a set of Rust crates. This page covers
+installing it, building from source, running the demo, and the shape of a minimal
+session in JavaScript.
+
+## Install from npm
+
+```bash
+npm install webtrip
+```
+
+The package includes TypeScript declarations. Two things to know about bundlers:
+
+- **Load it with a dynamic `import("webtrip")`.** The AudioWorklet and the
+  WebTransport worker import the package's JavaScript from its own URL and expect its
+  exports under their real names. A dynamic import keeps it as a separate chunk with
+  those names intact. A static import lets the bundler merge it into your app's chunk,
+  and audio fails to start.
+- **With Vite, exclude it from dependency pre-bundling** so the dev server serves it
+  next to its `.wasm` file:
+
+  ```js
+  // vite.config.js
+  export default { optimizeDeps: { exclude: ["webtrip"] } };
+  ```
+
+The page also has to meet the [hosting requirements](#hosting-requirements) below.
 
 ## Prerequisites
 
@@ -52,15 +76,14 @@ Cross-Origin-Opener-Policy: same-origin
 Cross-Origin-Embedder-Policy: require-corp
 ```
 
-`website/server.js` does this for the demo. Serve `pkg/` unbundled at a stable URL:
-the WebTransport worker re-imports `{origin}/pkg/webtrip.js` at runtime, so the page
-must load that same module rather than a bundler-hashed copy. See
-[browser support](browser-support.md) for the browser features WebTrip needs.
+`website/server.js` does this for the demo; with Vite, set the same headers under
+`server.headers` and `preview.headers`. See [browser support](browser-support.md) for
+the browser features WebTrip needs.
 
 ## A minimal session
 
 ```javascript
-const webtrip = await import("/pkg/webtrip.js");
+const webtrip = await import("webtrip");
 await webtrip.default(); // instantiate the WASM module (once per page)
 webtrip.init();          // install the panic hook
 

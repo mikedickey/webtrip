@@ -1,8 +1,8 @@
 // Runtime loader for the wasm-pack output (pkg/ at the repo root, served at
-// /pkg/). The module is deliberately NOT bundled by Vite: the WebTransport
-// worker re-imports the glue from `{origin}/pkg/webtrip.js` at runtime (see
-// src/audio/webtransport.rs::wasm_module_url), so the main thread must load
-// that same URL rather than a Vite-hashed copy. Routing the specifier through
+// /pkg/). The module is deliberately NOT bundled by Vite: the AudioWorklet and
+// WebTransport worker re-import the glue by its own `import.meta.url` (see
+// crates/web/src/dependent_module.rs) and need its real export names, and
+// loading the local build keeps the demo on the current source. Routing the specifier through
 // a variable keeps TypeScript and Vite from resolving it at build time; types
 // come from the wasm-pack-generated declarations instead.
 import type { DeviceInfo, WebTripSession } from "../../../pkg/webtrip";
