@@ -7,6 +7,7 @@ import rehypeHighlight from "rehype-highlight";
 import { DOCS } from "./content";
 import { resolveDocLink } from "./links";
 import NotFound from "../NotFound";
+import Mermaid from "./Mermaid";
 
 const components: Components = {
   a({ href = "", children, node: _node, ...rest }) {
@@ -30,6 +31,19 @@ const components: Components = {
         {children}
       </a>
     );
+  },
+  // Render ```mermaid fences as diagrams; every other fence stays a code block.
+  pre({ node, children, ...rest }) {
+    const code = node?.children[0];
+    if (
+      code?.type === "element" &&
+      code.tagName === "code" &&
+      (code.properties.className as string[] | undefined)?.includes("language-mermaid")
+    ) {
+      const source = code.children.map((c) => (c.type === "text" ? c.value : "")).join("");
+      return <Mermaid chart={source} />;
+    }
+    return <pre {...rest}>{children}</pre>;
   },
   // Scroll wide tables inside their own box instead of widening the page.
   table({ node: _node, ...props }) {
@@ -64,7 +78,7 @@ export default function DocPage() {
     <article className="prose">
       <Markdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeSlug, [rehypeHighlight, { detect: false }]]}
+        rehypePlugins={[rehypeSlug, [rehypeHighlight, { detect: false, plainText: ["mermaid"] }]]}
         components={components}
       >
         {doc.markdown}

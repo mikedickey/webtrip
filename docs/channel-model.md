@@ -215,46 +215,21 @@ The engine keeps the worklet's input width and the requested output count, so
 
 ## Send Path: Microphone → Network
 
-```
- getUserMedia stream                AudioWorklet thread                  Main thread / Worker
-        │                                    │                                    │
-        │ ① live MediaStreamTrack(s),        │                                    │
-        │   first in_channels kept by the    │                                    │
-        │   node's Explicit channelCount     │                                    │
-        ├───────────────────────────────────>│                                    │
-        │                            worklet.js process():                        │
-        │                       copies EVERY input channel                        │
-        │                       plane into inputViews[ch]                         │
-        │                                    │                                    │
-        │                            ② ProcessorHandle::render(in_channels, ...)   │
-        │                               → AudioProcessor::process(...)             │
-        │                               → SimpleMixer::render (mixer.rs)          │
-        │                                    │                                    │
-        │                            ③ apply_gain over the planar                  │
-        │                               `gained` scratch (in_channels × frames)   │
-        │                                    │                                    │
-        │                            ④ level meter: max_channel_rms                │
-        │                               (loudest channel, not the average)        │
-        │                                    │                                    │
-        │                            ⑤ interleave_planar → captured_interleaved   │
-        │                               (ONE conversion; feeds both ⑥ and the     │
-        │                                monitor mix on the receive side)         │
-        │                                    │                                    │
-        │                            ⑥ conform_interleaved_channels to the       │
-        │                               ring's wire_channels (if they differ),    │
-        │                               resample to the wire rate (if the device  │
-        │                               rate differs); AudioProcessor then        │
-        │                               RingBuffer::write()s the wire frames      │
-        │                                    │                                    │
-        │                                    │      (shared WASM memory)          │
-        │                                    │ ──────────────────────────────────>│
-        │                                    │                                    │
-        │                                    │                         ⑦ tick() (WebRTC) or
-        │                                    │                            send_loop (WebTransport)
-        │                                    │                            reads RingBuffer, frames a
-        │                                    │                            PacketHeader with byte 14 =
-        │                                    │                            receive_channels and byte 15 =
-        │                                    │                            send_channels, sends it
+```mermaid
+sequenceDiagram
+    participant GUM as getUserMedia stream
+    participant AW as AudioWorklet thread
+    participant NET as Main thread / Worker
+
+    GUM->>AW: ① live MediaStreamTrack(s),<br/>first in_channels kept by the<br/>node's Explicit channelCount
+    Note over AW: worklet.js process() copies<br/>EVERY input channel plane<br/>into inputViews[ch]
+    Note over AW: ② ProcessorHandle::render(in_channels, ...)<br/>→ AudioProcessor::process(...)<br/>→ SimpleMixer::render (mixer.rs)
+    Note over AW: ③ apply_gain over the planar<br/>gained scratch<br/>(in_channels × frames)
+    Note over AW: ④ level meter: max_channel_rms<br/>(loudest channel, not average)
+    Note over AW: ⑤ interleave_planar →<br/>captured_interleaved (ONE<br/>conversion, feeds both ⑥ and<br/>the receive-side monitor mix)
+    Note over AW: ⑥ conform_interleaved_channels<br/>to the ring's wire_channels<br/>(if they differ), resample to<br/>the wire rate (if the device<br/>rate differs), then<br/>AudioProcessor<br/>RingBuffer::write()s the<br/>wire frames
+    AW-->>NET: RingBuffer<br/>(shared WASM memory)
+    Note over NET: ⑦ tick() (WebRTC) or<br/>send_loop (WebTransport)<br/>reads the RingBuffer, frames<br/>a PacketHeader with<br/>byte 14 = receive_channels,<br/>byte 15 = send_channels,<br/>and sends it
 ```
 
 Key points:
@@ -284,48 +259,21 @@ Key points:
 
 ## Receive Path: Network → Speakers
 
-```
-   Network                    Main thread / Worker              AudioWorklet thread          Output device
-      │                                │                                  │                        │
-      ├─> ⑧ packet arrives             │                                  │                        │
-      │      deliver_received_packet   │                                  │                        │
-      │      (transport.rs)            │                                  │                        │
-      │                                │                                  │                        │
-      │            ⑨ Regulator::push_at(seq, header.num_outgoing_channels,│                        │
-      │               header.buffer_size, samples, now) — ADOPTS the      │                        │
-      │               peer's channel count and fpp from their first       │                        │
-      │               packet; rejects a mid-stream change instead of      │                        │
-      │               silently reinterpreting it                          │                        │
-      │                                │                                  │                        │
-      │                                │       (shared WASM memory)       │                        │
-      │                                │ <────────────────────────────────│                        │
-      │                                │                                  │                        │
-      │                                │                        ⑩ AudioProcessor::process:          │
-      │                                │                           regulator.pop_frames_at(          │
-      │                                │                           remote_interleaved, wire frames  │
-      │                                │                           this callback spans, now)        │
-      │                                │                           → peer channel count (0 = silence)│
-      │                                │                        SimpleMixer::render resamples to the │
-      │                                │                           device rate (if it differs), then:│
-      │                                │                                  │                        │
-      │                                │                        ⑪ map_to_output(remote_interleaved,  │
-      │                                │                           remote_channels, remote_mapped,   │
-      │                                │                           out_channels)                    │
-      │                                │                                  │                        │
-      │                                │                        ⑫ map_to_output(captured_interleaved,│
-      │                                │                           in_channels, monitor_mapped,      │
-      │                                │                           out_channels) — SAME policy,      │
-      │                                │                           applied to local capture for the  │
-      │                                │                           "hear yourself" monitor mix       │
-      │                                │                                  │                        │
-      │                                │                        ⑬ mix: remote_mapped +               │
-      │                                │                           monitor_mapped × monitor_volume,  │
-      │                                │                           × output_volume, clamp            │
-      │                                │                                  │                        │
-      │                                │                        ⑭ worklet.js copies each             │
-      │                                │                           outputViews[ch] into              │
-      │                                │                           outputs[0][ch]                    │
-      │                                │                                  ├───────────────────────>│
+```mermaid
+sequenceDiagram
+    participant WIRE as Network
+    participant NET as Main thread / Worker
+    participant AW as AudioWorklet thread
+    participant OUT as Output device
+
+    WIRE->>NET: ⑧ packet arrives<br/>deliver_received_packet<br/>(transport.rs)
+    Note over NET: ⑨ Regulator::push_at(seq,<br/>header.num_outgoing_channels,<br/>header.buffer_size, samples,<br/>now) ADOPTS the peer's<br/>channel count and fpp from<br/>their first packet, and<br/>rejects a mid-stream change<br/>instead of silently<br/>reinterpreting it
+    NET-->>AW: Regulator<br/>(shared WASM memory)
+    Note over AW: ⑩ AudioProcessor::process:<br/>regulator.pop_frames_at(<br/>remote_interleaved, wire<br/>frames this callback spans,<br/>now) → peer channel count<br/>(0 = silence).<br/>SimpleMixer::render resamples<br/>to the device rate (if it<br/>differs), then:
+    Note over AW: ⑪ map_to_output(<br/>remote_interleaved,<br/>remote_channels,<br/>remote_mapped, out_channels)
+    Note over AW: ⑫ map_to_output(<br/>captured_interleaved,<br/>in_channels, monitor_mapped,<br/>out_channels): SAME policy,<br/>applied to local capture for<br/>the "hear yourself" monitor
+    Note over AW: ⑬ mix: remote_mapped +<br/>monitor_mapped ×<br/>monitor_volume,<br/>× output_volume, clamp
+    AW->>OUT: ⑭ worklet.js copies<br/>each outputViews[ch]<br/>into outputs[0][ch]
 ```
 
 Key points:
