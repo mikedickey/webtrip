@@ -4,14 +4,15 @@
 //! Pure data and (de)serialization, no I/O: the WebSocket client that sends
 //! them lives in the browser host (`webtrip-web`).
 //!
-//! Message types, all JSON-encoded:
+//! Message types, all JSON objects (shown here as [`SignalingMessage::to_json`]
+//! writes them; [`SignalingMessage::from_json`] accepts any whitespace):
 //!
-//! - **Protocol Detection**: `{"protocol": "webrtc", "version": 1}` (client name is in WebSocket URL)
-//! - **SDP Offer**: `{"type": "offer", "sdp": "v=0\r\n..."}`
-//! - **SDP Answer**: `{"type": "answer", "sdp": "v=0\r\n..."}`
-//! - **ICE Candidate**: `{"type": "ice", "candidate": "...", "sdpMid": "...", "sdpMLineIndex": 0}`
-//! - **Hangup**: `{"type": "hangup"}`
-//! - **Error**: `{"type": "error", "message": "..."}`
+//! - **Protocol Detection**: `{"protocol":"webrtc","version":1}` (the client name goes in the WebSocket URL)
+//! - **SDP Offer**: `{"type":"offer","sdp":"v=0\r\n..."}`
+//! - **SDP Answer**: `{"type":"answer","sdp":"v=0\r\n..."}`
+//! - **ICE Candidate**: `{"type":"ice","candidate":"...","sdpMid":"...","sdpMLineIndex":0}`
+//! - **Hangup**: `{"type":"hangup"}`
+//! - **Error**: `{"type":"error","message":"..."}`
 
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
@@ -114,7 +115,12 @@ impl SignalingMessage {
         }
     }
 
-    /// Serialize to JSON
+    /// Serialize to compact JSON (no whitespace), in the shapes listed in the
+    /// [module docs](crate::network::signaling_message).
+    ///
+    /// Fields the message type needs but that are `None` are filled with
+    /// defaults rather than omitted: an empty `sdp` or `candidate`, `sdpMid`
+    /// `"data"`, `sdpMLineIndex` `0`, and error message `"Unknown error"`.
     pub fn to_json(&self) -> String {
         match &self.msg_type {
             SignalingMessageType::Protocol => {
@@ -150,46 +156,53 @@ impl SignalingMessage {
         }
     }
 
-    /// Parse from JSON
+    /// Parse one signaling message.
+    ///
+    /// Any JSON object with a top-level `"protocol"` key is the hub's answer
+    /// to the protocol handshake and parses as
+    /// [`Protocol`](SignalingMessageType::Protocol), with every other field
+    /// `None`. Otherwise the `"type"` string selects the message. For `"ice"`,
+    /// a missing `sdpMid` defaults to `"data"` and a missing `sdpMLineIndex`
+    /// to `0`; for `"error"`, a missing `message` defaults to
+    /// `"Unknown error"`. Unknown keys are ignored.
+    ///
+    /// # Errors
+    ///
+    /// A human-readable reason if `json` is not a JSON object, has no string
+    /// `"type"` (and no `"protocol"`), names an unknown type, or lacks a
+    /// required field: `sdp` for offers and answers, `candidate` for ICE.
     pub fn from_json(json: &str) -> Result<Self, String> {
-        // Simple JSON parsing without serde for wasm size
-        // This is a minimal parser for the specific message format
+        let value: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| format!("Invalid JSON: {e}"))?;
+        let object = value.as_object().ok_or("Message is not a JSON object")?;
 
-        let json = json.trim();
-
-        // Check for protocol detection response
-        if json.contains(r#""protocol""#) {
-            return Ok(Self {
-                msg_type: SignalingMessageType::Protocol,
-                sdp: None,
-                candidate: None,
-                sdp_mid: None,
-                sdp_m_line_index: None,
-                error: None,
-            });
+        if object.contains_key("protocol") {
+            return Ok(Self::protocol());
         }
 
-        // Extract type field
-        let msg_type = extract_string_field(json, "type")?;
+        let string_field = |field: &str| -> Result<&str, String> {
+            match object.get(field) {
+                None => Err(format!("Field '{field}' not found")),
+                Some(v) => v.as_str().ok_or_else(|| format!("Field '{field}' is not a string")),
+            }
+        };
 
-        match msg_type.as_str() {
-            "offer" => {
-                let sdp = extract_string_field(json, "sdp")?;
-                Ok(Self::offer(&sdp))
-            }
-            "answer" => {
-                let sdp = extract_string_field(json, "sdp")?;
-                Ok(Self::answer(&sdp))
-            }
+        let msg_type = string_field("type")?;
+        match msg_type {
+            "offer" => Ok(Self::offer(string_field("sdp")?)),
+            "answer" => Ok(Self::answer(string_field("sdp")?)),
             "ice" => {
-                let candidate = extract_string_field(json, "candidate")?;
-                let sdp_mid = extract_string_field(json, "sdpMid").unwrap_or_else(|_| "data".to_string());
-                let sdp_m_line_index = extract_number_field(json, "sdpMLineIndex").unwrap_or(0) as u16;
-                Ok(Self::ice(&candidate, &sdp_mid, sdp_m_line_index))
+                let candidate = string_field("candidate")?;
+                let sdp_mid = string_field("sdpMid").unwrap_or("data");
+                let sdp_m_line_index = object
+                    .get("sdpMLineIndex")
+                    .and_then(|n| n.as_u64())
+                    .map_or(0, |n| n as u16);
+                Ok(Self::ice(candidate, sdp_mid, sdp_m_line_index))
             }
             "hangup" => Ok(Self::hangup()),
             "error" => {
-                let message = extract_string_field(json, "message").unwrap_or_else(|_| "Unknown error".to_string());
+                let message = string_field("message").unwrap_or("Unknown error").to_string();
                 Ok(Self {
                     msg_type: SignalingMessageType::Error,
                     sdp: None,
@@ -221,70 +234,6 @@ fn escape_json_string(s: &str) -> String {
         }
     }
     result
-}
-
-/// Extract a string field from JSON
-fn extract_string_field(json: &str, field: &str) -> Result<String, String> {
-    let pattern = format!(r#""{}":"#, field);
-    let start = json.find(&pattern).ok_or_else(|| format!("Field '{}' not found", field))?;
-    let value_start = start + pattern.len();
-    let rest = &json[value_start..];
-
-    if !rest.starts_with('"') {
-        return Err(format!("Field '{}' is not a string", field));
-    }
-
-    let rest = &rest[1..]; // Skip opening quote
-    let mut result = String::new();
-    let mut chars = rest.chars().peekable();
-    let mut escaped = false;
-
-    while let Some(c) = chars.next() {
-        if escaped {
-            match c {
-                '"' => result.push('"'),
-                '\\' => result.push('\\'),
-                'n' => result.push('\n'),
-                'r' => result.push('\r'),
-                't' => result.push('\t'),
-                'u' => {
-                    // Unicode escape
-                    let hex: String = chars.by_ref().take(4).collect();
-                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                        if let Some(ch) = char::from_u32(code) {
-                            result.push(ch);
-                        }
-                    }
-                }
-                _ => {
-                    result.push('\\');
-                    result.push(c);
-                }
-            }
-            escaped = false;
-        } else if c == '\\' {
-            escaped = true;
-        } else if c == '"' {
-            break;
-        } else {
-            result.push(c);
-        }
-    }
-
-    Ok(result)
-}
-
-/// Extract a number field from JSON
-fn extract_number_field(json: &str, field: &str) -> Result<i64, String> {
-    let pattern = format!(r#""{}":"#, field);
-    let start = json.find(&pattern).ok_or_else(|| format!("Field '{}' not found", field))?;
-    let value_start = start + pattern.len();
-    let rest = &json[value_start..].trim_start();
-
-    let end = rest.find(|c: char| !c.is_ascii_digit() && c != '-').unwrap_or(rest.len());
-    let num_str = &rest[..end];
-
-    num_str.parse().map_err(|_| format!("Invalid number for field '{}'", field))
 }
 
 /// Connection state for hub signaling
@@ -454,49 +403,6 @@ mod tests {
         assert_eq!(escaped, input);
     }
 
-    // --- extract_string_field with realistic SDP payloads ---
-
-    #[test]
-    fn test_extract_string_field_realistic_sdp() {
-        // SDP contains colons and commas; the round-trip must preserve the full value
-        let sdp = "v=0\r\no=- 123 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE data\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n";
-        let json = SignalingMessage::offer(sdp).to_json();
-        let extracted = super::extract_string_field(&json, "sdp").unwrap();
-        assert_eq!(extracted, sdp);
-    }
-
-    #[test]
-    fn test_extract_string_field_with_escaped_chars() {
-        // Embedded double-quotes and backslashes must survive the round-trip
-        let sdp = r#"field with "quotes" and \backslash"#;
-        let json = SignalingMessage::offer(sdp).to_json();
-        let extracted = super::extract_string_field(&json, "sdp").unwrap();
-        assert_eq!(extracted, sdp);
-    }
-
-    #[test]
-    fn test_extract_string_field_missing() {
-        let json = r#"{"type":"offer"}"#;
-        let result = super::extract_string_field(json, "sdp");
-        assert!(result.is_err());
-    }
-
-    // --- extract_number_field boundary values ---
-
-    #[test]
-    fn test_extract_number_field_zero() {
-        let json = r#"{"type":"ice","candidate":"c","sdpMid":"data","sdpMLineIndex":0}"#;
-        let val = super::extract_number_field(json, "sdpMLineIndex").unwrap();
-        assert_eq!(val, 0);
-    }
-
-    #[test]
-    fn test_extract_number_field_missing() {
-        let json = r#"{"type":"ice","candidate":"c","sdpMid":"data"}"#;
-        let result = super::extract_number_field(json, "sdpMLineIndex");
-        assert!(result.is_err());
-    }
-
     // --- from_json error handling for malformed input ---
 
     #[test]
@@ -519,38 +425,57 @@ mod tests {
 
     #[test]
     fn test_from_json_non_string_type_field() {
-        // type field is a number, not a string — extract_string_field should return Err
         let result = SignalingMessage::from_json(r#"{"type":42}"#);
         assert!(result.is_err());
+        assert!(SignalingMessage::from_json("not json").is_err());
+        assert!(SignalingMessage::from_json(r#"["type","offer"]"#).is_err());
+    }
+
+    /// Regression: the old hand-rolled parser matched `"type":"` byte-for-byte,
+    /// so the module docs' own examples (a space after each colon) failed
+    /// with "Field 'type' is not a string".
+    #[test]
+    fn test_from_json_accepts_whitespace() {
+        let ice = SignalingMessage::from_json(
+            r#"{ "type" : "ice", "candidate": "c", "sdpMid": "audio", "sdpMLineIndex": 2 }"#,
+        )
+        .unwrap();
+        assert_eq!(ice.msg_type, SignalingMessageType::Ice);
+        assert_eq!(ice.candidate.as_deref(), Some("c"));
+        assert_eq!(ice.sdp_mid.as_deref(), Some("audio"));
+        assert_eq!(ice.sdp_m_line_index, Some(2));
+
+        let answer = SignalingMessage::from_json(r#"{"type": "answer", "sdp": "a\nb \"q\" é"}"#).unwrap();
+        assert_eq!(answer.sdp.as_deref(), Some("a\nb \"q\" \u{00e9}"));
+    }
+
+    /// ICE and error fields fall back to their documented defaults.
+    #[test]
+    fn test_from_json_optional_field_defaults() {
+        let ice = SignalingMessage::from_json(r#"{"type":"ice","candidate":"c"}"#).unwrap();
+        assert_eq!((ice.sdp_mid.as_deref(), ice.sdp_m_line_index), (Some("data"), Some(0)));
+        let err = SignalingMessage::from_json(r#"{"type":"error"}"#).unwrap();
+        assert_eq!(err.error.as_deref(), Some("Unknown error"));
     }
 
     // --- from_json protocol-response detection ---
 
     #[test]
     fn test_from_json_protocol_response() {
-        // Any payload containing a "protocol" key is treated as the handshake
-        // response and short-circuits to a Protocol message with all fields None.
-        let msg = SignalingMessage::from_json(r#"{"protocol":"webrtc","version":1}"#).unwrap();
+        // A top-level "protocol" key is the handshake response and
+        // short-circuits to a Protocol message with all fields None.
+        let msg = SignalingMessage::from_json(r#"{"protocol": "webrtc", "version": 1}"#).unwrap();
         assert_eq!(msg.msg_type, SignalingMessageType::Protocol);
         assert!(msg.sdp.is_none());
         assert!(msg.candidate.is_none());
         assert!(msg.sdp_mid.is_none());
         assert!(msg.sdp_m_line_index.is_none());
         assert!(msg.error.is_none());
-    }
 
-    // --- extract_string_field escape-sequence decoding ---
-
-    #[test]
-    fn test_extract_string_field_unescape_sequences() {
-        // Hand-crafted JSON (not a to_json round-trip) so every backslash escape
-        // branch in the unescape loop is exercised directly:
-        //   \n \r \t          -> the corresponding control chars
-        //   é            -> 'é' (unicode-escape branch)
-        //   \x                -> literal backslash + 'x' (unknown-escape fallback)
-        let json = r#"{"sdp":"a\nb\rc\tdé\xz"}"#;
-        let decoded = super::extract_string_field(json, "sdp").unwrap();
-        assert_eq!(decoded, "a\nb\rc\td\u{00e9}\\xz");
+        // Regression: the substring `"protocol"` inside a value (here an
+        // error message quoting it) used to be classified as the handshake.
+        let err = SignalingMessage::from_json(r#"{"type":"error","message":"bad \"protocol\" field"}"#).unwrap();
+        assert_eq!(err.msg_type, SignalingMessageType::Error);
     }
 
     // ── ICE candidate JSON parsing ────────────────────────────────────────────

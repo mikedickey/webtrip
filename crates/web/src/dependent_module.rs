@@ -40,6 +40,10 @@ pub fn on_the_fly(code: &str) -> Result<String, JsValue> {
 /// a blob URL at run time. A more sophisticated solution would have
 /// wasm-bindgen put such a module in `pkg/` at build time and return a URL to
 /// that file instead (wasm-bindgen issue #3019).
+///
+/// Internal: it expands to a path in a private module, so it cannot be used
+/// outside this crate.
+#[doc(hidden)]
 #[macro_export]
 macro_rules! dependent_module {
     ($file_name:expr) => {

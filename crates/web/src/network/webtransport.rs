@@ -27,8 +27,10 @@
 //!
 //! ## Browser Support
 //!
-//! - Chrome 97+ / Edge 97+: Full support
-//! - Safari / Firefox: Not yet supported (use WebRTC fallback)
+//! Needs the `WebTransport` API and `Atomics.waitAsync` in the worker; see
+//! [browser support](https://webtrip.dev/docs/browser-support) for versions.
+//! The session does not fall back to WebRTC on its own: check
+//! `WebTripSession.isWebTransportAvailable()` before selecting it.
 
 use crate::dependent_module;
 use crate::network::{SharedStateCallback, notify_transport_state, transport_error_from_js};

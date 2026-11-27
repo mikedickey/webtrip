@@ -213,7 +213,7 @@ export default function Demo() {
       if (cancelled) return;
       // Expose the engine to the unmount cleanup before any further awaits.
       engineRef.current = eng;
-      eng.session.set_on_state_change((state: string) => setSessionState(state as SessionState));
+      eng.session.setOnStateChange((state: string) => setSessionState(state as SessionState));
       // The singleton session outlives this component and may still be
       // connected (or tearing down) from a previous mount; sync the UI to it,
       // including which transport it is using.

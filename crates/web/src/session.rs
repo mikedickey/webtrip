@@ -22,7 +22,7 @@
 //!    └─> Admitted only from Idle (see `webtrip_core::lifecycle`)
 //!    └─> Starts audio (unless it is already running), then dials the hub over
 //!        the selected transport; WebRTC signaling (WebSocket, SDP offer/answer,
-//!        ICE, data channel) happens inside WebRtcTransport.connect_to_hub()
+//!        ICE, data channel) happens inside the WebRTC transport's connect
 //!
 //! 2. Once the transport is connected
 //!    └─> Transport published; a running engine's worklet node is rebuilt
@@ -36,7 +36,7 @@
 //! `disconnect()` may be called at any point: it cancels a connect in flight
 //! (audio bring-up *and* transport dial), waits for that connect to release what
 //! it created, then tears down the published connection. Every network state
-//! change is reported through `set_on_state_change` and readable with
+//! change is reported through `setOnStateChange` and readable with
 //! `getState()`; audio has its own `getAudioState()`.
 //!
 //! ## Buffer lifetime
@@ -81,8 +81,9 @@ pub use webtrip_core::session_stats::SessionStats;
 /// Default signaling port (same as JackTrip TCP port)
 pub const DEFAULT_SIGNALING_PORT: u16 = 4464;
 
-/// How long `connect` waits for the transport to connect before
-/// giving up and rejecting.
+/// How long `connect` waits for the transport to connect before giving up and
+/// rejecting with a `"TimeoutError"`. It covers only the dial, not audio
+/// bring-up (which may wait on a permission prompt).
 pub const CONNECT_TIMEOUT_MS: i32 = 45_000;
 
 // ============================================================================
@@ -188,9 +189,7 @@ fn new_transport(transport_type: TransportType) -> Result<Box<dyn Transport>, Js
         TransportType::WebRTC => Ok(Box::new(WebRtcTransport::new(Some(WebRtcConfig::low_latency()))?)),
         TransportType::WebTransport => {
             if !is_webtransport_available() {
-                return Err(js_error(
-                    "WebTransport is not supported in this browser. Please use Chrome 97+ or Edge 97+.",
-                ));
+                return Err(js_error("WebTransport is not supported in this browser; use WebRTC instead."));
             }
             Ok(Box::new(WebTransportImpl::new()?))
         }
@@ -301,21 +300,51 @@ enum Detached {
     InTransit,
 }
 
-/// WebTrip Session - coordinates all audio and network components
+/// A WebTrip session: the audio engine plus at most one hub connection.
 ///
-/// Every method takes `&self`, so JavaScript may call any of them (notably
-/// `disconnect()` and `getState()`) while a `connect()` promise is
-/// pending: wasm-bindgen holds an async method's borrow until its promise
-/// settles, and an `&mut self` borrow would make every such call throw.
+/// A session runs two independent state machines:
 ///
-/// The lifecycle invariants (connect only from `Idle`, a disconnect cancels a
-/// connect in flight, one teardown at a time; likewise for audio start/stop)
-/// live in the atomic [`Lifecycle`] and [`AudioLifecycle`]. The remaining
-/// interior mutability (`Cell`/`RefCell`/`Rc`) holds browser objects and the JS
-/// callbacks wired to them. It is confined to the agent that created the
-/// session: the session holds `js_sys` values, so it is neither `Send` nor
-/// `Sync`, and its callbacks run on that same agent's event loop. No `RefCell`
-/// borrow is held across an `.await`.
+/// - **Audio** (`getAudioState()`): `"stopped"` or `"running"`. `startAudio()`
+///   captures from the input device and plays to the output device;
+///   `stopAudio()` ends it. No callback fires on audio changes.
+/// - **Network** (`getState()`, reported to `setOnStateChange`): `"idle"`,
+///   `"connecting"`, `"connected"`, `"error"` or `"disconnecting"`.
+///   `connectNetwork()` dials a hub; `disconnectNetwork()` hangs up.
+///
+/// `connect()` and `disconnect()` do both: `connect()` starts audio if it is
+/// not already running, and `disconnect()` stops only the audio that
+/// `connect()` started. Either half may come first; whichever comes second
+/// attaches the running audio to the connection.
+///
+/// | Call | Network `"idle"` | `"connecting"` | `"connected"` | `"error"` | `"disconnecting"` |
+/// |------|------------------|----------------|---------------|-----------|-------------------|
+/// | `connect` / `connectNetwork` | dials | rejects | rejects | rejects (call `disconnect()` first) | waits, then dials |
+/// | `disconnect` / `disconnectNetwork` | resolves at once | cancels the dial, then tears down | tears down | tears down | waits for that teardown |
+///
+/// | Call | Audio stopped | starting | running | stopping |
+/// |------|---------------|----------|---------|----------|
+/// | `startAudio` | starts | rejects | rejects | waits, then starts |
+/// | `stopAudio` | resolves at once | cancels the start | stops | waits for that stop |
+///
+/// Any method may be called while another call's promise is pending (for
+/// example `disconnect()` during a `connect()` stuck on a permission prompt).
+/// All methods must be called from the agent (page or worker) that created the
+/// session.
+///
+/// To discard a session, await `disconnect()` (and `stopAudio()` if you started
+/// audio yourself), then call `free()`. `free()` throws while any of the
+/// session's promises is pending. A session freed while connected still tears
+/// its connection down in the background.
+// The lifecycle invariants (connect only from `Idle`, a disconnect cancels a
+// connect in flight, one teardown at a time; likewise for audio start/stop)
+// live in the atomic `Lifecycle` and `AudioLifecycle`. Every method takes
+// `&self` because wasm-bindgen holds an async method's borrow until its
+// promise settles, so an `&mut self` method would throw while any promise is
+// pending. The remaining interior mutability (`Cell`/`RefCell`/`Rc`) holds
+// browser objects and the JS callbacks wired to them, confined to the agent
+// that created the session: it holds `js_sys` values, so it is neither `Send`
+// nor `Sync`, and its callbacks run on that agent's event loop. No `RefCell`
+// borrow is held across an `.await`.
 #[wasm_bindgen]
 pub struct WebTripSession {
     // Audio components
@@ -406,7 +435,13 @@ pub struct WebTripSession {
 
 #[wasm_bindgen]
 impl WebTripSession {
-    /// Create a new session
+    /// Create a session.
+    ///
+    /// `audio_params_addr` must be a value returned by `createAudioParams()`
+    /// (in Rust, `webtrip_core::audio::params::create_audio_params`). Those
+    /// parameters are never freed, so create them once per page; sessions may
+    /// share them. Any other value is undefined behavior: the session and its
+    /// audio thread dereference the address.
     #[wasm_bindgen(constructor)]
     pub fn new(audio_params_addr: usize) -> Result<WebTripSession, JsValue> {
         // SAFETY: `audio_params_addr` is a wasm-bindgen boundary value from JS.
@@ -455,8 +490,20 @@ impl WebTripSession {
         })
     }
 
-    /// Set callback for network state changes. It receives the same strings as
-    /// [`get_state`](Self::get_state).
+    /// Set the callback for network state changes, replacing any earlier one.
+    /// It receives the same strings as `getState()`:
+    ///
+    /// - a connect: `"connecting"`, then `"connected"`, or `"idle"` if it fails
+    ///   or is cancelled
+    /// - a connection that fails after connecting: `"error"` (audio keeps
+    ///   running; call `disconnect()` to clean up)
+    /// - a disconnect: `"disconnecting"`, then `"idle"`
+    ///
+    /// It is not called with the current state when set, nor for a connect
+    /// rejected before it starts (for example while already connected), nor
+    /// for audio changes. It is called synchronously from inside the session
+    /// and may call back into it.
+    #[wasm_bindgen(js_name = setOnStateChange)]
     pub fn set_on_state_change(&self, callback: js_sys::Function) {
         *self.on_state_change.borrow_mut() = Some(callback);
     }
@@ -470,45 +517,34 @@ impl WebTripSession {
 
     /// Whether audio is running, independent of any connection: `"stopped"` or
     /// `"running"`.
+    ///
+    /// A start or stop still in progress reports `"stopped"`; `startAudio()`
+    /// called during a start rejects with "Audio is already starting".
     #[wasm_bindgen(js_name = getAudioState)]
     pub fn get_audio_state(&self) -> String {
         self.audio_lifecycle.state().as_str().to_string()
     }
 
-    /// Get current statistics: the aggregate over the live connections (all
-    /// zero when there are none).
+    /// Current statistics, summed over the live connection (all zero when there
+    /// is none).
+    #[wasm_bindgen(js_name = getStats)]
     pub fn get_stats(&self) -> SessionStats {
         let stats: Vec<_> = self.connections.borrow().iter().map(|c| c.buffers.stats()).collect();
         aggregate_session_stats(&stats)
     }
 
-    /// Get the current connection's send ring buffer flag pointer for
-    /// event-driven wake-up, or 0 when there is no connection.
+    /// Set how many channels this client sends over the wire (default 1, at
+    /// most 8).
     ///
-    /// Used with Atomics.waitAsync() in JavaScript for zero-CPU idle behavior.
-    /// Returns the memory address of the atomic flag that signals data availability.
-    /// Each connection has its own ring, so the address changes per connection:
-    /// read it after connecting and drop it when the connection ends. A cached
-    /// pointer from before connect is 0, and one kept across a disconnect
-    /// addresses a retired (possibly freed) ring that never wakes.
-    #[wasm_bindgen(js_name = getRingBufferFlagPtr)]
-    pub fn get_ring_buffer_flag_ptr(&self) -> usize {
-        self.with_send_ring(|ring| ring.get_has_data_flag_ptr()).unwrap_or(0)
-    }
-
-    /// Set how many channels this client sends over the wire (default 1).
-    ///
-    /// The wire channel-count setters are rejected unless the network is `Idle`,
-    /// and every channel-count setter rejects counts outside its ceiling
-    /// ([1, `MAX_WIRE_CHANNELS`] for send/receive, [1, `MAX_DEVICE_CHANNELS`] for
-    /// input/output): the transports and the render thread snapshot these when
-    /// the connection or engine is built, so a mid-flight change would desync
-    /// producer and consumer on the channel-agnostic `RingBuffer`.
+    /// Channel counts are fixed for the life of what they configure: the
+    /// send/receive counts can change only while the network is `"idle"`, the
+    /// input/output counts only while audio is stopped. A call at any other
+    /// time, or with a count out of range, is ignored with a console warning;
+    /// read the getter back to check.
     ///
     /// This is each outbound packet's payload width, independent of the
-    /// input device: captured audio is conformed to it on the render thread
-    /// (`conform_interleaved_channels`), e.g. 2 input channels averaged into
-    /// 1 sent. Each connection's send ring carries the width it was opened with.
+    /// input device: captured audio is mixed to it (for example 2 input
+    /// channels averaged into 1 sent).
     #[wasm_bindgen(js_name = setSendChannels)]
     pub fn set_send_channels(&self, channels: u8) {
         if self.can_set_channel_count("send", channels, MAX_WIRE_CHANNELS, self.network_is_idle()) {
@@ -522,14 +558,13 @@ impl WebTripSession {
         self.send_channels.get()
     }
 
-    /// Set how many channels this client asks the peer to send back
-    /// (default 2), advertised in every outbound packet's header. Network-idle
-    /// only (see [`set_send_channels`](Self::set_send_channels)).
+    /// Set how many channels this client asks the peer to send back (default
+    /// 2, at most 8), advertised in every outbound packet's header. Only while
+    /// the network is `"idle"`; see `setSendChannels` for when a call is
+    /// ignored.
     ///
-    /// The peer decides what it actually sends: the regulator adopts the
-    /// count from its first packet
-    /// ([`Regulator::push_at`](webtrip_core::stream::regulator::Regulator::push_at)) and
-    /// `map_to_output` maps it onto the output device.
+    /// The peer decides what it actually sends: whatever channel count its
+    /// packets carry is mapped onto the output device.
     #[wasm_bindgen(js_name = setReceiveChannels)]
     pub fn set_receive_channels(&self, channels: u8) {
         if self.can_set_channel_count("receive", channels, MAX_WIRE_CHANNELS, self.network_is_idle()) {
@@ -543,10 +578,10 @@ impl WebTripSession {
         self.receive_channels.get()
     }
 
-    /// Set how many input device channels to capture (default 2): the
-    /// device's first N, clamped at capture time to what the browser grants.
-    /// Rejected unless audio is stopped (see
-    /// [`set_send_channels`](Self::set_send_channels)).
+    /// Set how many input device channels to capture (default 2, at most 32):
+    /// the device's first N, clamped at capture time to what the browser
+    /// grants. Only while audio is stopped; see `setSendChannels` for when a
+    /// call is ignored.
     #[wasm_bindgen(js_name = setInputChannels)]
     pub fn set_input_channels(&self, channels: u8) {
         if self.can_set_channel_count("input", channels, MAX_DEVICE_CHANNELS, self.audio_is_stopped()) {
@@ -560,10 +595,10 @@ impl WebTripSession {
         self.input_channels.get()
     }
 
-    /// Set how many output device channels to play to (default 2): the
-    /// device's first N, clamped at capture time to the destination's
-    /// `maxChannelCount`. Rejected unless audio is stopped (see
-    /// [`set_send_channels`](Self::set_send_channels)).
+    /// Set how many output device channels to play to (default 2, at most 32):
+    /// the device's first N, clamped at capture time to the destination's
+    /// `maxChannelCount`. Only while audio is stopped; see `setSendChannels`
+    /// for when a call is ignored.
     #[wasm_bindgen(js_name = setOutputChannels)]
     pub fn set_output_channels(&self, channels: u8) {
         if self.can_set_channel_count("output", channels, MAX_DEVICE_CHANNELS, self.audio_is_stopped()) {
@@ -577,8 +612,10 @@ impl WebTripSession {
         self.output_channels.get()
     }
 
-    /// Set the transport type to use for connections
-    /// Must be called before connecting
+    /// Choose the transport for the next connection (default WebRTC). Only
+    /// while the network is `"idle"`; otherwise the call is ignored with a
+    /// console warning. The session never falls back on its own: with
+    /// WebTransport selected in a browser without it, `connect()` rejects.
     #[wasm_bindgen(js_name = setTransportType)]
     pub fn set_transport_type(&self, transport_type: TransportType) {
         if self.state() == SessionState::Idle {
@@ -595,25 +632,24 @@ impl WebTripSession {
         self.transport_type.get()
     }
 
-    /// Check if WebTransport is available in this browser
-    ///
-    /// WebTransport is supported in Chrome 97+, Edge 97+.
-    /// Safari and Firefox do not yet support WebTransport.
+    /// Whether this browser has the `WebTransport` API. See
+    /// [browser support](https://webtrip.dev/docs/browser-support) for versions.
     #[wasm_bindgen(js_name = isWebTransportAvailable)]
     pub fn is_webtransport_available_check() -> bool {
         is_webtransport_available()
     }
 
-    /// Set the output audio device for playback
+    /// Set the output device for playback: a `deviceId` from
+    /// `getAudioDevices()`, or `""`, `undefined` or `null` for the default.
     ///
-    /// Call while audio is stopped to store a sink for the next start, or while
-    /// it is running to route the live engine, whatever the network is doing
-    /// (a dial in progress included). Rejected while an audio start is in
-    /// flight: the engine is not published yet, and a store-only update would
-    /// be lost or force a deferred re-apply that races stop (WEB-72).
-    ///
-    /// # Arguments
-    /// * `device_id` - The device ID from the output device selector, or empty string/None for default
+    /// While audio is stopped this stores the device for the next start; while
+    /// it runs it also routes the live audio, whatever the network is doing.
+    /// Rejects while an audio start is in progress. The device is stored even
+    /// if routing then fails. In a browser without `AudioContext.setSinkId`
+    /// audio stays on the default output, with a console warning.
+    // Rejected mid-start because the engine is not published yet, and a
+    // store-only update would be lost or force a deferred re-apply that races
+    // stop (WEB-72).
     #[wasm_bindgen(js_name = setOutputDevice)]
     pub async fn set_output_device(&self, device_id: Option<String>) -> Result<(), JsValue> {
         if self.audio_lifecycle.phase() == AudioPhase::Starting {
@@ -640,16 +676,20 @@ impl WebTripSession {
     /// connection the engine monitors the input and plays nothing back; a
     /// connection made now or later is attached to it.
     ///
-    /// Rejects unless audio is stopped (a stop still tearing down is waited
-    /// out). A `stopAudio()` while this is pending (for instance on an
+    /// Arguments: an input `deviceId` from `getAudioDevices()` (`undefined`
+    /// for the default), then whether to enable auto gain control, echo
+    /// cancellation and noise suppression.
+    ///
+    /// This creates the `AudioContext` and may show the microphone permission
+    /// prompt. Call it from a user gesture (a click handler): otherwise the
+    /// browser may start the context suspended (see `isAudioSuspended()`).
+    ///
+    /// Rejects unless audio is stopped ("Audio is already starting", "Audio is
+    /// already running; call stopAudio() first"); a stop still in progress is
+    /// waited out. Errors from `getUserMedia` (for example a denied permission)
+    /// reject it too. A `stopAudio()` while this is pending (for instance on an
     /// unanswered permission prompt) makes it release whatever it has created
     /// and reject with an `Error` named `"AbortError"`.
-    ///
-    /// # Arguments
-    /// * `device_id` - Optional input device ID
-    /// * `auto_gain_control` - Enable AGC
-    /// * `echo_cancellation` - Enable echo cancellation
-    /// * `noise_suppression` - Enable noise suppression
     #[wasm_bindgen(js_name = startAudio)]
     pub async fn start_audio(
         &self,
@@ -666,8 +706,9 @@ impl WebTripSession {
     /// Stop the audio engine, resolving once audio is `"stopped"`. Any
     /// connection stays up (its transport keeps running, with nothing to send
     /// and nothing playing what it receives). Safe to call at any time and any
-    /// number of times; it also cancels a start in flight, and takes audio
-    /// that `connect()` started out of that connection's hands.
+    /// number of times; it also cancels a start in progress. Audio started
+    /// after this is yours: a later `disconnect()` does not stop it, even if
+    /// `connect()` had started the audio this call stopped.
     #[wasm_bindgen(js_name = stopAudio)]
     pub async fn stop_audio(&self) {
         self.audio_owned_by_connect.set(false);
@@ -677,14 +718,13 @@ impl WebTripSession {
     // ========== Network ==========
 
     /// Connect to a JackTrip hub server over the network only: audio is
-    /// neither started nor required. A running engine is attached to the
-    /// connection; one started later attaches itself. Admission, timeout and
-    /// cancellation are those of [`connect`](Self::connect).
+    /// neither started nor required. Running audio is attached to the
+    /// connection; audio started later attaches itself. Rejections, timeout
+    /// and cancellation are those of `connect()`.
     ///
-    /// # Arguments
-    /// * `server_host` - The hub server hostname (from studio.server_host)
-    /// * `port` - The signaling port (default 4464)
-    /// * `client_name` - Optional client name to send in connection request
+    /// Arguments: the hub host name (a studio's `serverHost`), the signaling
+    /// port (`undefined` for 4464), and an optional client name shown to other
+    /// participants.
     #[wasm_bindgen(js_name = connectNetwork)]
     pub async fn connect_network(
         &self,
@@ -704,33 +744,44 @@ impl WebTripSession {
         .await
     }
 
-    /// Connect to a JackTrip hub server
+    /// Start audio and connect to a JackTrip hub server: the main entry point
+    /// for joining a studio.
     ///
-    /// This is the main entry point for connecting to a studio. It:
-    /// 1. Waits for any disconnect still tearing down, then rejects unless the
-    ///    session is `Idle` (call `disconnect()` first after an `"error"`)
-    /// 2. Starts audio capture, unless audio is already running (then the
-    ///    capture options are ignored and `disconnect()` leaves audio running)
-    /// 3. Connects the selected transport (for WebRTC: WebSocket signaling,
-    ///    SDP offer/answer, ICE, data channel), giving up after
-    ///    `CONNECT_TIMEOUT_MS`
+    /// Arguments: the hub host name (a studio's `serverHost`), the signaling
+    /// port (`undefined` for 4464), then the `startAudio()` arguments (input
+    /// `deviceId`, auto gain control, echo cancellation, noise suppression),
+    /// then an optional client name shown to other participants.
+    ///
+    /// Steps:
+    /// 1. Waits for any disconnect still in progress, then rejects unless the
+    ///    network is `"idle"`.
+    /// 2. Starts audio, unless it is already running (then the capture
+    ///    arguments are ignored and `disconnect()` leaves audio running). A
+    ///    `startAudio()` still in progress is waited for rather than raced.
+    /// 3. Dials the selected transport (for WebRTC: WebSocket signaling, SDP
+    ///    offer/answer, ICE, data channel), giving up after 45 seconds. The
+    ///    timeout covers only this dial, not a permission prompt in step 2.
     ///
     /// Audio this call started is stopped again by `disconnect()` and by a
-    /// failed connect.
+    /// failed connect. Call it from a user gesture, as for `startAudio()`.
     ///
-    /// A `disconnect()` while this is pending makes it release whatever it has
-    /// created and reject with an `Error` named `"AbortError"`; it never
-    /// reaches `"connected"` afterwards. A timed-out dial rejects with
-    /// `"TimeoutError"`. Any failed connect leaves the session `"idle"`.
+    /// Rejects with:
+    /// - "A connection is already in progress", "Already connected; call
+    ///   disconnect() first", or "The previous connection failed; call
+    ///   disconnect() before reconnecting" when the network is not `"idle"`
+    /// - any `startAudio()` error, such as a denied microphone permission
+    /// - "WebTransport is not supported in this browser" when WebTransport is
+    ///   selected but unavailable
+    /// - an error saying the packet size does not fit the transport
+    /// - "The connection failed while it was being set up", or the
+    ///   transport's own error, when the dial fails
+    /// - an `Error` named `"TimeoutError"` when the dial times out
+    /// - an `Error` named `"AbortError"` when `disconnect()` is called while
+    ///   this is pending; it never reaches `"connected"` afterwards
     ///
-    /// # Arguments
-    /// * `server_host` - The hub server hostname (from studio.server_host)
-    /// * `port` - The signaling port (default 4464)
-    /// * `device_id` - Optional input device ID
-    /// * `auto_gain_control` - Enable AGC
-    /// * `echo_cancellation` - Enable echo cancellation
-    /// * `noise_suppression` - Enable noise suppression
-    /// * `client_name` - Optional client name to send in connection request
+    /// A connect that fails after it was admitted leaves the network
+    /// `"idle"`. A connection that fails later moves to `"error"`, with audio
+    /// still running, until you call `disconnect()`.
     #[wasm_bindgen(js_name = connect)]
     pub async fn connect(
         &self,
@@ -759,37 +810,35 @@ impl WebTripSession {
         .await
     }
 
-    /// Disconnect from the hub server, resolving once the session is `Idle`,
-    /// and stop the audio `connect()` started (audio you started yourself with
-    /// `startAudio()` keeps running; so does everything after
-    /// [`disconnect_network`](Self::disconnect_network)).
+    /// Disconnect from the hub server, resolving once the network is
+    /// `"idle"`, and stop the audio `connect()` started. Audio you started
+    /// yourself with `startAudio()` keeps running, and so does audio left by
+    /// `disconnectNetwork()`.
     ///
-    /// Safe to call at any time and any number of times: from `Idle` it is a
-    /// no-op, and a call while another disconnect is running waits for that
-    /// one instead of starting a second teardown. A connect in flight is
-    /// cancelled first, and its own cleanup is awaited before anything else
-    /// is torn down.
-    ///
-    /// Teardown awaits full transport shutdown before retiring the
-    /// connection's buffers. That ordering is load-bearing: the `Regulator`
-    /// is shared via a raw pointer with the transport (for WebTransport, the
-    /// worker thread writes to it), so freeing it before the transport has
-    /// quiesced would let a late `regulator.push()` write freed memory.
-    /// Awaiting `transport.close()` establishes the happens-before ordering
-    /// we need: for WebTransport the future resolves after the worker posts
-    /// `"disconnected"` (both send and receive loops have exited); for WebRTC
-    /// the teardown is fully synchronous. The 2s WebTransport
-    /// force-terminate fallback is a residual race — see
-    /// `WebTransportImpl::close`. The buffers are then freed only once the
-    /// audio side is quiescent too (see the `connection` module). A connect
-    /// issued meanwhile waits for this to finish.
+    /// Never rejects. Safe to call at any time and any number of times: when
+    /// `"idle"` it resolves at once, and a call while another disconnect is
+    /// running waits for that one. A connect in progress is cancelled (it
+    /// rejects with `"AbortError"`) and its cleanup is awaited first. A
+    /// connect issued meanwhile waits for this to finish.
+    // Teardown awaits full transport shutdown before retiring the connection's
+    // buffers. That ordering is load-bearing: the `Regulator` is shared via a
+    // raw pointer with the transport (for WebTransport, the worker thread
+    // writes to it), so freeing it before the transport has quiesced would let
+    // a late `regulator.push()` write freed memory. Awaiting
+    // `transport.close()` establishes the happens-before ordering: for
+    // WebTransport the future resolves after the worker posts `"disconnected"`
+    // (both send and receive loops have exited); for WebRTC the teardown is
+    // fully synchronous. The 2s WebTransport force-terminate fallback is a
+    // residual race — see `WebTransportImpl::close`. The buffers are then
+    // freed only once the audio side is quiescent too (see the `connection`
+    // module).
     pub async fn disconnect(&self) {
         self.disconnect_with(true).await;
     }
 
     /// Disconnect from the hub server over the network only, with the same
-    /// guarantees as [`disconnect`](Self::disconnect), but audio is left running
-    /// even when `connect()` started it. That audio is then yours to stop with
+    /// guarantees as `disconnect()`, but audio is left running even when
+    /// `connect()` started it. That audio is then yours to stop with
     /// `stopAudio()`: a later `disconnect()` does not touch it.
     #[wasm_bindgen(js_name = disconnectNetwork)]
     pub async fn disconnect_network(&self) {
@@ -848,12 +897,13 @@ impl WebTripSession {
 #[wasm_bindgen]
 impl WebTripSession {
 
-    /// Return true when the underlying AudioContext is still suspended.
+    /// Whether audio is running but its `AudioContext` is suspended (`false`
+    /// when audio is stopped).
     ///
-    /// On iOS Safari the context may stay suspended after `connect` completes
-    /// because `resume()` requires a direct user-gesture activation.  The TypeScript
-    /// layer can call this after a successful connect to decide whether to show a
-    /// "Tap to enable audio" prompt.
+    /// Browsers start a context suspended when it is not created from a user
+    /// gesture, and iOS Safari may keep it suspended even after a successful
+    /// `startAudio()` or `connect()`. Check this afterwards and, if it is
+    /// `true`, show a "Tap to enable audio" control that calls `resumeAudio()`.
     #[wasm_bindgen(js_name = isAudioSuspended)]
     pub fn is_audio_suspended(&self) -> bool {
         self.audio_engine
@@ -863,10 +913,10 @@ impl WebTripSession {
             .unwrap_or(false)
     }
 
-    /// Explicitly resume the AudioContext.
-    ///
-    /// Call this from inside a synchronous user-gesture handler (e.g. a button `onclick`)
-    /// so that iOS Safari grants the audio-output activation.
+    /// Resume a suspended `AudioContext` (see `isAudioSuspended()`). Call it
+    /// directly from a user-gesture handler (for example a button's `onclick`)
+    /// so the browser allows audio output. Resolves at once when audio is
+    /// stopped.
     #[wasm_bindgen(js_name = resumeAudio)]
     pub async fn resume_audio(&self) -> Result<(), JsValue> {
         let ctx = self.audio_engine.borrow().as_ref().map(AudioEngine::context);
@@ -2948,7 +2998,7 @@ mod tests {
         assert_eq!(session.get_state(), "idle", "audio alone is not a connection");
         assert!(session.has_engine());
         assert_eq!(session.engine_attached(), None);
-        assert_eq!(session.get_ring_buffer_flag_ptr(), 0);
+        assert_eq!(session.connection_id(), None);
         assert!(start_audio(&session).await.is_err(), "a second start must be refused");
 
         session

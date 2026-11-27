@@ -197,28 +197,18 @@ impl Default for TransportConfig {
     }
 }
 
-/// WebRTC Data Channel Transport
+/// WebRTC data-channel transport to a JackTrip hub server.
 ///
-/// Handles peer-to-peer connection establishment and audio data transmission.
-/// Designed to work with JackTrip hub servers that support WebRTC.
-/// 
-/// ## Internal Signaling
-/// 
-/// This transport manages all WebRTC signaling internally via `connect_to_hub()`:
-/// - Creates and manages HubSignaling (WebSocket connection)
-/// - Handles SDP offer/answer exchange
-/// - Manages ICE candidate exchange
-/// - Sets up unreliable, unordered data channel for audio
+/// `Transport::connect` does all signaling itself: it opens a
+/// `HubSignaling` WebSocket, exchanges the SDP offer/answer and ICE
+/// candidates, and sets up the unreliable, unordered data channel the audio
+/// travels on.
 ///
-/// ## Internal Tick Loop
-/// 
-/// WebRTC requires data channel operations to stay on the main JavaScript thread.
-/// To work around this, the WebRTC transport manages its own internal tick loop:
-/// - Reads from the ring buffer (audio to send)
-/// - Writes to the jitter buffer (audio received)
-/// - Uses Atomics.waitAsync for efficient wake-up
-///
-/// Other transports (like WebTransport) don't need this and can run entirely in workers.
+/// Data-channel I/O must stay on the main thread, so the transport does no
+/// work on its own: its host calls `Transport::tick` to send what the ring
+/// buffer holds and deliver what was received to the regulator.
+/// `WebTripSession` ticks it from the audio callback while audio runs and on
+/// a timer otherwise.
 #[wasm_bindgen]
 pub struct WebRtcTransport {
     config: TransportConfig,
@@ -298,7 +288,11 @@ impl WebRtcTransport {
         })
     }
 
-    /// Set callback for connection state changes (optional, for external monitoring)
+    /// Set a JS callback for connection state changes. It receives the
+    /// transport state strings (`"disconnected"`, `"connecting"`,
+    /// `"connected"`, `"failed"`, `"closed"`). Same as the
+    /// `Transport::set_on_state_change` trait method, which this inherent
+    /// method shadows, but taking a JS function.
     pub fn set_on_state_change(&mut self, callback: js_sys::Function) {
         Transport::set_on_state_change(
             self,
@@ -1082,28 +1076,6 @@ fn warn_if_sctp_limit_below(pc: &RtcPeerConnection, packet_bytes: usize) {
     }
 }
 
-impl WebRtcTransport {
-    /// Transition to `state`, firing the state-change callback only on an
-    /// actual change (idempotent for repeated calls with the same state).
-    fn set_state(&mut self, state: TransportState) {
-        if self.state != state {
-            self.state = state;
-            self.notify_state_change();
-        }
-    }
-
-    /// Mark the connection as connected
-    /// Call this after receiving confirmation that the data channel is open
-    pub fn set_connected(&mut self) {
-        self.set_state(TransportState::Connected);
-    }
-
-    /// Mark the connection as failed
-    pub fn set_failed(&mut self) {
-        self.set_state(TransportState::Failed);
-    }
-}
-
 // Implement the Transport trait for WebRtcTransport
 impl Transport for WebRtcTransport {
     fn transport_type(&self) -> TransportType {
@@ -1343,36 +1315,6 @@ mod tests {
     }
 
     // ── Transport state surface (Category A) ─────────────────────────────────
-
-    /// `set_connected()` transitions to `Connected` (via the shared `set_state`
-    /// helper) and fires the registered state-change callback exactly once; a
-    /// second call is idempotent (state already `Connected`, so no further
-    /// notification). `set_failed()` is a thin wrapper over the same helper.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test]
-    fn webrtc_set_connected_notifies_once_then_idempotent() {
-        let mut transport = WebRtcTransport::new(Some(TransportConfig::low_latency()))
-            .expect("transport construction should succeed");
-
-        let (log, cb) = recording_transport_callback();
-        Transport::set_on_state_change(
-            &mut transport,
-            cb,
-        );
-
-        transport.set_connected();
-        assert_eq!(Transport::state(&transport), TransportState::Connected);
-        assert_eq!(log.borrow().as_slice(), ["connected"]);
-
-        // Already Connected → no state change and therefore no second callback.
-        transport.set_connected();
-        assert_eq!(Transport::state(&transport), TransportState::Connected);
-        assert_eq!(
-            log.borrow().as_slice(),
-            ["connected"],
-            "set_connected must be idempotent (no duplicate notification)"
-        );
-    }
 
     /// `set_audio_buffers()` must resize the internal scratch buffers to match
     /// the configured `buffer_size`/`channels`: `audio_to_send_buffer` to one

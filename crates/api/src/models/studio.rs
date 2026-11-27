@@ -41,10 +41,10 @@ pub struct ServerMix {
     pub mix_code: Option<String>,
 }
 
-/// Studio configuration state when connected to by devices.
-///
-/// Spec composes this as `AudioProperties` + `ServerMix` + a few studio-level
-/// fields; we flatten the shared structs.
+/// The studio settings devices apply when they connect: audio properties, the
+/// mix, broadcast visibility, expiry and capacity. The [`audio`](Self::audio)
+/// and [`mix`](Self::mix) fields are flattened, so their keys sit at the top
+/// level of the JSON object.
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
@@ -58,7 +58,9 @@ pub struct ServerAgentConfig {
     #[serde(flatten)]
     pub mix: ServerMix,
 
-    /// Broadcast visibility setting
+    /// Broadcast visibility: [`Offline`](BroadcastVisibility::Offline),
+    /// [`Public`](BroadcastVisibility::Public) or
+    /// [`Unlisted`](BroadcastVisibility::Unlisted)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub broadcast: Option<BroadcastVisibility>,
 
@@ -127,11 +129,12 @@ pub struct Server {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invite_key: Option<String>,
 
-    /// Cloud region identifier
+    /// Cloud region identifier, e.g. `ec2-us-oregon` or `azure-us-wa-seattle`
+    /// (the keys of [`SystemApi::list_regions`](crate::api::system::SystemApi::list_regions))
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
 
-    /// Instance size/type
+    /// Instance type, e.g. `c5.large`, `Standard_F2s_v2` or `e2-highcpu-2`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
 
@@ -143,12 +146,15 @@ pub struct Server {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ResourceStatus>,
 
-    /// Non-zero if this studio is provisioned and managed by JackTrip
+    /// `1` if JackTrip provisions and manages this studio, `0` if it is
+    /// self-hosted
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed: Option<i32>,
 
-    /// Collaboration intent advertised by the studio owner
-    /// (0 = unset, 1 = not looking, 2 = looking for band members, 3 = looking for students)
+    /// Collaboration intent advertised by the studio owner: `0` = unset,
+    /// `1` = not looking, `2` = looking for band members, `3` = looking for
+    /// students. Also the value to pass as
+    /// [`StreamSearchQuery::looking_for`](super::StreamSearchQuery::looking_for).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub looking_for: Option<i32>,
 
@@ -262,35 +268,68 @@ pub struct MixerConfig {
     pub encoding: Option<String>,
 }
 
-/// A participant in a studio session
+/// A participant in a studio's active session
+/// (`GET /studios/{studioId}/participants`). Keys are snake_case on the wire.
+///
+/// For the participant's full profile, pass `user_id` to
+/// [`StudiosApi::get_participant`](crate::api::studios::StudiosApi::get_participant).
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
 pub struct Participant {
     /// Participant's user ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
 
-    /// Participant's display name
+    /// Participant's profile picture URL
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub picture: Option<String>,
+}
 
-    /// Device ID (for JackTrip devices)
+/// A studio's current session (`GET /studios/{studioId}/session`).
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
+#[serde(rename_all = "camelCase")]
+pub struct Session {
+    /// Session ID
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub device_id: Option<String>,
+    pub id: Option<String>,
 
-    /// Whether the participant is muted
+    /// Studio ID
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub muted: Option<bool>,
+    pub server_id: Option<String>,
 
-    /// Participant's volume level (0-100)
+    /// When the session started (RFC3339)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub volume: Option<u32>,
+    pub started_at: Option<String>,
 
-    /// Join timestamp (RFC3339)
+    /// Whether this is the first session on its cloud instance
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub joined_at: Option<String>,
+    pub is_initial: Option<bool>,
+
+    /// Session API key; only for self-hosted studios, and only when the caller
+    /// is a studio admin
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+
+    /// Session API secret; present under the same conditions as `api_key`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_secret: Option<String>,
+}
+
+// Hand-written so the session secret never reaches logs.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("id", &self.id)
+            .field("server_id", &self.server_id)
+            .field("started_at", &self.started_at)
+            .field("is_initial", &self.is_initial)
+            .field("api_key", &self.api_key)
+            .field("api_secret", &self.api_secret.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -345,7 +384,7 @@ mod tests {
         assert_eq!(s.agent.audio.period, Some(Period::P128));
         assert_eq!(s.agent.audio.queue_buffer, Some(QueueBuffer::Q4));
         assert_eq!(s.agent.audio.buffer_strategy, Some(BufferStrategy::Standard));
-        assert_eq!(s.agent.broadcast, Some(BroadcastVisibility::Public));
+        assert_eq!(s.agent.broadcast, Some(BroadcastVisibility::Unlisted));
         assert_eq!(s.agent.max_musicians, Some(5));
         assert_eq!(s.agent.mix.mix_branch.as_deref(), Some("main"));
         assert_eq!(s.agent.expires_at.as_deref(), Some("2026-06-14T00:00:00Z"));
@@ -366,9 +405,22 @@ mod tests {
     }
 
     #[test]
-    fn server_status_removed_variant_roundtrips() {
-        let s: Server = serde_json::from_str(r#"{"status":"Removed"}"#).unwrap();
-        assert_eq!(s.status, Some(ResourceStatus::Removed));
+    fn participant_and_session_wire_format() {
+        // Regression: Participant was camelCase with invented fields
+        // (`muted`, `volume`, `joinedAt`); the API sends snake_case `user_id`.
+        let p = serde_json::json!({"user_id": "u1", "picture": "p.png"});
+        let parsed: Participant = serde_json::from_value(p.clone()).unwrap();
+        assert_eq!(parsed.user_id.as_deref(), Some("u1"));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), p);
+
+        let s = serde_json::json!({
+            "id": "sess1", "serverId": "st1", "startedAt": "t", "isInitial": true,
+            "apiKey": "k", "apiSecret": "shh"
+        });
+        let parsed: Session = serde_json::from_value(s.clone()).unwrap();
+        assert_eq!(parsed.server_id.as_deref(), Some("st1"));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), s);
+        assert!(!format!("{parsed:?}").contains("shh"));
     }
 
     #[test]

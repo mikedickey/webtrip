@@ -9,56 +9,6 @@ use tsify_next::Tsify;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-/// User billing information
-#[cfg_attr(feature = "wasm", derive(Tsify))]
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
-pub struct BillingInfo {
-    /// Stripe customer ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub customer_id: Option<String>,
-
-    /// Current subscription plan
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub plan: Option<String>,
-
-    /// Subscription status
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-
-    /// Current billing period end date
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub period_end: Option<String>,
-}
-
-/// Subscription plan
-#[cfg_attr(feature = "wasm", derive(Tsify))]
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
-pub struct Plan {
-    /// Plan identifier
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-
-    /// Plan name
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-
-    /// Monthly price in cents
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub price: Option<f64>,
-
-    /// Maximum number of musicians allowed
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_musicians: Option<i32>,
-
-    /// Included studio minutes
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub studio_minutes: Option<f64>,
-}
-
 /// Resolved plan pricing (`GET /users/{userId}/plans`).
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -101,26 +51,26 @@ pub struct Redemption {
     pub redeemed_at: Option<String>,
 }
 
-/// Studio utilization statistics
+/// Studio usage over one time span.
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct Usage {
-    /// Earliest RFC3339-formatted timestamp of results
+    /// Start of the span (RFC3339)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub earliest: Option<String>,
 
-    /// Latest RFC3339-formatted timestamp of results
+    /// End of the span (RFC3339)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest: Option<String>,
 
-    /// Aggregated result of data within the time span
+    /// Musician minutes used within the span
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total: Option<f64>,
 }
 
-/// Usage API response model
+/// Studio usage (`GET /usage`): a total plus one [`Usage`] per day.
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
@@ -139,24 +89,6 @@ pub struct UsageResponse {
 mod tests {
     use super::*;
     use super::super::test_utils::roundtrip;
-
-    #[test]
-    fn billing_info_fixture_known_good() {
-        let json = r#"{
-          "customerId": "cus_abc",
-          "plan": "pro",
-          "status": "active",
-          "periodEnd": "2026-07-01T00:00:00Z"
-        }"#;
-        let b: BillingInfo = serde_json::from_str(json).unwrap();
-        assert_eq!(b.customer_id.as_deref(), Some("cus_abc"));
-        assert_eq!(b.plan.as_deref(), Some("pro"));
-        assert_eq!(b.status.as_deref(), Some("active"));
-
-        let out = roundtrip(&b);
-        assert!(out.contains("\"customerId\":"));
-        assert!(out.contains("\"periodEnd\":"));
-    }
 
     #[test]
     fn plan_price_renames_price_id() {

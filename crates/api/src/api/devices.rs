@@ -5,8 +5,12 @@
 //! [`ApiClient::devices`].
 //!
 //! **Authentication:** every endpoint requires a bearer token
-//! ([`ApiClient::set_bearer_token`]); see [`DevicesApi::send_heartbeat`] for
-//! device-side credentials.
+//! ([`ApiClient::set_bearer_token`]) except [`DevicesApi::send_heartbeat`],
+//! which authenticates with the device's own API key in the request body, and
+//! [`DevicesApi::list_studio_devices`].
+//!
+//! The devices' live-update topics are WebSocket endpoints and are not covered
+//! by this client.
 //!
 //! # Example
 //!
@@ -53,15 +57,10 @@ use serde::Serialize;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-// =============================================================================
-// Devices API
-// =============================================================================
-
-api_module_struct!(DevicesApi);
-
-// =============================================================================
-// Rust API (primary interface)
-// =============================================================================
+api_module_struct!(
+    /// JackTrip device endpoints; obtain with [`ApiClient::devices`].
+    DevicesApi
+);
 
 impl DevicesApi {
     /// List all devices in the account (`GET /devices`).
@@ -94,10 +93,11 @@ impl DevicesApi {
 
     /// Send a device heartbeat (`POST /devices/{device_id}/heartbeat`).
     ///
-    /// Used by JackTrip device agents to report their version and network/RTT
-    /// statistics ([`models::DeviceNetworkStats`], flattened into the body).
-    /// The body may carry the device's API key (`api_prefix`/`api_secret`).
-    /// The response is the [`models::DeviceAgentConfig`] the device should apply.
+    /// Used by JackTrip device agents to report their MAC address, version
+    /// and ping statistics. The request authenticates with the device's API
+    /// key ([`models::HeartbeatRequest::credentials`]), not a bearer token.
+    /// The response is the [`models::DeviceAgentConfig`] the device should
+    /// apply.
     pub async fn send_heartbeat(
         &self,
         device_id: &str,
@@ -108,6 +108,7 @@ impl DevicesApi {
     }
 
     /// List devices connected to a studio (`GET /studios/{studio_id}/devices`).
+    /// Does not require authentication.
     pub async fn list_studio_devices(&self, studio_id: &str) -> Result<Vec<models::Device>, ApiError> {
         let path = format!("/studios/{}/devices", urlencode(studio_id));
         self.client.get(&path).await
@@ -336,13 +337,14 @@ mod tests {
             "POST",
             "/devices/dev123/heartbeat",
             200,
-            r#"{"device":{"id":"dev123"}}"#,
+            r#"{"serverHost":"h.example.com","period":128,"authToken":"tok"}"#,
         )
         .await;
 
         let body = models::HeartbeatRequest::default();
         let config = api(&client).send_heartbeat("dev123", &body).await.unwrap();
-        assert_eq!(config.device.unwrap().id, Some("dev123".to_string()));
+        assert_eq!(config.server.server_host.as_deref(), Some("h.example.com"));
+        assert_eq!(config.auth_token.as_deref(), Some("tok"));
         mock.assert_async().await;
     }
 

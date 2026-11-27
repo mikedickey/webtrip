@@ -11,7 +11,7 @@
 //! # async fn run(client: &ApiClient, wav_bytes: Vec<u8>) -> Result<(), ApiError> {
 //! let track = client.tracks().upload_track("studio123", "bassline.wav", wav_bytes).await?;
 //! if let Some(id) = &track.id {
-//!     let update = TrackUpdateRequest { volume: Some(80), ..Default::default() };
+//!     let update = TrackUpdateRequest { name: Some("Bass line".into()) };
 //!     client.tracks().update_track("studio123", id, &update).await?;
 //! }
 //! # Ok(())
@@ -20,30 +20,22 @@
 //!
 //! ```js
 //! const track = await client.tracks().uploadTrack('studio123', 'bassline.wav', wavBytes); // Uint8Array
-//! await client.tracks().updateTrack('studio123', track.id, { volume: 80 });
+//! await client.tracks().updateTrack('studio123', track.id, { name: 'Bass line' });
 //! const { results } = await client.tracks().listTracks('studio123', 1, 20);
 //! ```
 //!
-//! The `GET /studios/{studioId}/tracks/{trackId}/download` route is intentionally
-//! omitted: per the OpenAPI spec it is authenticated with VS-agent
-//! `APIPrefix`/`APISecret` credentials rather than the user JWT this client
-//! carries, making it a VS-agent endpoint that falls outside this client-facing
-//! module's scope.
+//! Downloading a track's audio is not available here: that endpoint is for
+//! studio servers and authenticates with server credentials, not a user token.
 
 use super::{ApiClient, ApiError, PaginationQuery, urlencode};
 use crate::models;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-// =============================================================================
-// Tracks API
-// =============================================================================
-
-api_module_struct!(TracksApi);
-
-// =============================================================================
-// Rust API (primary interface)
-// =============================================================================
+api_module_struct!(
+    /// Studio backing-track endpoints; obtain with [`ApiClient::tracks`].
+    TracksApi
+);
 
 fn tracks_path(studio_id: &str) -> String {
     format!("/studios/{}/tracks", urlencode(studio_id))
@@ -64,19 +56,17 @@ impl TracksApi {
         page: Option<i32>,
         limit: Option<i32>,
     ) -> Result<models::PaginatedBackingTracks, ApiError> {
-        let path = tracks_path(studio_id);
-
-        if page.is_some() || limit.is_some() {
-            self.client.get_with_query(&path, &PaginationQuery { page, limit }).await
-        } else {
-            self.client.get(&path).await
-        }
+        self.client.get_with_query(&tracks_path(studio_id), &PaginationQuery { page, limit }).await
     }
 
     /// Upload a new backing track (`POST /studios/{studioId}/tracks`).
     ///
     /// `data` is the raw WAV, MP3, or FLAC file, sent as the `file` part of a
     /// `multipart/form-data` body under `file_name`.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Http`] `406` if the file is not WAV, MP3 or FLAC.
     pub async fn upload_track(
         &self,
         studio_id: &str,
@@ -93,10 +83,7 @@ impl TracksApi {
         self.client.get(&track_path(studio_id, track_id)).await
     }
 
-    /// Update a backing track's name and mix settings
-    /// (`PUT /studios/{studioId}/tracks/{trackId}`).
-    ///
-    /// Only the fields set in `update` are sent.
+    /// Rename a backing track (`PUT /studios/{studioId}/tracks/{trackId}`).
     pub async fn update_track(
         &self,
         studio_id: &str,

@@ -31,9 +31,9 @@
 //!
 //! // Downloading a studio recording needs a bearer token.
 //! client.set_bearer_token("<token>".to_string());
-//! let download = client.recordings().download_recording("studio123", "rec456").await?;
-//! if let Some(url) = download.url {
-//!     println!("download from {url}");
+//! match client.recordings().download_recording("studio123", "rec456").await? {
+//!     Some(download) => println!("download from {:?}", download.url),
+//!     None => println!("still transcoding; try again later"),
 //! }
 //! # Ok(())
 //! # }
@@ -49,7 +49,8 @@
 //! const page = await client.recordings().listRecordingsPaginated(1, 20);
 //!
 //! client.setBearerToken(token);
-//! const { url } = await client.recordings().downloadRecording('studio123', 'rec456');
+//! const download = await client.recordings().downloadRecording('studio123', 'rec456');
+//! if (download) location.href = download.url; // undefined while transcoding
 //!
 //! const bytes = new Uint8Array(await file.arrayBuffer());
 //! await client.recordings().updateRecordingBanner('studio123', 'rec456', bytes, file.type);
@@ -63,15 +64,11 @@ use serde::Serialize;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-// =============================================================================
-// Recordings API
-// =============================================================================
-
-api_module_struct!(RecordingsApi);
-
-// =============================================================================
-// Rust API (primary interface)
-// =============================================================================
+api_module_struct!(
+    /// Public, studio and user recording endpoints; obtain with
+    /// [`ApiClient::recordings`].
+    RecordingsApi
+);
 
 fn recording_like_path(recording_id: &str) -> String {
     format!("/recordings/{}/likes", urlencode(recording_id))
@@ -120,18 +117,13 @@ impl RecordingsApi {
             following: Option<bool>,
         }
 
-        if page.is_some() || limit.is_some() || following.is_some() {
-            self.client.get_with_query("/recordings-paginated", &Query { page, limit, following }).await
-        } else {
-            self.client.get("/recordings-paginated").await
-        }
+        self.client.get_with_query("/recordings-paginated", &Query { page, limit, following }).await
     }
 
     /// Get a public recording by ID.
     ///
     /// `GET /recordings/{recordingId}`. No authentication required. The
-    /// [`models::PersonalizedRecording`] adds the caller's `liked` and
-    /// `following` state to the recording metadata.
+    /// [`models::PersonalizedRecording`] adds whether the caller has liked it.
     pub async fn get_recording(&self, recording_id: &str) -> Result<models::PersonalizedRecording, ApiError> {
         let path = format!("/recordings/{}", urlencode(recording_id));
         self.client.get(&path).await
@@ -186,12 +178,7 @@ impl RecordingsApi {
         limit: Option<i32>,
     ) -> Result<models::PaginatedServerRecordings, ApiError> {
         let path = format!("{}-paginated", studio_recordings_path(studio_id));
-
-        if page.is_some() || limit.is_some() {
-            self.client.get_with_query(&path, &PaginationQuery { page, limit }).await
-        } else {
-            self.client.get(&path).await
-        }
+        self.client.get_with_query(&path, &PaginationQuery { page, limit }).await
     }
 
     /// Get one of a studio's recordings.
@@ -230,16 +217,18 @@ impl RecordingsApi {
     /// The returned [`models::RecordingDownload::url`] downloads the recording
     /// as a FLAC or ZIP file.
     ///
-    /// The endpoint responds `202` while the recording is still being
-    /// transcoded and `400` if it is in progress or has been deleted. `400`
-    /// surfaces as [`ApiError::Http`]; `202` is a success status, so it does
-    /// *not* — check that `url` is present before using it, and retry later if
-    /// it is not.
+    /// Returns `Ok(None)` while the recording is still being transcoded (the
+    /// server answers `202` with no body); retry later.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Http`] `400` if the recording is still in progress or has
+    /// been deleted.
     pub async fn download_recording(
         &self,
         studio_id: &str,
         recording_id: &str,
-    ) -> Result<models::RecordingDownload, ApiError> {
+    ) -> Result<Option<models::RecordingDownload>, ApiError> {
         let path = format!("{}/download", studio_recording_path(studio_id, recording_id));
         self.client.get(&path).await
     }
@@ -294,12 +283,7 @@ impl RecordingsApi {
         limit: Option<i32>,
     ) -> Result<models::PaginatedServerRecordings, ApiError> {
         let path = format!("/users/{}/recordings-paginated", urlencode(user_id));
-
-        if page.is_some() || limit.is_some() {
-            self.client.get_with_query(&path, &PaginationQuery { page, limit }).await
-        } else {
-            self.client.get(&path).await
-        }
+        self.client.get_with_query(&path, &PaginationQuery { page, limit }).await
     }
 
     /// Get a user's recording quota usage.
@@ -401,13 +385,16 @@ impl RecordingsApi {
         self.delete_studio_recording(&studio_id, &recording_id).await
     }
 
+    /// Resolves to a `RecordingDownload`, or `undefined` while the recording
+    /// is still transcoding; see [`RecordingsApi::download_recording`].
     #[wasm_bindgen(js_name = downloadRecording)]
     pub async fn download_recording_js(
         &self,
         studio_id: String,
         recording_id: String,
-    ) -> Result<models::RecordingDownload, ApiError> {
-        self.download_recording(&studio_id, &recording_id).await
+    ) -> Result<JsValue, ApiError> {
+        let download = self.download_recording(&studio_id, &recording_id).await?;
+        to_js_value(&download)
     }
 
     #[wasm_bindgen(js_name = updateRecordingBanner)]
@@ -728,11 +715,22 @@ mod tests {
         )
         .await;
 
-        let result = api(&client).download_recording("st1", "rec1").await.unwrap();
+        let result = api(&client).download_recording("st1", "rec1").await.unwrap().expect("ready");
         assert_eq!(
             result.url,
             Some("https://storage.example.com/rec1.flac?token=abc".to_string())
         );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_download_recording_202_while_transcoding_is_none() {
+        // Regression: the empty 202 body failed to decode, so a recording
+        // still transcoding surfaced as a Serialization error.
+        let (mut server, client) = mock_api().await;
+        let mock = mock_empty(&mut server, "GET", "/studios/st1/recordings/rec1/download", 202).await;
+
+        assert_eq!(api(&client).download_recording("st1", "rec1").await.unwrap(), None);
         mock.assert_async().await;
     }
 

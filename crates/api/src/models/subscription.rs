@@ -1,7 +1,7 @@
 //! Studio subscription (membership) model
 //!
 //! A "subscription" here is **not** a billing plan — it represents a user who is
-//! a member of a studio. Consumed by the studio-subscriptions API module.
+//! a member of a studio. See [`api::subscriptions`](crate::api::subscriptions).
 
 use super::ModifiedAtTime;
 use serde::{Deserialize, Serialize};
@@ -12,8 +12,10 @@ use wasm_bindgen::prelude::*;
 
 /// A studio membership ("subscription") linking a user to a studio.
 ///
-/// Note the mixed wire casing: `user_id` and `updated_at` are snake_case while
-/// `serverId` is camelCase, so every field uses an explicit serde rename.
+/// The wire casing is mixed: the user-profile keys (`user_id`, `name`, …,
+/// `updated_at`) are snake_case while `serverId`, `createdAt` and `updatedAt`
+/// are camelCase. A member's profile `updated_at` and the membership's
+/// `updatedAt` are separate fields.
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]

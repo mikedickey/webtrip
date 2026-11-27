@@ -19,7 +19,7 @@ export default function StatsPanel({ engine }: { engine: DemoEngine }) {
 
   useEffect(() => {
     const id = window.setInterval(() => {
-      const s = engine.session.get_stats();
+      const s = engine.session.getStats();
       const played = Number(s.regulator_packets_played);
       const plc = Number(s.regulator_plc_count);
       setStats({

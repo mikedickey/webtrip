@@ -1,35 +1,39 @@
 //! API request body types
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 #[cfg(feature = "wasm")]
 use tsify_next::Tsify;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-/// Device heartbeat request
+/// Device heartbeat body (`POST /devices/{deviceId}/heartbeat`): the device's
+/// API key plus what it reports. Both parts are flattened into one JSON object.
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
 pub struct HeartbeatRequest {
-    /// Network and RTT statistics
+    /// The device's API key (`apiPrefix` / `apiSecret`)
     #[serde(flatten)]
-    pub net: super::DeviceNetworkStats,
+    pub credentials: super::AgentCredentials,
+
+    /// MAC address, version, type and ping statistics
+    #[serde(flatten)]
+    pub heartbeat: super::DeviceHeartbeat,
 }
 
-/// Send a message request
+/// Send-message body (`POST /streams/{streamId}/conversations/{userId}/messages`).
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
 pub struct SendMessageRequest {
-    /// Message content
+    /// Message text
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub text: Option<String>,
 
-    /// Message type (text, image, etc.)
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub message_type: Option<String>,
+    /// `0` = normal (the default), `1` = deleted
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<i32>,
 }
 
 /// Mark-messages-read request (`POST /streams/{streamId}/conversations/{userId}/last`).
@@ -56,108 +60,145 @@ pub struct UpdateMessageRequest {
     pub status: Option<i32>,
 }
 
-/// Studio session feedback request
+/// Studio feedback body (`POST /studios/{studioId}/feedback`).
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct FeedbackRequest {
-    /// Rating (1-5)
+    /// Rating from 1 to 5
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rating: Option<i32>,
 
-    /// Feedback comment
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
-
-    /// Session ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-
-    /// Audio quality rating (1-5)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub audio_quality: Option<i32>,
-
-    /// Latency rating (1-5)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latency: Option<i32>,
-
-    /// Whether there were connection issues
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub had_issues: Option<bool>,
-}
-
-/// Studio invite request
-#[cfg_attr(feature = "wasm", derive(Tsify))]
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
-pub struct InviteRequest {
-    /// Email address to invite
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub email: Option<String>,
-
-    /// Invite message
+    /// Feedback text
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 
-    /// Invite type (email, sms, link)
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub invite_type: Option<String>,
+    /// Client platform, e.g. `"web"` or `"desktop"`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+
+    /// Operating system version
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os_version: Option<String>,
+
+    /// Application version
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+
+    /// Audio input device name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_device: Option<String>,
+
+    /// Audio output device name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_device: Option<String>,
+
+    /// Description of any device issues
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_issues: Option<String>,
 }
 
-/// Track update request
+/// Studio invitation body (`POST /studios/{studioId}/invite`).
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
+pub struct InviteRequest {
+    /// Email addresses to invite
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emails: Vec<String>,
+
+    /// Optional message included in the invitation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Backing-track update body (`PUT /studios/{studioId}/tracks/{trackId}`).
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 pub struct TrackUpdateRequest {
-    /// Track name
+    /// New track display name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// An analytics event (`POST /collect`). Keys are snake_case on the wire
+/// except `EnableCustomValue` / `CustomValue`.
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
+pub struct AnalyticsEvent {
+    /// Event name, e.g. `vs_studio`, `vs_device` or `vs_session`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
-    /// Volume level (0-100)
+    /// ID of the user the event concerns
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub volume: Option<u32>,
+    pub user: Option<String>,
 
-    /// Pan position (-100 to 100)
+    /// Whether the event came from an anonymous user
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pan: Option<i32>,
+    pub is_anonymous: Option<bool>,
 
-    /// Whether the track is muted
+    /// URL the event originated from
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mute: Option<bool>,
+    pub url: Option<String>,
 
-    /// Whether the track is soloed
+    /// Arbitrary key/value labels
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub solo: Option<bool>,
+    pub labels: Option<HashMap<String, String>>,
+
+    /// Optional deduplication key
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insert_id: Option<String>,
+
+    /// Event time (RFC3339); set by the server, so leave it `None` when sending
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+
+    /// Optional user details for enriched tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_metadata: Option<AnalyticsUserMetadata>,
+
+    /// When `true`, [`custom_value`](Self::custom_value) replaces the event's
+    /// default metric value
+    #[serde(rename = "EnableCustomValue", skip_serializing_if = "Option::is_none")]
+    pub enable_custom_value: Option<bool>,
+
+    /// Custom metric value, used when `enable_custom_value` is `true`
+    #[serde(rename = "CustomValue", skip_serializing_if = "Option::is_none")]
+    pub custom_value: Option<f64>,
 }
 
-/// Analytics event
+/// User details attached to an [`AnalyticsEvent`]. Keys are snake_case.
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
-pub struct AnalyticsEvent {
-    /// Event name
+pub struct AnalyticsUserMetadata {
+    /// Email address
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub event: Option<String>,
+    pub email: Option<String>,
 
-    /// Event properties
+    /// First name
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub properties: Option<serde_json::Value>,
+    pub first_name: Option<String>,
 
-    /// User ID (if authenticated)
+    /// Last name
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub user_id: Option<String>,
+    pub last_name: Option<String>,
 
-    /// Anonymous ID
+    /// Browser user agent
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub anonymous_id: Option<String>,
+    pub user_agent: Option<String>,
 
-    /// Event timestamp (RFC3339)
+    /// Facebook click ID
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub timestamp: Option<String>,
+    pub fbclid: Option<String>,
+
+    /// When `fbclid` was first seen
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fbclid_timestamp: Option<String>,
 }
 
 /// Checkout session request (`POST /users/{userId}/checkout`).
@@ -166,7 +207,7 @@ pub struct AnalyticsEvent {
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct CheckoutRequest {
-    /// Subscription plan name to check out (required)
+    /// Subscription plan name to check out, e.g. `"solo"` or `"ensemble"` (required)
     pub plan: String,
 
     /// URL to redirect to after checkout completes (required)
@@ -205,8 +246,7 @@ pub struct CodeRequest {
 
 /// Create studio subscription request (`POST /studios/{studioId}/subscriptions`).
 ///
-/// All fields are optional in the spec; `inviteKey` is only required for
-/// private studios.
+/// All fields are optional; `inviteKey` is only needed for private studios.
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
@@ -228,87 +268,90 @@ pub struct CreateSubscriptionRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::test_utils::roundtrip;
+    use serde_json::json;
+
+    // Each request body below once used field names the API does not read,
+    // so the server silently dropped them. These pin the exact JSON sent.
 
     #[test]
-    fn heartbeat_request_renames_type_field() {
+    fn heartbeat_request_wire_format() {
         let h = HeartbeatRequest {
-            net: super::super::DeviceNetworkStats {
-                api_prefix: Some("pref".into()),
-                api_secret: Some("sec".into()),
-                mac: Some("00:11:22:33:44:55".into()),
-                version: Some("2.4.0".into()),
-                device_type: Some("usb-x2".into()),
-                pkts_recv: Some(100),
-                pkts_sent: Some(101),
-                rtt: super::super::RttStats {
-                    min_rtt: Some(10),
-                    max_rtt: Some(30),
-                    avg_rtt: Some(15),
-                    stddev_rtt: Some(2),
-                    latest_rtt: Some(14),
-                    stats_updated_at: Some("2026-06-14T00:00:00Z".into()),
-                },
+            credentials: super::super::AgentCredentials { api_prefix: Some("pre".into()), api_secret: Some("sec".into()) },
+            heartbeat: super::super::DeviceHeartbeat {
+                mac: Some("00:11".into()),
+                ping: super::super::PingStats { avg_rtt: Some(15), ..Default::default() },
+                ..Default::default()
             },
         };
-        let s = roundtrip(&h);
-        assert!(s.contains("\"type\":\"usb-x2\""));
-        assert!(s.contains("\"apiPrefix\":\"pref\""));
-        assert!(s.contains("\"pktsRecv\":100"));
-        assert!(s.contains("\"statsUpdatedAt\":"));
+        assert_eq!(
+            serde_json::to_value(&h).unwrap(),
+            json!({"apiPrefix": "pre", "apiSecret": "sec", "mac": "00:11", "avg_rtt": 15})
+        );
     }
 
     #[test]
-    fn send_message_request_renames_type_field() {
-        let m = SendMessageRequest {
-            content: Some("hello".into()),
-            message_type: Some("text".into()),
+    fn message_feedback_invite_and_track_wire_format() {
+        let m = SendMessageRequest { text: Some("hello".into()), status: Some(0) };
+        assert_eq!(serde_json::to_value(&m).unwrap(), json!({"text": "hello", "status": 0}));
+
+        let f = FeedbackRequest {
+            rating: Some(5),
+            message: Some("great".into()),
+            os_version: Some("14".into()),
+            app_version: Some("1.0".into()),
+            input_device: Some("mic".into()),
+            device_issues: Some("none".into()),
+            ..Default::default()
         };
-        let s = roundtrip(&m);
-        assert!(s.contains("\"type\":\"text\""));
-        assert!(!s.contains("messageType"));
+        assert_eq!(
+            serde_json::to_value(&f).unwrap(),
+            json!({"rating": 5, "message": "great", "osVersion": "14", "appVersion": "1.0",
+                   "inputDevice": "mic", "deviceIssues": "none"})
+        );
+
+        let i = InviteRequest { emails: vec!["a@example.com".into()], message: Some("join".into()) };
+        assert_eq!(serde_json::to_value(&i).unwrap(), json!({"emails": ["a@example.com"], "message": "join"}));
+
+        let t = TrackUpdateRequest { name: Some("Loop".into()) };
+        assert_eq!(serde_json::to_value(&t).unwrap(), json!({"name": "Loop"}));
     }
 
     #[test]
-    fn checkout_request_wire_format() {
+    fn analytics_event_wire_format() {
+        let e = AnalyticsEvent {
+            name: Some("vs_session".into()),
+            user: Some("u1".into()),
+            is_anonymous: Some(false),
+            labels: Some(HashMap::from([("k".to_string(), "v".to_string())])),
+            insert_id: Some("dedupe".into()),
+            user_metadata: Some(AnalyticsUserMetadata { first_name: Some("Ada".into()), ..Default::default() }),
+            enable_custom_value: Some(true),
+            custom_value: Some(1.5),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&e).unwrap(),
+            json!({"name": "vs_session", "user": "u1", "is_anonymous": false, "labels": {"k": "v"},
+                   "insert_id": "dedupe", "user_metadata": {"first_name": "Ada"},
+                   "EnableCustomValue": true, "CustomValue": 1.5})
+        );
+    }
+
+    #[test]
+    fn billing_request_wire_format() {
         let r = CheckoutRequest {
-            plan: "pro".into(),
+            plan: "solo".into(),
             pricing_mode: Some("yearly".into()),
             callback_url: "https://app/done".into(),
             force_stripe_test_mode: Some(true),
         };
-        let s = roundtrip(&r);
-        assert!(s.contains("\"plan\":\"pro\""));
-        assert!(s.contains("\"pricingMode\":\"yearly\""));
-        // callbackURL keeps its uppercase casing on the wire.
-        assert!(s.contains("\"callbackURL\":"));
-        assert!(s.contains("\"forceStripeTestMode\":true"));
-        assert!(!s.contains("\"callbackUrl\":"));
-    }
-
-    #[test]
-    fn billing_portal_request_renames_callback_url() {
-        let r = BillingPortalRequest { callback_url: Some("https://app/done".into()) };
-        let s = roundtrip(&r);
-        assert!(s.contains("\"callbackURL\":"));
-        assert!(!s.contains("\"callbackUrl\":"));
-    }
-
-    #[test]
-    fn create_subscription_request_omits_none_fields() {
-        let r = CreateSubscriptionRequest::default();
-        assert_eq!(roundtrip(&r), "{}");
-    }
-
-    #[test]
-    fn invite_request_renames_type_field() {
-        let i = InviteRequest {
-            email: Some("a@b".into()),
-            message: Some("join us".into()),
-            invite_type: Some("email".into()),
-        };
-        let s = roundtrip(&i);
-        assert!(s.contains("\"type\":\"email\""));
+        assert_eq!(
+            serde_json::to_value(&r).unwrap(),
+            json!({"plan": "solo", "pricingMode": "yearly", "callbackURL": "https://app/done",
+                   "forceStripeTestMode": true})
+        );
+        let p = BillingPortalRequest { callback_url: Some("https://app/done".into()) };
+        assert_eq!(serde_json::to_value(&p).unwrap(), json!({"callbackURL": "https://app/done"}));
+        assert_eq!(serde_json::to_value(CreateSubscriptionRequest::default()).unwrap(), json!({}));
     }
 }
-

@@ -1,7 +1,9 @@
 //! JackTrip Wire Protocol Implementation
 //!
-//! This module implements the JackTrip network audio protocol for WebRTC data channels.
-//! The protocol matches JackTrip's native C++ implementation for interoperability.
+//! A transport-agnostic codec for the JackTrip network audio protocol: the same
+//! bytes go over WebRTC data channels, WebTransport datagrams, or any other
+//! datagram transport a host provides. The format matches JackTrip's native
+//! C++ implementation for interoperability.
 //!
 //! ## Packet Format (DefaultHeaderStruct)
 //!
@@ -106,9 +108,12 @@ pub struct FppFit {
 /// packet (header + audio) fits in `max_bytes`, clamped to
 /// `[MIN_FPP, MAX_FPP]`.
 ///
-/// A power of two because the regulator sizes its history as whole packets of
-/// `HIST_FPP / fpp`, which truncates for a non-divisor. Packet geometry comes
-/// from [`packet_bytes`], so there is one definition of it.
+/// The result is a power of two because the receiving
+/// [`Regulator`](crate::stream::regulator::Regulator) keeps its concealment
+/// history as a whole number of packets, which only divides evenly for powers
+/// of two. Packet geometry comes from [`packet_bytes`]. If not even
+/// [`MIN_FPP`] fits, the result is `MIN_FPP` with
+/// [`FppLimit::Floor`].
 pub fn fit_fpp(max_bytes: usize, channels: u8, bit_depth: u8, preferred: usize) -> FppFit {
     let packet_bytes = |fpp: usize| packet_bytes(fpp, channels, bit_depth);
 
@@ -220,11 +225,13 @@ impl SampleRateCode {
 /// The encoding/decoding is handled automatically by `serialize()` and `deserialize()`.
 #[derive(Debug, Clone, Copy)]
 pub struct PacketHeader {
-    /// Timestamp in samples since stream start (8 bytes)
+    /// Timestamp (8 bytes). WebTrip's senders put a frame counter here,
+    /// advancing by `buffer_size` per packet; its receive path ignores the
+    /// field, ordering packets by `sequence_number` and timing them by arrival.
     pub timestamp: u64,
     /// Sequence number for packet ordering (2 bytes, wraps at 65535)
     pub sequence_number: u16,
-    /// Number of samples per channel in this packet (2 bytes)
+    /// Frames per packet: samples per channel in this packet (2 bytes)
     pub buffer_size: u16,
     /// Sample rate code (1 byte)
     pub sample_rate: SampleRateCode,
@@ -232,8 +239,11 @@ pub struct PacketHeader {
     pub bit_depth: u8,
     /// Channels the sender receives from the network — the count it wants sent back
     pub num_incoming_channels: u8,
-    /// Channels the sender transmits — this packet's payload width
-    /// Note: This is the decoded value; wire format uses special encoding
+    /// Channels the sender transmits — this packet's payload width.
+    ///
+    /// This is the decoded value: `0` means the sender transmits no audio
+    /// (`255` on the wire), and a value equal to
+    /// [`num_incoming_channels`](Self::num_incoming_channels) is sent as `0`.
     pub num_outgoing_channels: u8,
 }
 
@@ -306,7 +316,14 @@ impl PacketHeader {
         packet_bytes(self.buffer_size as usize, self.num_outgoing_channels, self.bit_depth)
     }
 
-    /// Serialize header to bytes (little-endian byte order)
+    /// Write the 16-byte header into `buffer[..16]` (little-endian).
+    ///
+    /// No field is validated; [`deserialize`](Self::deserialize) is where
+    /// values are checked.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::BufferTooSmall`] if `buffer` is shorter than 16 bytes.
     pub fn serialize(&self, buffer: &mut [u8]) -> Result<(), ProtocolError> {
         if buffer.len() < HEADER_SIZE {
             return Err(ProtocolError::BufferTooSmall);
@@ -331,7 +348,19 @@ impl PacketHeader {
         Ok(())
     }
 
-    /// Deserialize header from bytes (little-endian byte order)
+    /// Parse and validate the 16-byte header at the start of `buffer`.
+    ///
+    /// An unknown sample-rate byte decodes as 48 kHz rather than failing.
+    /// Rejections are logged at `error` level.
+    ///
+    /// # Errors
+    ///
+    /// - [`ProtocolError::BufferTooSmall`]: fewer than 16 bytes.
+    /// - [`ProtocolError::InvalidChannelCount`]: incoming channels outside
+    ///   `1..=`[`MAX_WIRE_CHANNELS`], or decoded outgoing channels above it.
+    /// - [`ProtocolError::InvalidBitDepth`]: bit depth not 8, 16, 24 or 32.
+    /// - [`ProtocolError::InvalidBufferSize`]: frames per packet outside
+    ///   [`MIN_FPP`]`..=`[`MAX_FPP`].
     pub fn deserialize(buffer: &[u8]) -> Result<Self, ProtocolError> {
         if buffer.len() < HEADER_SIZE {
             log::error!("❌ Buffer too small: {} bytes (need {})", buffer.len(), HEADER_SIZE);
@@ -418,17 +447,24 @@ fn wire_idx(i: usize, channels: usize, buf_size: usize) -> usize {
 pub struct AudioPacket {
     /// The 16-byte header that precedes the samples on the wire.
     pub header: PacketHeader,
-    /// Audio samples as 32-bit floats (interleaved for stereo)
+    /// Audio samples, interleaved by frame, nominally in `[-1.0, 1.0]`.
+    ///
+    /// Must hold exactly `header.buffer_size * header.num_outgoing_channels`
+    /// samples for serialization. (The wire stores channels one after
+    /// another; the codec converts.)
     pub samples: Vec<f32>,
 }
 
 impl AudioPacket {
-    /// Create a new audio packet
+    /// Create a packet from a header and its samples. Keep `samples.len()`
+    /// equal to `header.buffer_size * header.num_outgoing_channels`; see
+    /// [`samples`](Self::samples).
     pub fn new(header: PacketHeader, samples: Vec<f32>) -> Self {
         Self { header, samples }
     }
 
-    /// Create a mono packet from samples
+    /// Create a mono, 16-bit, 48 kHz packet; `buffer_size` is `samples.len()`.
+    /// Keep that within [`MAX_FPP`] frames for the peer to accept it.
     pub fn mono(sequence_number: u16, timestamp: u64, samples: Vec<f32>) -> Self {
         let mut header = PacketHeader::new(sequence_number, timestamp);
         header.buffer_size = samples.len() as u16;
@@ -436,7 +472,9 @@ impl AudioPacket {
         Self { header, samples }
     }
 
-    /// Create a stereo packet from interleaved samples
+    /// Create a stereo, 16-bit, 48 kHz packet from interleaved samples;
+    /// `buffer_size` is `samples.len() / 2`. `samples.len()` must be even, or
+    /// [`serialize`](Self::serialize) panics on the extra sample.
     pub fn stereo(sequence_number: u16, timestamp: u64, samples: Vec<f32>) -> Self {
         let mut header = PacketHeader::stereo(sequence_number, timestamp);
         header.buffer_size = (samples.len() / 2) as u16;
@@ -444,13 +482,24 @@ impl AudioPacket {
         Self { header, samples }
     }
 
-    /// Serialize samples directly into a buffer without creating an AudioPacket (no allocation)
+    /// Serialize a 16-bit, 48 kHz packet straight from a sample slice, without
+    /// building an `AudioPacket` (no allocation). For the send path.
     ///
-    /// This is optimized for the send path where we want to avoid cloning the samples vector.
     /// `samples` is interleaved at `send_channels`, which becomes the header's
     /// payload width (`num_outgoing_channels`, byte 15); `receive_channels` is
     /// the count asked back from the peer (`num_incoming_channels`, byte 14).
-    /// Returns the number of bytes written.
+    /// The frames per packet is `samples.len() / send_channels`. Returns the
+    /// number of bytes written.
+    ///
+    /// # Errors
+    ///
+    /// - [`ProtocolError::InvalidChannelCount`]: `send_channels` or
+    ///   `receive_channels` outside `1..=`[`MAX_WIRE_CHANNELS`].
+    /// - [`ProtocolError::InvalidBufferSize`]: `samples.len()` is not a whole
+    ///   number of frames, or the frame count is outside
+    ///   [`MIN_FPP`]`..=`[`MAX_FPP`].
+    /// - [`ProtocolError::BufferTooSmall`]: `buffer` cannot hold the packet
+    ///   (see [`PacketHeader::total_packet_size_out`]).
     pub fn serialize_samples_into(
         sequence_number: u16,
         timestamp: u64,
@@ -459,8 +508,16 @@ impl AudioPacket {
         receive_channels: u8,
         buffer: &mut [u8],
     ) -> Result<usize, ProtocolError> {
+        let valid_channels = 1..=MAX_WIRE_CHANNELS;
+        if !valid_channels.contains(&send_channels) || !valid_channels.contains(&receive_channels) {
+            return Err(ProtocolError::InvalidChannelCount);
+        }
+        let frames = samples.len() / send_channels as usize;
+        if samples.len() % send_channels as usize != 0 || !(MIN_FPP..=MAX_FPP).contains(&frames) {
+            return Err(ProtocolError::InvalidBufferSize);
+        }
         let mut header = PacketHeader::new(sequence_number, timestamp);
-        header.buffer_size = (samples.len() / send_channels.max(1) as usize) as u16;
+        header.buffer_size = frames as u16;
         header.num_incoming_channels = receive_channels;
         header.num_outgoing_channels = send_channels;
 
@@ -485,21 +542,30 @@ impl AudioPacket {
                     buffer[offset..offset + 2].copy_from_slice(&int_sample.to_le_bytes());
                 }
             }
-            _ => {
-                // For other bit depths, fall back to the standard path
-                // (in practice we always use 16-bit)
-                return Err(ProtocolError::InvalidBitDepth);
-            }
+            // `PacketHeader::new` always picks 16-bit.
+            _ => unreachable!("serialize_samples_into only writes 16-bit"),
         }
 
         Ok(total_size)
     }
 
-    /// Serialize the entire packet into a provided buffer (no allocation)
+    /// Serialize the packet into `buffer` (no allocation). Returns the number
+    /// of bytes written.
     ///
-    /// Returns the number of bytes written.
-    /// Audio samples are serialized according to the bit_depth field in the header.
-    /// f32 samples in the range [-1.0, 1.0] are converted to the appropriate integer format.
+    /// Samples are encoded at the header's `bit_depth`: 8, 16 and 24 bits are
+    /// clamped to `[-1.0, 1.0]` and scaled to signed integers; 32 bits are
+    /// written as raw little-endian `f32`, unclamped.
+    ///
+    /// # Errors
+    ///
+    /// - [`ProtocolError::BufferTooSmall`]: `buffer` is shorter than
+    ///   [`PacketHeader::total_packet_size_out`].
+    /// - [`ProtocolError::InvalidBitDepth`]: bit depth not 8, 16, 24 or 32.
+    ///
+    /// # Panics
+    ///
+    /// If `samples.len()` is larger than
+    /// `header.buffer_size * header.num_outgoing_channels`.
     pub fn serialize_into(&self, buffer: &mut [u8]) -> Result<usize, ProtocolError> {
         let total_size = self.header.total_packet_size_out();
         if buffer.len() < total_size {
@@ -554,10 +620,8 @@ impl AudioPacket {
         Ok(total_size)
     }
 
-    /// Serialize the entire packet to bytes (allocating version, for compatibility)
-    ///
-    /// Audio samples are serialized according to the bit_depth field in the header.
-    /// f32 samples in the range [-1.0, 1.0] are converted to the appropriate integer format.
+    /// Serialize the packet into a new `Vec`. Same encoding, errors and panics
+    /// as [`serialize_into`](Self::serialize_into).
     pub fn serialize(&self) -> Result<Vec<u8>, ProtocolError> {
         let total_size = self.header.total_packet_size_out();
         let mut buffer = vec![0u8; total_size];
@@ -565,9 +629,18 @@ impl AudioPacket {
         Ok(buffer)
     }
 
-    /// Deserialize a packet from bytes into a provided samples buffer (no allocation)
+    /// Decode a packet, replacing the contents of `samples` with its audio
+    /// (interleaved, `buffer_size * num_outgoing_channels` samples). Returns
+    /// the header.
     ///
-    /// Clears and fills the provided samples vector. Returns the packet header.
+    /// Reusing one `samples` vector avoids allocation once it has grown to the
+    /// largest packet seen.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`PacketHeader::deserialize`] rejects, plus
+    /// [`ProtocolError::BufferTooSmall`] when the payload is shorter than the
+    /// header says.
     pub fn deserialize_into(buffer: &[u8], samples: &mut Vec<f32>) -> Result<PacketHeader, ProtocolError> {
         let header = PacketHeader::deserialize(buffer)?;
 
@@ -639,7 +712,8 @@ impl AudioPacket {
         Ok(header)
     }
 
-    /// Deserialize a packet from bytes (allocating version, for compatibility)
+    /// Decode a packet into a new `AudioPacket`. Same errors as
+    /// [`deserialize_into`](Self::deserialize_into).
     pub fn deserialize(buffer: &[u8]) -> Result<Self, ProtocolError> {
         let mut samples = Vec::new();
         let header = Self::deserialize_into(buffer, &mut samples)?;
@@ -653,12 +727,13 @@ pub enum ProtocolError {
     /// The byte buffer is shorter than the header, or than the header plus
     /// the audio payload it describes.
     BufferTooSmall,
-    /// The incoming channel count is 0 or above `MAX_WIRE_CHANNELS`, or the
-    /// decoded outgoing count is above `MAX_WIRE_CHANNELS`.
+    /// The incoming channel count is 0 or above [`MAX_WIRE_CHANNELS`], or the
+    /// decoded outgoing count is above it.
     InvalidChannelCount,
     /// The bit depth is not 8, 16, 24 or 32.
     InvalidBitDepth,
-    /// The header's frames per packet is outside `[MIN_FPP, MAX_FPP]`.
+    /// The frames per packet is outside [`MIN_FPP`]`..=`[`MAX_FPP`] (or, when
+    /// serializing, the samples are not a whole number of frames).
     InvalidBufferSize,
 }
 
@@ -673,7 +748,14 @@ impl std::fmt::Display for ProtocolError {
     }
 }
 
-/// Stream statistics for monitoring connection quality
+impl std::error::Error for ProtocolError {}
+
+/// Plain counters for monitoring a stream's quality.
+///
+/// Nothing in WebTrip fills these in; they are a container for a host's own
+/// counting. For the statistics WebTrip does collect, see
+/// [`RegulatorStats`](crate::stream::regulator::RegulatorStats) and
+/// [`SessionStats`](crate::session_stats::SessionStats).
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(Debug, Clone, Default)]
 pub struct StreamStats {
@@ -699,7 +781,8 @@ impl StreamStats {
         Self::default()
     }
 
-    /// Calculate packet loss percentage
+    /// Lost packets as a percentage of received plus lost (`0.0` when both
+    /// are zero).
     pub fn packet_loss_percent(&self) -> f32 {
         if self.packets_received + self.packets_lost == 0 {
             0.0
@@ -709,7 +792,10 @@ impl StreamStats {
     }
 }
 
-/// Audio format configuration
+/// A description of an audio stream's format, with derived rates.
+///
+/// A plain value type; the codec does not read it. The rate helpers divide by
+/// `sample_rate` / `buffer_size`, so keep those non-zero.
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(Debug, Clone, Copy)]
 pub struct AudioFormat {
@@ -1364,11 +1450,36 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_samples_into_buffer_too_small_returns_error() {
+    fn test_serialize_samples_into_rejects_invalid_input() {
         let samples = vec![0.0f32; 128];
         let mut tiny_buf = vec![0u8; 4]; // way too small
         let result = AudioPacket::serialize_samples_into(0, 0, &samples, 1, 2, &mut tiny_buf);
         assert_eq!(result, Err(ProtocolError::BufferTooSmall));
+
+        // Regression: these used to emit a packet `deserialize` rejects, or
+        // write samples past the length it returned. Both sides of each
+        // boundary are checked.
+        let mut buf = vec![0u8; 4096];
+        let max = MAX_WIRE_CHANNELS;
+        let cases: [(&[f32], u8, u8, Result<(), ProtocolError>); 9] = [
+            (&[0.0; 64], 0, 2, Err(ProtocolError::InvalidChannelCount)),
+            (&[0.0; 64], 1, 0, Err(ProtocolError::InvalidChannelCount)),
+            (&[0.0; 64 * 9], max + 1, 2, Err(ProtocolError::InvalidChannelCount)),
+            (&[0.0; 64 * 8], max, max, Ok(())),
+            (&[0.0; 129], 2, 2, Err(ProtocolError::InvalidBufferSize)), // partial frame
+            (&[0.0; MIN_FPP - 1], 1, 2, Err(ProtocolError::InvalidBufferSize)),
+            (&[0.0; MIN_FPP], 1, 2, Ok(())),
+            (&[0.0; MAX_FPP], 1, 2, Ok(())),
+            (&[0.0; MAX_FPP + 1], 1, 2, Err(ProtocolError::InvalidBufferSize)),
+        ];
+        for (samples, send, receive, expected) in cases {
+            let result = AudioPacket::serialize_samples_into(0, 0, samples, send, receive, &mut buf);
+            assert_eq!(result.map(|_| ()), expected, "{} samples, send {send}, receive {receive}", samples.len());
+            if let Ok(written) = result {
+                // Whatever it accepts must decode.
+                assert!(AudioPacket::deserialize(&buf[..written]).is_ok());
+            }
+        }
     }
 }
 

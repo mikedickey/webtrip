@@ -7,6 +7,7 @@
 
 pub mod webrtc;
 pub mod webtransport;
+#[doc(hidden)]
 pub mod webtransport_worker;
 pub mod signaling;
 

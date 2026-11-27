@@ -1,6 +1,9 @@
-//! Channel ceilings. Two independent concepts that were once one constant:
-//! what the *wire* may carry and what a *device* may expose. Both are rails
-//! with a stated reason, never silent ceilings.
+//! The bounds every layer agrees on: channel counts, frames per packet, sample
+//! rates, packet size and connection count.
+//!
+//! Wire limits (what a network stream may carry) and device limits (what a
+//! local audio device may expose) are independent. Each is a rail with a stated
+//! reason, never a silent ceiling.
 
 /// Maximum audio channels a single network stream may carry.
 ///
@@ -13,9 +16,10 @@
 pub const MAX_WIRE_CHANNELS: u8 = 8;
 
 /// Maximum channels of a local audio device (capture or playback) the engine
-/// will address. Bounds the worklet ABI's scratch buffers and the
-/// `AudioProcessor` device-width buffers, which are preallocated at this width
-/// so a wide interface never allocates on the render thread.
+/// will address. Bounds the audio host's scratch buffers and the
+/// [`AudioProcessor`](crate::audio::processor::AudioProcessor) device-width
+/// buffers, which are preallocated at this width so a wide interface never
+/// allocates on the render thread.
 pub const MAX_DEVICE_CHANNELS: u8 = 32;
 
 /// Fewest frames per packet a stream may carry, in either direction: JackTrip's
@@ -44,8 +48,11 @@ pub const MAX_CONNECTIONS: usize = 1;
 /// no retransmits, so every fragment multiplies loss).
 pub const MAX_UNFRAGMENTED_PACKET_BYTES: usize = 1200;
 
-/// Frames in one Web Audio render quantum — the callback size the worklet
-/// hands the processor. Sizes every render-thread scratch buffer.
+/// Frames in one Web Audio render quantum: the callback size the browser host
+/// hands the processor, and the default for [`AudioProcessor::new`](crate::audio::processor::AudioProcessor::new).
+/// A native host with another callback size passes its own to
+/// [`AudioProcessor::with_network`](crate::audio::processor::AudioProcessor::with_network)
+/// and sizes its regulator with [`wire_frames_per_callback`].
 pub const RENDER_QUANTUM_FRAMES: usize = 128;
 
 /// The rate network streams run at, and the rate the regulator and every
@@ -53,8 +60,8 @@ pub const RENDER_QUANTUM_FRAMES: usize = 128;
 /// different rate; the mixer converts between the two.
 pub const WIRE_SAMPLE_RATE: u32 = 48_000;
 
-/// Lowest device (`AudioContext`) sample rate the engine accepts. Browsers
-/// allow 8 kHz contexts; below that nothing real exists, and the floor bounds
+/// Lowest device sample rate the engine accepts. Browsers allow 8 kHz audio
+/// contexts; below that nothing real exists, and the floor bounds
 /// how many wire frames one callback can need (see [`wire_frames_per_callback`]),
 /// which sizes the regulator's frame FIFO before the context's rate is known.
 pub const MIN_DEVICE_SAMPLE_RATE: u32 = 8_000;
@@ -75,9 +82,10 @@ pub const fn wire_frames_per_callback(callback_frames: usize, device_rate: u32, 
 }
 
 /// Wire frames the regulator must be able to serve in one pop to feed one
-/// render quantum at any supported device rate (the slowest device needs the
-/// most). The regulator is built before the context's rate is known, so it is
-/// sized for this worst case.
+/// [`RENDER_QUANTUM_FRAMES`] callback at any supported device rate (the slowest
+/// device needs the most). The browser host builds its regulator before the
+/// device rate is known, so it sizes for this worst case; a host with another
+/// callback size uses [`wire_frames_per_callback`] instead.
 pub const MAX_WIRE_FRAMES_PER_CALLBACK: usize =
     wire_frames_per_callback(RENDER_QUANTUM_FRAMES, MIN_DEVICE_SAMPLE_RATE, WIRE_SAMPLE_RATE);
 

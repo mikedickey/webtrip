@@ -104,6 +104,10 @@ pub struct InstanceType {
     #[serde(default, rename = "vCPU", skip_serializing_if = "Option::is_none")]
     pub vcpu: Option<u32>,
 
+    /// Minimum number of participants supported
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<u32>,
+
     /// Maximum number of participants supported
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<u32>,

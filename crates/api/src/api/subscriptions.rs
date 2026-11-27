@@ -37,15 +37,10 @@ use crate::models;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-// =============================================================================
-// Subscriptions API
-// =============================================================================
-
-api_module_struct!(SubscriptionsApi);
-
-// =============================================================================
-// Rust API (primary interface)
-// =============================================================================
+api_module_struct!(
+    /// Studio membership endpoints; obtain with [`ApiClient::subscriptions`].
+    SubscriptionsApi
+);
 
 impl SubscriptionsApi {
     /// List the studios a user is a member of (`GET /users/{userId}/subscriptions`).

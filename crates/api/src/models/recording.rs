@@ -74,7 +74,8 @@ pub struct RecordingMetadata {
     pub updated_at: Option<String>,
 }
 
-/// Recording with personalized user data
+/// A recording plus whether the caller has liked it. The
+/// [`metadata`](Self::metadata) fields are flattened.
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
@@ -84,18 +85,13 @@ pub struct PersonalizedRecording {
     #[serde(flatten)]
     pub metadata: RecordingMetadata,
 
-    /// Whether the current user has liked this recording
+    /// Whether the caller has liked this recording
     #[serde(skip_serializing_if = "Option::is_none")]
     pub liked: Option<bool>,
-
-    /// Whether the current user follows the channel
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub following: Option<bool>,
 }
 
-/// Server-side recording with additional studio/session identifiers.
-///
-/// Spec composes this as `RecordingMetadata` + `{serverId, sessionId, ownerId}`.
+/// A recording plus the studio, session and owner that produced it. The
+/// [`metadata`](Self::metadata) fields are flattened.
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
@@ -238,15 +234,13 @@ mod tests {
                 ..Default::default()
             },
             liked: Some(true),
-            following: Some(false),
         };
         let s = roundtrip(&p);
         // Flatten means the metadata fields appear at the top level alongside
-        // `liked`/`following`, NOT nested under `metadata`.
+        // `liked`, NOT nested under `metadata`.
         assert!(s.contains("\"id\":\"r1\""));
         assert!(s.contains("\"status\":1"));
         assert!(s.contains("\"liked\":true"));
-        assert!(s.contains("\"following\":false"));
         assert!(!s.contains("\"metadata\":"));
     }
 

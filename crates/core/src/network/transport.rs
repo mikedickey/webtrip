@@ -1,7 +1,9 @@
-//! Transport abstraction layer for audio packet transmission
+//! The contract between a host and the transports that carry its packets.
 //!
-//! This module defines the trait that all transport implementations must implement,
-//! allowing for runtime selection of different transport mechanisms (WebRTC, WebTransport, etc.)
+//! [`Transport`] is the trait every transport implements, so a host can pick
+//! one at run time. The browser host ships WebRTC data-channel and
+//! WebTransport implementations; a native host can supply its own (UDP, for
+//! example).
 
 use std::pin::Pin;
 use std::future::Future;
@@ -96,13 +98,15 @@ pub fn fit_send_fpp(
     Ok(fit.fpp)
 }
 
-/// Transport type selection
+/// Which transport carries a connection's packets.
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportType {
-    /// WebRTC Data Channels (current, universal support)
+    /// WebRTC data channels (unordered, no retransmits). Available in every
+    /// browser WebTrip supports.
     WebRTC,
-    /// WebTransport (future, Chrome/Edge only)
+    /// WebTransport datagrams over QUIC, where the browser provides
+    /// `WebTransport` (see [Browser support](https://webtrip.dev/docs/browser-support)).
     WebTransport,
 }
 
@@ -115,7 +119,8 @@ impl TransportType {
         }
     }
 
-    /// Get a short identifier for the transport
+    /// Get a short identifier for the transport: `"webrtc"` or
+    /// `"webtransport"`, the strings [`from_id`](Self::from_id) accepts.
     pub fn id(&self) -> String {
         match self {
             TransportType::WebRTC => "webrtc".to_string(),
@@ -150,11 +155,13 @@ pub enum TransportState {
     Closed,
 }
 
-/// Audio buffer configuration passed to transports that need internal tick loops.
+/// The audio buffers a host hands a transport with
+/// [`Transport::set_audio_buffers`].
 ///
-/// The buffers live in shared WASM memory owned by `WebTripSession` (in `webtrip-web`); the
-/// transport reaches them through [`SharedPtr`], which carries the `Send`/`Sync`
-/// assertion so this struct needs no hand-rolled `unsafe impl`.
+/// The host owns both buffers; the transport reads outbound audio from the
+/// ring and pushes received packets into the regulator, through
+/// [`SharedPtr`]s, possibly from another thread. The buffers must stay alive
+/// until [`Transport::close`] resolves `true`.
 #[derive(Debug, Clone, Copy)]
 pub struct AudioBufferConfig {
     /// Ring buffer (local-to-network); reached via its `&self` API.
@@ -162,7 +169,7 @@ pub struct AudioBufferConfig {
     /// Jitter buffer (network-to-local); reached via its `&self` SPSC API
     /// through [`SharedPtr::as_ref`].
     pub network_to_local: SharedPtr<crate::stream::regulator::Regulator>,
-    /// Buffer size in samples per channel
+    /// Frames per outbound packet (samples per channel).
     pub buffer_size: usize,
     /// Channels this client sends: the ring buffer's interleaved width and
     /// every outbound packet's payload width (`num_outgoing_channels`, byte 15)
@@ -185,6 +192,11 @@ const _: () = {
 impl AudioBufferConfig {
     /// Interleaved samples in one outbound packet: `buffer_size` frames at
     /// `send_channels` wide.
+    ///
+    /// # Panics
+    ///
+    /// Debug builds assert that one packet fits in half of
+    /// [`RING_BUFFER_SIZE`](crate::stream::ring_buffer::RING_BUFFER_SIZE).
     pub fn samples_per_packet(&self) -> usize {
         let samples = self.buffer_size * self.send_channels as usize;
         // A packet the ring cannot hold twice over would stall the send path
@@ -222,6 +234,8 @@ pub fn transport_state_str(state: TransportState) -> &'static str {
     }
 }
 
+// Host glue: the browser transports report state as strings to JS callbacks.
+#[doc(hidden)]
 /// Whether a transport-level state string reports that the connection failed.
 ///
 /// Only failures cross from the transport into the session: the session
@@ -276,21 +290,34 @@ impl std::fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
-/// Transport trait that all implementations must implement
-/// 
-/// This is a minimal interface focused on audio packet transmission.
-/// Implementation-specific details (like WebRTC signaling and internal tick loops) 
-/// are handled internally by each transport.
-/// 
-/// ## Buffer Management
-/// 
-/// Transports run their own internal loops to manage audio packet flow:
-/// - `set_audio_buffers()` provides access to ring buffer (send) and jitter buffer (receive)
-/// - `start_streaming()` begins the internal send/receive loop
-/// - The transport directly reads from ring buffer and writes to jitter buffer
-/// 
-/// This design keeps transport logic isolated and allows WebRTC to stay on the main
-/// thread while other transports (like WebTransport) can run in worker threads.
+/// A transport that carries one connection's audio packets.
+///
+/// A minimal interface focused on moving packets. Signaling, sockets and
+/// threads are each implementation's own business.
+///
+/// # Call order
+///
+/// A host drives a transport through one lifetime:
+///
+/// 1. [`set_audio_buffers`](Self::set_audio_buffers): hand over the send ring
+///    and the receive regulator.
+/// 2. [`set_on_state_change`](Self::set_on_state_change): optional, to hear
+///    about failures.
+/// 3. [`connect`](Self::connect), awaited.
+/// 4. [`tick`](Self::tick), repeatedly while connected: the transport reads
+///    whole packets from the ring and sends them, and pushes received packets
+///    into the regulator. A transport with its own loop (e.g. on a worker
+///    thread) may ignore ticks.
+/// 5. [`close`](Self::close), awaited before the buffers are freed.
+///
+/// A transport is not reused after `close`; a new connection gets a new one.
+///
+/// # Threading
+///
+/// The trait, its futures and [`StateCallback`] are not `Send`: a host drives
+/// one transport from a single thread (on a multithreaded executor, a
+/// single-threaded local task set). Only the buffers in [`AudioBufferConfig`]
+/// cross threads.
 pub trait Transport {
     /// Get current transport type
     fn transport_type(&self) -> TransportType;
@@ -298,43 +325,42 @@ pub trait Transport {
     /// Get current connection state
     fn state(&self) -> TransportState;
 
-    /// Set audio buffer pointers (for transports that need internal tick loops)
-    /// 
-    /// This is called by the session before starting the connection to give
-    /// the transport access to audio buffers. WebRTC transport uses this to
-    /// run its internal tick loop. Other transports can ignore this.
+    /// Hand the transport its audio buffers, before [`connect`](Self::connect).
+    ///
+    /// The buffers must stay alive until [`close`](Self::close) resolves
+    /// `true`. The default ignores them, for a transport that carries no audio.
     fn set_audio_buffers(&mut self, _config: AudioBufferConfig) {
         // Default: no-op (not all transports need buffers)
     }
 
     /// The largest packet, in bytes, this transport carries without
-    /// fragmenting or dropping it, if it knows. The session fits the send fpp
-    /// to it before connecting (`fit_fpp`).
+    /// fragmenting or dropping it, if it knows. The host fits the send fpp to
+    /// it before connecting (see [`fit_fpp`]).
     ///
-    /// `None` means the limit is not known before connecting: the transport
-    /// fits the send fpp itself once connected (WebTransport's worker reads
-    /// the datagram size from the live session). WebRTC answers with the
-    /// fragmentation-free floor.
+    /// `None` means the limit is not known before connecting, and the
+    /// transport fits the send fpp itself once connected (the WebTransport
+    /// implementation reads the datagram size from the live session). If a
+    /// transport has no better figure,
+    /// [`MAX_UNFRAGMENTED_PACKET_BYTES`](crate::limits::MAX_UNFRAGMENTED_PACKET_BYTES)
+    /// is the safe answer.
     fn max_packet_bytes(&self) -> Option<usize> {
         None
     }
 
-    /// Set callback for transport state changes
-    /// 
-    /// This allows the session layer to be notified when the transport's
-    /// connection state changes (e.g., connected, failed, disconnected).
-    /// The callback receives the new [`TransportState`]
+    /// Set the callback for transport state changes.
+    ///
+    /// The callback receives the new [`TransportState`] each time the
+    /// connection's state changes (e.g. connected, failed, disconnected), on
+    /// the thread that drives the transport.
     fn set_on_state_change(&mut self, _callback: StateCallback) {
         // Default: no-op (not all transports need state callbacks)
     }
 
-    /// Connect to a hub server
-    /// 
-    /// This async method establishes a connection to the hub server and returns
-    /// when the connection is fully established and ready to send/receive packets.
-    /// 
-    /// Transports manage their own internal send/receive loops after connection.
-    /// 
+    /// Connect to a hub server.
+    ///
+    /// Resolves once the connection is established and ready to carry
+    /// packets, or with a [`TransportError`] saying why it could not connect.
+    ///
     /// # Arguments
     /// * `server` - Server hostname or IP
     /// * `port` - Server port
@@ -346,12 +372,13 @@ pub trait Transport {
         client_name: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + '_>>;
 
-    /// Process one audio callback tick
-    /// 
-    /// Called by the session layer each time the audio worklet's process() callback runs.
+    /// Move pending packets in both directions.
+    ///
+    /// The host calls this regularly while connected; the browser host ticks
+    /// from the audio callback while audio runs and from a timer otherwise.
     /// Transports should:
-    /// - Read from ring buffer and send packets
-    /// - Receive packets and write to jitter buffer
+    /// - read whole packets from the ring buffer and send them;
+    /// - push received packets into the regulator.
     fn tick(&mut self) {
         // Default: no-op (for transports that don't need tick processing)
     }
@@ -367,7 +394,7 @@ pub trait Transport {
     /// shutdown message to a worker, scheduling a fallback timer) and returns
     /// a future that resolves once the transport is fully torn down. Callers
     /// that need to guarantee no further writes to the audio buffers (e.g.
-    /// before resetting a `Regulator`) must `await` the returned future. For
+    /// before freeing or reusing them) must `await` the returned future. For
     /// best-effort cleanup (e.g. in `Drop`) the future can be discarded; the
     /// synchronous teardown has already been initiated.
     ///

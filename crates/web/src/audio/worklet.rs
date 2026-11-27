@@ -18,8 +18,10 @@ use web_sys::{AudioContext, AudioWorkletNode, AudioWorkletNodeOptions, ChannelIn
 /// would compile and go unnoticed.
 pub type ProcessorCallback = Box<dyn FnMut(&[f32], usize, &mut [f32], usize) -> bool + Send>;
 
-/// Handle for a WASM audio processor that can be passed to the AudioWorklet.
+/// Internal: the worklet ABI. Exported only because `worklet.js` calls it
+/// from the AudioWorklet thread; it is not part of the public API.
 ///
+/// Handle for a WASM audio processor that can be passed to the AudioWorklet.
 /// Owns preallocated planar scratch buffers in WASM linear memory
 /// (`RENDER_QUANTUM_FRAMES * MAX_DEVICE_CHANNELS` each) so `worklet.js` can build
 /// stable `Float32Array` views over them once and `.set()` each channel in
@@ -67,7 +69,7 @@ impl ProcessorHandle {
     /// `debug_assert!` alone does not run in an optimized (release) Wasm
     /// build, so an out-of-range value from a caller would otherwise slice
     /// `input_scratch`/`output_scratch` out of bounds and panic regardless of
-    /// build profile (see PR #84 review). The input and output planes this
+    /// build profile. The input and output planes this
     /// reads/writes are laid out contiguously at stride `frames`, which only
     /// matches the fixed `ch * RENDER_QUANTUM_FRAMES` offsets the JS side
     /// builds its views at when `frames == RENDER_QUANTUM_FRAMES` — true for
@@ -100,7 +102,8 @@ impl ProcessorHandle {
     /// # Safety
     ///
     /// `val` must be an address previously returned by [`into_raw_ptr`](Self::into_raw_ptr) and must
-    /// not have been reconstructed already.
+    /// not have been reconstructed already. The JS export cannot enforce
+    /// this: only `worklet.js` may call it.
     pub unsafe fn from_raw_ptr(val: usize) -> Self {
         *Box::from_raw(val as *mut _)
     }

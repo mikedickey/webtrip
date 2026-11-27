@@ -29,6 +29,6 @@ wasm = ["webtrip-core/wasm", "webtrip-api/wasm"]
 web = ["dep:webtrip-web"]
 
 [dependencies]
-webtrip-core = { path = "../core", version = "0.2.1" }
-webtrip-api = { path = "../api", version = "0.2.1" }
-webtrip-web = { path = "../web", version = "0.2.1", optional = true }
+webtrip-core = { path = "../core", version = "0.2.2" }
+webtrip-api = { path = "../api", version = "0.2.2" }
+webtrip-web = { path = "../web", version = "0.2.2", optional = true }

@@ -204,7 +204,7 @@ async function inPageDrive({ transportName, host, port, connectTimeoutMs, sendPo
   // Poll the send path: captured (fake-device) audio must reach the ring buffer.
   const deadline = Date.now() + sendPollMs;
   while (Date.now() < deadline) {
-    if (Number(session.get_stats().ring_buffer_samples_written) > 0) break;
+    if (Number(session.getStats().ring_buffer_samples_written) > 0) break;
     await new Promise((r) => setTimeout(r, 200));
   }
 
@@ -222,7 +222,7 @@ async function inPageDrive({ transportName, host, port, connectTimeoutMs, sendPo
   // (`#[wasm_bindgen_test]` in crates/web/src/network/webtransport_worker.rs and
   // crates/web/src/network/webrtc.rs; see WEB-45). Those feed synthetic inbound data straight
   // into the receive handlers and assert on Regulator state + the stats counters.
-  const s = session.get_stats();
+  const s = session.getStats();
   const result = {
     connected,
     sentSamples: Number(s.ring_buffer_samples_written),

@@ -1,20 +1,26 @@
-//! Session statistics and the pure decision kernels the browser host's loops
-//! call. Portable: plain data and arithmetic, no browser API.
+//! Session statistics: the counters a host reports for its connections.
+//! Portable: plain data and arithmetic.
 
 use crate::stream::regulator::RegulatorStats;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-/// Session statistics (the shape JavaScript reads): the aggregate over every
-/// live connection. One connection's statistics, as built by
-/// [`build_connection_stats`], have the same fields ([`ConnectionStats`]); the
-/// session folds them with [`aggregate_session_stats`].
+/// A snapshot of a session's statistics, summed over every live connection.
+///
+/// Send-path fields come from each connection's send
+/// [`RingBuffer`](crate::stream::ring_buffer::RingBuffer); receive-path
+/// (`regulator_*`) fields come from its
+/// [`Regulator`](crate::stream::regulator::Regulator). Counters are totals
+/// since the connection opened; when a session has several connections,
+/// counts and depths add and tolerance, headroom and latencies report the
+/// worst connection. All zero when nothing is connected.
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(Debug, Clone, Default)]
 pub struct SessionStats {
     /// Packets the transport has put on the network.
     pub packets_sent: u64,
-    /// Packets the regulator has received.
+    /// Packets the regulator has accepted from the network (see
+    /// [`RegulatorStats::packets_received`]).
     pub packets_received: u64,
 
     // Ring buffer stats (send path)
@@ -32,17 +38,23 @@ pub struct SessionStats {
     pub regulator_tolerance_ms: f64,
     /// Current headroom (extra buffering) in milliseconds
     pub regulator_headroom_ms: f64,
-    /// Maximum latency observed in this period (ms)
+    /// Largest latency seen in the last tolerance window, in milliseconds;
+    /// `0` in fixed-tolerance mode and during warm-up (see
+    /// [`RegulatorStats::max_latency_ms`]).
     pub regulator_max_latency_ms: f64,
-    /// Current buffer depth (packets buffered)
+    /// Packets between the newest received and the last played (see
+    /// [`Regulator::depth`](crate::stream::regulator::Regulator::depth)).
     pub regulator_depth: u32,
-    /// Current latency in milliseconds
+    /// Current buffering latency in milliseconds (see
+    /// [`Regulator::latency_ms`](crate::stream::regulator::Regulator::latency_ms)).
     pub regulator_latency_ms: f32,
     /// Whether regulator is initialized (received first packet)
     pub regulator_initialized: bool,
     /// Packets successfully played
     pub regulator_packets_played: u64,
-    /// Number of PLC activations (packet loss concealment)
+    /// Glitches: underruns (a packet missing at play time, concealed by
+    /// packet loss concealment) plus overruns (late packets skipped to catch
+    /// up). See [`RegulatorStats::glitches`].
     pub regulator_plc_count: u64,
     /// Last packet sequence number received (u16, wraps at 65535)
     pub regulator_last_seq: u16,
@@ -64,13 +76,10 @@ impl SessionStats {
     }
 }
 
+// The single mapping from a connection's ring and regulator readings to its
+// stats, so the browser host's `get_stats` can be tested without a session.
+#[doc(hidden)]
 /// Construct a [`ConnectionStats`] from its raw component values.
-///
-/// This is the single authoritative mapping point; the browser host's
-/// `WebTripSession::get_stats` delegates here (via
-/// [`aggregate_session_stats`]) so the mapping can be tested without
-/// constructing the full session (which requires a live `AudioEngine` and
-/// `Transport`).
 pub fn build_connection_stats(
     reg_stats: RegulatorStats,
     regulator_depth: u32,
@@ -134,9 +143,11 @@ pub fn aggregate_session_stats(connections: &[ConnectionStats]) -> SessionStats 
 }
 
 /// What the tick loop should do in a single iteration.
+// Host glue for the transports' tick loops.
+#[doc(hidden)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum TickDecision {
-    /// Not connected: drain the ring buffer so `Atomics.waitAsync` can sleep.
+    /// Not connected: drain the ring buffer so a wait on its has-data flag can sleep.
     Drain,
     /// No work to do this iteration: exit the loop.
     Idle,
@@ -150,9 +161,10 @@ pub enum TickDecision {
 }
 
 /// Compute what the tick loop should do given the current transport state.
-///
-/// This is the pure decision kernel of `do_tick`; it takes plain integers and
-/// booleans so it can be called from native unit tests without any browser API.
+/// `available` and `samples_needed` are interleaved samples in the send ring.
+// The pure decision kernel of the WebRTC transport's `do_tick`, testable
+// natively.
+#[doc(hidden)]
 pub fn tick_decision(
     is_connected: bool,
     available: u32,
