@@ -80,6 +80,12 @@ Cross-Origin-Embedder-Policy: require-corp
 `server.headers` and `preview.headers`. See [browser support](browser-support.md) for
 the browser features WebTrip needs.
 
+The page must also be a **secure context** (HTTPS, or `localhost` in development):
+hub signaling uses `wss://`, and microphone access and WebTransport are only
+available in secure contexts. Start audio (`startAudio()` or `connect()`) from a user
+gesture such as a click; otherwise the browser may keep the `AudioContext`
+suspended (see `isAudioSuspended()` / `resumeAudio()`).
+
 ## A minimal session
 
 ```javascript
@@ -92,7 +98,7 @@ webtrip.init();          // install the panic hook
 const params = webtrip.createAudioParams();
 const session = new webtrip.WebTripSession(params);
 
-session.set_on_state_change((state) => console.log("network:", state));
+session.setOnStateChange((state) => console.log("network:", state));
 
 // Start audio and connect to a JackTrip hub in one call...
 await session.connect(

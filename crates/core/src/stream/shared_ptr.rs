@@ -1,9 +1,10 @@
-//! A raw pointer to a value living in shared WASM linear memory.
+//! A raw address of a `T: Sync` value shared across threads.
 //!
-//! WebTrip hands buffer addresses across the AudioWorklet / WebTransport-worker
-//! boundary as integers — the browser only lets you `postMessage` numbers, not
-//! Rust references (see [`docs/architecture.md`](https://webtrip.dev/docs/architecture)).
-//! On the receiving side the address is turned back into a reference.
+//! Hosts hand buffer addresses between threads as plain integers. In the
+//! browser build that is how a buffer crosses into the AudioWorklet or the
+//! WebTransport worker, since `postMessage` carries numbers, not Rust references
+//! (see [Architecture](https://webtrip.dev/docs/architecture)). On the receiving
+//! side the address is turned back into a reference.
 //!
 //! `SharedPtr<T>` is the single place that address reconstruction and deref
 //! happen. It:
@@ -14,7 +15,7 @@
 //!   laundered across threads),
 //! - makes [`new`](SharedPtr::new) / [`from_addr`](SharedPtr::from_addr)
 //!   `unsafe` so each call site must acknowledge that the address points at a
-//!   live `T` (WEB-71), and
+//!   live `T`, and
 //! - hands out a shared `&T` through one audited `unsafe` block inside
 //!   [`as_ref`](SharedPtr::as_ref) instead of the `unsafe { &*ptr }`
 //!   incantation being copy-pasted at every call site.
@@ -24,13 +25,13 @@
 //! and [`Regulator`](crate::stream::regulator::Regulator)'s `&self` APIs). Prefer
 //! [`as_ref`](SharedPtr::as_ref). [`as_mut`](SharedPtr::as_mut) remains for the
 //! rare case where exclusive access is genuinely proven; nothing in the audio
-//! path uses it after WEB-53.
+//! path uses it.
 
-/// An integer address into shared WASM linear memory, typed as a pointer to `T`.
+/// A shared address, typed as a pointer to `T`, that may cross threads.
 ///
 /// Cheap to copy (it is just an address). Construct with [`SharedPtr::new`] from
-/// a raw pointer or [`SharedPtr::from_addr`] from an integer received over
-/// `postMessage` — both are `unsafe` and require a live pointee.
+/// a raw pointer or [`SharedPtr::from_addr`] from an integer received from
+/// another thread — both are `unsafe` and require a live pointee.
 pub struct SharedPtr<T> {
     ptr: *mut T,
 }
@@ -73,7 +74,7 @@ impl<T> SharedPtr<T> {
     /// obtained through [`as_ref`](Self::as_ref) / [`as_mut`](Self::as_mut).
     /// Reconstructing from an arbitrary address and then calling those methods
     /// is otherwise undefined behaviour — that is why construction, not deref,
-    /// is the `unsafe` boundary (WEB-71).
+    /// is the `unsafe` boundary.
     pub const unsafe fn new(ptr: *mut T) -> Self {
         Self { ptr }
     }
@@ -95,14 +96,14 @@ impl<T> SharedPtr<T> {
         }
     }
 
-    /// Rebuild a `SharedPtr` from an integer address received over `postMessage`.
+    /// Rebuild a `SharedPtr` from an integer address, typically one received
+    /// from another thread (in the browser build, over `postMessage`).
     ///
     /// # Safety
     ///
     /// `addr` must be 0 (null), or the address of a live `T` that outlives
     /// every borrow obtained through [`as_ref`](Self::as_ref) /
-    /// [`as_mut`](Self::as_mut). The integer typically arrives from another
-    /// agent via `postMessage`; the sender must have published a real
+    /// [`as_mut`](Self::as_mut). The sender must have published a real
     /// allocation that remains alive for the receiver's use.
     pub const unsafe fn from_addr(addr: usize) -> Self {
         Self {
@@ -110,8 +111,8 @@ impl<T> SharedPtr<T> {
         }
     }
 
-    /// The pointer as an integer address (for handing back across the worker
-    /// boundary or for logging).
+    /// The pointer as an integer address (for handing to another thread or for
+    /// logging).
     pub fn addr(&self) -> usize {
         self.ptr as usize
     }

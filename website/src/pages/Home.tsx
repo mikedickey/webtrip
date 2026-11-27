@@ -21,20 +21,20 @@ const FEATURES = [
 
 const USE_CASES = [
   {
-    title: "Natural conversations",
-    body: "Tone, inflection, pauses — the cues that carry meaning beyond words — are exactly what lossy compression flattens. And when the round trip is short, turn-taking just works: no talking over each other, no awkward gaps.",
+    title: "Online gaming",
+    body: "Shaving over 100 ms off every callout makes a huge difference when a team is coordinating. Everyone reacts to the same moment, not one that has already passed.",
   },
   {
     title: "AI voice",
     body: "Cleaner audio in means more accurate speech-to-text out — fewer misheard words, fewer wrong answers. Lower latency cuts the wait for a response, so talking to an agent feels like a conversation instead of a walkie-talkie.",
   },
   {
-    title: "Music lessons",
-    body: "A teacher has to hear exactly what the student played — the full spectrum, every dynamic and overtone. Codecs tuned for speech discard the detail that useful feedback depends on.",
+    title: "Making music together",
+    body: "A teacher has to hear exactly what the student played, and trading riffs or feeling out a groove falls apart with even modest delay. Speech codecs strip the overtones and dynamics both depend on.",
   },
   {
-    title: "Writing songs together",
-    body: "Trading riffs, finding a harmony, feeling out a groove — collaboration this immediate falls apart with even modest delay. And a rough idea's character lives in nuances that speech codecs strip away.",
+    title: "Natural conversations",
+    body: "Tone, inflection, pauses — the cues that carry meaning beyond words — are exactly what lossy compression flattens. And when the round trip is short, turn-taking just works: no talking over each other, no awkward gaps.",
   },
   {
     title: "Therapy & guided meditation",

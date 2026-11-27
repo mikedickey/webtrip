@@ -1,6 +1,10 @@
 #![doc = include_str!("../README.md")]
 
-// Linked so the API's `#[wasm_bindgen]` exports reach the generated package
+// Linked so the API's `#[wasm_bindgen]` exports (`ApiClient` and friends)
+// reach the generated package. Hidden: Rust users get these from
+// `webtrip-api` (or `webtrip::api`), and inlining them here would document
+// every model twice.
+#[doc(hidden)]
 pub use webtrip_api::{api, models};
 
 // Browser hosts
@@ -21,24 +25,29 @@ mod tick_clock;
 #[cfg(all(test, target_arch = "wasm32"))]
 mod test_support;
 
-// Re-export public types for convenience
-pub use audio::{DeviceInfo, ProcessorHandle, AudioEngine};
+// Re-export public types for convenience. The core types are `no_inline`, so
+// they link to their one page in `webtrip-core` instead of being documented
+// again here.
+pub use audio::{DeviceInfo, AudioEngine};
+#[doc(no_inline)]
 pub use webtrip_core::audio::{AudioProcessor, AudioParams};
+#[doc(no_inline)]
 pub use webtrip_core::stream::{RingBuffer, Regulator, RegulatorStats};
+#[doc(no_inline)]
 pub use webtrip_core::network::{
     // Protocol types
-    AudioFormat, AudioPacket, PacketHeader, StreamStats,
+    AudioPacket, PacketHeader,
     // Transport types
     Transport, TransportType, TransportState,
 };
-pub use network::{
-    TransportConfig, WebRtcTransport, WebTransportImpl,
-    // Signaling types
-    HubSignaling, HubConnectionState, SignalingMessage,
-};
+pub use network::{TransportConfig, WebRtcTransport, WebTransportImpl, HubSignaling};
+#[doc(no_inline)]
+pub use network::{HubConnectionState, SignalingMessage};
 
 // Re-export session types
-pub use session::{WebTripSession, SessionState, SessionStats};
+pub use session::WebTripSession;
+#[doc(no_inline)]
+pub use session::{SessionState, SessionStats};
 
 use wasm_bindgen::prelude::*;
 
@@ -49,20 +58,13 @@ pub(crate) fn now_ms() -> f64 {
     js_sys::Date::now()
 }
 
-/// Initialize the WASM module (call once at startup)
+/// Finish setting up the module: call once per page, after the default
+/// export (`await webtrip.default()`) has instantiated it. Routes the
+/// library's log output to the console and reports Rust panics there.
 #[wasm_bindgen]
 pub fn init() {
     console_error_panic_hook::set_once();
     console_log::install();
-}
-
-/// Get the WASM memory for use with Atomics.waitAsync
-///
-/// This is needed by the event-driven network loop to access
-/// the ring buffer flag via SharedArrayBuffer.
-#[wasm_bindgen(js_name = getWasmMemory)]
-pub fn get_wasm_memory() -> JsValue {
-    wasm_bindgen::memory().into()
 }
 
 /// Serialize this module's accumulated LLVM coverage counters as `.profraw`
@@ -76,6 +78,7 @@ pub fn get_wasm_memory() -> JsValue {
 /// Only compiled under the `coverage` feature, which pulls in `minicov` to
 /// supply the profiler runtime (`-Zno-profiler-runtime` omits LLVM's own).
 #[cfg(feature = "coverage")]
+#[doc(hidden)]
 #[wasm_bindgen(js_name = __coverageDump)]
 pub fn coverage_dump() -> Vec<u8> {
     let mut data = Vec::new();

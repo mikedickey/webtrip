@@ -377,7 +377,7 @@ flowchart TB
 - ✅ All logic in Rust (type-safe, zero-copy buffer access)
 
 **Cons:**
-- ❌ Limited browser support (Chrome 97+, Edge 97+; Safari/Firefox not yet supported)
+- ❌ Needs newer browsers than WebRTC (see [browser support](browser-support.md))
 - ⚠️ Requires minimal JavaScript bootstrap (~40 lines)
 
 **Why JavaScript Glue is Needed:**

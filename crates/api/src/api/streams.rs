@@ -1,24 +1,24 @@
-//! Streams API: JackTrip Radio broadcasts, channels, chat, and studio stream
-//! management.
+//! Streams API: JackTrip Radio broadcasts, channels, conversations, and studio
+//! stream management.
 //!
 //! Reach it through [`ApiClient::streams`]. The endpoints fall into four groups:
 //!
 //! - **Discovery** — list, search and fetch public broadcasts and channels.
 //!   No authentication needed.
 //! - **Following** — follow or unfollow a broadcast.
-//! - **Chat and conversations** — a broadcast's chat session and the per-user
-//!   conversations attached to a stream.
+//! - **Conversations** — the per-user message threads attached to a stream.
 //! - **Studio streams** — configure, activate, and simulcast the live stream
 //!   that a studio broadcasts.
 //!
 //! Everything except discovery requires a bearer token
-//! ([`ApiClient::set_bearer_token`]).
+//! ([`ApiClient::set_bearer_token`]). Broadcast chat is a WebSocket endpoint
+//! and is not covered by this client.
 //!
 //! # Example
 //!
 //! ```rust,no_run
 //! use webtrip_api::api::{ApiClient, ApiError};
-//! use webtrip_api::models::{ActivationRequestOpts, StreamSearchQuery};
+//! use webtrip_api::models::{ActivationRequestOpts, BroadcastVisibility, StreamSearchQuery};
 //!
 //! # async fn example() -> Result<(), ApiError> {
 //! let client = ApiClient::new();
@@ -30,9 +30,12 @@
 //!
 //! // Going live from a studio needs a bearer token.
 //! client.set_bearer_token("<token>".to_string());
-//! let opts = ActivationRequestOpts { active: Some(true) };
+//! let opts = ActivationRequestOpts {
+//!     visibility: Some(BroadcastVisibility::Public),
+//!     ..Default::default()
+//! };
 //! let stream = client.streams().activate_studio_stream("studio123", &opts).await?;
-//! println!("HLS: {:?}", stream.hls_url);
+//! println!("live as stream {:?}", stream.id);
 //! # Ok(())
 //! # }
 //! ```
@@ -49,8 +52,9 @@
 //!
 //! client.setBearerToken(token);
 //! await client.streams().updateSimulcastDestination('studio123', 'youtube', {
-//!   rtmpUrl: 'rtmp://a.rtmp.youtube.com/live2',
-//!   streamKey: '<key>',
+//!   name: 'youtube',
+//!   url: 'rtmp://a.rtmp.youtube.com/live2',
+//!   key: '<key>',
 //! });
 //! ```
 
@@ -61,15 +65,22 @@ use crate::models;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-// =============================================================================
-// Streams API
-// =============================================================================
+api_module_struct!(
+    /// JackTrip Radio broadcast, channel, conversation and studio-stream
+    /// endpoints; obtain with [`ApiClient::streams`].
+    StreamsApi
+);
 
-api_module_struct!(StreamsApi);
-
-// =============================================================================
-// Rust API (primary interface)
-// =============================================================================
+/// Query for the paginated conversation and message lists: an optional
+/// filter plus `page`/`limit`, each sent only when set.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FilteredPage<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<&'a str>,
+    #[serde(flatten)]
+    page: PaginationQuery,
+}
 
 fn stream_follow_path(stream_id: &str) -> String {
     format!("/streams/{}/follow", urlencode(stream_id))
@@ -156,27 +167,24 @@ impl StreamsApi {
         page: Option<i32>,
         limit: Option<i32>,
     ) -> Result<models::PaginatedChannels, ApiError> {
-        if page.is_some() || limit.is_some() {
-            self.client.get_with_query("/channels-paginated", &PaginationQuery { page, limit }).await
-        } else {
-            self.client.get("/channels-paginated").await
-        }
+        self.client.get_with_query("/channels-paginated", &PaginationQuery { page, limit }).await
     }
 
-    /// Get a chat session for a broadcast.
-    ///
-    /// `GET /streams/{streamId}/chat/{chatId}`. Requires a bearer token.
-    pub async fn get_stream_chat(&self, stream_id: &str, chat_id: &str) -> Result<models::ChatSession, ApiError> {
-        let path = format!("/streams/{}/chat/{}", urlencode(stream_id), urlencode(chat_id));
-        self.client.get(&path).await
-    }
-
-    /// List the conversations attached to a stream.
+    /// Get a page of the conversations attached to a stream.
     ///
     /// `GET /streams/{streamId}/conversations`. Requires a bearer token.
-    pub async fn get_stream_conversations(&self, stream_id: &str) -> Result<Vec<models::Conversation>, ApiError> {
+    /// `user_id` narrows the results to one user's conversation; `page`
+    /// (1-indexed) and `limit` fall back to the server defaults when `None`.
+    pub async fn get_stream_conversations(
+        &self,
+        stream_id: &str,
+        user_id: Option<&str>,
+        page: Option<i32>,
+        limit: Option<i32>,
+    ) -> Result<models::PaginatedConversations, ApiError> {
         let path = format!("/streams/{}/conversations", urlencode(stream_id));
-        self.client.get(&path).await
+        let query = FilteredPage { user_id, page: PaginationQuery { page, limit } };
+        self.client.get_with_query(&path, &query).await
     }
 
     /// Get the conversation with one user on a stream.
@@ -205,15 +213,20 @@ impl StreamsApi {
         self.client.post_no_response(&path, req).await
     }
 
-    /// List the messages in a conversation.
+    /// Get a page of the messages in a conversation.
     ///
-    /// `GET /streams/{streamId}/conversations/{userId}/messages`. Requires a bearer token.
+    /// `GET /streams/{streamId}/conversations/{userId}/messages`. Requires a
+    /// bearer token. Pagination behaves as in
+    /// [`get_stream_conversations`](Self::get_stream_conversations).
     pub async fn get_conversation_messages(
         &self,
         stream_id: &str,
         user_id: &str,
-    ) -> Result<Vec<models::Message>, ApiError> {
-        self.client.get(&conversation_messages_path(stream_id, user_id)).await
+        page: Option<i32>,
+        limit: Option<i32>,
+    ) -> Result<models::PaginatedMessages, ApiError> {
+        let query = FilteredPage { user_id: None, page: PaginationQuery { page, limit } };
+        self.client.get_with_query(&conversation_messages_path(stream_id, user_id), &query).await
     }
 
     /// Send a message in a conversation.
@@ -292,11 +305,13 @@ impl StreamsApi {
         self.client.put(&path, stream).await
     }
 
-    /// Start or stop a studio's live stream.
+    /// Start, change or stop a studio's broadcast or recording.
     ///
-    /// `POST /studios/{studioId}/stream/activate`. Requires a bearer token. Set
-    /// [`models::ActivationRequestOpts::active`] to `true` to go live or `false`
-    /// to stop; returns the updated [`models::LiveStream`].
+    /// `POST /studios/{studioId}/stream/activate`. Requires a bearer token.
+    /// [`models::ActivationRequestOpts::visibility`] picks the mode (public or
+    /// unlisted broadcast, private or stem recording);
+    /// [`Offline`](models::BroadcastVisibility::Offline) stops it. Returns the
+    /// updated [`models::LiveStream`].
     pub async fn activate_studio_stream(
         &self,
         studio_id: &str,
@@ -317,15 +332,17 @@ impl StreamsApi {
 
     /// Add or update a simulcast destination.
     ///
-    /// `PUT /studios/{studioId}/simulcast/{destination}`. Requires a bearer token. `destination`
-    /// is the destination's name in the path (e.g. `"youtube"`); the
-    /// destination is added if it does not exist yet, otherwise updated.
+    /// `PUT /studios/{studioId}/simulcast/{destination}`. Requires a bearer
+    /// token. `destination` is the platform name (`"youtube"`, `"facebook"` or
+    /// `"twitch"`); the destination is added if it does not exist yet,
+    /// otherwise updated. The server returns no body; re-read with
+    /// [`get_simulcast_destinations`](Self::get_simulcast_destinations).
     pub async fn update_simulcast_destination(
         &self,
         studio_id: &str,
         destination: &str,
         config_data: &models::SimulcastDestination,
-    ) -> Result<models::SimulcastDestination, ApiError> {
+    ) -> Result<(), ApiError> {
         let path = format!("/studios/{}/simulcast/{}", urlencode(studio_id), urlencode(destination));
         self.client.put(&path, config_data).await
     }
@@ -388,15 +405,15 @@ impl StreamsApi {
         self.list_channels_paginated(page, limit).await
     }
 
-    #[wasm_bindgen(js_name = getStreamChat)]
-    pub async fn get_stream_chat_js(&self, stream_id: String, chat_id: String) -> Result<models::ChatSession, ApiError> {
-        self.get_stream_chat(&stream_id, &chat_id).await
-    }
-
     #[wasm_bindgen(js_name = getStreamConversations)]
-    pub async fn get_stream_conversations_js(&self, stream_id: String) -> Result<JsValue, ApiError> {
-        let conversations = self.get_stream_conversations(&stream_id).await?;
-        to_js_value(&conversations)
+    pub async fn get_stream_conversations_js(
+        &self,
+        stream_id: String,
+        user_id: Option<String>,
+        page: Option<i32>,
+        limit: Option<i32>,
+    ) -> Result<models::PaginatedConversations, ApiError> {
+        self.get_stream_conversations(&stream_id, user_id.as_deref(), page, limit).await
     }
 
     #[wasm_bindgen(js_name = getStreamConversation)]
@@ -419,9 +436,14 @@ impl StreamsApi {
     }
 
     #[wasm_bindgen(js_name = getConversationMessages)]
-    pub async fn get_conversation_messages_js(&self, stream_id: String, user_id: String) -> Result<JsValue, ApiError> {
-        let messages = self.get_conversation_messages(&stream_id, &user_id).await?;
-        to_js_value(&messages)
+    pub async fn get_conversation_messages_js(
+        &self,
+        stream_id: String,
+        user_id: String,
+        page: Option<i32>,
+        limit: Option<i32>,
+    ) -> Result<models::PaginatedMessages, ApiError> {
+        self.get_conversation_messages(&stream_id, &user_id, page, limit).await
     }
 
     #[wasm_bindgen(js_name = sendMessage)]
@@ -499,7 +521,7 @@ impl StreamsApi {
         studio_id: String,
         destination: String,
         config_data: models::SimulcastDestination,
-    ) -> Result<models::SimulcastDestination, ApiError> {
+    ) -> Result<(), ApiError> {
         self.update_simulcast_destination(&studio_id, &destination, &config_data).await
     }
 
@@ -612,13 +634,13 @@ mod tests {
             "GET",
             "/streams/stream123",
             200,
-            r#"{"id":"stream123","name":"My Stream","followers":42}"#,
+            r#"{"id":"stream123","name":"My Stream","views":42}"#,
         )
         .await;
 
         let stream = api(&client).get_stream("stream123").await.unwrap();
         assert_eq!(stream.base.id, Some("stream123".to_string()));
-        assert_eq!(stream.followers, Some(42));
+        assert_eq!(stream.views, Some(42));
         mock.assert_async().await;
     }
 
@@ -699,36 +721,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_stream_chat() {
+    async fn test_get_stream_conversations_is_paginated_and_filtered() {
+        // Regression: decoded as a bare array, but the API returns a
+        // paginated envelope.
         let (mut server, client) = mock_api().await;
-        let mock = mock_json(
-            &mut server,
-            "GET",
-            "/streams/s1/chat/chat1",
-            200,
-            r#"{"id":"chat1","roomId":"r1"}"#,
-        )
-        .await;
+        let mock = server
+            .mock("GET", "/streams/s1/conversations")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("userId".into(), "u1".into()),
+                mockito::Matcher::UrlEncoded("limit".into(), "5".into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"_meta":{"total":1,"pages":1,"current":1,"count":1,"limit":5},"results":[{"userId":"u1"}]}"#)
+            .create_async()
+            .await;
 
-        let chat = api(&client).get_stream_chat("s1", "chat1").await.unwrap();
-        assert_eq!(chat.id, Some("chat1".to_string()));
-        mock.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn test_get_stream_conversations() {
-        let (mut server, client) = mock_api().await;
-        let mock = mock_json(
-            &mut server,
-            "GET",
-            "/streams/s1/conversations",
-            200,
-            r#"[{"id":"conv1"}]"#,
-        )
-        .await;
-
-        let result = api(&client).get_stream_conversations("s1").await.unwrap();
-        assert_eq!(result[0].id, Some("conv1".to_string()));
+        let page = api(&client).get_stream_conversations("s1", Some("u1"), None, Some(5)).await.unwrap();
+        assert_eq!(page.results[0].user_id.as_deref(), Some("u1"));
         mock.assert_async().await;
     }
 
@@ -740,7 +750,7 @@ mod tests {
             "GET",
             "/streams/s1/conversations/u1",
             200,
-            r#"{"id":"conv1","userId":"u1"}"#,
+            r#"{"streamId":"s1","userId":"u1"}"#,
         )
         .await;
 
@@ -750,38 +760,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_conversation_messages() {
+    async fn test_get_conversation_messages_is_paginated() {
+        // Regression: decoded as a bare array of messages with a `content`
+        // field; the API returns a paginated envelope of `text` messages.
         let (mut server, client) = mock_api().await;
         let mock = mock_json(
             &mut server,
             "GET",
             "/streams/s1/conversations/u1/messages",
             200,
-            r#"[{"id":"m1","content":"hi"}]"#,
+            r#"{"_meta":{"total":1,"pages":1,"current":1,"count":1,"limit":20},"results":[{"id":"m1","text":"hi"}]}"#,
         )
         .await;
 
-        let result = api(&client).get_conversation_messages("s1", "u1").await.unwrap();
-        assert_eq!(result[0].content, Some("hi".to_string()));
+        let page = api(&client).get_conversation_messages("s1", "u1", None, None).await.unwrap();
+        assert_eq!(page.results[0].text.as_deref(), Some("hi"));
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_send_message() {
         let (mut server, client) = mock_api().await;
-        let mock = mock_json(
-            &mut server,
-            "POST",
-            "/streams/s1/conversations/u1/messages",
-            200,
-            r#"{"id":"m2","content":"yo"}"#,
-        )
-        .await;
+        let mock = server
+            .mock("POST", "/streams/s1/conversations/u1/messages")
+            .match_body(mockito::Matcher::Json(serde_json::json!({"text": "yo"})))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"m2","text":"yo"}"#)
+            .create_async()
+            .await;
 
-        let req = models::SendMessageRequest {
-            content: Some("yo".to_string()),
-            ..Default::default()
-        };
+        let req = models::SendMessageRequest { text: Some("yo".to_string()), ..Default::default() };
         let msg = api(&client).send_message("s1", "u1", &req).await.unwrap();
         assert_eq!(msg.id, Some("m2".to_string()));
         mock.assert_async().await;
@@ -806,19 +815,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mark_conversation_read_error() {
-        let (mut server, client) = mock_api().await;
-        let mock = mock_empty(&mut server, "POST", "/streams/s1/conversations/u1/last", 403).await;
-
-        let err = api(&client)
-            .mark_conversation_read("s1", "u1", &models::MarkReadRequest::default())
-            .await
-            .unwrap_err();
-        assert_http_status(err, 403);
-        mock.assert_async().await;
-    }
-
-    #[tokio::test]
     async fn test_get_conversation_message() {
         let (mut server, client) = mock_api().await;
         let mock = mock_json(
@@ -826,13 +822,12 @@ mod tests {
             "GET",
             "/streams/s1/conversations/u1/messages/m1",
             200,
-            r#"{"id":"m1","content":"hi"}"#,
+            r#"{"id":"m1","text":"hi"}"#,
         )
         .await;
 
         let msg = api(&client).get_conversation_message("s1", "u1", "m1").await.unwrap();
-        assert_eq!(msg.id, Some("m1".to_string()));
-        assert_eq!(msg.content, Some("hi".to_string()));
+        assert_eq!(msg.text, Some("hi".to_string()));
         mock.assert_async().await;
     }
 
@@ -845,7 +840,7 @@ mod tests {
             .match_body(mockito::Matcher::Json(serde_json::json!({"status": 1})))
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"id":"m1","content":"hi"}"#)
+            .with_body(r#"{"id":"m1","status":1}"#)
             .create_async()
             .await;
 
@@ -854,7 +849,7 @@ mod tests {
             .update_conversation_message("s1", "u1", "m1", &req)
             .await
             .unwrap();
-        assert_eq!(msg.id, Some("m1".to_string()));
+        assert_eq!(msg.status, Some(1));
         mock.assert_async().await;
     }
 
@@ -866,26 +861,19 @@ mod tests {
             "GET",
             "/studios/st1/stream",
             200,
-            r#"{"id":"ls1","active":true}"#,
+            r#"{"id":"ls1","serverId":"st1"}"#,
         )
         .await;
 
         let stream = api(&client).get_studio_stream("st1").await.unwrap();
-        assert_eq!(stream.active, Some(true));
+        assert_eq!(stream.server_id.as_deref(), Some("st1"));
         mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_create_studio_stream() {
         let (mut server, client) = mock_api().await;
-        let mock = mock_json(
-            &mut server,
-            "POST",
-            "/studios/st1/stream",
-            200,
-            r#"{"id":"ls1"}"#,
-        )
-        .await;
+        let mock = mock_json(&mut server, "POST", "/studios/st1/stream", 201, r#"{"id":"ls1"}"#).await;
 
         let body = models::LiveStream::default();
         let stream = api(&client).create_studio_stream("st1", &body).await.unwrap();
@@ -912,20 +900,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_activate_studio_stream() {
+    async fn test_activate_studio_stream_sends_visibility() {
+        // Regression: the body was `{"active": true}`, which the API ignores.
         let (mut server, client) = mock_api().await;
-        let mock = mock_json(
-            &mut server,
-            "POST",
-            "/studios/st1/stream/activate",
-            200,
-            r#"{"id":"ls1","active":true}"#,
-        )
-        .await;
+        let mock = server
+            .mock("POST", "/studios/st1/stream/activate")
+            .match_body(mockito::Matcher::Json(serde_json::json!({"visibility": 1})))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"ls1"}"#)
+            .create_async()
+            .await;
 
-        let opts = models::ActivationRequestOpts { active: Some(true) };
+        let opts = models::ActivationRequestOpts {
+            visibility: Some(models::BroadcastVisibility::Public),
+            ..Default::default()
+        };
         let stream = api(&client).activate_studio_stream("st1", &opts).await.unwrap();
-        assert_eq!(stream.active, Some(true));
+        assert_eq!(stream.id.as_deref(), Some("ls1"));
         mock.assert_async().await;
     }
 
@@ -937,33 +929,25 @@ mod tests {
             "GET",
             "/studios/st1/simulcast",
             200,
-            r#"[{"id":"d1","platform":"youtube"}]"#,
+            r#"[{"name":"youtube","url":"rtmp://a.rtmp.youtube.com/live2","key":"k"}]"#,
         )
         .await;
 
         let result = api(&client).get_simulcast_destinations("st1").await.unwrap();
-        assert_eq!(result[0].platform, Some("youtube".to_string()));
+        assert_eq!(result[0].name.as_deref(), Some("youtube"));
+        assert_eq!(result[0].url.as_deref(), Some("rtmp://a.rtmp.youtube.com/live2"));
         mock.assert_async().await;
     }
 
     #[tokio::test]
-    async fn test_update_simulcast_destination() {
+    async fn test_update_simulcast_destination_accepts_empty_200() {
+        // Regression: the endpoint answers 200 with no body, which failed to
+        // decode as a `SimulcastDestination`.
         let (mut server, client) = mock_api().await;
-        let mock = mock_json(
-            &mut server,
-            "PUT",
-            "/studios/st1/simulcast/d1",
-            200,
-            r#"{"id":"d1","enabled":true}"#,
-        )
-        .await;
+        let mock = mock_empty(&mut server, "PUT", "/studios/st1/simulcast/youtube", 200).await;
 
-        let cfg = models::SimulcastDestination::default();
-        let dest = api(&client)
-            .update_simulcast_destination("st1", "d1", &cfg)
-            .await
-            .unwrap();
-        assert_eq!(dest.enabled, Some(true));
+        let cfg = models::SimulcastDestination { name: Some("youtube".into()), ..Default::default() };
+        api(&client).update_simulcast_destination("st1", "youtube", &cfg).await.unwrap();
         mock.assert_async().await;
     }
 

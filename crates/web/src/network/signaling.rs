@@ -50,9 +50,12 @@ use web_sys::{CloseEvent, Event, MessageEvent, WebSocket};
 
 use webtrip_core::network::signaling_message::{HubConnectionState, SignalingMessage, SignalingMessageType};
 
-/// Hub server signaling client
+/// Hub server signaling client: the WebSocket a WebRTC transport uses to
+/// exchange its SDP offer/answer and ICE candidates with a JackTrip hub.
 ///
-/// Handles WebSocket connection and signaling with a JackTrip hub server.
+/// Set every callback before `connect()`: the answer, ICE, error and
+/// WebSocket-close handlers capture the callbacks when it is called, so ones
+/// set afterwards are not called for those events.
 #[wasm_bindgen]
 pub struct HubSignaling {
     /// Server URL (always `wss://` for hub WebRTC signaling)
@@ -111,14 +114,12 @@ impl HubSignaling {
 
 #[wasm_bindgen]
 impl HubSignaling {
-    /// Create a new hub signaling client
+    /// Create a hub signaling client for `wss://<serverHost>:<port>/webrtc`
+    /// (always TLS).
     ///
-    /// WebRTC hub signaling always uses a TLS WebSocket (`wss://`) on the `/webrtc` path.
-    ///
-    /// # Arguments
-    /// * `server_host` - The hub server hostname (from studio.server_host)
-    /// * `port` - The signaling port (default 4464)
-    /// * `client_name` - Client identifier (sent as URL query parameter), empty string for anonymous
+    /// Arguments: the hub host name (a studio's `serverHost`), the signaling
+    /// port (normally 4464), and the client name sent as the `name` query
+    /// parameter (`""` for none).
     #[wasm_bindgen(constructor)]
     pub fn new(server_host: &str, port: u16, client_name: &str) -> Self {
         // Only include name parameter if client_name is not empty
@@ -132,8 +133,9 @@ impl HubSignaling {
         Self::build(server_url)
     }
 
-    /// Create from a full WebSocket URL (`ws://` is upgraded to `wss://` for hub signaling)
-    pub fn from_url(url: &str, _client_name: &str) -> Self {
+    /// Create from a full WebSocket URL, including any `name` query parameter
+    /// (`ws://` is upgraded to `wss://`).
+    pub fn from_url(url: &str) -> Self {
         let server_url = if url.starts_with("ws://") {
             format!("wss://{}", &url[5..])
         } else {
@@ -142,22 +144,31 @@ impl HubSignaling {
         Self::build(server_url)
     }
 
-    /// Set callback for SDP answer received
+    /// Set the callback for the hub's SDP answer. It receives the SDP string.
+    /// Set it before `connect()`.
     pub fn set_on_answer(&mut self, callback: js_sys::Function) {
         self.js_on_answer = Some(callback);
     }
 
-    /// Set callback for ICE candidate received
+    /// Set the callback for ICE candidates from the hub. It receives the
+    /// whole signaling message as JSON text
+    /// (`{"type":"ice","candidate":...,"sdpMid":...,"sdpMLineIndex":...}`), not
+    /// just the candidate. Set it before `connect()`.
     pub fn set_on_ice(&mut self, callback: js_sys::Function) {
         self.js_on_ice = Some(callback);
     }
 
-    /// Set callback for errors
+    /// Set the callback for errors. It receives the hub's error message, or
+    /// `"WebSocket error"` for a socket error. Set it before `connect()`.
     pub fn set_on_error(&mut self, callback: js_sys::Function) {
         self.js_on_error = Some(callback);
     }
 
-    /// Set callback for state changes
+    /// Set the callback for state changes. It receives `"disconnected"`,
+    /// `"connecting"`, `"handshaking"`, `"negotiating"`, `"connected"`,
+    /// `"failed"` or `"closed"`, and `"closed:<code>"` (for example
+    /// `"closed:1006"`) when the WebSocket closes. The `"closed:<code>"`
+    /// report is only delivered to a callback set before `connect()`.
     pub fn set_on_state_change(&mut self, callback: js_sys::Function) {
         self.js_on_state_change = Some(callback);
     }
@@ -386,13 +397,13 @@ mod tests {
 
     #[test]
     fn test_from_url_upgrades_ws_to_wss() {
-        let sig = HubSignaling::from_url("ws://hub.example.com:4464/webrtc", "");
+        let sig = HubSignaling::from_url("ws://hub.example.com:4464/webrtc");
         assert_eq!(sig.server_url, "wss://hub.example.com:4464/webrtc");
     }
 
     #[test]
     fn test_from_url_passes_through_wss() {
-        let sig = HubSignaling::from_url("wss://hub.example.com:4464/webrtc", "");
+        let sig = HubSignaling::from_url("wss://hub.example.com:4464/webrtc");
         assert_eq!(sig.server_url, "wss://hub.example.com:4464/webrtc");
     }
 
@@ -405,7 +416,7 @@ mod tests {
             HubConnectionState::Negotiating,
             HubConnectionState::Connected,
         ] {
-            let mut sig = HubSignaling::from_url("wss://hub.example.com/webrtc", "");
+            let mut sig = HubSignaling::from_url("wss://hub.example.com/webrtc");
             sig.state = state;
             assert!(sig.is_connected(), "{:?} should count as connected", state);
         }
@@ -419,7 +430,7 @@ mod tests {
             HubConnectionState::Failed,
             HubConnectionState::Closed,
         ] {
-            let mut sig = HubSignaling::from_url("wss://hub.example.com/webrtc", "");
+            let mut sig = HubSignaling::from_url("wss://hub.example.com/webrtc");
             sig.state = state;
             assert!(!sig.is_connected(), "{:?} should not count as connected", state);
         }

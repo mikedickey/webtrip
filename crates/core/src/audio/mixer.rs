@@ -1,10 +1,13 @@
 //! The device↔network bridge, expressed as N device streams and M network
 //! streams. The only implementation, [`SimpleMixer`], handles one of each.
 //!
-//! The engine does no I/O: no `Regulator`, `RingBuffer`, `SharedPtr` or
-//! `AudioParams` appear here. `AudioProcessor` does the pointer work, decodes
-//! atomics into [`MixControls`] and encodes [`MixMeters`] back, which keeps the
-//! engine portable and testable with plain slices.
+//! The engine does no I/O: no [`Regulator`](crate::stream::regulator::Regulator),
+//! [`RingBuffer`](crate::stream::ring_buffer::RingBuffer),
+//! [`SharedPtr`](crate::stream::shared_ptr::SharedPtr) or
+//! [`AudioParams`](crate::audio::params::AudioParams) appear here.
+//! [`AudioProcessor`](crate::audio::processor::AudioProcessor) does the pointer
+//! work, decodes atomics into [`MixControls`] and encodes [`MixMeters`] back,
+//! which keeps the engine portable and testable with plain slices.
 //!
 //! An absent network is an empty slice: `net_in: &[]` is silence and
 //! `net_out: &mut []` means nothing is sent.
@@ -15,7 +18,10 @@ use crate::audio::dsp::{
 };
 use crate::limits::{MAX_DEVICE_SAMPLE_RATE, MAX_WIRE_CHANNELS, MIN_DEVICE_SAMPLE_RATE};
 
-/// Why a layout was refused by [`MixEngine::prepare`].
+/// Why a mixer could not be set up: a layout refused by
+/// [`MixEngine::prepare`], or (the `Regulator*` variants) a regulator that
+/// [`AudioProcessor::with_network`](crate::audio::processor::AudioProcessor::with_network)
+/// cannot use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MixError {
     /// A dimension of the layout was zero, which could never hold a stream.
@@ -74,12 +80,16 @@ impl std::error::Error for MixError {}
 /// buffer in [`MixEngine::prepare`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MixLayout {
-    /// Most frames any one `render` call will carry.
+    /// Most frames any one `render` call will carry. When `device_rate` and
+    /// `wire_rate` differ, this is also the exact size of every call: the
+    /// resampler runs in fixed chunks, and a call of another size sends and
+    /// receives nothing (debug builds assert).
     pub max_frames: usize,
     /// Widest device stream (capture or playback), in channels.
     pub max_device_channels: usize,
-    /// The device's actual sample rate (`AudioContext.sampleRate`), which may
-    /// differ from the rate it was asked for.
+    /// The device's actual sample rate in Hz (in the browser,
+    /// `AudioContext.sampleRate`), which may differ from the rate it was asked
+    /// for.
     pub device_rate: u32,
     /// The rate network streams run at. The mixer converts between the two
     /// when they differ, and does nothing when they match.
@@ -114,7 +124,9 @@ pub struct DeviceIn<'a> {
 
 /// A playback device stream, planar like [`DeviceIn`].
 pub struct DeviceOut<'a> {
-    /// `channels` blocks of equal length, one per channel; overwritten by `render`.
+    /// `channels` blocks of equal length, one per channel. `render` overwrites
+    /// the first `frames * channels` samples, where `frames` is the capture's
+    /// frame count.
     pub planar: &'a mut [f32],
     /// Channel count of `planar`.
     pub channels: usize,
@@ -163,7 +175,9 @@ pub struct MixIo<'a, 'b> {
 pub trait MixEngine: Send {
     /// Off the RT thread. Sizes every scratch buffer. The only place it allocates.
     fn prepare(&mut self, layout: &MixLayout) -> Result<(), MixError>;
-    /// On the RT thread. No allocation, no locking, no unbounded work.
+    /// On the RT thread. No locking and no unbounded work; no allocation as
+    /// long as the call stays within the prepared [`MixLayout`] (a larger one
+    /// grows the scratch buffers once rather than panicking).
     fn render(&mut self, controls: &MixControls, io: &mut MixIo<'_, '_>) -> MixMeters;
     /// Wire-rate frames the next `render` of `device_frames` device frames
     /// reads from each `net_in`. Equal to `device_frames` unless the engine

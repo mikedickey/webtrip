@@ -484,21 +484,20 @@ thread_local! {
 }
 
 /// Statistics for the WebTransport worker
-#[wasm_bindgen]
 #[derive(Debug, Clone, Default)]
-pub struct WebTransportWorkerStats {
+pub(crate) struct WebTransportWorkerStats {
     /// Datagrams written successfully.
-    pub packets_sent: u64,
+    pub(crate) packets_sent: u64,
     /// Datagrams read, whether or not they decoded.
-    pub packets_received: u64,
+    pub(crate) packets_received: u64,
     /// Bytes in the datagrams written successfully.
-    pub bytes_sent: u64,
+    pub(crate) bytes_sent: u64,
     /// Bytes in every datagram read.
-    pub bytes_received: u64,
+    pub(crate) bytes_received: u64,
     /// Datagram writes that failed.
-    pub send_errors: u64,
+    pub(crate) send_errors: u64,
     /// Received datagrams that failed to decode as audio packets.
-    pub receive_errors: u64,
+    pub(crate) receive_errors: u64,
 }
 
 // Global stats (accessed from async loops)
@@ -510,8 +509,7 @@ thread_local! {
 /// 
 /// Called from JavaScript after the worker receives the 'init' message with
 /// WASM memory and buffer pointers.
-#[wasm_bindgen(js_name = workerInit)]
-pub fn worker_init(
+pub(crate) fn worker_init(
     ring_buffer_ptr: usize,
     regulator_ptr: usize,
     buffer_size: usize,
@@ -535,8 +533,7 @@ pub fn worker_init(
 /// 1. Establishes a WebTransport connection using browser's native API
 /// 2. Starts parallel send and receive loops
 /// 3. Returns when connection is closed or error occurs
-#[wasm_bindgen(js_name = workerConnect)]
-pub async fn worker_connect(server_url: String) -> Result<(), JsValue> {
+pub(crate) async fn worker_connect(server_url: String) -> Result<(), JsValue> {
     // Mark as running
     WORKER_STATE.with(|state| {
         state.borrow().start();
@@ -639,8 +636,7 @@ fn fpp_message(fpp: usize, max_datagram_size: usize) -> JsValue {
 ///
 /// `"disconnected"` is posted later by `maybe_post_disconnected` once
 /// **both** loops have exited (send flushes JackTrip exit packets first).
-#[wasm_bindgen(js_name = workerDisconnect)]
-pub fn worker_disconnect() {
+pub(crate) fn worker_disconnect() {
     // Clone out the Int32Array first so we don't hold the RefCell borrow across
     // the notify call (which also avoids lifetime issues with the inner borrow).
     let (array, idle) = WORKER_STATE.with(|state| {
@@ -667,8 +663,7 @@ pub fn worker_disconnect() {
 }
 
 /// Get current worker statistics
-#[wasm_bindgen(js_name = workerGetStats)]
-pub fn worker_get_stats() -> WebTransportWorkerStats {
+pub(crate) fn worker_get_stats() -> WebTransportWorkerStats {
     STATS.with(|stats| stats.borrow().clone())
 }
 
@@ -1051,9 +1046,11 @@ async fn receive_loop_body(
     Ok(())
 }
 
-/// Entry point for the worker when loaded as a module
-/// 
-/// Sets up message handling for communication with the main thread.
+/// Runs once in every agent that instantiates the module (the page, this
+/// worker, the AudioWorklet), as wasm-bindgen's start function. It only
+/// installs the panic hook; the worker's message handling is wired by
+/// `webtransport_worker.js`, which forwards each message to
+/// `handleWorkerMessage`.
 #[wasm_bindgen(start)]
 pub fn worker_main() {
     // Set up panic hook for better error messages
@@ -1063,8 +1060,9 @@ pub fn worker_main() {
     // This function just ensures the WASM module is ready
 }
 
-/// Handle incoming message from main thread
-/// 
+/// Internal: called by the bundled `webtransport_worker.js` for each message
+/// from the main thread; not part of the public API.
+///
 /// Message types:
 /// - { type: "init", ringBufferPtr, regulatorPtr, bufferSize, sendChannels, receiveChannels }
 /// - { type: "connect", serverUrl }

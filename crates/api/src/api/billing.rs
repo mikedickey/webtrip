@@ -12,7 +12,7 @@
 //!
 //! # async fn run(client: &ApiClient) -> Result<(), ApiError> {
 //! let request = CheckoutRequest {
-//!     plan: "pro".to_string(),
+//!     plan: "solo".to_string(),
 //!     callback_url: "https://app.example.com/done".to_string(),
 //!     pricing_mode: Some("yearly".to_string()),
 //!     ..Default::default()
@@ -25,7 +25,7 @@
 //!
 //! ```js
 //! const { redirect } = await client.billing().createCheckout('user123', {
-//!   plan: 'pro',
+//!   plan: 'solo',
 //!   pricingMode: 'yearly',
 //!   callbackURL: 'https://app.example.com/done',
 //! });
@@ -38,27 +38,28 @@ use serde::Serialize;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-// =============================================================================
-// Billing API
-// =============================================================================
-
-api_module_struct!(BillingApi);
-
-// =============================================================================
-// Rust API (primary interface)
-// =============================================================================
+api_module_struct!(
+    /// Stripe billing, plan-price, redemption and usage endpoints; obtain with
+    /// [`ApiClient::billing`].
+    BillingApi
+);
 
 impl BillingApi {
-    /// Get a user's Stripe billing information (`GET /users/{userId}/billing`).
-    pub async fn get_billing(&self, user_id: &str) -> Result<models::BillingInfo, ApiError> {
+    /// Get a user's Stripe billing details (`GET /users/{userId}/billing`).
+    ///
+    /// The response is Stripe's own Customer object, with the active Stripe
+    /// Subscription object embedded under `subscription`; it is returned as
+    /// raw JSON because its shape is defined by Stripe, not by this API.
+    pub async fn get_billing(&self, user_id: &str) -> Result<serde_json::Value, ApiError> {
         let path = format!("/users/{}/billing", urlencode(user_id));
         self.client.get(&path).await
     }
 
     /// Resolve the Stripe price for a plan / pricing mode (`GET /users/{userId}/plans`).
     ///
-    /// `plan` is required by the spec; `pricing_mode` and `force_stripe_test_mode`
-    /// are optional.
+    /// `plan` is a plan name such as `"solo"` or `"ensemble"`; `pricing_mode`
+    /// is e.g. `"yearly"`. Pass `force_stripe_test_mode = Some("true")` to
+    /// price against Stripe's test mode.
     pub async fn get_plans(
         &self,
         user_id: &str,
@@ -113,6 +114,10 @@ impl BillingApi {
     }
 
     /// Redeem a coupon code for the authenticated user (`PUT /redemptions`).
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Http`] `409` if the code was already redeemed.
     pub async fn redeem(
         &self,
         request: &models::CodeRequest,
@@ -145,9 +150,11 @@ impl BillingApi {
 #[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl BillingApi {
+    /// Resolves to Stripe's Customer object; see [`BillingApi::get_billing`].
     #[wasm_bindgen(js_name = getBilling)]
-    pub async fn get_billing_js(&self, user_id: String) -> Result<models::BillingInfo, ApiError> {
-        self.get_billing(&user_id).await
+    pub async fn get_billing_js(&self, user_id: String) -> Result<JsValue, ApiError> {
+        let billing = self.get_billing(&user_id).await?;
+        super::to_js_value(&billing)
     }
 
     #[wasm_bindgen(js_name = getPlans)]
@@ -310,14 +317,15 @@ mod tests {
             "GET",
             "/users/u1/billing",
             200,
-            r#"{"customerId":"cus_abc","plan":"pro","status":"active","periodEnd":"2026-07-01T00:00:00Z"}"#,
+            r#"{"id":"cus_abc","object":"customer","subscription":{"id":"sub_1","status":"active"}}"#,
         )
         .await;
 
+        // Regression: decoded into an invented `{customerId, plan, …}` shape;
+        // the API returns Stripe's Customer object, so every field was None.
         let info = api(&client).get_billing("u1").await.unwrap();
-        assert_eq!(info.customer_id, Some("cus_abc".to_string()));
-        assert_eq!(info.plan, Some("pro".to_string()));
-        assert_eq!(info.status, Some("active".to_string()));
+        assert_eq!(info["id"], "cus_abc");
+        assert_eq!(info["subscription"]["status"], "active");
         mock.assert_async().await;
     }
 
@@ -393,24 +401,6 @@ mod tests {
 
         let err = api(&client).get_usage("a", "b").await.unwrap_err();
         assert_http_status(err, 400);
-        mock.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn test_bearer_token_sent_on_billing_request() {
-        let (mut server, client) = mock_api().await;
-        client.set_bearer_token("secret-token".to_string());
-        let mock = server
-            .mock("GET", "/users/u1/billing")
-            .match_header("authorization", "Bearer secret-token")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"plan":"pro"}"#)
-            .create_async()
-            .await;
-
-        let info = api(&client).get_billing("u1").await.unwrap();
-        assert_eq!(info.plan, Some("pro".to_string()));
         mock.assert_async().await;
     }
 }

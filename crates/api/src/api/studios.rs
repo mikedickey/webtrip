@@ -1,15 +1,19 @@
 //! Studios API endpoints.
 //!
 //! Create, configure, and delete JackTrip virtual studios, and query their
-//! access rights, participants, sessions, chat, and mixers. Obtain a
+//! access rights, participants, sessions, and mixers. Obtain a
 //! [`StudiosApi`] with [`ApiClient::studios`].
 //!
-//! A studio is modeled as [`models::Server`] (its spec name). Create and update
+//! A studio is modeled as [`models::Server`] (its API name). Create and update
 //! take a `Server`; reads return [`models::ServerWithSubscription`], which adds
 //! the caller's relationship to the studio (`admin`, `owner`, `subStatus`).
 //!
 //! **Authentication:** every endpoint requires a bearer token
-//! ([`ApiClient::set_bearer_token`]) except [`StudiosApi::list_mixers`].
+//! ([`ApiClient::set_bearer_token`]) except [`StudiosApi::list_mixers`] and
+//! [`StudiosApi::get_participant`].
+//!
+//! Studio chat and the studio's live-update topics are WebSocket endpoints and
+//! are not covered by this client.
 //!
 //! # Example
 //!
@@ -23,7 +27,7 @@
 //!
 //! let new_studio = Server {
 //!     config: ServerConfig { name: Some("My Studio".into()), ..Default::default() },
-//!     region: Some("us-west-1".into()),
+//!     region: Some("ec2-us-oregon".into()),
 //!     ..Default::default()
 //! };
 //! let studio = client.studios().create_studio(&new_studio).await?;
@@ -45,8 +49,8 @@
 //! const client = new ApiClient();
 //! client.setBearerToken('your-jwt-token');
 //!
-//! const studio = await client.studios().createStudio({ name: 'My Studio', region: 'us-west-1' });
-//! const { token, url } = await client.studios().getLivekitToken(studio.id);
+//! const studio = await client.studios().createStudio({ name: 'My Studio', region: 'ec2-us-oregon' });
+//! const { token } = await client.studios().getLivekitToken(studio.id);
 //! await client.studios().updateBanner(studio.id, pngBytes, 'image/png'); // pngBytes: Uint8Array
 //! ```
 
@@ -57,15 +61,10 @@ use crate::models;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-// =============================================================================
-// Studios API
-// =============================================================================
-
-api_module_struct!(StudiosApi);
-
-// =============================================================================
-// Rust API (primary interface)
-// =============================================================================
+api_module_struct!(
+    /// Studio management endpoints; obtain with [`ApiClient::studios`].
+    StudiosApi
+);
 
 impl StudiosApi {
     /// List all studios for the authenticated user (`GET /studios`).
@@ -89,6 +88,11 @@ impl StudiosApi {
     }
 
     /// Update a studio's configuration (`PUT /studios/{studio_id}`).
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Http`] `406` when the change is refused because the
+    /// session-concurrency limit is reached or a session is in motion.
     pub async fn update_studio(&self, studio_id: &str, studio: &models::Server) -> Result<models::ServerWithSubscription, ApiError> {
         let path = format!("/studios/{}", urlencode(studio_id));
         self.client.put(&path, studio).await
@@ -98,15 +102,6 @@ impl StudiosApi {
     pub async fn delete_studio(&self, studio_id: &str) -> Result<(), ApiError> {
         let path = format!("/studios/{}", urlencode(studio_id));
         self.client.delete(&path).await
-    }
-
-    /// Extend a studio's expiration time (`POST /studios/{studio_id}/extend`).
-    ///
-    /// The endpoint responds with `202 Accepted` (extended) or `204 No Content`
-    /// (no extension needed) and never returns a body.
-    pub async fn extend_studio(&self, studio_id: &str) -> Result<(), ApiError> {
-        let path = format!("/studios/{}/extend", urlencode(studio_id));
-        self.client.post_empty_no_response(&path).await
     }
 
     /// Get the authenticated user's access rights for a studio
@@ -140,46 +135,39 @@ impl StudiosApi {
         self.client.get("/mixers").await
     }
 
-    /// Get a LiveKit access token and server URL for the studio
+    /// Get a LiveKit access token for the studio
     /// (`POST /studios/{studio_id}/lktoken`).
     pub async fn get_livekit_token(&self, studio_id: &str) -> Result<models::LiveKitTokenResponse, ApiError> {
         let path = format!("/studios/{}/lktoken", urlencode(studio_id));
         self.client.post_empty(&path).await
     }
 
-    /// Send an invite for a studio (`POST /studios/{studio_id}/invite`).
-    /// The server returns no body.
+    /// Email invitations to join a studio (`POST /studios/{studio_id}/invite`).
     pub async fn send_invite(&self, studio_id: &str, invite: &models::InviteRequest) -> Result<(), ApiError> {
         let path = format!("/studios/{}/invite", urlencode(studio_id));
         self.client.post_no_response(&path, invite).await
     }
 
-    /// Submit feedback for a studio session
-    /// (`POST /studios/{studio_id}/feedback`). The server returns no body.
+    /// Submit feedback about a studio session
+    /// (`POST /studios/{studio_id}/feedback`).
     pub async fn submit_feedback(&self, studio_id: &str, feedback: &models::FeedbackRequest) -> Result<(), ApiError> {
         let path = format!("/studios/{}/feedback", urlencode(studio_id));
         self.client.post_no_response(&path, feedback).await
     }
 
-    /// Get a chat session for a studio (`GET /studios/{studio_id}/chat/{chat_id}`).
-    ///
-    /// The studio's chat ID is its `chatId` field.
-    pub async fn get_chat(&self, studio_id: &str, chat_id: &str) -> Result<models::ChatSession, ApiError> {
-        let path = format!("/studios/{}/chat/{}", urlencode(studio_id), urlencode(chat_id));
-        self.client.get(&path).await
-    }
-
-    /// Get the participants in a studio (`GET /studios/{studio_id}/participants`).
+    /// Get the participants in a studio's active session
+    /// (`GET /studios/{studio_id}/participants`).
     pub async fn get_participants(&self, studio_id: &str) -> Result<Vec<models::Participant>, ApiError> {
         let path = format!("/studios/{}/participants", urlencode(studio_id));
         self.client.get(&path).await
     }
 
-    /// Get a single studio participant's full user metadata by user ID.
+    /// Get a studio participant's full profile by user ID
+    /// (`GET /studios/{studio_id}/participants/{user_id}`). Does not require
+    /// authentication.
     ///
-    /// `GET /studios/{studio_id}/participants/{user_id}` returns a complete
-    /// [`models::User`], not the lighter session-scoped [`models::Participant`]
-    /// from [`Self::get_participants`].
+    /// Returns a complete [`models::User`], not the lighter
+    /// [`models::Participant`] from [`Self::get_participants`].
     pub async fn get_participant(&self, studio_id: &str, user_id: &str) -> Result<models::User, ApiError> {
         let path = format!(
             "/studios/{}/participants/{}",
@@ -229,11 +217,6 @@ impl StudiosApi {
         self.delete_studio(&studio_id).await
     }
 
-    #[wasm_bindgen(js_name = extendStudio)]
-    pub async fn extend_studio_js(&self, studio_id: String) -> Result<(), ApiError> {
-        self.extend_studio(&studio_id).await
-    }
-
     #[wasm_bindgen(js_name = getAccessSettings)]
     pub async fn get_access_settings_js(&self, studio_id: String) -> Result<models::ServerAccess, ApiError> {
         self.get_access_settings(&studio_id).await
@@ -268,11 +251,6 @@ impl StudiosApi {
     #[wasm_bindgen(js_name = submitFeedback)]
     pub async fn submit_feedback_js(&self, studio_id: String, feedback: models::FeedbackRequest) -> Result<(), ApiError> {
         self.submit_feedback(&studio_id, &feedback).await
-    }
-
-    #[wasm_bindgen(js_name = getChat)]
-    pub async fn get_chat_js(&self, studio_id: String, chat_id: String) -> Result<models::ChatSession, ApiError> {
-        self.get_chat(&studio_id, &chat_id).await
     }
 
     #[wasm_bindgen(js_name = getParticipants)]
@@ -415,16 +393,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_extend_studio_success() {
-        // Spec: 202 (extended) or 204 (no extension needed), no JSON body.
-        let (mut server, client) = mock_api().await;
-        let mock = mock_empty(&mut server, "POST", "/studios/st1/extend", 202).await;
-
-        api(&client).extend_studio("st1").await.unwrap();
-        mock.assert_async().await;
-    }
-
-    #[tokio::test]
     async fn test_get_access_settings_success() {
         let (mut server, client) = mock_api().await;
         let mock = mock_json(
@@ -487,7 +455,7 @@ mod tests {
             "POST",
             "/studios/st1/lktoken",
             200,
-            r#"{"token":"tok123","url":"wss://lk"}"#,
+            r#"{"token":"tok123"}"#,
         )
         .await;
 
@@ -497,11 +465,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_invite_success() {
+    async fn test_send_invite_ignores_ok_body() {
         let (mut server, client) = mock_api().await;
-        let mock = mock_empty(&mut server, "POST", "/studios/st1/invite", 204).await;
+        let mock = mock_json(&mut server, "POST", "/studios/st1/invite", 200, r#"{"ok":true}"#).await;
 
-        let body = models::InviteRequest::default();
+        let body = models::InviteRequest { emails: vec!["a@example.com".into()], message: None };
         api(&client).send_invite("st1", &body).await.unwrap();
         mock.assert_async().await;
     }
@@ -517,24 +485,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_chat_success() {
-        let (mut server, client) = mock_api().await;
-        let mock = mock_json(
-            &mut server,
-            "GET",
-            "/studios/st1/chat/chat1",
-            200,
-            r#"{"id":"chat1","roomId":"r1"}"#,
-        )
-        .await;
-
-        let chat = api(&client).get_chat("st1", "chat1").await.unwrap();
-        assert_eq!(chat.id, Some("chat1".to_string()));
-        assert_eq!(chat.room_id, Some("r1".to_string()));
-        mock.assert_async().await;
-    }
-
-    #[tokio::test]
     async fn test_get_participants_success() {
         let (mut server, client) = mock_api().await;
         let mock = mock_json(
@@ -542,7 +492,7 @@ mod tests {
             "GET",
             "/studios/st1/participants",
             200,
-            r#"[{"userId":"u1","name":"Alice"}]"#,
+            r#"[{"user_id":"u1","picture":"p.png"}]"#,
         )
         .await;
 
@@ -589,13 +539,13 @@ mod tests {
             "GET",
             "/studios/st1/session",
             200,
-            r#"{"id":"sess1","studioId":"st1"}"#,
+            r#"{"id":"sess1","serverId":"st1"}"#,
         )
         .await;
 
         let session = api(&client).get_session("st1").await.unwrap();
         assert_eq!(session.id, Some("sess1".to_string()));
-        assert_eq!(session.studio_id, Some("st1".to_string()));
+        assert_eq!(session.server_id, Some("st1".to_string()));
         mock.assert_async().await;
     }
 

@@ -1,18 +1,17 @@
 //! Audio Callback Loop
 //!
-//! Provides a timing mechanism synchronized with the audio worklet's process() callback.
-//! When the worklet processes audio, it signals via Atomics.notify, and this loop
-//! wakes up via Atomics.waitAsync to trigger transport packet processing.
-//!
-//! Requires Atomics.waitAsync and SharedArrayBuffer (Chrome 87+, Firefox 89+, Safari 16.4+).
+//! The loops the session's tick clock (`crate::tick_clock`) runs on. While
+//! audio runs, the worklet's `process()` callback signals via `Atomics.notify`
+//! and [`AudioCallbackLoop`] wakes via `Atomics.waitAsync` to tick the
+//! transport. Without audio, or without `Atomics.waitAsync` (Chrome 87+,
+//! Firefox 145+, Safari 16.4+), [`IntervalTickLoop`] ticks on a timer instead.
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-/// Check if Atomics.waitAsync is supported by the browser
-///
-/// Requires both Atomics.waitAsync AND SharedArrayBuffer to be available.
-/// Always returns `false` on non-WASM targets (native `cargo test` runs).
+/// Whether this agent has both `Atomics.waitAsync` and `SharedArrayBuffer`.
+/// Without them a WebRTC connection ticks on a timer, and WebTransport does
+/// not work. Always `false` off `wasm32` (native `cargo test` runs).
 #[wasm_bindgen(js_name = hasAtomicsWaitAsync)]
 pub fn has_atomics_wait_async() -> bool {
     #[cfg(target_arch = "wasm32")]
@@ -48,22 +47,11 @@ pub fn has_atomics_wait_async() -> bool {
     }
 }
 
-/// Start an audio-callback-driven loop using Atomics.waitAsync
-/// 
-/// This function spawns a JavaScript async loop that:
-/// 1. Waits for the ring buffer flag to change (via Atomics.waitAsync)
-/// 2. Calls the provided tick callback when woken (audio callback occurred)
-/// 3. Returns a stop function to terminate the loop
-/// 
-/// # Arguments
-/// * `memory` - WebAssembly memory containing the ring buffer flag
-/// * `flag_ptr` - Pointer to the atomic flag (byte offset)
-/// * `tick_callback` - Function to call when audio callback occurs
-/// 
-/// # Returns
-/// A JavaScript function that stops the loop when called
-#[wasm_bindgen(js_name = startAudioCallbackLoop)]
-pub fn start_audio_callback_loop(
+/// Start a JavaScript async loop that sleeps on the 32-bit flag at byte
+/// offset `flag_ptr` in `memory` (via `Atomics.waitAsync`) and calls
+/// `tick_callback` each time it is woken. Returns a function that stops the
+/// loop.
+fn start_audio_callback_loop(
     memory: &JsValue,
     flag_ptr: usize,
     tick_callback: &js_sys::Function,
@@ -152,9 +140,11 @@ impl AudioCallbackLoop {
         }
     }
     
-    /// Start the audio callback loop with Atomics.waitAsync
-    /// 
-    /// Returns true if started successfully, false if not supported
+    /// Start the loop with `Atomics.waitAsync`, ticking `tick_callback` each
+    /// time the flag at `flag_ptr` is notified.
+    ///
+    /// Returns `Ok(false)`, without starting, when `Atomics.waitAsync` is not
+    /// supported, and `Err` when the JavaScript loop could not be created.
     pub fn start_with_atomics(
         &mut self,
         memory: &JsValue,
@@ -181,7 +171,8 @@ impl AudioCallbackLoop {
         }
     }
     
-    /// Check if the loop is running
+    /// Check if the loop is running (test-only observer).
+    #[cfg(all(test, target_arch = "wasm32"))]
     pub fn is_running(&self) -> bool {
         self.stop_fn.is_some()
     }

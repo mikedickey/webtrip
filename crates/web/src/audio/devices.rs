@@ -9,7 +9,7 @@ use web_sys::{
 use crate::audio::engine::{route_output_sink, AudioConstraints};
 use webtrip_core::limits::MAX_DEVICE_CHANNELS;
 
-/// Device information
+/// An audio input or output device, as listed by `getAudioDevices()`.
 #[wasm_bindgen]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -38,7 +38,7 @@ impl DeviceInfo {
 /// audio inputs and outputs are kept; anything else (e.g. video inputs) is
 /// discarded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AudioDeviceKind {
+pub(crate) enum AudioDeviceKind {
     /// An audio input (microphone).
     Input,
     /// An audio output (speaker).
@@ -52,13 +52,13 @@ pub enum AudioDeviceKind {
 /// This decouples categorization from `web_sys::MediaDeviceInfo` so the logic
 /// can be unit-tested natively without a browser.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RawDevice {
+pub(crate) struct RawDevice {
     /// The browser's device ID.
-    pub device_id: String,
+    pub(crate) device_id: String,
     /// The human-readable device name.
-    pub label: String,
+    pub(crate) label: String,
     /// Whether the device is an input, an output, or neither.
-    pub kind: AudioDeviceKind,
+    pub(crate) kind: AudioDeviceKind,
 }
 
 /// Pure core: split a list of devices into (inputs, outputs), preserving order
@@ -83,7 +83,7 @@ fn categorize_devices_core(devices: &[RawDevice]) -> (Vec<DeviceInfo>, Vec<Devic
 }
 
 /// Get the MediaDevices API from the browser
-pub fn get_media_devices() -> Result<MediaDevices, JsValue> {
+pub(crate) fn get_media_devices() -> Result<MediaDevices, JsValue> {
     let window = web_sys::window()
         .ok_or_else(|| JsValue::from_str("Window not available"))?;
     let navigator = window.navigator();
@@ -93,7 +93,7 @@ pub fn get_media_devices() -> Result<MediaDevices, JsValue> {
 }
 
 /// Stop all tracks in a media stream
-pub fn stop_media_stream(stream: &MediaStream) {
+pub(crate) fn stop_media_stream(stream: &MediaStream) {
     let tracks = stream.get_tracks();
     for i in 0..tracks.length() {
         if let Some(track) = tracks.get(i).dyn_into::<web_sys::MediaStreamTrack>().ok() {
@@ -193,7 +193,7 @@ pub(crate) fn track_channels(
 /// Opens the device (the default input when `deviceId` is absent or empty)
 /// with processing off and the native-width channel request, reads the
 /// capture track's channel capability, and stops the stream. Resolves to a
-/// count in `[1, MAX_DEVICE_CHANNELS]`.
+/// count from 1 to 32.
 ///
 /// A module-level function rather than a session method: it probes hardware
 /// and needs nothing from a session.
@@ -218,9 +218,9 @@ pub async fn get_input_device_channels(device_id: Option<String>) -> Result<u32,
 /// given (a no-op without `setSinkId`, so Safari and Firefox report the
 /// default output — the device they play to anyway), reads the
 /// destination's `maxChannelCount`, and closes the context. Resolves to a
-/// count in `[1, MAX_DEVICE_CHANNELS]`.
+/// count from 1 to 32.
 ///
-/// Module-level for the same reason as [`get_input_device_channels`].
+/// Module-level for the same reason as `getInputDeviceChannels`.
 #[wasm_bindgen(js_name = getOutputDeviceChannels)]
 pub async fn get_output_device_channels(device_id: Option<String>) -> Result<u32, JsValue> {
     let ctx = AudioContext::new()?;
@@ -284,8 +284,16 @@ fn categorize_devices(devices: &js_sys::Array) -> (js_sys::Array, js_sys::Array)
     (input_devices, output_devices)
 }
 
-/// Get available audio devices (returns {inputDevices, outputDevices})
-#[wasm_bindgen(js_name = getAudioDevices)]
+/// List the audio input and output devices, as
+/// `{ inputDevices: DeviceInfo[], outputDevices: DeviceInfo[] }`.
+///
+/// Asks for microphone access first (showing the permission prompt if it has
+/// not been granted), because browsers hide device labels until it is. Rejects
+/// if access is denied.
+#[wasm_bindgen(
+    js_name = getAudioDevices,
+    unchecked_return_type = "{ inputDevices: DeviceInfo[]; outputDevices: DeviceInfo[] }"
+)]
 pub async fn get_audio_devices() -> Result<JsValue, JsValue> {
     let media_devices = get_media_devices()?;
 

@@ -1,106 +1,14 @@
-//! Event models
+//! Upcoming-event models
 
-use super::Visibility;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "wasm")]
 use tsify_next::Tsify;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-/// Core event fields shared between public and studio-owned event types.
-#[cfg_attr(feature = "wasm", derive(Tsify))]
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
-pub struct CoreEventFields {
-    /// Event ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-
-    /// Event title
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-
-    /// Event description
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-
-    /// Stream/channel ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream_id: Option<String>,
-
-    /// Event image URL
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
-
-    /// Start time (RFC3339)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_time: Option<String>,
-
-    /// End time (RFC3339)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub end_time: Option<String>,
-
-    /// Timezone (e.g., "America/Los_Angeles")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timezone: Option<String>,
-
-    /// Whether this is a recurring event
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recurring: Option<bool>,
-
-    /// Recurrence rule (iCal RRULE format)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rrule: Option<String>,
-}
-
-/// Public upcoming event information
-#[cfg_attr(feature = "wasm", derive(Tsify))]
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
-pub struct PublicUpcomingEvent {
-    /// Core event fields
-    #[serde(flatten)]
-    pub core: CoreEventFields,
-
-    /// Stream/channel name
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream_name: Option<String>,
-
-    /// Banner image URL
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub banner_url: Option<String>,
-}
-
-/// Studio event (editable by owner)
-#[cfg_attr(feature = "wasm", derive(Tsify))]
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
-pub struct UpcomingEvent {
-    /// Core event fields
-    #[serde(flatten)]
-    pub core: CoreEventFields,
-
-    /// Studio ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub studio_id: Option<String>,
-
-    /// Visibility setting
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub visibility: Option<Visibility>,
-
-    /// Creation timestamp (RFC3339)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<String>,
-
-    /// Last update timestamp (RFC3339)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<String>,
-}
-
-/// Event information (simplified)
+/// The fields every event carries. [`UpcomingEvent`] and
+/// [`PublicUpcomingEvent`] flatten it, so its keys sit at the top level of
+/// their JSON objects.
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
@@ -110,48 +18,88 @@ pub struct EventInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 
-    /// Event title
+    /// Event name
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
+    pub name: Option<String>,
 
-    /// Start time (RFC3339)
+    /// Event description
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_time: Option<String>,
+    pub description: Option<String>,
 
-    /// End time (RFC3339)
+    /// Event image URL
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub end_time: Option<String>,
+    pub image: Option<String>,
+
+    /// When the event starts (RFC3339)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
+
+    /// When the event ends (RFC3339)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+
+    /// When the event was created (RFC3339)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+}
+
+/// An event as listed publicly on JackTrip Radio, with its studio's name and
+/// banner.
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
+#[serde(rename_all = "camelCase")]
+pub struct PublicUpcomingEvent {
+    /// Common event fields (flattened)
+    #[serde(flatten)]
+    pub event: EventInfo,
+
+    /// ID of the studio hosting the event
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
+
+    /// Display name of the studio hosting the event
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+
+    /// Studio banner image URL
+    #[serde(rename = "bannerURL", skip_serializing_if = "Option::is_none")]
+    pub banner_url: Option<String>,
+}
+
+/// An event as managed by its studio (`/studios/{studioId}/events`).
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
+#[serde(rename_all = "camelCase")]
+pub struct UpcomingEvent {
+    /// Common event fields (flattened)
+    #[serde(flatten)]
+    pub event: EventInfo,
+
+    /// ID of the studio hosting the event
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::test_utils::roundtrip;
 
     #[test]
-    fn public_upcoming_event_fixture_known_good() {
-        // Fixture modeled after the `api::events` module docs.
-        let json = r#"{
-          "id": "evt-1",
-          "title": "Friday Night Jam",
-          "description": "Recurring jam",
-          "streamId": "stream-1",
-          "streamName": "Studio Live",
-          "image": "https://cdn.example.com/img.png",
-          "bannerUrl": "https://cdn.example.com/banner.png",
-          "startTime": "2026-06-20T01:00:00Z",
-          "endTime": "2026-06-20T03:00:00Z",
-          "timezone": "America/Los_Angeles",
-          "recurring": true,
-          "rrule": "FREQ=WEEKLY;BYDAY=FR"
-        }"#;
-        let e: PublicUpcomingEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(e.core.recurring, Some(true));
-        assert_eq!(e.core.timezone.as_deref(), Some("America/Los_Angeles"));
-        let s = roundtrip(&e);
-        assert!(s.contains("\"streamId\":"));
-        assert!(s.contains("\"startTime\":"));
-        assert!(s.contains("\"endTime\":"));
+    fn event_wire_format() {
+        // Regression: events used `title` / `startTime` / `endTime`; the API
+        // sends `name` / `start` / `end`, so every event decoded empty.
+        let json = serde_json::json!({
+            "id": "evt-1", "name": "Friday Night Jam", "description": "Weekly jam",
+            "image": "img.png", "start": "2026-06-20T01:00:00Z", "end": "2026-06-20T03:00:00Z",
+            "createdAt": "2026-06-01T00:00:00Z",
+            "serverId": "studio-1", "serverName": "Studio", "bannerURL": "b.png"
+        });
+        let e: PublicUpcomingEvent = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(e.event.name.as_deref(), Some("Friday Night Jam"));
+        assert_eq!(e.event.start.as_deref(), Some("2026-06-20T01:00:00Z"));
+        assert_eq!(e.banner_url.as_deref(), Some("b.png"));
+        assert_eq!(serde_json::to_value(&e).unwrap(), json);
     }
 }
-

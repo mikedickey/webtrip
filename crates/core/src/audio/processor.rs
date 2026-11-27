@@ -63,10 +63,10 @@ pub(crate) fn compute_peak_update(current_db: f32, peak_db: f32, hold_counter: u
 /// itself lives behind [`MixEngine`], which sees only plain slices.
 pub struct AudioProcessor {
     params: &'static AudioParams,
-    /// Ring buffer for sending local audio to network (audio device → worklet → main thread → network).
+    /// Ring buffer for sending local audio to the network.
     /// Null when no network is attached; reached via its `&self` API through [`SharedPtr::as_ref`].
     local_to_network_buffer: SharedPtr<RingBuffer>,
-    /// Jitter buffer for receiving audio from network (network → main thread → jitter buffer → worklet → audio device).
+    /// Jitter buffer for receiving audio from the network.
     /// Null when no network is attached; reached via its `&self` SPSC API through [`SharedPtr::as_ref`].
     network_to_local_buffer: SharedPtr<Regulator>,
     mixer: Box<dyn MixEngine>,
@@ -99,17 +99,38 @@ impl AudioProcessor {
         .expect("equal rates always build")
     }
 
-    /// Create processor with network audio support
-    /// - local_to_network_buffer: ring buffer for sending local audio to network
-    /// - network_to_local_buffer: jitter buffer for receiving audio from network
-    /// - max_callback_frames: the most frames any `process` call will carry;
-    ///   every render-thread scratch buffer is sized from it here, off the
-    ///   render thread
-    /// - device_rate / wire_rate: the audio device's actual rate and the rate
-    ///   network streams (and the regulator) run at. When they differ the mixer
-    ///   converts both directions; the regulator only ever sees wire frames.
+    /// Create a processor attached to a connection's buffers. Call during
+    /// setup, off the audio thread: this is where every scratch buffer is
+    /// allocated.
     ///
-    /// Fails when the rates cannot be converted between, naming both.
+    /// - `params`: the shared controls and meters. A native host can make the
+    ///   `&'static` with `Box::leak(Box::default())`, once per audio engine.
+    /// - `local_to_network_buffer`: the send ring this processor writes
+    ///   captured audio into, or [`SharedPtr::null`] to send nothing.
+    /// - `network_to_local_buffer`: the regulator this processor pops peer
+    ///   audio from, or [`SharedPtr::null`] to receive nothing.
+    /// - `max_callback_frames`: the most frames any [`process`](Self::process)
+    ///   call will carry. When the two rates differ, every call must carry
+    ///   exactly this many frames (the resampler runs in fixed chunks).
+    /// - `device_rate` / `wire_rate`: the audio device's actual rate and the
+    ///   rate network streams (and the regulator) run at, in Hz. When they
+    ///   differ the mixer converts both directions; the regulator only ever
+    ///   sees wire frames.
+    ///
+    /// Both buffers must outlive the processor.
+    ///
+    /// # Errors
+    ///
+    /// - [`MixError::UnsupportedRates`]: the rates cannot be converted
+    ///   between (a zero rate, or a device rate outside
+    ///   [`MIN_DEVICE_SAMPLE_RATE`](crate::limits::MIN_DEVICE_SAMPLE_RATE)`..=`[`MAX_DEVICE_SAMPLE_RATE`](crate::limits::MAX_DEVICE_SAMPLE_RATE)).
+    /// - [`MixError::EmptyLayout`]: `max_callback_frames` is zero.
+    /// - [`MixError::RegulatorCapacity`]: the regulator's
+    ///   [`callback_capacity`](Regulator::callback_capacity) is below the wire
+    ///   frames one callback can need (see
+    ///   [`wire_frames_per_callback`]).
+    /// - [`MixError::RegulatorRate`]: the regulator's sample rate is not
+    ///   `wire_rate`.
     pub fn with_network(
         params: &'static AudioParams,
         local_to_network_buffer: SharedPtr<RingBuffer>,
@@ -156,15 +177,26 @@ impl AudioProcessor {
         })
     }
 
-    /// Process audio: calculate volume levels, handle network audio, and generate output.
+    /// Run one audio callback: apply input gain, write the capture to the
+    /// send ring, pop peer audio from the regulator, mix peer and monitor into
+    /// `output`, and publish the input meters to [`AudioParams`].
+    ///
+    /// Call from the audio thread only (it is the regulator's consumer and
+    /// the ring's producer). Real-time safe while each call stays within
+    /// `max_callback_frames`.
     ///
     /// `input` is planar across `in_channels` input channels: `input[ch *
     /// frames + frame]`, `frames == input.len() / in_channels`. `output` is
     /// planar across `out_channels` output channels: `output[ch * frames +
-    /// frame]`.
+    /// frame]`, `frames * out_channels` samples long.
     ///
-    /// `now_ms` is the host's wall-clock time for this callback, handed to the
-    /// regulator's `pop_frames_at`; the processor itself never reads a clock.
+    /// `now_ms` is the host's clock for this callback, handed to
+    /// [`Regulator::pop_frames_at`]; the processor itself never reads a clock.
+    /// It must be the same clock and epoch the receive path passes to
+    /// [`Regulator::push_at`], or the jitter statistics are meaningless.
+    ///
+    /// Always returns `true` (the value an AudioWorklet `process()` returns
+    /// to keep running).
     pub fn process(&mut self, input: &[f32], in_channels: usize, output: &mut [f32], out_channels: usize, now_ms: f64) -> bool {
         let in_channels = in_channels.max(1);
         let out_channels = out_channels.max(1);

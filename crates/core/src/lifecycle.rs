@@ -38,9 +38,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub enum SessionState {
     /// No connection and nothing in flight; the only state a connect may start from
     Idle = 0,
-    /// Dialing the hub and bringing audio up
+    /// Dialing the hub (and, for a combined connect, bringing audio up)
     Connecting = 1,
-    /// Transport connected and audio running
+    /// Transport connected. Audio is tracked separately and may or may not be
+    /// running.
     Connected = 2,
     /// The transport reported that an established connection failed; its
     /// resources are still held until `disconnect()` releases them

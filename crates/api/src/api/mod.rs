@@ -10,7 +10,7 @@
 //!
 //! | Accessor | Module | Covers |
 //! |----------|--------|--------|
-//! | [`ApiClient::system`] | [`system`] | Health checks, regions, redirects, analytics |
+//! | [`ApiClient::system`] | [`system`] | Health checks, client IP, regions, analytics |
 //! | [`ApiClient::users`] | [`users`] | User profiles, notifications, referrals |
 //! | [`ApiClient::studios`] | [`studios`] | Virtual studio management |
 //! | [`ApiClient::devices`] | [`devices`] | JackTrip hardware devices |
@@ -21,34 +21,59 @@
 //! | [`ApiClient::subscriptions`] | [`subscriptions`] | Studio memberships (not billing) |
 //! | [`ApiClient::tracks`] | [`tracks`] | Backing tracks for a studio |
 //!
+//! # Environments
+//!
+//! | Environment | Base URL | How |
+//! |-------------|----------|-----|
+//! | Production | `https://www.jacktrip.com/api` ([`DEFAULT_BASE_URL`]) | [`ApiClient::new`] |
+//! | Test | `https://test.jacktrip.com/api` | [`ApiClient::with_base_url`] |
+//!
+//! Tokens are issued per environment: a production token is rejected by the
+//! test API and vice versa.
+//!
 //! # Authentication
 //!
-//! Most endpoints require a JWT, sent as `Authorization: Bearer <token>` once
-//! [`ApiClient::set_bearer_token`] has been called. A few (e.g.
-//! [`system::SystemApi::ping`]) work without one. With no token set, no
-//! `Authorization` header is sent; in the browser the underlying `fetch` then
-//! carries the page's cookies only when the API is same-origin with the page,
-//! so a cross-origin host needs an explicit token.
+//! Most endpoints require a JWT issued by JackTrip's Auth0 tenant
+//! (`https://auth.jacktrip.org`, audience `https://api.jacktrip.org`), sent as
+//! `Authorization: Bearer <token>` once [`ApiClient::set_bearer_token`] has been
+//! called. Each module's docs say which of its endpoints work without one (e.g.
+//! [`system::SystemApi::ping`]).
+//!
+//! The client never obtains or refreshes a token. When a request fails with
+//! [`ApiError::Http`] status `401`, get a fresh token from Auth0 and call
+//! [`ApiClient::set_bearer_token`] again: every API object obtained from the
+//! client (and every clone of it) uses the new token on its next request.
+//!
+//! With no token set, no `Authorization` header is sent; in the browser the
+//! underlying `fetch` then carries the page's cookies only when the API is
+//! same-origin with the page, so a cross-origin host needs an explicit token.
+//!
+//! # Runtime
+//!
+//! Natively the client is built on `reqwest` with `rustls`, so its futures
+//! must run on a [tokio](https://docs.rs/tokio) runtime. On `wasm32` they run
+//! on the browser's event loop (via `wasm-bindgen-futures`) and use `fetch`.
 //!
 //! # Quick start (Rust)
 //!
 //! ```rust,no_run
 //! use webtrip_api::api::{ApiClient, ApiError};
 //!
-//! # async fn run() -> Result<(), ApiError> {
-//! let client = ApiClient::with_base_url("https://test.jacktrip.com/api".to_string());
+//! #[tokio::main]
+//! async fn main() -> Result<(), ApiError> {
+//!     let client = ApiClient::with_base_url("https://test.jacktrip.com/api".to_string());
 //!
-//! // Unauthenticated
-//! let ping = client.system().ping().await?;
-//! println!("API version: {:?}", ping.version);
+//!     // Unauthenticated
+//!     let ping = client.system().ping().await?;
+//!     println!("API status: {:?}", ping.status);
 //!
-//! // Authenticated
-//! client.set_bearer_token("your-jwt-token".to_string());
-//! let user = client.users().get_current_user().await?;
-//! let studios = client.studios().list_studios().await?;
-//! println!("{:?} has {} studios", user.name, studios.len());
-//! # Ok(())
-//! # }
+//!     // Authenticated
+//!     client.set_bearer_token("your-jwt-token".to_string());
+//!     let user = client.users().get_current_user().await?;
+//!     let studios = client.studios().list_studios().await?;
+//!     println!("{:?} has {} studios", user.name, studios.len());
+//!     Ok(())
+//! }
 //! ```
 //!
 //! # Quick start (JavaScript)
@@ -68,10 +93,24 @@
 //!
 //! # Errors
 //!
-//! Rust callers get an [`ApiError`] and can match on its variants. In
-//! JavaScript the returned promise rejects with the error's [`Display`](fmt::Display)
-//! string (e.g. `"HTTP 401 error: Unauthorized"`), so callers distinguish cases
-//! by prefix:
+//! Every endpoint fails with an [`ApiError`]:
+//!
+//! | Variant | Cause | Typical handling |
+//! |---------|-------|------------------|
+//! | [`ApiError::Request`] | No response: connection, DNS or TLS failure, or the [timeout](ApiClient::set_timeout_ms) elapsed | Retry with backoff |
+//! | [`ApiError::Http`] `401` | Token missing, expired, or for another environment | Refresh the token, call [`ApiClient::set_bearer_token`] |
+//! | [`ApiError::Http`] `403` / `404` | Not permitted / no such resource | Surface to the user |
+//! | [`ApiError::Http`] `409` | Conflict, e.g. already subscribed or already redeemed | Usually safe to ignore |
+//! | [`ApiError::Http`] `429` | Rate limited | Retry later |
+//! | [`ApiError::Serialization`] | A 2xx body that does not match the expected type | Report as a bug |
+//!
+//! Endpoint docs list any other statuses specific to that endpoint. For
+//! `Http`, the server's own message is in `body`, usually as a JSON
+//! [`ErrorResponse`](crate::models::ErrorResponse).
+//!
+//! In JavaScript the returned promise rejects with the error's
+//! [`Display`](fmt::Display) string (e.g. `"HTTP 401 error: Unauthorized"`),
+//! which omits the response body, so callers distinguish cases by prefix:
 //!
 //! ```js
 //! try {
@@ -93,10 +132,18 @@ use std::time::Duration;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-// Macro to generate API module struct + constructors boilerplate
+// Declares one endpoint-group struct. API objects are only obtained from an
+// `ApiClient` accessor so they always share its configuration; there is
+// deliberately no standalone constructor (in Rust or JS) that would build a
+// separate, unauthenticated client.
 macro_rules! api_module_struct {
-    ($name:ident) => {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        ///
+        /// Cheap to clone: every clone shares the [`ApiClient`] configuration
+        /// it was obtained from.
         #[cfg_attr(feature = "wasm", wasm_bindgen)]
+        #[derive(Clone, Debug)]
         pub struct $name {
             client: ApiClient,
         }
@@ -105,16 +152,6 @@ macro_rules! api_module_struct {
             pub(crate) fn from_client(client: &ApiClient) -> Self {
                 Self {
                     client: client.clone(),
-                }
-            }
-        }
-
-        #[cfg_attr(feature = "wasm", wasm_bindgen)]
-        impl $name {
-            #[cfg_attr(feature = "wasm", wasm_bindgen(constructor))]
-            pub fn new() -> Self {
-                Self {
-                    client: ApiClient::new(),
                 }
             }
         }
@@ -162,9 +199,17 @@ pub const DEFAULT_USER_AGENT: &str = concat!("webtrip/", env!("CARGO_PKG_VERSION
 /// request. Cloning an `ApiClient` likewise yields another handle to the same
 /// configuration.
 ///
-/// The configuration sits behind a lock, so a client can be shared across
-/// threads and reconfigured from any of them; a request reads the settings
-/// once, when it is built.
+/// Cloning is cheap (an `Arc` and a pooled HTTP client handle). Natively an
+/// `ApiClient` is `Send + Sync`: the configuration sits behind a lock, so a
+/// client can be shared across threads and reconfigured from any of them, and
+/// a request reads the settings once, when it is built. On `wasm32` the
+/// returned futures are not `Send` and run on the agent that created them.
+///
+/// [`new`](Self::new) targets production ([`DEFAULT_BASE_URL`]); use
+/// [`with_base_url`](Self::with_base_url) for the test environment. See the
+/// [module docs](self) for authentication and the runtime requirements.
+///
+/// `Debug` output redacts the bearer token.
 ///
 /// | Setting | Default | Rust | JavaScript |
 /// |---------|---------|------|------------|
@@ -195,21 +240,40 @@ pub const DEFAULT_USER_AGENT: &str = concat!("webtrip/", env!("CARGO_PKG_VERSION
 /// const user = await client.users().getCurrentUser();
 /// ```
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiClient {
     http: reqwest::Client,
     config: Arc<RwLock<ClientConfig>>,
 }
 
+impl fmt::Debug for ApiClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApiClient").field("config", &*self.config()).finish_non_exhaustive()
+    }
+}
+
 /// The settings every request is built from, shared by an [`ApiClient`], its
 /// clones and the API objects obtained from it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ClientConfig {
     base_url: String,
     bearer_token: Option<String>,
     user_agent: Option<String>,
     timeout_ms: u32,
     headers: HashMap<String, String>,
+}
+
+// Hand-written so `{:?}` on a client never prints the bearer token.
+impl fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("base_url", &self.base_url)
+            .field("bearer_token", &self.bearer_token.as_ref().map(|_| "<redacted>"))
+            .field("user_agent", &self.user_agent)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl Default for ClientConfig {
@@ -226,7 +290,8 @@ impl Default for ClientConfig {
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 impl ApiClient {
-    /// Create a client pointed at [`DEFAULT_BASE_URL`] with no bearer token.
+    /// Create a client for the production API ([`DEFAULT_BASE_URL`]) with no
+    /// bearer token.
     #[cfg_attr(feature = "wasm", wasm_bindgen(constructor))]
     pub fn new() -> Self {
         Self::default()
@@ -257,6 +322,10 @@ impl ApiClient {
     }
 
     /// Set the JWT sent as `Authorization: Bearer <token>` on every request.
+    ///
+    /// Applies to the next request made through this client, any clone of it,
+    /// and every API object obtained from either. Call it again with a fresh
+    /// token after a `401`; the client does not refresh tokens itself.
     #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setBearerToken))]
     pub fn set_bearer_token(&self, token: String) {
         self.config_mut().bearer_token = Some(token);
@@ -449,6 +518,21 @@ impl ApiClient {
         self.handle_response(response).await
     }
 
+    /// Execute a GET request whose 2xx body is plain text, returned verbatim.
+    pub(crate) async fn get_text(&self, path: &str) -> ApiResult<String> {
+        let response = self
+            .build_request(reqwest::Method::GET, path)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if status.is_success() {
+            Ok(body)
+        } else {
+            Err(http_error(status, Some(body)))
+        }
+    }
+
     /// Execute a GET request with query parameters
     pub(crate) async fn get_with_query<T: for<'de> Deserialize<'de>, Q: Serialize>(
         &self,
@@ -569,18 +653,6 @@ impl ApiClient {
         self.handle_empty_response(response).await
     }
 
-    /// Execute a DELETE request and return the response body
-    // Retained as a shared helper for downstream endpoint work (e.g. WEB-35).
-    #[allow(dead_code)]
-    pub(crate) async fn delete_with_response<T: for<'de> Deserialize<'de>>(&self, path: &str) -> ApiResult<T> {
-        let response = self
-            .build_request(reqwest::Method::DELETE, path)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
     /// Execute a PUT request with query parameters (no body)
     pub(crate) async fn put_with_query<Q: Serialize>(&self, path: &str, query: &Q) -> ApiResult<()> {
         let response = self
@@ -592,7 +664,11 @@ impl ApiClient {
         self.handle_empty_response(response).await
     }
 
-    /// Handle a response that should contain JSON
+    /// Handle a response that should contain JSON.
+    ///
+    /// An empty 2xx body (e.g. `202 Accepted` / `204 No Content`) decodes as
+    /// JSON `null`, so `T = ()` and `T = Option<_>` accept it while a struct
+    /// `T` still fails with [`ApiError::Serialization`].
     async fn handle_response<T: for<'de> Deserialize<'de>>(
         &self,
         response: reqwest::Response,
@@ -601,30 +677,30 @@ impl ApiClient {
         let body = response.text().await?;
 
         if status.is_success() {
-            serde_json::from_str(&body).map_err(ApiError::from)
+            let json = if body.trim().is_empty() { "null" } else { body.as_str() };
+            serde_json::from_str(json).map_err(ApiError::from)
         } else {
-            Err(ApiError::Http {
-                status: status.as_u16(),
-                message: status.canonical_reason().unwrap_or("Unknown error").to_string(),
-                body: Some(body),
-            })
+            Err(http_error(status, Some(body)))
         }
     }
 
-    /// Handle a response that should be empty (204 No Content, etc.)
+    /// Handle a response whose body, if any, is ignored on success.
     async fn handle_empty_response(&self, response: reqwest::Response) -> ApiResult<()> {
         let status = response.status();
 
         if status.is_success() {
             Ok(())
         } else {
-            let body = response.text().await.ok();
-            Err(ApiError::Http {
-                status: status.as_u16(),
-                message: status.canonical_reason().unwrap_or("Unknown error").to_string(),
-                body,
-            })
+            Err(http_error(status, response.text().await.ok()))
         }
+    }
+}
+
+fn http_error(status: reqwest::StatusCode, body: Option<String>) -> ApiError {
+    ApiError::Http {
+        status: status.as_u16(),
+        message: status.canonical_reason().unwrap_or("Unknown error").to_string(),
+        body,
     }
 }
 
@@ -653,12 +729,14 @@ impl ApiClient {
 /// ```
 #[derive(Debug)]
 pub enum ApiError {
-    /// The request never produced a response: connection refused, DNS
-    /// failure, TLS error, or the body could not be read.
+    /// The request never produced a complete response: connection refused,
+    /// DNS failure, TLS error, the [timeout](ApiClient::set_timeout_ms)
+    /// elapsed, or the body could not be read. The string is the underlying
+    /// transport error's message.
     Request(String),
     /// A 2xx response whose body did not deserialize into the expected type
-    /// (malformed JSON or a schema mismatch), or a value that could not be
-    /// converted to/from JavaScript.
+    /// (malformed JSON, a schema mismatch, or an empty body where a value was
+    /// expected), or a value that could not be converted to/from JavaScript.
     Serialization(String),
     /// The server answered with a non-2xx status.
     Http {
@@ -668,8 +746,10 @@ pub enum ApiError {
         /// Canonical reason phrase for `status` (e.g. `"Not Found"`), not a
         /// server-supplied message.
         message: String,
-        /// Raw response body, which usually carries the server's error detail.
-        /// Not included in the [`Display`](fmt::Display) output.
+        /// Raw response body, which usually carries the server's error detail
+        /// as a JSON [`ErrorResponse`](crate::models::ErrorResponse). Not
+        /// included in the [`Display`](fmt::Display) output, so JavaScript
+        /// callers never see it.
         body: Option<String>,
     },
 }
@@ -732,9 +812,21 @@ pub(crate) fn to_js_value<T: serde::Serialize>(val: &T) -> Result<JsValue, ApiEr
     val.serialize(&serializer).map_err(|e| ApiError::Serialization(e.to_string()))
 }
 
-/// URL encode a string for use in URL paths
+/// Percent-encode a string as a single URL path segment: every byte except
+/// RFC 3986 unreserved characters (`A-Z a-z 0-9 - . _ ~`) becomes `%XX`, so a
+/// space is `%20` (not the form-encoding `+`, which a path keeps literally)
+/// and `/` cannot split the segment.
 pub(crate) fn urlencode<T: AsRef<str>>(s: T) -> String {
-    url::form_urlencoded::byte_serialize(s.as_ref().as_bytes()).collect()
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.as_ref().len());
+    for b in s.as_ref().bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -769,14 +861,26 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_urlencode_space_becomes_plus() {
-        // form_urlencoded encodes space as '+', not %20
-        assert_eq!(urlencode("hello world"), "hello+world");
+    fn test_urlencode_encodes_a_path_segment() {
+        // Regression: form encoding turned a space into '+', which a path
+        // segment keeps as a literal '+'.
+        assert_eq!(urlencode("hello world"), "hello%20world");
+        assert_eq!(urlencode("a+b"), "a%2Bb");
+        assert_eq!(urlencode("foo/bar?x#y"), "foo%2Fbar%3Fx%23y");
+        assert_eq!(urlencode("auth0|abc"), "auth0%7Cabc");
+        assert_eq!(urlencode("é"), "%C3%A9");
+        assert_eq!(urlencode("Az09-._~"), "Az09-._~");
     }
 
     #[test]
-    fn test_urlencode_reserved_slash_is_percent_encoded() {
-        assert_eq!(urlencode("foo/bar"), "foo%2Fbar");
+    fn test_debug_redacts_bearer_token_and_header_values() {
+        let client = ApiClient::new();
+        client.set_bearer_token("secret-token".to_string());
+        client.add_header("APISecret".to_string(), "secret-header".to_string());
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("secret-token"), "{debug}");
+        assert!(!debug.contains("secret-header"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
     }
 
     // =========================================================================
@@ -964,6 +1068,24 @@ mod tests {
             other => panic!("Expected ApiError::Serialization, got {:?}", other),
         }
         mock.assert_async().await;
+    }
+
+    // =========================================================================
+    // handle_response: empty 2xx body decodes as `null`
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handle_response_empty_2xx_body_decodes_as_null() {
+        // Regression: an empty 202/204 body was parsed as "" and always failed
+        // with a Serialization error, even for endpoints that return nothing.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server.mock("GET", "/empty").with_status(202).expect(3).create_async().await;
+        let client = ApiClient::with_base_url(server.url());
+
+        assert!(client.get::<()>("/empty").await.is_ok());
+        assert_eq!(client.get::<Option<SimpleResponse>>("/empty").await.unwrap(), None);
+        let err = client.get::<SimpleResponse>("/empty").await.unwrap_err();
+        assert!(matches!(err, ApiError::Serialization(_)), "{err:?}");
     }
 
     // =========================================================================

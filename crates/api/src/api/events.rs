@@ -19,7 +19,7 @@
 //! // Public: no token needed.
 //! let page = client.events().list_events_paginated(Some(1), Some(20)).await?;
 //! for event in &page.results {
-//!     println!("{:?}", event.core.title);
+//!     println!("{:?} starts {:?}", event.event.name, event.event.start);
 //! }
 //!
 //! // Studio events need a bearer token.
@@ -41,7 +41,9 @@
 //!
 //! client.setBearerToken(token);
 //! const event = await client.events().createStudioEvent('studio123', {
-//!   title: 'Live Session',
+//!   name: 'Live Session',
+//!   start: '2026-06-20T01:00:00Z',
+//!   end: '2026-06-20T03:00:00Z',
 //! });
 //! ```
 
@@ -52,15 +54,10 @@ use crate::models;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-// =============================================================================
-// Events API
-// =============================================================================
-
-api_module_struct!(EventsApi);
-
-// =============================================================================
-// Rust API (primary interface)
-// =============================================================================
+api_module_struct!(
+    /// Public and studio event endpoints; obtain with [`ApiClient::events`].
+    EventsApi
+);
 
 impl EventsApi {
     /// List all public upcoming events.
@@ -82,26 +79,22 @@ impl EventsApi {
         page: Option<i32>,
         limit: Option<i32>,
     ) -> Result<models::PaginatedEvents, ApiError> {
-        if page.is_some() || limit.is_some() {
-            self.client.get_with_query("/events-paginated", &PaginationQuery { page, limit }).await
-        } else {
-            self.client.get("/events-paginated").await
-        }
+        self.client.get_with_query("/events-paginated", &PaginationQuery { page, limit }).await
     }
 
     /// Get a public event by ID.
     ///
-    /// `GET /events/{eventId}`. No authentication required. Note that the API
-    /// returns an *array* of [`models::PublicUpcomingEvent`], not a single object.
-    pub async fn get_event(&self, event_id: &str) -> Result<Vec<models::PublicUpcomingEvent>, ApiError> {
+    /// `GET /events/{eventId}`. No authentication required.
+    pub async fn get_event(&self, event_id: &str) -> Result<models::PublicUpcomingEvent, ApiError> {
         let path = format!("/events/{}", urlencode(event_id));
         self.client.get(&path).await
     }
 
-    /// Get the radio channel an event broadcasts on.
+    /// Get the radio channel an event broadcasts on, with the details needed
+    /// to reach the studio serving it.
     ///
     /// `GET /events/{eventId}/channel`. No authentication required.
-    pub async fn get_event_channel(&self, event_id: &str) -> Result<models::StreamInfo, ApiError> {
+    pub async fn get_event_channel(&self, event_id: &str) -> Result<models::StreamCacheEntry, ApiError> {
         let path = format!("/events/{}/channel", urlencode(event_id));
         self.client.get(&path).await
     }
@@ -199,13 +192,12 @@ impl EventsApi {
     }
 
     #[wasm_bindgen(js_name = getEvent)]
-    pub async fn get_event_js(&self, event_id: String) -> Result<JsValue, ApiError> {
-        let events = self.get_event(&event_id).await?;
-        to_js_value(&events)
+    pub async fn get_event_js(&self, event_id: String) -> Result<models::PublicUpcomingEvent, ApiError> {
+        self.get_event(&event_id).await
     }
 
     #[wasm_bindgen(js_name = getEventChannel)]
-    pub async fn get_event_channel_js(&self, event_id: String) -> Result<models::StreamInfo, ApiError> {
+    pub async fn get_event_channel_js(&self, event_id: String) -> Result<models::StreamCacheEntry, ApiError> {
         self.get_event_channel(&event_id).await
     }
 
@@ -273,13 +265,13 @@ mod tests {
             "GET",
             "/events",
             200,
-            r#"[{"id":"event1","title":"Test Event"}]"#,
+            r#"[{"id":"event1","name":"Test Event"}]"#,
         )
         .await;
 
         let result = api(&client).list_events().await.unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].core.id, Some("event1".to_string()));
+        assert_eq!(result[0].event.id, Some("event1".to_string()));
         mock.assert_async().await;
     }
 
@@ -339,14 +331,14 @@ mod tests {
             "GET",
             "/events/evt123",
             200,
-            r#"[{"id":"evt123","title":"My Event","startTime":"2024-01-01T00:00:00Z"}]"#,
+            r#"{"id":"evt123","name":"My Event","start":"2024-01-01T00:00:00Z"}"#,
         )
         .await;
 
         let result = api(&client).get_event("evt123").await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].core.id, Some("evt123".to_string()));
-        assert_eq!(result[0].core.title, Some("My Event".to_string()));
+        assert_eq!(result.event.id, Some("evt123".to_string()));
+        assert_eq!(result.event.name, Some("My Event".to_string()));
+        assert_eq!(result.event.start.as_deref(), Some("2024-01-01T00:00:00Z"));
         mock.assert_async().await;
     }
 
@@ -373,7 +365,7 @@ mod tests {
         .await;
 
         let channel = api(&client).get_event_channel("evt1").await.unwrap();
-        assert_eq!(channel.id, Some("chan1".to_string()));
+        assert_eq!(channel.base.id, Some("chan1".to_string()));
         mock.assert_async().await;
     }
 
@@ -390,7 +382,7 @@ mod tests {
         .await;
 
         let result = api(&client).get_similar_events("evt1").await.unwrap();
-        assert_eq!(result[0].core.id, Some("evt2".to_string()));
+        assert_eq!(result[0].event.id, Some("evt2".to_string()));
         mock.assert_async().await;
     }
 
@@ -430,12 +422,12 @@ mod tests {
             "GET",
             "/studios/st1/events",
             200,
-            r#"[{"id":"evt1","studioId":"st1"}]"#,
+            r#"[{"id":"evt1","serverId":"st1"}]"#,
         )
         .await;
 
         let result = api(&client).list_studio_events("st1").await.unwrap();
-        assert_eq!(result[0].studio_id, Some("st1".to_string()));
+        assert_eq!(result[0].server_id, Some("st1".to_string()));
         mock.assert_async().await;
     }
 
@@ -447,13 +439,13 @@ mod tests {
             "GET",
             "/studios/st1/events/evt1",
             200,
-            r#"{"id":"evt1","studioId":"st1"}"#,
+            r#"{"id":"evt1","serverId":"st1"}"#,
         )
         .await;
 
         let event = api(&client).get_studio_event("st1", "evt1").await.unwrap();
-        assert_eq!(event.core.id, Some("evt1".to_string()));
-        assert_eq!(event.studio_id, Some("st1".to_string()));
+        assert_eq!(event.event.id, Some("evt1".to_string()));
+        assert_eq!(event.server_id, Some("st1".to_string()));
         mock.assert_async().await;
     }
 
@@ -471,7 +463,7 @@ mod tests {
 
         let body = models::UpcomingEvent::default();
         let event = api(&client).create_studio_event("st1", &body).await.unwrap();
-        assert_eq!(event.core.id, Some("evt1".to_string()));
+        assert_eq!(event.event.id, Some("evt1".to_string()));
         mock.assert_async().await;
     }
 
@@ -483,7 +475,7 @@ mod tests {
             "PUT",
             "/studios/st1/events/evt1",
             200,
-            r#"{"id":"evt1","title":"updated"}"#,
+            r#"{"id":"evt1","name":"updated"}"#,
         )
         .await;
 
@@ -492,7 +484,7 @@ mod tests {
             .update_studio_event("st1", "evt1", &body)
             .await
             .unwrap();
-        assert_eq!(event.core.title, Some("updated".to_string()));
+        assert_eq!(event.event.name, Some("updated".to_string()));
         mock.assert_async().await;
     }
 

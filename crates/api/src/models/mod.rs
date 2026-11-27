@@ -1,7 +1,21 @@
-//! JackTrip Virtual Studio API Models
+//! Typed request and response models for the JackTrip Virtual Studio API.
 //!
-//! Clean, typed data models for the JackTrip API. All models are serializable
-//! via serde and automatically generate TypeScript types via tsify.
+//! Each type mirrors one JSON shape from the API's OpenAPI spec, with the same
+//! wire names (camelCase unless a type's docs say otherwise). Where the spec
+//! composes one shape from another (`allOf`), the shared part is a nested
+//! struct marked `#[serde(flatten)]`, so its keys sit at the top level of the
+//! JSON object; e.g. a [`ServerWithSubscription`]'s studio fields are on
+//! `.server`.
+//!
+//! **Decoding is lenient.** Nearly every field is an `Option`: a field the
+//! server omits decodes as `None`, and fields this crate does not model are
+//! ignored. A response therefore never fails to decode because the server
+//! added a field, but a misnamed field shows up only as a `None`. When
+//! serialized, `None` fields are omitted, so request bodies send only what
+//! you set.
+//!
+//! With the `wasm` feature every model also derives `tsify` and gets a
+//! generated TypeScript type of the same name and shape.
 
 // Shared enums and common types
 mod common;
@@ -52,4 +66,3 @@ pub use requests::*;
 
 mod responses;
 pub use responses::*;
-

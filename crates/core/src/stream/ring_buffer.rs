@@ -1,10 +1,13 @@
-//! Ring Buffer for Audio Data Transfer
+//! Lock-free SPSC ring buffer for the send path.
 //!
-//! Provides a lock-free ring buffer for sending audio data from
-//! the AudioWorklet (real-time thread) to the main thread (network I/O).
+//! [`RingBuffer`] carries captured audio from the real-time audio thread (the
+//! producer) to the thread that builds and sends packets (the consumer). In
+//! the browser build those are the AudioWorklet and the main thread or
+//! WebTransport worker.
 //!
-//! Note: Receiving is handled directly by the LockFreeJitterBuffer,
-//! which the worklet reads from directly - no intermediate buffer needed!
+//! The receive path needs no ring: the network thread pushes into a
+//! [`Regulator`](crate::stream::regulator::Regulator) and the audio thread pops
+//! from it directly.
 
 use crate::limits::{MAX_FPP, MAX_WIRE_CHANNELS};
 use std::cell::UnsafeCell;
@@ -16,19 +19,23 @@ use wasm_bindgen::prelude::*;
 /// Size of the ring buffer in samples: two packets at the widest, longest
 /// stream the wire allows (`MAX_FPP` frames of `MAX_WIRE_CHANNELS` channels).
 ///
-/// A hard ceiling on `fpp * send_channels`, not a sizing nit: `write` rejects
-/// an oversized write while both send paths wait for `available >= fpp *
-/// channels`, so a packet larger than the ring is a permanent silent stall.
-/// Holding two packets lets the producer write one while the consumer drains
-/// the other. A power of two, because positions wrap as `u32`, which only
+/// One packet (`fpp * channels` samples) must fit in half of this, so that
+/// the producer can write one packet while the consumer drains the other. A
+/// consumer that waits for more samples than the ring can hold never wakes.
+/// Every stream the wire allows fits. A power of two, because positions wrap as `u32`, which only
 /// stays continuous modulo a divisor of 2^32.
 pub const RING_BUFFER_SIZE: usize = (2 * MAX_FPP * MAX_WIRE_CHANNELS as usize).next_power_of_two();
 
-/// Shared ring buffer between worklet and main thread
-/// 
-/// Data flow:
-///   Worklet: write() -> ring buffer -> Atomics.notify()
-///   Main thread: Atomics.waitAsync() -> read() -> WebRTC send
+/// Shared ring buffer from the audio thread to the send path.
+///
+/// Data flow: the audio thread calls [`write`](Self::write) with captured
+/// samples and then wakes the consumer; the consumer waits for
+/// [`available`](Self::available) to reach one packet, calls
+/// [`read`](Self::read), and sends the packet. Writes are dropped until
+/// [`set_streaming(true)`](Self::set_streaming).
+///
+/// All lengths are in interleaved samples at
+/// [`wire_channels`](Self::wire_channels) channels.
 ///
 /// # Concurrency contract
 ///
@@ -89,7 +96,8 @@ pub struct RingBuffer {
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 impl RingBuffer {
-    /// Create a new ring buffer
+    /// Create an empty ring of [`RING_BUFFER_SIZE`] samples, mono, with
+    /// streaming off.
     #[cfg_attr(feature = "wasm", wasm_bindgen(constructor))]
     pub fn new() -> Self {
         Self {
@@ -106,7 +114,8 @@ impl RingBuffer {
         }
     }
 
-    /// Enable/disable streaming
+    /// Enable or disable streaming. While disabled, [`write`](Self::write)
+    /// drops everything.
     pub fn set_streaming(&self, active: bool) {
         self.streaming_active.store(if active { 1 } else { 0 }, Ordering::SeqCst);
     }
@@ -116,17 +125,17 @@ impl RingBuffer {
         self.streaming_active.load(Ordering::SeqCst) != 0
     }
 
-    /// Get overrun count
+    /// Writes refused because the ring was full.
     pub fn overruns(&self) -> u64 {
         self.overruns.load(Ordering::Relaxed)
     }
 
-    /// Get total write count
+    /// Successful writes.
     pub fn writes(&self) -> u64 {
         self.writes.load(Ordering::Relaxed)
     }
 
-    /// Get total samples written
+    /// Samples accepted by successful writes.
     pub fn samples_written(&self) -> u64 {
         self.samples_written.load(Ordering::Relaxed)
     }
@@ -143,14 +152,14 @@ impl RingBuffer {
         self.packets_sent.load(Ordering::Relaxed)
     }
 
-    /// Get available samples to read
+    /// Samples waiting to be read.
     pub fn available(&self) -> u32 {
         let write = self.write_pos.load(Ordering::Acquire);
         let read = self.read_pos.load(Ordering::Acquire);
         write.wrapping_sub(read)
     }
 
-    /// Reset statistics
+    /// Zero the overrun, write, sample and packet-sent counters.
     pub fn reset_stats(&self) {
         self.overruns.store(0, Ordering::Relaxed);
         self.writes.store(0, Ordering::Relaxed);
@@ -158,23 +167,27 @@ impl RingBuffer {
         self.packets_sent.store(0, Ordering::Relaxed);
     }
 
-    /// Get pointer to the has_data flag for JavaScript Atomics.waitAsync()
-    /// 
-    /// This enables event-driven wake-up instead of polling:
-    /// - AudioWorklet sets flag to 1 and calls Atomics.notify()
-    /// - Main thread waits with Atomics.waitAsync()
-    /// - Zero CPU usage when idle!
+    /// Address of the ring's "has data" flag, an `AtomicU32` that is `1` while
+    /// samples are waiting and `0` once the consumer has drained them.
+    ///
+    /// For event-driven wake-up instead of polling: the consumer waits on this
+    /// word (in the browser, `Atomics.waitAsync` on the shared memory) and the
+    /// producer wakes it after a successful [`write`](Self::write) (e.g.
+    /// `Atomics.notify`). The address is valid only while this ring is alive.
     #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getHasDataFlagPtr))]
     pub fn get_has_data_flag_ptr(&self) -> usize {
         &self.has_data_flag as *const AtomicU32 as usize
     }
 
-    // === Called from AudioWorklet (real-time thread) ===
+    // === Producer (real-time audio thread) ===
 
-    /// Write audio samples to the buffer
-    /// 
-    /// After writing, sets the has_data_flag to signal waiting threads.
-    /// AudioWorklet should call Atomics.notify() after this returns true.
+    /// Write interleaved samples. Producer side; real-time safe.
+    ///
+    /// All or nothing: returns `false` without writing anything if streaming
+    /// is off, or if fewer than `samples.len()` samples of space are free (which
+    /// also counts an [`overrun`](Self::overruns)). On success sets the
+    /// has-data flag; the producer should then wake the consumer (see
+    /// [`get_has_data_flag_ptr`](Self::get_has_data_flag_ptr)).
     pub fn write(&self, samples: &[f32]) -> bool {
         if !self.is_streaming() {
             return false;
@@ -217,12 +230,16 @@ impl RingBuffer {
         true
     }
 
-    // === Called from main thread (network I/O) ===
+    // === Consumer (send path) ===
 
-    /// Read audio samples from the buffer
-    /// 
-    /// Clears the has_data_flag when buffer becomes empty,
-    /// allowing the main thread to sleep via Atomics.waitAsync().
+    /// Read exactly `output.len()` interleaved samples. Consumer side;
+    /// real-time safe.
+    ///
+    /// All or nothing: if fewer samples are available, zero-fills `output`,
+    /// clears the has-data flag and returns `false`. Clears the flag too when
+    /// this read empties the ring, so the consumer can go back to waiting.
+    /// Read in multiples of [`wire_channels`](Self::wire_channels) to stay
+    /// frame-aligned.
     pub fn read(&self, output: &mut [f32]) -> bool {
         let write_pos = self.write_pos.load(Ordering::Acquire);
         let read_pos = self.read_pos.load(Ordering::Acquire);
@@ -268,8 +285,7 @@ impl RingBuffer {
     /// `read` clears the flag only on an exact drain or a failed read, so a
     /// consumer that stops at a partial unit (a write size that is not a
     /// multiple of the packet size, e.g. a resampled capture) would leave it at
-    /// 1, and `Atomics.waitAsync` would return "not-equal" forever: a
-    /// synchronous spin. Call this when the consumer decides to wait.
+    /// 1, and a wait on the flag would return at once forever: a busy spin. Call this when the consumer decides to wait.
     ///
     /// The flag is cleared *first* and `available` re-checked after, so a write
     /// landing in between (it stores `write_pos`, then sets the flag) is never
@@ -288,8 +304,9 @@ impl RingBuffer {
     /// `[1, MAX_WIRE_CHANNELS]`. The render thread conforms captured audio to
     /// it before writing, so a reader that frames packets at the same width
     /// always finds whole packets. Per-connection wire state: it lives with
-    /// the ring, not with the device-wide `AudioParams`. Set it before the
-    /// ring is attached to a worklet.
+    /// the ring, not with the device-wide
+    /// [`AudioParams`](crate::audio::params::AudioParams). Set it before the
+    /// producer starts writing.
     pub fn set_wire_format(&self, channels: u8) {
         let channels = u32::from(channels).clamp(1, u32::from(MAX_WIRE_CHANNELS));
         self.wire_channels.store(channels, Ordering::Relaxed);

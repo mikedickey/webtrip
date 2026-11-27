@@ -6,95 +6,53 @@ use tsify_next::Tsify;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-/// Ping/health check response
+/// Health-check response (`GET /ping`).
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
 pub struct Ping {
-    /// API version
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-
-    /// Server timestamp (RFC3339)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timestamp: Option<String>,
-
-    /// Service status
+    /// Service status; `"OK"` when healthy
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
 }
 
-/// Ping statistics
+/// LiveKit access token for a studio (`POST /studios/{studioId}/lktoken`).
 #[cfg_attr(feature = "wasm", derive(Tsify))]
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
-pub struct PingStats {
-    /// RTT statistics
-    #[serde(flatten)]
-    pub rtt: super::RttStats,
-
-    /// Packets sent
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub packets_sent: Option<i32>,
-
-    /// Packets received
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub packets_received: Option<i32>,
-
-    /// Packet loss percentage
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub packet_loss: Option<f64>,
-}
-
-/// LiveKit token response
-#[cfg_attr(feature = "wasm", derive(Tsify))]
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
 pub struct LiveKitTokenResponse {
-    /// LiveKit access token
+    /// LiveKit access token (a JWT)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-
-    /// LiveKit server URL
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
 }
 
-/// Unread messages count response
+// Hand-written so the token never reaches logs.
+impl std::fmt::Debug for LiveKitTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveKitTokenResponse")
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// The JSON body of most API error responses.
+///
+/// Parse it from the `body` of an [`ApiError::Http`](crate::api::ApiError::Http):
+///
+/// ```
+/// use webtrip_api::models::ErrorResponse;
+///
+/// let body = r#"{"error":"Studio is in motion"}"#;
+/// let parsed: ErrorResponse = serde_json::from_str(body).unwrap();
+/// assert_eq!(parsed.error.as_deref(), Some("Studio is in motion"));
+/// ```
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
-pub struct UnreadMessagesResponse {
-    /// Number of unread messages
+pub struct ErrorResponse {
+    /// Human-readable error message
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub count: Option<i32>,
-}
-
-/// API error response
-#[cfg_attr(feature = "wasm", derive(Tsify))]
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
-pub struct Error {
-    /// Error code
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
-
-    /// Error message
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-
-    /// HTTP status code
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<i32>,
-
-    /// Additional error details
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<serde_json::Value>,
+    pub error: Option<String>,
 }
 
 /// Shared creation and update timestamp model
@@ -112,7 +70,8 @@ pub struct ModifiedAtTime {
     pub updated_at: Option<String>,
 }
 
-/// Redirect response (e.g. billing portal / checkout URLs, `/redirect/{ext}`)
+/// A URL to send the user to: a Stripe billing-portal or checkout session, or
+/// an event's live stream.
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
@@ -180,9 +139,9 @@ pub struct ServerConfig {
     pub enabled: Option<bool>,
 }
 
-/// Server with the authenticated user's relationship to it.
-///
-/// Spec composes this as `Server` + `{admin, owner, subStatus}`.
+/// A studio together with the authenticated user's relationship to it
+/// (`admin`, `owner`, `subStatus`). The [`server`](Self::server) fields are
+/// flattened to the top level of the JSON object.
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]

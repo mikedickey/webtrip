@@ -100,7 +100,11 @@ impl AudioConstraints {
     }
 }
 
-/// Audio engine with capture and playback capabilities
+/// The audio engine behind `WebTripSession`: an `AudioContext`, the input
+/// stream, and the AudioWorklet node that runs the portable processor.
+///
+/// Most callers want `WebTripSession`, which creates, attaches and stops the
+/// engine for them. Use the engine directly only for audio with no session.
 #[wasm_bindgen]
 pub struct AudioEngine {
     ctx: AudioContext,
@@ -149,15 +153,21 @@ fn context_options(sample_rate: Option<f32>) -> AudioContextOptions {
 
 #[wasm_bindgen]
 impl AudioEngine {
-    /// Create a new audio engine (without network support)
+    /// Create an engine with no network buffers. `params_addr` must come from
+    /// `createAudioParams()`; any other value is undefined behavior.
     #[wasm_bindgen(js_name = create)]
     pub async fn create(params_addr: usize) -> Result<AudioEngine, JsValue> {
         Self::create_with_network(params_addr, std::ptr::null_mut(), std::ptr::null_mut()).await
     }
 
-    /// Create a new audio engine with network audio support
-    /// - local_to_network_buffer_ptr: ring buffer for sending local audio to network
-    /// - network_to_local_buffer_ptr: jitter buffer for receiving audio from network
+    /// Create an engine whose processor writes captured audio to the send
+    /// `RingBuffer` at `local_to_network_buffer_ptr` and plays from the
+    /// receive `Regulator` at `network_to_local_buffer_ptr` (either may be
+    /// null).
+    ///
+    /// `params_addr` must come from `createAudioParams()`, and each non-null
+    /// buffer must stay alive until the engine has stopped (`stopCapture()`
+    /// resolved `true`); otherwise the audio thread reads freed memory.
     #[wasm_bindgen(js_name = createWithNetwork)]
     pub async fn create_with_network(
         params_addr: usize,
@@ -212,13 +222,18 @@ impl AudioEngine {
         self.ctx.sample_rate()
     }
 
-    /// Set the local-to-network ring buffer pointer
+    /// Set the send `RingBuffer` the next worklet node writes to (null for
+    /// none). Takes effect when a node is next built (by `startCapture()` or
+    /// an output-device change), not on a running node. The buffer must
+    /// outlive every node built against it, as for `createWithNetwork`.
     #[wasm_bindgen(js_name = setLocalToNetworkBuffer)]
     pub fn set_local_to_network_buffer(&mut self, ptr: *mut RingBuffer) {
         self.local_to_network_buffer_ptr = ptr;
     }
 
-    /// Set the network-to-local jitter buffer pointer
+    /// Set the receive `Regulator` the next worklet node plays from (null for
+    /// none), with the same timing and lifetime rules as
+    /// `setLocalToNetworkBuffer`.
     #[wasm_bindgen(js_name = setNetworkToLocalBuffer)]
     pub fn set_network_to_local_buffer(&mut self, ptr: *mut Regulator) {
         self.network_to_local_buffer_ptr = ptr;
@@ -486,17 +501,15 @@ impl AudioEngine {
         port
     }
 
-    /// Check whether the AudioContext is still suspended (e.g. waiting for a user gesture on iOS).
+    /// Whether the `AudioContext` is suspended (for example waiting for a user
+    /// gesture).
     #[wasm_bindgen(js_name = isSuspended)]
     pub fn is_suspended(&self) -> bool {
         audio_context_state(&self.ctx).as_deref() == Some("suspended")
     }
 
-    /// Explicitly resume the AudioContext.
-    ///
-    /// Must be called from within a synchronous user-gesture handler on iOS Safari so that the
-    /// browser grants the audio-output activation.  Exposed so the TypeScript layer can wire a
-    /// "Tap to enable audio" button after the connection is established.
+    /// Resume the `AudioContext`. Call it directly from a user-gesture handler
+    /// so the browser allows audio output.
     #[wasm_bindgen(js_name = resumeCtx)]
     pub async fn resume_ctx(&self) -> Result<(), JsValue> {
         resume_context(&self.ctx).await
@@ -508,8 +521,8 @@ impl AudioEngine {
     /// becomes inert within one render quantum, then awaits
     /// [`AudioContext.close`](https://developer.mozilla.org/en-US/docs/Web/API/AudioContext/close)
     /// (with a timeout) so the worklet global scope is destroyed before the
-    /// caller frees the connection's stream buffers (WEB-53 Bug 7 / WEB-66).
-    /// Closing — not merely suspending — also
+    /// caller frees the connection's stream buffers. Closing, not merely
+    /// suspending, also
     /// prevents a leaked context from being resumed and racing a freed
     /// regulator as a second consumer.
     ///
@@ -520,7 +533,7 @@ impl AudioEngine {
     ///
     /// This is terminal for the engine: a closed context cannot be restarted.
     /// Callers that only need to rebuild capture on the same context (e.g.
-    /// [`start_capture`](Self::start_capture)) must use node teardown alone.
+    /// `startCapture()`) must use node teardown alone.
     #[wasm_bindgen(js_name = stopCapture)]
     pub async fn stop_capture(&mut self) -> bool {
         self.stop_capture_with_timeout(AUDIO_CONTEXT_CLOSE_TIMEOUT_MS)
@@ -625,11 +638,10 @@ impl AudioEngine {
         self.worklet_node.is_some()
     }
 
-    /// Get the worklet node's message port for event-driven audio processing
-    /// 
-    /// The worklet posts 'audio-ready' messages after each process() call,
-    /// allowing the network loop to wake immediately when audio data is available
-    /// instead of polling at a fixed interval.
+    /// The running worklet node's message port, or `undefined` while not
+    /// capturing. The port carries only the stop handshake: the engine posts
+    /// `"stop"` and the worklet replies `"stopped"` once it has stopped
+    /// processing.
     #[wasm_bindgen(js_name = getWorkletPort)]
     pub fn get_worklet_port(&self) -> Option<web_sys::MessagePort> {
         self.worklet_node.as_ref().and_then(|node| node.port().ok())

@@ -1,6 +1,6 @@
 //! Stream and broadcast models
 
-use super::Visibility;
+use super::BroadcastVisibility;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "wasm")]
 use tsify_next::Tsify;
@@ -50,10 +50,10 @@ pub struct StreamInfo {
     pub banner_url: Option<String>,
 }
 
-/// Stream info enriched with search-specific flags, returned by `GET /streams/search`.
-///
-/// Spec models this as an `allOf` over [`StreamInfo`]; we mirror that with a
-/// flattened `base`.
+/// A [`StreamInfo`] with search-specific flags, returned by
+/// [`StreamsApi::search_streams`](crate::api::streams::StreamsApi::search_streams).
+/// The [`base`](Self::base) fields are flattened to the top level of the JSON
+/// object.
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
@@ -71,7 +71,7 @@ pub struct StreamInfoSearchResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
 
-    /// Studio looking-for status
+    /// Studio looking-for status (see [`Server::looking_for`](super::Server::looking_for))
     #[serde(skip_serializing_if = "Option::is_none")]
     pub looking_for: Option<i32>,
 
@@ -108,7 +108,9 @@ pub struct StreamInfoSearchResult {
     pub num_public_recordings: Option<i32>,
 }
 
-/// Stream info with engagement metrics
+/// A [`StreamInfo`] with studio details and engagement counts, returned by
+/// [`StreamsApi::get_stream`](crate::api::streams::StreamsApi::get_stream).
+/// The [`base`](Self::base) fields are flattened.
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
@@ -118,23 +120,121 @@ pub struct StreamInfoWithEngagement {
     #[serde(flatten)]
     pub base: StreamInfo,
 
-    /// Number of current viewers
+    /// Studio ID; present only if the caller has access to the studio
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub viewers: Option<i32>,
+    pub server_id: Option<String>,
 
-    /// Number of followers
+    /// Cloud region identifier
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub followers: Option<i32>,
+    pub region: Option<String>,
 
-    /// Whether the current user follows this stream
+    /// Studio looking-for status (see [`Server::looking_for`](super::Server::looking_for))
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub following: Option<bool>,
+    pub looking_for: Option<i32>,
+
+    /// Skill levels the studio is targeted at
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_levels: Option<Vec<String>>,
+
+    /// Instruments associated with the studio
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instruments: Option<Vec<String>>,
+
+    /// Genres associated with the studio
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genres: Option<Vec<String>>,
+
+    /// Whether the studio is publicly accessible
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public: Option<bool>,
+
+    /// Number of broadcast views
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub views: Option<i64>,
+
+    /// Number of broadcast likes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub likes: Option<i64>,
+
+    /// Whether the caller has liked this broadcast
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liked: Option<bool>,
+
+    /// Whether the caller follows this stream
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub followed: Option<bool>,
 }
 
-/// Query options for `GET /streams/search`.
-///
-/// Mirrors the spec's query parameters; all fields are optional and omitted from
-/// the request when `None`.
+/// A [`StreamInfo`] with the details needed to reach the studio serving it,
+/// returned by [`EventsApi::get_event_channel`](crate::api::events::EventsApi::get_event_channel).
+/// The [`base`](Self::base) fields are flattened.
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
+#[serde(rename_all = "camelCase")]
+pub struct StreamCacheEntry {
+    /// Base stream information
+    #[serde(flatten)]
+    pub base: StreamInfo,
+
+    /// Studio ID backing this stream
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
+
+    /// Cloud region identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+
+    /// Hostname of the studio server serving the stream
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+
+    /// Whether JackTrip manages the studio
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed: Option<bool>,
+
+    /// The studio's current session ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
+    /// Token for accessing the studio server in this session
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+
+    /// Studio looking-for status (see [`Server::looking_for`](super::Server::looking_for))
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub looking_for: Option<i32>,
+
+    /// Skill levels the studio is targeted at
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_levels: Option<Vec<String>>,
+
+    /// Instruments associated with the studio
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instruments: Option<Vec<String>>,
+
+    /// Genres associated with the studio
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genres: Option<Vec<String>>,
+}
+
+// Hand-written so the auth token never reaches logs.
+impl std::fmt::Debug for StreamCacheEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamCacheEntry")
+            .field("base", &self.base)
+            .field("server_id", &self.server_id)
+            .field("region", &self.region)
+            .field("host", &self.host)
+            .field("managed", &self.managed)
+            .field("session_id", &self.session_id)
+            .field("auth_token", &self.auth_token.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Query options for `GET /streams/search`; every field is optional and
+/// omitted from the request when `None`.
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
@@ -144,11 +244,12 @@ pub struct StreamSearchQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub q: Option<String>,
 
-    /// Studio looking-for status filter
+    /// Looking-for status filter, using the codes of
+    /// [`Server::looking_for`](super::Server::looking_for)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub looking_for: Option<i32>,
 
-    /// Skill level filter
+    /// Skill level filter, e.g. `"beginner"`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skill_level: Option<String>,
 
@@ -160,7 +261,7 @@ pub struct StreamSearchQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub genre: Option<String>,
 
-    /// Cloud region filter
+    /// Cloud region filter (a region ID such as `ec2-us-oregon`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
 
@@ -173,15 +274,39 @@ pub struct StreamSearchQuery {
     pub limit: Option<i32>,
 }
 
-/// Live stream configuration
+/// A studio's JackTrip Radio live stream (`/studios/{studioId}/stream`).
 #[cfg_attr(feature = "wasm", derive(Tsify))]
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct LiveStream {
     /// Stream ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+
+    /// Studio ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
+
+    /// Session ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
+    /// ID of the recording made from this stream
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_id: Option<String>,
+
+    /// Studio owner's user ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+
+    /// Auth token
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+
+    /// Whether the stream is ephemeral
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral: Option<bool>,
 
     /// Stream name
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,67 +316,77 @@ pub struct LiveStream {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    /// Visibility setting
+    /// Cumulative follower count
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub visibility: Option<Visibility>,
+    pub follows: Option<i64>,
 
-    /// Whether the stream is currently active
+    /// When the stream started (RFC3339)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub active: Option<bool>,
+    pub start_time: Option<String>,
 
-    /// RTMP stream key (write-only)
+    /// When the stream was last updated (RFC3339)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream_key: Option<String>,
-
-    /// HLS playback URL
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hls_url: Option<String>,
-
-    /// RTMP ingest URL
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rtmp_url: Option<String>,
+    pub updated_at: Option<String>,
 }
 
-/// Simulcast destination configuration
+// Hand-written so the auth token never reaches logs.
+impl std::fmt::Debug for LiveStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveStream")
+            .field("id", &self.id)
+            .field("server_id", &self.server_id)
+            .field("session_id", &self.session_id)
+            .field("name", &self.name)
+            .field("auth_token", &self.auth_token.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
+}
+
+/// A simulcast destination: an RTMP endpoint the studio's broadcast is
+/// re-published to. One per platform, identified by [`name`](Self::name).
 #[cfg_attr(feature = "wasm", derive(Tsify))]
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-#[serde(rename_all = "camelCase")]
 pub struct SimulcastDestination {
-    /// Destination ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-
-    /// Destination platform (youtube, twitch, facebook, custom)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub platform: Option<String>,
-
-    /// Destination name/label
+    /// Platform: `"youtube"`, `"facebook"` or `"twitch"`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
-    /// RTMP URL for the destination
+    /// RTMP ingest URL
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rtmp_url: Option<String>,
+    pub url: Option<String>,
 
-    /// Stream key for the destination
+    /// Stream key used when publishing
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream_key: Option<String>,
-
-    /// Whether this destination is enabled
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
+    pub key: Option<String>,
 }
 
-/// Stream activation options
+// Hand-written so the stream key never reaches logs.
+impl std::fmt::Debug for SimulcastDestination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimulcastDestination")
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("key", &self.key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Activation body (`POST /studios/{studioId}/stream/activate`): what the
+/// studio should broadcast or record.
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct ActivationRequestOpts {
-    /// Whether to activate (true) or deactivate (false)
+    /// Broadcast or recording mode; [`Offline`](BroadcastVisibility::Offline)
+    /// stops it
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub active: Option<bool>,
+    pub visibility: Option<BroadcastVisibility>,
+
+    /// Session ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Backing track file stored for a studio
@@ -354,6 +489,47 @@ mod tests {
         assert!(out.contains("\"lookingFor\":"));
         assert!(out.contains("\"bannerURL\":"));
         assert!(!out.contains("\"base\":"));
+    }
+
+    #[test]
+    fn live_stream_simulcast_and_activation_wire_format() {
+        // Regression: these used invented fields (`rtmpUrl`, `streamKey`,
+        // `hlsUrl`, `active`) that the API neither sends nor reads.
+        let ls = serde_json::json!({
+            "id": "st-1", "serverId": "studio-1", "sessionId": "sess", "recordingId": "rec",
+            "ownerId": "u1", "ephemeral": false, "name": "Live", "follows": 3, "startTime": "t"
+        });
+        let parsed: LiveStream = serde_json::from_value(ls.clone()).unwrap();
+        assert_eq!(parsed.server_id.as_deref(), Some("studio-1"));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), ls);
+
+        let d = SimulcastDestination { name: Some("youtube".into()), url: Some("rtmp://x".into()), key: Some("k".into()) };
+        assert_eq!(
+            serde_json::to_value(&d).unwrap(),
+            serde_json::json!({"name": "youtube", "url": "rtmp://x", "key": "k"})
+        );
+        assert!(!format!("{d:?}").contains("\"k\""));
+
+        let a = ActivationRequestOpts { visibility: Some(BroadcastVisibility::Unlisted), session_id: Some("sess".into()) };
+        assert_eq!(serde_json::to_value(&a).unwrap(), serde_json::json!({"visibility": 2, "sessionId": "sess"}));
+    }
+
+    #[test]
+    fn engagement_and_cache_entry_wire_format() {
+        let e = serde_json::json!({
+            "id": "s1", "serverId": "st1", "lookingFor": 1, "views": 9, "likes": 2,
+            "liked": true, "followed": false
+        });
+        let parsed: StreamInfoWithEngagement = serde_json::from_value(e.clone()).unwrap();
+        assert_eq!(parsed.base.id.as_deref(), Some("s1"));
+        assert_eq!(parsed.views, Some(9));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), e);
+
+        let c = serde_json::json!({"id": "s1", "host": "h.example.com", "managed": true, "authToken": "s3cr3t"});
+        let parsed: StreamCacheEntry = serde_json::from_value(c.clone()).unwrap();
+        assert_eq!(parsed.host.as_deref(), Some("h.example.com"));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), c);
+        assert!(!format!("{parsed:?}").contains("s3cr3t"));
     }
 
     #[test]
