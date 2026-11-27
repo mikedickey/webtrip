@@ -30,7 +30,7 @@ mod test_support;
 // again here.
 pub use audio::{DeviceInfo, AudioEngine};
 #[doc(no_inline)]
-pub use webtrip_core::audio::{AudioProcessor, AudioParams};
+pub use webtrip_core::audio::{AudioParams, AudioParamsHandle, AudioProcessor};
 #[doc(no_inline)]
 pub use webtrip_core::stream::{RingBuffer, Regulator, RegulatorStats};
 #[doc(no_inline)]

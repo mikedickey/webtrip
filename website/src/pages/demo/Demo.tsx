@@ -175,9 +175,9 @@ export default function Demo() {
     setInputGain(s.inputGain);
     setOutputVolume(s.outputVolume);
     setMonitorVolume(s.monitorVolume);
-    eng.m.setInputGainFromPtr(eng.paramsPtr, s.inputGain);
-    eng.m.setOutputVolumeFromPtr(eng.paramsPtr, s.outputVolume / 100);
-    eng.m.setMonitorVolumeFromPtr(eng.paramsPtr, s.monitorVolume / 100);
+    eng.params.setInputGain(s.inputGain);
+    eng.params.setOutputVolume(s.outputVolume / 100);
+    eng.params.setMonitorVolume(s.monitorVolume / 100);
   };
 
   // Persist on every change, but only once the saved settings have been
@@ -638,7 +638,7 @@ export default function Demo() {
             display={`${inputGain >= 0 ? "+" : ""}${inputGain.toFixed(1)} dB`}
             onChange={(v) => {
               setInputGain(v);
-              engine.m.setInputGainFromPtr(engine.paramsPtr, v);
+              engine.params.setInputGain(v);
             }}
           />
           <Slider
@@ -649,7 +649,7 @@ export default function Demo() {
             display={`${Math.round(outputVolume)}%`}
             onChange={(v) => {
               setOutputVolume(v);
-              engine.m.setOutputVolumeFromPtr(engine.paramsPtr, v / 100);
+              engine.params.setOutputVolume(v / 100);
             }}
           />
           <Slider
@@ -660,7 +660,7 @@ export default function Demo() {
             display={monitorVolume === 0 ? "Off" : `${Math.round(monitorVolume)}%`}
             onChange={(v) => {
               setMonitorVolume(v);
-              engine.m.setMonitorVolumeFromPtr(engine.paramsPtr, v / 100);
+              engine.params.setMonitorVolume(v / 100);
             }}
           />
         </div>

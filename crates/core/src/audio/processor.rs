@@ -627,13 +627,13 @@ mod tests {
         use crate::stream::regulator::Regulator;
         let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
         // Default capacity is one packet (64 frames); callbacks are 128.
-        let reg = Regulator::with_params(1, 64, 48_000, 5.0);
-        let result = matched_rate_processor(params, SharedPtr::null(), SharedPtr::from_ref(&reg), RENDER_QUANTUM_FRAMES);
+        let reg = Box::leak(Box::new(Regulator::with_params(1, 64, 48_000, 5.0)));
+        let result = matched_rate_processor(params, SharedPtr::null(), SharedPtr::from_static(reg), RENDER_QUANTUM_FRAMES);
         assert!(matches!(result, Err(MixError::RegulatorCapacity { capacity: 64, .. })));
 
         // Capacity is fine but the regulator runs at a rate other than the wire's.
-        let reg = Regulator::with_params(1, 64, 44_100, 5.0).with_callback_capacity(RENDER_QUANTUM_FRAMES);
-        let result = matched_rate_processor(params, SharedPtr::null(), SharedPtr::from_ref(&reg), RENDER_QUANTUM_FRAMES);
+        let reg = Box::leak(Box::new(Regulator::with_params(1, 64, 44_100, 5.0).with_callback_capacity(RENDER_QUANTUM_FRAMES)));
+        let result = matched_rate_processor(params, SharedPtr::null(), SharedPtr::from_static(reg), RENDER_QUANTUM_FRAMES);
         assert!(matches!(result, Err(MixError::RegulatorRate { regulator_rate: 44_100, .. })));
     }
 
@@ -644,9 +644,9 @@ mod tests {
     fn test_with_network_returns_err_for_unsupported_device_rate() {
         use crate::stream::regulator::Regulator;
         let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
-        let reg = Regulator::with_params(1, 64, WIRE_SAMPLE_RATE, 5.0);
+        let reg = Box::leak(Box::new(Regulator::with_params(1, 64, WIRE_SAMPLE_RATE, 5.0)));
         for device_rate in [0, MIN_DEVICE_SAMPLE_RATE - 1, MAX_DEVICE_SAMPLE_RATE + 1] {
-            let result = AudioProcessor::with_network(params, SharedPtr::null(), SharedPtr::from_ref(&reg), RENDER_QUANTUM_FRAMES, device_rate, WIRE_SAMPLE_RATE);
+            let result = AudioProcessor::with_network(params, SharedPtr::null(), SharedPtr::from_static(reg), RENDER_QUANTUM_FRAMES, device_rate, WIRE_SAMPLE_RATE);
             assert!(matches!(result, Err(MixError::UnsupportedRates { .. })), "device rate {device_rate}");
         }
     }
@@ -664,12 +664,12 @@ mod tests {
         const LEVEL: f32 = 0.5;
 
         let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
-        let reg = Regulator::with_params(1, FPP, 48_000, 5.0).with_callback_capacity(FRAMES);
-        let mut processor = matched_rate_processor(params, SharedPtr::null(), SharedPtr::from_ref(&reg), FRAMES).expect("matched rates build");
+        let reg = Box::leak(Box::new(Regulator::with_params(1, FPP, 48_000, 5.0).with_callback_capacity(FRAMES)));
+        let mut processor = matched_rate_processor(params, SharedPtr::null(), SharedPtr::from_static(reg), FRAMES).expect("matched rates build");
         let input = vec![0.0f32; FRAMES];
         let mut output = vec![0.0f32; FRAMES];
         let mut checked = 0;
-        drive_callbacks(&reg, (FPP, FRAMES, 1), 120, |_| vec![LEVEL; FPP], |k, now| {
+        drive_callbacks(reg, (FPP, FRAMES, 1), 120, |_| vec![LEVEL; FPP], |k, now| {
             processor.process(&input, 1, &mut output, 1, now);
             if k >= SETTLE_CALLBACKS {
                 checked += 1;
@@ -694,12 +694,14 @@ mod tests {
         const FPP: usize = 64;
 
         let params: &'static AudioParams = Box::leak(Box::new(AudioParams::default()));
-        let reg = Regulator::with_params(1, FPP, WIRE_SAMPLE_RATE, 5.0)
-            .with_callback_capacity(wire_frames_per_callback(RENDER_QUANTUM_FRAMES, DEVICE_RATE, WIRE_SAMPLE_RATE));
+        let reg = Box::leak(Box::new(
+            Regulator::with_params(1, FPP, WIRE_SAMPLE_RATE, 5.0)
+                .with_callback_capacity(wire_frames_per_callback(RENDER_QUANTUM_FRAMES, DEVICE_RATE, WIRE_SAMPLE_RATE)),
+        ));
         let mut processor = AudioProcessor::with_network(
             params,
             SharedPtr::null(),
-            SharedPtr::from_ref(&reg),
+            SharedPtr::from_static(reg),
             RENDER_QUANTUM_FRAMES,
             DEVICE_RATE,
             WIRE_SAMPLE_RATE,
@@ -708,7 +710,7 @@ mod tests {
         let input = vec![0.0f32; RENDER_QUANTUM_FRAMES];
         let mut output = vec![0.0f32; RENDER_QUANTUM_FRAMES];
         let mut played = Vec::new();
-        drive_callbacks(&reg, (FPP, FPP, 1), 300, |seq| tones(&[TONE], 0.5, WIRE_SAMPLE_RATE, seq * FPP, FPP), |k, now| {
+        drive_callbacks(reg, (FPP, FPP, 1), 300, |seq| tones(&[TONE], 0.5, WIRE_SAMPLE_RATE, seq * FPP, FPP), |k, now| {
             processor.process(&input, 1, &mut output, 1, now);
             if k >= SETTLE_CALLBACKS {
                 played.extend_from_slice(&output);

@@ -78,8 +78,8 @@ Therefore:
   concern.** A data race that a browser happens to tolerate is still a data race on a
   native build.
 - When a structure is *not* yet provably sound under concurrent access, say so
-  explicitly in its docs and link the tracking work (see `SharedPtr::as_mut` for the
-  house style) rather than leaving a silent assumption behind.
+  explicitly in its docs (a `# Safety` or "Soundness" paragraph stating the gap) and
+  link the tracking work, rather than leaving a silent assumption behind.
 
 ## No Code Duplication
 

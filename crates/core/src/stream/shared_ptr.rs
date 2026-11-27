@@ -15,23 +15,25 @@
 //!   laundered across threads),
 //! - makes [`new`](SharedPtr::new) / [`from_addr`](SharedPtr::from_addr)
 //!   `unsafe` so each call site must acknowledge that the address points at a
-//!   live `T`, and
+//!   live `T` for as long as anything may borrow through the pointer (the one
+//!   safe constructor, [`from_static`](SharedPtr::from_static), takes a
+//!   `&'static T`, which already guarantees that), and
 //! - hands out a shared `&T` through one audited `unsafe` block inside
 //!   [`as_ref`](SharedPtr::as_ref) instead of the `unsafe { &*ptr }`
 //!   incantation being copy-pasted at every call site.
 //!
 //! The pointee must coordinate cross-thread access through atomics and/or
 //! interior mutability, and say so by being `Sync` (e.g. [`RingBuffer`](crate::stream::ring_buffer::RingBuffer)
-//! and [`Regulator`](crate::stream::regulator::Regulator)'s `&self` APIs). Prefer
-//! [`as_ref`](SharedPtr::as_ref). [`as_mut`](SharedPtr::as_mut) remains for the
-//! rare case where exclusive access is genuinely proven; nothing in the audio
-//! path uses it.
+//! and [`Regulator`](crate::stream::regulator::Regulator)'s `&self` APIs). Every
+//! borrow is a shared one: there is no way to obtain a `&mut T` through a
+//! `SharedPtr`.
 
 /// A shared address, typed as a pointer to `T`, that may cross threads.
 ///
 /// Cheap to copy (it is just an address). Construct with [`SharedPtr::new`] from
 /// a raw pointer or [`SharedPtr::from_addr`] from an integer received from
-/// another thread — both are `unsafe` and require a live pointee.
+/// another thread — both are `unsafe` and require a live pointee — or safely
+/// with [`SharedPtr::from_static`] from a `&'static T`.
 pub struct SharedPtr<T> {
     ptr: *mut T,
 }
@@ -71,21 +73,23 @@ impl<T> SharedPtr<T> {
     /// # Safety
     ///
     /// `ptr` must be null, or point to a live `T` that outlives every borrow
-    /// obtained through [`as_ref`](Self::as_ref) / [`as_mut`](Self::as_mut).
-    /// Reconstructing from an arbitrary address and then calling those methods
-    /// is otherwise undefined behaviour — that is why construction, not deref,
-    /// is the `unsafe` boundary.
+    /// obtained through [`as_ref`](Self::as_ref). Reconstructing from an
+    /// arbitrary address and then calling that method is otherwise undefined
+    /// behaviour — that is why construction, not deref, is the `unsafe`
+    /// boundary.
     pub const unsafe fn new(ptr: *mut T) -> Self {
         Self { ptr }
     }
 
-    /// Point at a value the caller already holds a shared reference to. The
-    /// pointee is only ever reached again through [`as_ref`](Self::as_ref), so
-    /// casting away `const` here grants nothing the `&T` didn't.
-    pub fn from_ref(value: &T) -> Self {
-        // SAFETY: pointer derived from a live `&T`; the pointee outlives any
-        // borrow obtained while that reference (or an equivalent lifecycle
-        // guarantee) remains valid.
+    /// Point at a value that lives for the rest of the program.
+    ///
+    /// Safe because a `&'static T` already guarantees what [`new`](Self::new)
+    /// asks its caller to: the pointee outlives every borrow that
+    /// [`as_ref`](Self::as_ref) can hand out. (A `SharedPtr` is `Copy` and may
+    /// outlive a shorter borrow, which is why no `&'a T` constructor exists.)
+    pub fn from_static(value: &'static T) -> Self {
+        // SAFETY: `value` lives for `'static`, so no borrow through `as_ref`
+        // can outlive it.
         unsafe { Self::new(std::ptr::from_ref(value).cast_mut()) }
     }
 
@@ -102,9 +106,9 @@ impl<T> SharedPtr<T> {
     /// # Safety
     ///
     /// `addr` must be 0 (null), or the address of a live `T` that outlives
-    /// every borrow obtained through [`as_ref`](Self::as_ref) /
-    /// [`as_mut`](Self::as_mut). The sender must have published a real
-    /// allocation that remains alive for the receiver's use.
+    /// every borrow obtained through [`as_ref`](Self::as_ref). The sender must
+    /// have published a real allocation that remains alive for the receiver's
+    /// use.
     pub const unsafe fn from_addr(addr: usize) -> Self {
         Self {
             ptr: addr as *mut T,
@@ -138,23 +142,5 @@ impl<T> SharedPtr<T> {
         // SAFETY: non-null; construction (`new` / `from_addr`) asserted the
         // pointee is live for the duration of every borrow obtained here.
         Some(unsafe { &*self.ptr })
-    }
-
-    /// Borrow the pointee as a mutable reference, or `None` if the pointer is null.
-    ///
-    /// # Safety
-    ///
-    /// This materialises a `&mut T` from a shared address, which asserts
-    /// exclusive access to the whole pointee. It is sound only if no other
-    /// reference to the pointee is live for the duration of the returned borrow.
-    ///
-    /// Prefer [`as_ref`](Self::as_ref). The audio path no longer needs this for
-    /// [`Regulator`](crate::stream::regulator::Regulator) (WEB-53); it remains for
-    /// any future pointee that genuinely requires exclusive access.
-    pub unsafe fn as_mut<'a>(&self) -> Option<&'a mut T> {
-        if self.ptr.is_null() {
-            return None;
-        }
-        Some(&mut *self.ptr)
     }
 }

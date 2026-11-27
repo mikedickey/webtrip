@@ -33,13 +33,13 @@ export default function LevelMeter({ engine, active }: { engine: DemoEngine; act
       return;
     }
 
-    const { m, paramsPtr } = engine;
+    const { params } = engine;
     let frameId: number;
     const animate = () => {
-      const volume = m.getVolumeLevelFromPtr(paramsPtr);
-      const peakVolume = m.getPeakLevelFromPtr(paramsPtr);
-      const db = m.getDbLevelFromPtr(paramsPtr);
-      const peakDb = m.getPeakDbLevelFromPtr(paramsPtr);
+      const volume = params.getVolumeLevel();
+      const peakVolume = params.getPeakLevel();
+      const db = params.getDbLevel();
+      const peakDb = params.getPeakDbLevel();
 
       fill.style.width = `${Math.min(volume, 100)}%`;
       peak.style.left = `${Math.min(peakVolume, 100)}%`;

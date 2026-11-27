@@ -93,7 +93,7 @@ use webtrip_core::audio::params::create_audio_params;
 use webtrip_web::WebTripSession;
 
 // Inside an async fn on the page's main thread.
-let session = WebTripSession::new(create_audio_params())?;
+let session = WebTripSession::new(&create_audio_params())?;
 session
     .connect("hub.example.com".into(), Some(4464), None, false, false, false, Some("me".into()))
     .await?;

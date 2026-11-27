@@ -411,7 +411,16 @@ impl WorkerState {
         }
     }
 
-    fn configure(
+    /// Point the worker at a connection's buffers and record its wire format.
+    ///
+    /// # Safety
+    ///
+    /// `ring_ptr` and `reg_ptr` must each be 0 (null) or the address of a live
+    /// `RingBuffer` / `Regulator` that stays alive until this worker has been
+    /// terminated (so its send and receive loops have exited). The main-thread
+    /// session publishes the addresses of the connection's boxed buffers and
+    /// keeps them alive, live then retired, for exactly that long.
+    unsafe fn configure(
         &mut self,
         ring_ptr: usize,
         reg_ptr: usize,
@@ -419,11 +428,12 @@ impl WorkerState {
         send_channels: u8,
         receive_channels: u8,
     ) {
-        // SAFETY: addresses published by the main-thread session from buffers
-        // it owns; the worker is terminated (and its loops exit) before those
-        // buffers are freed.
-        self.ring_buffer_ptr = unsafe { SharedPtr::from_addr(ring_ptr) };
-        self.regulator_ptr = unsafe { SharedPtr::from_addr(reg_ptr) };
+        // SAFETY: the caller's contract (see `# Safety`) is that each address is
+        // null or a live buffer that outlives this worker.
+        unsafe {
+            self.ring_buffer_ptr = SharedPtr::from_addr(ring_ptr);
+            self.regulator_ptr = SharedPtr::from_addr(reg_ptr);
+        }
         self.send_channels = send_channels;
         self.receive_channels = receive_channels;
         self.set_send_fpp(buffer_size);
@@ -537,11 +547,14 @@ thread_local! {
     static STATS: RefCell<WebTransportWorkerStats> = RefCell::new(WebTransportWorkerStats::default());
 }
 
-/// Initialize the worker with buffer pointers
-/// 
-/// Called from JavaScript after the worker receives the 'init' message with
-/// WASM memory and buffer pointers.
-pub(crate) fn worker_init(
+/// Initialize the worker with the connection's buffer addresses and wire
+/// format, from the `"init"` message the main thread posts.
+///
+/// # Safety
+///
+/// As for [`WorkerState::configure`]: `ring_buffer_ptr` and `regulator_ptr`
+/// are each 0 or the address of a live buffer that outlives this worker.
+pub(crate) unsafe fn worker_init(
     ring_buffer_ptr: usize,
     regulator_ptr: usize,
     buffer_size: usize,
@@ -549,13 +562,16 @@ pub(crate) fn worker_init(
     receive_channels: u8,
 ) {
     WORKER_STATE.with(|state| {
-        state.borrow_mut().configure(
-            ring_buffer_ptr,
-            regulator_ptr,
-            buffer_size,
-            send_channels,
-            receive_channels,
-        );
+        // SAFETY: the caller's contract is `configure`'s.
+        unsafe {
+            state.borrow_mut().configure(
+                ring_buffer_ptr,
+                regulator_ptr,
+                buffer_size,
+                send_channels,
+                receive_channels,
+            );
+        }
     });
 }
 
@@ -1102,6 +1118,7 @@ pub fn worker_main() {
 /// - { type: "connect", serverUrl }
 /// - { type: "disconnect" }
 /// - { type: "getStats" }
+#[doc(hidden)]
 #[wasm_bindgen(js_name = handleWorkerMessage)]
 pub fn handle_worker_message(msg: JsValue) -> js_sys::Promise {
     let msg_type = Reflect::get(&msg, &"type".into())
@@ -1132,7 +1149,11 @@ pub fn handle_worker_message(msg: JsValue) -> js_sys::Promise {
                 .and_then(|v| v.as_f64())
                 .unwrap_or(2.0) as u8;
 
-            worker_init(ring_ptr, reg_ptr, buffer_size, send_channels, receive_channels);
+            // SAFETY: the `"init"` message is posted by `webtransport.rs` on the
+            // main thread with the addresses of the connection's `StreamBuffers`
+            // (`AudioBufferConfig`), which the session keeps alive, live then
+            // retired, until this worker has been terminated.
+            unsafe { worker_init(ring_ptr, reg_ptr, buffer_size, send_channels, receive_channels) };
             
             // Post ready message to main thread
             post_message_to_main(&JsValue::from_str("ready"));
@@ -1484,7 +1505,8 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn handle_worker_message_get_stats_resolves_stats_object() {
-        worker_init(0, 0, 128, 1, 2);
+        // SAFETY: null addresses point at nothing.
+        unsafe { worker_init(0, 0, 128, 1, 2) };
 
         let msg = worker_message(&[("type", JsValue::from_str("getStats"))]);
         let result = JsFuture::from(handle_worker_message(msg))
@@ -1523,7 +1545,8 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn handle_worker_message_disconnect_resolves_ok() {
-        worker_init(0, 0, 128, 1, 2);
+        // SAFETY: null addresses point at nothing.
+        unsafe { worker_init(0, 0, 128, 1, 2) };
 
         let msg = worker_message(&[("type", JsValue::from_str("disconnect"))]);
         let result = JsFuture::from(handle_worker_message(msg))
@@ -1578,7 +1601,8 @@ mod tests {
         let samples_per_packet = buffer_size * send_channels as usize;
 
         let mut state = WorkerState::new();
-        state.configure(ring_ptr, reg_ptr, buffer_size, send_channels, receive_channels);
+        // SAFETY: `ring` and `regulator` are stack locals that outlive `state`.
+        unsafe { state.configure(ring_ptr, reg_ptr, buffer_size, send_channels, receive_channels) };
 
         assert_eq!(state.ring_buffer_ptr.addr(), ring_ptr, "ring buffer pointer must be stored");
         assert_eq!(state.regulator_ptr.addr(), reg_ptr, "regulator pointer must be stored");
@@ -1626,13 +1650,16 @@ mod tests {
         let frame = buffer_size * send_channels as usize;
 
         let mut state = WorkerState::new();
-        state.configure(
-            &ring as *const RingBuffer as usize,
-            &mut regulator as *mut Regulator as usize,
-            buffer_size,
-            send_channels,
-            receive_channels,
-        );
+        // SAFETY: `ring` and `regulator` are stack locals that outlive `state`.
+        unsafe {
+            state.configure(
+                &ring as *const RingBuffer as usize,
+                &mut regulator as *mut Regulator as usize,
+                buffer_size,
+                send_channels,
+                receive_channels,
+            );
+        }
 
         // Empty ring buffer → nothing to send, counters untouched.
         assert!(build_next_packet(&state).is_none(), "an empty ring buffer must not produce a packet");
@@ -1716,7 +1743,9 @@ mod tests {
         let reg_ptr = &mut regulator as *mut Regulator as usize;
 
         WORKER_STATE.with(|state| {
-            state.borrow_mut().configure(ring_ptr, reg_ptr, 128, 1, 2);
+            // SAFETY: `ring` and `regulator` outlive this test, which resets
+            // the shared state to null pointers below before they drop.
+            unsafe { state.borrow_mut().configure(ring_ptr, reg_ptr, 128, 1, 2) };
             state.borrow().start();
         });
         assert!(
@@ -1738,7 +1767,8 @@ mod tests {
         // buffers drop, so no later test can observe dangling pointers or
         // notify on a stale `Int32Array`. `configure()` with a null ring
         // buffer also clears the cached has_data view.
-        WORKER_STATE.with(|state| state.borrow_mut().configure(0, 0, 128, 1, 2));
+        // SAFETY: null addresses point at nothing.
+        WORKER_STATE.with(|state| unsafe { state.borrow_mut().configure(0, 0, 128, 1, 2) });
         assert!(
             WORKER_STATE.with(|s| s.borrow().has_data_int32_array.borrow().is_none()),
             "re-configure with a null ring buffer must clear the cached has_data view"

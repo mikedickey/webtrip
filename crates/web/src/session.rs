@@ -60,7 +60,7 @@ use crate::connection::{check_connection_capacity, Connection, ConsumerHold, Ret
 use crate::js_util::{cancelled_error, named_error};
 use crate::audio::engine::{close_audio_context_now, resume_context, route_output_sink, AudioEngine};
 use crate::tick_clock::{TickClock, TickSource};
-use webtrip_core::audio::params::AudioParams;
+use webtrip_core::audio::params::AudioParamsHandle;
 use webtrip_core::limits::{MAX_DEVICE_CHANNELS, MAX_WIRE_CHANNELS};
 use webtrip_core::stream::regulator::Regulator;
 use webtrip_core::session_stats::aggregate_session_stats;
@@ -205,19 +205,19 @@ struct CaptureParams {
 }
 
 /// The engine worklet's `(send ring, receive regulator)` pointers.
-type NetworkBuffers = (*mut RingBuffer, *mut Regulator);
+type NetworkBuffers = (SharedPtr<RingBuffer>, SharedPtr<Regulator>);
 
 /// `buffers`, or null pointers (a worklet node that reads no connection).
 fn or_detached(buffers: Option<NetworkBuffers>) -> NetworkBuffers {
-    buffers.unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()))
+    buffers.unwrap_or((SharedPtr::null(), SharedPtr::null()))
 }
 
 /// A connection's stream buffers as the engine's worklet is pointed at them.
 #[derive(Clone, Copy)]
 struct Published {
     id: u64,
-    ring: *mut RingBuffer,
-    regulator: *mut Regulator,
+    ring: SharedPtr<RingBuffer>,
+    regulator: SharedPtr<Regulator>,
 }
 
 /// Create an `AudioEngine` and start capture, honouring `cancelled` after each
@@ -227,7 +227,7 @@ struct Published {
 /// `capture_gate` (tests) holds bring-up after construction to simulate a
 /// stuck permission prompt; `capture_waiting` is set while that gate is held.
 async fn bring_up_engine(
-    params_addr: usize,
+    params: AudioParamsHandle,
     network: Option<NetworkBuffers>,
     capture: CaptureParams,
     output_device_id: Option<String>,
@@ -238,12 +238,8 @@ async fn bring_up_engine(
     capture_gate: Option<js_sys::Promise>,
     capture_waiting: Option<Rc<Cell<bool>>>,
 ) -> Result<AudioEngine, JsValue> {
-    // `AudioEngine` is a `#[wasm_bindgen]` boundary type, so it takes raw
-    // pointers / addresses here and wraps them in `SharedPtr` internally
-    // when it builds the `AudioProcessor`.
     let (local_to_network, network_to_local) = or_detached(network);
-    let mut engine =
-        AudioEngine::create_with_network(params_addr, local_to_network, network_to_local).await?;
+    let mut engine = AudioEngine::create_with_network(params, local_to_network, network_to_local).await?;
     // Lets an abort close the context while `getUserMedia` is still pending.
     *context_slot.borrow_mut() = Some(engine.context());
     if cancelled.load(Ordering::Acquire) {
@@ -348,7 +344,7 @@ enum Detached {
 #[wasm_bindgen]
 pub struct WebTripSession {
     // Audio components
-    audio_params: SharedPtr<AudioParams>,
+    audio_params: AudioParamsHandle,
     audio_engine: RefCell<Option<AudioEngine>>,
     audio_lifecycle: Arc<AudioLifecycle>,
     /// Which engine is current; tags the buffers retired against its worklet
@@ -435,19 +431,14 @@ pub struct WebTripSession {
 
 #[wasm_bindgen]
 impl WebTripSession {
-    /// Create a session.
+    /// Create a session over the shared audio controls and meters.
     ///
-    /// `audio_params_addr` must be a value returned by `createAudioParams()`
-    /// (in Rust, `webtrip_core::audio::params::create_audio_params`). Those
-    /// parameters are never freed, so create them once per page; sessions may
-    /// share them. Any other value is undefined behavior: the session and its
-    /// audio thread dereference the address.
+    /// `audio_params` comes from `createAudioParams()` (in Rust,
+    /// `webtrip_core::audio::params::create_audio_params`). Those parameters
+    /// are never freed, so create them once per page; sessions may share them.
     #[wasm_bindgen(constructor)]
-    pub fn new(audio_params_addr: usize) -> Result<WebTripSession, JsValue> {
-        // SAFETY: `audio_params_addr` is a wasm-bindgen boundary value from JS.
-        // Callers pass the address from [`create_audio_params`] (a leaked
-        // `AudioParams` that outlives the session and every agent holding it).
-        let audio_params = unsafe { SharedPtr::<AudioParams>::from_addr(audio_params_addr) };
+    pub fn new(audio_params: &AudioParamsHandle) -> Result<WebTripSession, JsValue> {
+        let audio_params = *audio_params;
         let send_fpp = DEFAULT_BUFFER_SIZE as usize;
         // Only each connection's regulator geometry until the peer's first
         // packet, whose frames per packet it adopts.
@@ -1236,7 +1227,7 @@ impl WebTripSession {
         }
         let mut engine = self.audio_engine.borrow_mut();
         let Some(engine) = engine.as_mut() else { return Detached::InTransit };
-        match engine.attach_network(std::ptr::null_mut(), std::ptr::null_mut()) {
+        match engine.attach_network(SharedPtr::null(), SharedPtr::null()) {
             Ok(replaced) => {
                 self.engine_attached.set(None);
                 replaced.map_or(Detached::NotAttached, Detached::Pending)
@@ -1502,8 +1493,12 @@ impl WebTripSession {
     fn published_buffers(&self) -> Option<Published> {
         self.connections.borrow().iter().find(|c| c.transport.borrow().is_some()).map(|c| Published {
             id: c.id,
-            ring: c.buffers.ring_ptr(),
-            regulator: c.buffers.regulator_ptr(),
+            // SAFETY: the connection's buffers stay alive until the engine
+            // node that receives these pointers has stopped: ending the
+            // connection retires them (`retire_until_stopped`) rather than
+            // dropping them.
+            ring: unsafe { c.buffers.ring_ptr() },
+            regulator: unsafe { c.buffers.regulator_ptr() },
         })
     }
 
@@ -1616,20 +1611,15 @@ impl WebTripSession {
 
     /// Connection `id`'s buffers, as handed to a transport before it connects.
     fn audio_buffer_config(&self, id: u64) -> AudioBufferConfig {
-        let (ring, regulator) = self.with_opened_buffers(id, |b| (b.ring_ptr(), b.regulator_ptr()));
-        // SAFETY: both pointers are into the connection's boxed buffers, which
-        // stay alive (live, then retired) until every agent holding them has
-        // stopped; they are only ever dereferenced as shared references
-        // (`SharedPtr::as_ref`), their mutable state being atomics and
-        // `UnsafeCell`.
-        unsafe {
-            AudioBufferConfig {
-                local_to_network: SharedPtr::new(ring),
-                network_to_local: SharedPtr::new(regulator),
-                buffer_size: self.send_fpp,
-                send_channels: self.send_channels.get(),
-                receive_channels: self.receive_channels.get(),
-            }
+        // SAFETY: as in `published_buffers`: the transport these go to is torn
+        // down before the connection's buffers are retired and freed.
+        let (ring, regulator) = self.with_opened_buffers(id, |b| unsafe { (b.ring_ptr(), b.regulator_ptr()) });
+        AudioBufferConfig {
+            local_to_network: ring,
+            network_to_local: regulator,
+            buffer_size: self.send_fpp,
+            send_channels: self.send_channels.get(),
+            receive_channels: self.receive_channels.get(),
         }
     }
 
@@ -1653,7 +1643,7 @@ impl WebTripSession {
     ) -> Result<AudioEngine, (JsValue, Option<AudioEngine>)> {
         #[cfg(all(test, target_arch = "wasm32"))]
         crate::test_support::note_start_engine();
-        let params_addr = self.audio_params.addr();
+        let params = self.audio_params;
         let output_device_id = self.output_device_id.borrow().clone();
         let input_channels = self.input_channels.get() as u32;
         let output_channels = self.output_channels.get() as u32;
@@ -1682,7 +1672,7 @@ impl WebTripSession {
             let outcome = Rc::clone(&outcome);
             wasm_bindgen_futures::spawn_local(async move {
                 let result = bring_up_engine(
-                    params_addr,
+                    params,
                     network,
                     capture,
                     output_device_id,
@@ -1943,12 +1933,13 @@ mod tests {
     use wasm_bindgen::closure::Closure;
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;
-
-    /// A session over `params`, which must outlive it (the session holds its
-    /// address): declare `params` first so it is dropped last.
     #[cfg(target_arch = "wasm32")]
-    fn new_session(params: &AudioParams) -> Rc<WebTripSession> {
-        Rc::new(WebTripSession::new(SharedPtr::from_ref(params).addr()).expect("session construction should succeed"))
+    use webtrip_core::audio::params::create_audio_params;
+
+    /// A session over its own (leaked, as in production) audio parameters.
+    #[cfg(target_arch = "wasm32")]
+    fn new_session() -> Rc<WebTripSession> {
+        Rc::new(WebTripSession::new(&create_audio_params()).expect("session construction should succeed"))
     }
 
     /// The session's (send, receive, input, output) channel counts.
@@ -2050,8 +2041,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_mock_connect_disconnect_lifecycle() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
         let (log, _cb) = attach_state_log(&session);
 
         assert_eq!(session.get_state(), "idle");
@@ -2153,8 +2143,7 @@ mod tests {
     async fn session_closes_audiocontext_before_freeing_buffers_on_disconnect() {
         use crate::audio::engine::audio_context_state;
 
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
 
         session
             .connect_with_test_transport(true, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
@@ -2213,8 +2202,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn forced_transport_close_keeps_the_buffers_alive() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
 
         session
             .connect_with_test_transport(true, Box::new(MockTransport::new().with_forced_close()), CONNECT_TIMEOUT_MS)
@@ -2234,8 +2222,7 @@ mod tests {
         use crate::audio::engine::AUDIO_CONTEXT_CLOSE_TIMEOUT_MS;
         use wasm_bindgen::closure::Closure;
 
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
         session
             .connect_with_test_transport(true, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await
@@ -2293,8 +2280,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_disconnect_cancels_a_dialing_connect() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
         let (log, _cb) = attach_state_log(&session);
 
         let (dial_gate, finish_dial) = gate();
@@ -2322,8 +2308,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_disconnect_cancels_after_a_successful_dial() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
         let (log, _cb) = attach_state_log(&session);
         let _ = crate::test_support::take_start_engine_calls();
 
@@ -2374,8 +2359,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_set_output_device_applies_while_dialing_over_running_audio() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
 
         start_audio(&session).await.expect("audio should start");
         let (dial_gate, finish_dial) = gate();
@@ -2410,8 +2394,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_disconnect_during_gated_capture_resolves_promptly() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
         let (log, _cb) = attach_state_log(&session);
 
         let (capture_gate, finish_capture) = gate();
@@ -2465,8 +2448,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_disconnect_during_the_dial_stops_the_audio_the_connect_started() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
         let (log, _cb) = attach_state_log(&session);
 
         let (dial_gate, _never_opened) = gate();
@@ -2493,8 +2475,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_disconnect_network_during_the_dial_leaves_the_connect_audio_running() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
 
         let (dial_gate, _never_opened) = gate();
         let transport = MockTransport::new().with_connect_gate(dial_gate);
@@ -2517,8 +2498,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_audio_restarted_during_the_dial_is_not_owned_by_the_connect() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
 
         let (dial_gate, open_dial) = gate();
         let transport = MockTransport::new().with_connect_gate(dial_gate);
@@ -2543,8 +2523,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_connect_adopts_an_audio_start_in_flight() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
 
         let (capture_gate, finish_capture) = gate();
         session.set_capture_gate(capture_gate);
@@ -2573,8 +2552,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_disconnect_joining_a_network_disconnect_still_stops_connect_audio() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
         let (close_gate, finish_close) = gate();
         session
             .connect_with_test_transport(true, Box::new(MockTransport::new().with_close_gate(close_gate)), CONNECT_TIMEOUT_MS)
@@ -2608,8 +2586,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_connect_fails_when_the_transport_fails_during_bring_up() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
         let (log, _cb) = attach_state_log(&session);
 
         let transport = MockTransport::new();
@@ -2633,8 +2610,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_connect_times_out_a_stalled_dial() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
         let (log, _cb) = attach_state_log(&session);
 
         let (dial_gate, _never_opened) = gate();
@@ -2658,8 +2634,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_connect_is_admitted_only_from_idle() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
         let (log, _cb) = attach_state_log(&session);
 
         // Connect while connecting.
@@ -2721,8 +2696,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_teardown_coalesces_and_holds_off_the_next_connect() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
         let (log, _cb) = attach_state_log(&session);
 
         let (close_gate, finish_close) = gate();
@@ -2774,8 +2748,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_connect_invalid_host_fails_back_to_idle() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
         let (log, _cb) = attach_state_log(&session);
 
         // Default transport is WebRTC; an empty host yields an invalid
@@ -2808,8 +2781,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_audio_controls_no_engine_branch() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
 
         assert!(
             !session.is_audio_suspended(),
@@ -2829,8 +2801,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_drop_does_not_emit_error_from_webrtc_close() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
         let (log, _cb) = attach_state_log(&session);
 
         let (close_gate, finish_close) = gate();
@@ -2869,8 +2840,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_reconnect_adopts_the_second_peers_shape() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
 
         session
             .connect_with_test_transport(true, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
@@ -2903,8 +2873,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn retired_buffers_are_freed_by_the_stopped_acknowledgement() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
 
         let (stopped, acknowledge) = gate();
         session.retire_until_stopped(StreamBuffers::new(1, 2, 128), vec![stopped], None);
@@ -2944,8 +2913,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_network_without_audio_still_ticks_the_transport() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
 
         let transport = MockTransport::new();
         let probe = transport.probe();
@@ -2989,8 +2957,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_audio_outlives_the_connection() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
         let (log, _cb) = attach_state_log(&session);
 
         start_audio(&session).await.expect("audio should start with no connection");
@@ -3042,8 +3009,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_reconnect_with_audio_running_adopts_the_second_peers_shape() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
         start_audio(&session).await.expect("audio should start");
 
         session
@@ -3072,8 +3038,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_connect_owns_only_the_audio_it_started() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
 
         session
             .connect_with_test_transport(true, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
@@ -3124,8 +3089,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_stop_audio_cancels_a_pending_start() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
 
         let (capture_gate, finish_capture) = gate();
         session.set_capture_gate(capture_gate);
@@ -3165,8 +3129,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn session_disconnect_during_an_audio_start_keeps_the_buffers_for_the_engine() {
-        let params = AudioParams::default();
-        let session = new_session(&params);
+        let session = new_session();
         session
             .connect_with_test_transport(false, Box::new(MockTransport::new()), CONNECT_TIMEOUT_MS)
             .await

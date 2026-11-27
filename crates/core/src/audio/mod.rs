@@ -10,5 +10,5 @@ pub mod params;
 /// The per-callback processor that feeds a [`mixer::MixEngine`] from the network buffers and publishes meters.
 pub mod processor;
 
-pub use params::AudioParams;
+pub use params::{AudioParams, AudioParamsHandle};
 pub use processor::AudioProcessor;
