@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   getDemoEngine,
   isIOS,
+  listAudioDevices,
   type AudioDevices,
   type DemoEngine,
   type SessionState,
@@ -234,7 +235,7 @@ export default function Demo() {
         eng.session.getTransportType() === eng.m.TransportType.WebTransport ? "webtransport" : "webrtc",
       );
       try {
-        const devs = (await eng.m.getAudioDevices()) as AudioDevices;
+        const devs = await listAudioDevices(eng.m);
         if (cancelled) return;
         setEngine(eng);
         setDevices(devs);
@@ -259,7 +260,7 @@ export default function Demo() {
     let cancelled = false;
     const handleDeviceChange = async () => {
       try {
-        const devs = (await engine.m.getAudioDevices()) as AudioDevices;
+        const devs = await listAudioDevices(engine.m);
         if (cancelled) return;
         setDevices(devs);
         setInputDeviceId((current) => pickDevice(devs.inputDevices, current));
@@ -588,8 +589,8 @@ export default function Demo() {
             </select>
           ) : (
             <>
-              {/* iOS Safari (and some other mobile browsers) do not enumerate
-                  audiooutput devices; show a disabled placeholder instead. */}
+              {/* No selectable outputs (see listAudioDevices, and browsers
+                  that enumerate none): show a disabled placeholder. */}
               <select
                 id="output-device"
                 className="select"

@@ -87,8 +87,8 @@ function sanitize(raw: unknown, fallback: Settings): Settings {
   };
 }
 
-// Browsers that cannot enumerate output devices (iOS Safari) list none, so the
-// only selection that can have been saved there is the empty one.
+// Browsers without selectable outputs (see listAudioDevices) list none, so the
+// only selection that can be saved there is the empty one.
 function deviceAvailable(list: DeviceInfo[], id: string): boolean {
   return list.length === 0 ? id === "" : list.some((d) => d.deviceId === id);
 }
