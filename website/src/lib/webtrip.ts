@@ -77,6 +77,14 @@ export function getDemoEngine(): Promise<DemoEngine> {
   return enginePromise;
 }
 
+// The devices the demo can offer. Without AudioContext.setSinkId (Firefox,
+// Safari) playback cannot be routed, so no outputs are listed even when the
+// browser enumerates some: selecting one would have no effect.
+export async function listAudioDevices(m: WebtripModule): Promise<AudioDevices> {
+  const devices = (await m.getAudioDevices()) as AudioDevices;
+  return "setSinkId" in AudioContext.prototype ? devices : { ...devices, outputDevices: [] };
+}
+
 /** Detect iOS / iPadOS (including iPad on iOS 13+ which reports as "Macintosh"). */
 export function isIOS(): boolean {
   return (
