@@ -6,7 +6,7 @@ use crate::audio::devices::{
     clamp_channel_count, first_audio_track, get_media_devices, get_user_media_audio,
     resolve_granted_channels, stop_media_stream, track_channels,
 };
-use webtrip_core::audio::params::AudioParams;
+use webtrip_core::audio::params::AudioParamsHandle;
 use webtrip_core::audio::processor::AudioProcessor;
 use webtrip_core::limits::{MAX_DEVICE_CHANNELS, RENDER_QUANTUM_FRAMES, WIRE_SAMPLE_RATE};
 use crate::audio::worklet::{create_worklet_node_with_flag, register_audio_worklet};
@@ -104,16 +104,17 @@ impl AudioConstraints {
 /// stream, and the AudioWorklet node that runs the portable processor.
 ///
 /// Most callers want `WebTripSession`, which creates, attaches and stops the
-/// engine for them. Use the engine directly only for audio with no session.
-#[wasm_bindgen]
+/// engine for them. Rust hosts may use the engine directly for audio with no
+/// session; it is not exported to JavaScript, which reaches audio only through
+/// `WebTripSession`.
 pub struct AudioEngine {
     ctx: AudioContext,
     worklet_node: Option<AudioWorkletNode>,
     source_node: Option<MediaStreamAudioSourceNode>,
     current_stream: Option<MediaStream>,
-    params: SharedPtr<AudioParams>,
-    local_to_network_buffer_ptr: *mut RingBuffer,
-    network_to_local_buffer_ptr: *mut Regulator,
+    params: AudioParamsHandle,
+    local_to_network_buffer_ptr: SharedPtr<RingBuffer>,
+    network_to_local_buffer_ptr: SharedPtr<Regulator>,
     /// `"stopped"` acknowledgements of nodes replaced by an output-device
     /// rebuild ([`reconfigure_for_sink`](Self::reconfigure_for_sink)), joined,
     /// that no caller has consumed yet. Those nodes read the same buffers as
@@ -151,28 +152,23 @@ fn context_options(sample_rate: Option<f32>) -> AudioContextOptions {
     options
 }
 
-#[wasm_bindgen]
 impl AudioEngine {
-    /// Create an engine with no network buffers. `params_addr` must come from
-    /// `createAudioParams()`; any other value is undefined behavior.
-    #[wasm_bindgen(js_name = create)]
-    pub async fn create(params_addr: usize) -> Result<AudioEngine, JsValue> {
-        Self::create_with_network(params_addr, std::ptr::null_mut(), std::ptr::null_mut()).await
+    /// Create an engine with no network buffers.
+    pub async fn create(params: AudioParamsHandle) -> Result<AudioEngine, JsValue> {
+        Self::create_with_network(params, SharedPtr::null(), SharedPtr::null()).await
     }
 
     /// Create an engine whose processor writes captured audio to the send
     /// `RingBuffer` at `local_to_network_buffer_ptr` and plays from the
     /// receive `Regulator` at `network_to_local_buffer_ptr` (either may be
-    /// null).
-    ///
-    /// `params_addr` must come from `createAudioParams()`, and each non-null
-    /// buffer must stay alive until the engine has stopped (`stopCapture()`
-    /// resolved `true`); otherwise the audio thread reads freed memory.
-    #[wasm_bindgen(js_name = createWithNetwork)]
+    /// null). Each non-null buffer must stay alive until the engine has
+    /// stopped (`stop_capture` resolved `true`), as the pointers' contract
+    /// ([`SharedPtr::new`]) requires; otherwise the audio thread reads freed
+    /// memory.
     pub async fn create_with_network(
-        params_addr: usize,
-        local_to_network_buffer_ptr: *mut RingBuffer,
-        network_to_local_buffer_ptr: *mut Regulator,
+        params: AudioParamsHandle,
+        local_to_network_buffer_ptr: SharedPtr<RingBuffer>,
+        network_to_local_buffer_ptr: SharedPtr<Regulator>,
     ) -> Result<AudioEngine, JsValue> {
         // Configure AudioContext with minimal latency, asking for the wire
         // rate so the browser resamples at the device edge when it can (no
@@ -203,10 +199,7 @@ impl AudioEngine {
             worklet_node: None,
             source_node: None,
             current_stream: None,
-            // SAFETY: `params_addr` is a wasm-bindgen boundary value from JS /
-            // the session. Callers pass the address from `create_audio_params`
-            // (a leaked `AudioParams` that outlives the engine).
-            params: unsafe { SharedPtr::from_addr(params_addr) },
+            params,
             local_to_network_buffer_ptr,
             network_to_local_buffer_ptr,
             superseded_stops: None,
@@ -217,26 +210,8 @@ impl AudioEngine {
     }
 
     /// Get the AudioContext sample rate
-    #[wasm_bindgen(js_name = getSampleRate)]
     pub fn get_sample_rate(&self) -> f32 {
         self.ctx.sample_rate()
-    }
-
-    /// Set the send `RingBuffer` the next worklet node writes to (null for
-    /// none). Takes effect when a node is next built (by `startCapture()` or
-    /// an output-device change), not on a running node. The buffer must
-    /// outlive every node built against it, as for `createWithNetwork`.
-    #[wasm_bindgen(js_name = setLocalToNetworkBuffer)]
-    pub fn set_local_to_network_buffer(&mut self, ptr: *mut RingBuffer) {
-        self.local_to_network_buffer_ptr = ptr;
-    }
-
-    /// Set the receive `Regulator` the next worklet node plays from (null for
-    /// none), with the same timing and lifetime rules as
-    /// `setLocalToNetworkBuffer`.
-    #[wasm_bindgen(js_name = setNetworkToLocalBuffer)]
-    pub fn set_network_to_local_buffer(&mut self, ptr: *mut Regulator) {
-        self.network_to_local_buffer_ptr = ptr;
     }
 
     /// Start audio capture from the specified input device
@@ -246,7 +221,6 @@ impl AudioEngine {
     /// `output_channels` channels (fewer when the destination supports fewer).
     /// A given `output_device_id` is routed before the worklet is connected,
     /// so playback never starts on the default output.
-    #[wasm_bindgen(js_name = startCapture)]
     pub async fn start_capture(
         &mut self,
         device_id: Option<String>,
@@ -354,7 +328,7 @@ impl AudioEngine {
         // called outside an active user-gesture context (which expires ~5 s after a tap).
         // Awaiting it would hang the entire connect flow. Instead we fire it as a background
         // task; the context will resume either immediately (iOS 16+ where getUserMedia acts as
-        // an implicit unlock) or on the next user interaction (older iOS via resumeCtx()).
+        // an implicit unlock) or on the next user interaction (older iOS via resume_ctx()).
         let resume_promise = self.ctx.resume()?;
         wasm_bindgen_futures::spawn_local(async move {
             let _ = JsFuture::from(resume_promise).await;
@@ -403,19 +377,9 @@ impl AudioEngine {
         input_channels: usize,
         output_channels: usize,
     ) -> Result<Option<web_sys::MessagePort>, JsValue> {
-        // Create processor with network support. `AudioEngine` stores raw
-        // buffer pointers (it is a `#[wasm_bindgen]` boundary type); wrap them
-        // in `SharedPtr` here so the processor and the flag read below go
-        // through the one audited deref.
-        let params = self
-            .params
-            .as_ref()
-            .ok_or_else(|| JsValue::from_str("AudioEngine requires a non-null AudioParams pointer"))?;
-        // SAFETY: both raw pointers were published by the session from buffers
-        // it owns; the session keeps those buffers alive until after the
-        // worklet (and therefore this processor) has stopped.
-        let local_to_network = unsafe { SharedPtr::new(self.local_to_network_buffer_ptr) };
-        let network_to_local = unsafe { SharedPtr::new(self.network_to_local_buffer_ptr) };
+        let params = self.params.get();
+        let local_to_network = self.local_to_network_buffer_ptr;
+        let network_to_local = self.network_to_local_buffer_ptr;
 
         let mut processor = if local_to_network.is_null() && network_to_local.is_null() {
             AudioProcessor::new(params)
@@ -503,14 +467,12 @@ impl AudioEngine {
 
     /// Whether the `AudioContext` is suspended (for example waiting for a user
     /// gesture).
-    #[wasm_bindgen(js_name = isSuspended)]
     pub fn is_suspended(&self) -> bool {
         audio_context_state(&self.ctx).as_deref() == Some("suspended")
     }
 
     /// Resume the `AudioContext`. Call it directly from a user-gesture handler
     /// so the browser allows audio output.
-    #[wasm_bindgen(js_name = resumeCtx)]
     pub async fn resume_ctx(&self) -> Result<(), JsValue> {
         resume_context(&self.ctx).await
     }
@@ -533,8 +495,7 @@ impl AudioEngine {
     ///
     /// This is terminal for the engine: a closed context cannot be restarted.
     /// Callers that only need to rebuild capture on the same context (e.g.
-    /// `startCapture()`) must use node teardown alone.
-    #[wasm_bindgen(js_name = stopCapture)]
+    /// [`start_capture`](Self::start_capture)) must use node teardown alone.
     pub async fn stop_capture(&mut self) -> bool {
         self.stop_capture_with_timeout(AUDIO_CONTEXT_CLOSE_TIMEOUT_MS)
             .await
@@ -589,8 +550,8 @@ impl AudioEngine {
     /// previous pointers are kept, matching the node that is still running.
     pub(crate) fn attach_network(
         &mut self,
-        local_to_network: *mut RingBuffer,
-        network_to_local: *mut Regulator,
+        local_to_network: SharedPtr<RingBuffer>,
+        network_to_local: SharedPtr<Regulator>,
     ) -> Result<Option<js_sys::Promise>, JsValue> {
         let previous = (self.local_to_network_buffer_ptr, self.network_to_local_buffer_ptr);
         self.local_to_network_buffer_ptr = local_to_network;
@@ -633,7 +594,6 @@ impl AudioEngine {
     }
 
     /// Check if audio is currently being captured
-    #[wasm_bindgen(js_name = isCapturing)]
     pub fn is_capturing(&self) -> bool {
         self.worklet_node.is_some()
     }
@@ -642,7 +602,6 @@ impl AudioEngine {
     /// capturing. The port carries only the stop handshake: the engine posts
     /// `"stop"` and the worklet replies `"stopped"` once it has stopped
     /// processing.
-    #[wasm_bindgen(js_name = getWorkletPort)]
     pub fn get_worklet_port(&self) -> Option<web_sys::MessagePort> {
         self.worklet_node.as_ref().and_then(|node| node.port().ok())
     }
@@ -652,7 +611,6 @@ impl AudioEngine {
     /// `maxChannelCount` and `MAX_DEVICE_CHANNELS` — see `configure_destination`).
     /// `None` until capture has started AND the worklet node has actually
     /// been built; always `>= 1` once known.
-    #[wasm_bindgen(js_name = outputChannels)]
     pub fn output_channels(&self) -> Option<u32> {
         (self.worklet_output_channels > 0).then_some(self.worklet_output_channels as u32)
     }
@@ -669,7 +627,6 @@ impl AudioEngine {
     ///
     /// # Arguments
     /// * `device_id` - The device ID from the output device selector, or empty string for default
-    #[wasm_bindgen(js_name = setOutputDevice)]
     pub async fn set_output_device(&mut self, device_id: Option<String>) -> Result<(), JsValue> {
         route_output_sink(self.ctx.as_ref(), device_id).await?;
         self.reconfigure_for_sink()
@@ -962,6 +919,8 @@ mod tests {
 
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;
+    #[cfg(target_arch = "wasm32")]
+    use webtrip_core::audio::params::create_audio_params;
 
     /// Build an `AudioEngine` in the browser harness.
     ///
@@ -970,8 +929,8 @@ mod tests {
     /// browser test bootstraps the same way instead of re-rolling the
     /// `AudioEngine::create(...).await.expect(...)` dance.
     #[cfg(target_arch = "wasm32")]
-    async fn create_engine(params: &AudioParams) -> AudioEngine {
-        AudioEngine::create(SharedPtr::from_ref(params).addr())
+    async fn create_engine() -> AudioEngine {
+        AudioEngine::create(create_audio_params())
             .await
             .expect("AudioEngine::create should succeed in the browser")
     }
@@ -1028,11 +987,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn engine_create_reports_plausible_sample_rate() {
-        // `create` stores the params pointer but `get_sample_rate` never
-        // dereferences it, so a stack `AudioParams` kept alive for the duration
-        // of the test is sufficient.
-        let params = AudioParams::default();
-        let engine = create_engine(&params).await;
+        let engine = create_engine().await;
 
         let sample_rate = engine.get_sample_rate();
         assert!(
@@ -1130,10 +1085,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn worklet_port_tracks_capture_lifecycle() {
-        // `start_capture` dereferences the params pointer, so `params` must
-        // outlive the engine — declare it first so it drops last.
-        let params = AudioParams::default();
-        let mut engine = create_engine(&params).await;
+        let mut engine = create_engine().await;
 
         assert!(
             !engine.is_capturing(),
@@ -1187,8 +1139,7 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn attach_network_replaces_the_node_and_acknowledges_the_old_one() {
-        let params = AudioParams::default();
-        let mut engine = create_engine(&params).await;
+        let mut engine = create_engine().await;
         engine
             .start_capture(None, None, false, false, false, 2, 2)
             .await
@@ -1196,10 +1147,10 @@ mod tests {
         let widths = (engine.worklet_input_channels, engine.worklet_output_channels);
 
         // No network yet, so this first replacement is of a network-less node.
-        let mut ring = RingBuffer::new();
-        let mut regulator = Regulator::new();
+        let ring = SharedPtr::from_static(Box::leak(Box::new(RingBuffer::new())));
+        let regulator = SharedPtr::from_static(Box::leak(Box::new(Regulator::new())));
         let first = engine
-            .attach_network(&mut ring as *mut RingBuffer, &mut regulator as *mut Regulator)
+            .attach_network(ring, regulator)
             .expect("attaching a connection should rebuild the node")
             .expect("a running node must be replaced, and so acknowledged");
         let stopped = await_with_timeout(first, 2000).await;
@@ -1212,14 +1163,14 @@ mod tests {
 
         // Detaching rebuilds again, at the same widths, against no buffers.
         let second = engine
-            .attach_network(std::ptr::null_mut(), std::ptr::null_mut())
+            .attach_network(SharedPtr::null(), SharedPtr::null())
             .expect("detaching should rebuild the node")
             .expect("the network-attached node must be acknowledged on replacement");
         assert!(matches!(await_with_timeout(second, 2000).await, TimeoutRace::Fulfilled));
 
         // Without a running node there is nothing to rebuild or acknowledge.
         engine.stop_capture().await;
-        assert!(engine.attach_network(std::ptr::null_mut(), std::ptr::null_mut()).unwrap().is_none());
+        assert!(engine.attach_network(SharedPtr::null(), SharedPtr::null()).unwrap().is_none());
         close_engine(engine).await;
     }
 
@@ -1230,21 +1181,21 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     async fn failed_attach_network_keeps_the_previous_buffer_pointers() {
-        let params = AudioParams::default();
-        let mut engine = create_engine(&params).await;
+        let mut engine = create_engine().await;
         engine
             .start_capture(None, None, false, false, false, 2, 2)
             .await
             .expect("start_capture should resolve with the fake-device flags");
 
-        let valid_params = engine.params;
-        // SAFETY: a null address makes the rebuild's params lookup fail; it is
-        // restored before the engine is used again.
-        engine.params = unsafe { SharedPtr::from_addr(0) };
-        let mut ring = RingBuffer::new();
-        let mut regulator = Regulator::new();
-        let result = engine.attach_network(&mut ring as *mut RingBuffer, &mut regulator as *mut Regulator);
-        engine.params = valid_params;
+        // A regulator at a rate other than the wire's makes the processor
+        // refuse the rebuild (`MixError::RegulatorRate`), whatever rate the
+        // context runs at.
+        let ring = SharedPtr::from_static(Box::leak(Box::new(RingBuffer::new())));
+        let regulator = SharedPtr::from_static(Box::leak(Box::new(
+            Regulator::with_params(1, 64, 44_100, 5.0)
+                .with_callback_capacity(webtrip_core::limits::MAX_WIRE_FRAMES_PER_CALLBACK),
+        )));
+        let result = engine.attach_network(ring, regulator);
 
         assert!(result.is_err(), "the rebuild was made to fail");
         assert!(engine.is_capturing(), "the old node keeps running");
@@ -1274,8 +1225,7 @@ mod tests {
         use wasm_bindgen::closure::Closure;
 
         for after_sink in [false, true] {
-            let params = AudioParams::default();
-            let mut engine = create_engine(&params).await;
+            let mut engine = create_engine().await;
             let cancelled = Arc::new(AtomicBool::new(!after_sink));
             let flag = cancelled.clone();
             let stub = Closure::wrap(Box::new(move |_id: JsValue| -> js_sys::Promise {
@@ -1324,8 +1274,7 @@ mod tests {
     async fn stop_capture_returns_when_close_hangs() {
         use wasm_bindgen::closure::Closure;
 
-        let params = AudioParams::default();
-        let mut engine = create_engine(&params).await;
+        let mut engine = create_engine().await;
         let ctx = engine.context();
         let original_close = js_sys::Reflect::get(ctx.as_ref(), &"close".into())
             .expect("AudioContext must expose close");
@@ -1404,39 +1353,38 @@ mod tests {
         assert_eq!(audio_context_state(&ctx).as_deref(), Some("closed"));
     }
 
-    /// Wiring buffer pointers via the setters must route a later `start_capture`
+    /// Buffers attached before capture starts must route `start_capture`
     /// through the *networked* processor branch.
     ///
     /// An engine built with `create` starts with null buffer pointers;
-    /// `set_local_to_network_buffer` / `set_network_to_local_buffer` install
-    /// real buffers after the fact, so `start_capture` takes the
-    /// `AudioProcessor::with_network` branch and hands the worklet the ring
-    /// buffer's has-data flag.
+    /// `attach_network` with no node running only stores the buffers, so
+    /// `start_capture` takes the `AudioProcessor::with_network` branch and
+    /// hands the worklet the ring buffer's has-data flag.
     ///
     /// To prove the networked branch was actually taken (and not just that
     /// capture came up — `is_capturing` / `get_worklet_port` are identical on
     /// both branches), we assert a **network-only side effect**: with streaming
     /// enabled, the running worklet's networked send path writes the captured
-    /// fake-device tone into the very ring buffer wired via the setter, so
+    /// fake-device tone into the very ring buffer attached, so
     /// `samples_written` climbs above zero. The non-network processor
     /// (`AudioProcessor::new`) holds no ring buffer and could never produce this
-    /// write, so a non-zero count is unique to the networked path fed by the
-    /// setters.
+    /// write, so a non-zero count is unique to the networked path.
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
-    async fn buffer_setters_feed_capture_path() {
+    async fn attached_buffers_feed_capture_path() {
         use crate::test_support::wait_until;
 
-        // All three backing allocations must outlive the engine, which holds raw
-        // pointers into them — declare them before the engine so they drop last.
-        let params = AudioParams::default();
-        let mut ring = RingBuffer::new();
+        let ring: &'static RingBuffer = Box::leak(Box::new(RingBuffer::new()));
         // Sized like the session's: the context may not run at the wire rate.
-        let mut regulator = Regulator::new().with_callback_capacity(webtrip_core::limits::MAX_WIRE_FRAMES_PER_CALLBACK);
-        let mut engine = create_engine(&params).await;
+        let regulator: &'static Regulator = Box::leak(Box::new(
+            Regulator::new().with_callback_capacity(webtrip_core::limits::MAX_WIRE_FRAMES_PER_CALLBACK),
+        ));
+        let mut engine = create_engine().await;
 
-        engine.set_local_to_network_buffer(&mut ring as *mut RingBuffer);
-        engine.set_network_to_local_buffer(&mut regulator as *mut Regulator);
+        let stored = engine
+            .attach_network(SharedPtr::from_static(ring), SharedPtr::from_static(regulator))
+            .expect("storing buffers with no node running cannot fail");
+        assert!(stored.is_none(), "with no node running there is nothing to acknowledge");
 
         // The networked send path is a no-op unless the ring buffer is
         // streaming, so enable it before the worklet starts producing.
@@ -1473,7 +1421,7 @@ mod tests {
         assert!(
             wrote_to_ring,
             "the networked worklet must write captured audio into the ring buffer \
-             wired via set_local_to_network_buffer (samples_written stayed 0)"
+             attached via attach_network (samples_written stayed 0)"
         );
 
         assert!(

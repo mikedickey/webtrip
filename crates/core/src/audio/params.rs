@@ -2,8 +2,6 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-use crate::stream::shared_ptr::SharedPtr;
-
 /// Minimum dB level (silence threshold)
 pub const MIN_DB: f32 = -60.0;
 /// Maximum dB level (clipping)
@@ -28,9 +26,12 @@ fn db_to_percent(db: f32) -> f32 {
 /// stored in fixed point: dB to 0.01 dB, volumes to 0.001.
 ///
 /// In Rust, create one with [`Default`] (unity gain, full output, monitor off)
-/// and give the processor a `&'static` to it, e.g. `Box::leak(Box::default())`.
-/// JavaScript callers get its address from `createAudioParams()`.
-#[cfg_attr(feature = "wasm", wasm_bindgen)]
+/// and give the processor a `&'static` to it, e.g. `Box::leak(Box::default())`,
+/// or call [`create_audio_params`], which does that and returns an
+/// [`AudioParamsHandle`]. JavaScript callers get the handle from
+/// `createAudioParams()` and use its methods, which mirror these. The JavaScript
+/// class named `AudioParams` is that handle, not this struct, which has no
+/// JavaScript binding.
 pub struct AudioParams {
     /// Current dB level (stored as (db - MIN_DB) * 100 for fixed-point)
     pub(crate) db_level: AtomicI32,
@@ -63,186 +64,135 @@ impl Default for AudioParams {
     }
 }
 
-#[cfg_attr(feature = "wasm", wasm_bindgen)]
-impl AudioParams {
+/// A handle to an [`AudioParams`] that lives for the rest of the program.
+///
+/// Exported to JavaScript and TypeScript as the class `AudioParams` (the Rust
+/// struct of that name is not exported), so `new WebTripSession(params)` takes
+/// "an `AudioParams`" there and an `AudioParamsHandle` here.
+///
+/// [`create_audio_params`] (`createAudioParams()` in JavaScript) returns one.
+/// Pass it to `new WebTripSession(..)`, and read and write the parameters
+/// through its methods, which mirror [`AudioParams`]'s. The parameters are
+/// never freed, so a handle, and every copy of it, stays valid: JavaScript's
+/// `free()` releases only the handle object.
+#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = AudioParams))]
+#[derive(Clone, Copy)]
+pub struct AudioParamsHandle {
+    params: &'static AudioParams,
+}
+
+impl AudioParamsHandle {
+    /// A handle to `params`.
+    pub fn new(params: &'static AudioParams) -> Self {
+        Self { params }
+    }
+
+    /// The parameters themselves, as an
+    /// [`AudioProcessor`](crate::audio::processor::AudioProcessor) takes them.
+    pub fn get(self) -> &'static AudioParams {
+        self.params
+    }
+}
+
+/// Defines each [`AudioParams`] method once and, from the same definition, the
+/// JavaScript method of the same name on [`AudioParamsHandle`] that forwards to
+/// it. A new parameter, or a changed doc range, is edited here and nowhere else.
+macro_rules! audio_param_methods {
+    ($(
+        $(#[$doc:meta])*
+        $js_name:ident => fn $name:ident($self_:ident $(, $arg:ident: $ty:ty)*) $(-> $ret:ty)? $body:block
+    )*) => {
+        impl AudioParams {
+            $(
+                $(#[$doc])*
+                pub fn $name(&$self_ $(, $arg: $ty)*) $(-> $ret)? $body
+            )*
+        }
+
+        /// The JavaScript surface of the handle: each method is the
+        /// [`AudioParams`] method of the same name.
+        #[cfg(feature = "wasm")]
+        #[wasm_bindgen(js_class = "AudioParams")]
+        impl AudioParamsHandle {
+            $(
+                $(#[$doc])*
+                #[wasm_bindgen(js_name = $js_name)]
+                pub fn $name(&self $(, $arg: $ty)*) $(-> $ret)? {
+                    self.params.$name($($arg),*)
+                }
+            )*
+        }
+    };
+}
+
+audio_param_methods! {
     /// Get the current dB level (-60.0 to 0.0)
-    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getDbLevel))]
-    pub fn get_db_level(&self) -> f32 {
+    getDbLevel => fn get_db_level(self) -> f32 {
         decode_db(self.db_level.load(Ordering::Relaxed))
     }
 
     /// Get the peak dB level (-60.0 to 0.0)
-    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getPeakDbLevel))]
-    pub fn get_peak_db_level(&self) -> f32 {
+    getPeakDbLevel => fn get_peak_db_level(self) -> f32 {
         decode_db(self.peak_db_level.load(Ordering::Relaxed))
     }
 
     /// Get the current volume level as a percentage (0.0 to 100.0)
     /// Maps -60dB to 0% and 0dB to 100%
-    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getVolumeLevel))]
-    pub fn get_volume_level(&self) -> f32 {
+    getVolumeLevel => fn get_volume_level(self) -> f32 {
         db_to_percent(self.get_db_level())
     }
 
     /// Get the peak level as a percentage (0.0 to 100.0)
-    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getPeakLevel))]
-    pub fn get_peak_level(&self) -> f32 {
+    getPeakLevel => fn get_peak_level(self) -> f32 {
         db_to_percent(self.get_peak_db_level())
     }
 
     /// Set monitor volume (0.0 to 1.0)
-    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setMonitorVolume))]
-    pub fn set_monitor_volume(&self, volume: f32) {
+    setMonitorVolume => fn set_monitor_volume(self, volume: f32) {
         self.monitor_volume.store(encode_volume(volume.clamp(0.0, 1.0)), Ordering::Relaxed);
     }
 
     /// Get monitor volume (0.0 to 1.0)
-    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getMonitorVolume))]
-    pub fn get_monitor_volume(&self) -> f32 {
+    getMonitorVolume => fn get_monitor_volume(self) -> f32 {
         decode_volume(self.monitor_volume.load(Ordering::Relaxed))
     }
 
     /// Get the total number of audio callbacks processed so far
-    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getCallbackCount))]
-    pub fn get_callback_count(&self) -> u64 {
+    getCallbackCount => fn get_callback_count(self) -> u64 {
         self.callback_count.load(Ordering::Relaxed)
     }
 
     /// Set input gain in dB (-20.0 to +20.0)
-    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setInputGain))]
-    pub fn set_input_gain(&self, gain_db: f32) {
+    setInputGain => fn set_input_gain(self, gain_db: f32) {
         let clamped = gain_db.clamp(-20.0, 20.0);
         self.input_gain_db.store((clamped * 100.0) as i32, Ordering::Relaxed);
     }
 
     /// Get input gain in dB
-    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getInputGain))]
-    pub fn get_input_gain(&self) -> f32 {
+    getInputGain => fn get_input_gain(self) -> f32 {
         self.input_gain_db.load(Ordering::Relaxed) as f32 / 100.0
     }
 
     /// Set output volume (0.0 to 1.0)
-    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setOutputVolume))]
-    pub fn set_output_volume(&self, volume: f32) {
+    setOutputVolume => fn set_output_volume(self, volume: f32) {
         self.output_volume.store(encode_volume(volume.clamp(0.0, 1.0)), Ordering::Relaxed);
     }
 
     /// Get output volume (0.0 to 1.0)
-    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getOutputVolume))]
-    pub fn get_output_volume(&self) -> f32 {
+    getOutputVolume => fn get_output_volume(self) -> f32 {
         decode_volume(self.output_volume.load(Ordering::Relaxed))
     }
 }
 
-// ==============================================================================
-// Pointer-based helper functions for cross-thread access
-// ==============================================================================
-
-/// Create a new set of shared audio controls and meters, and return its
-/// address.
+/// Create a new set of shared audio controls and meters that is never freed,
+/// and return a handle to it.
 ///
-/// Pass the address to `new WebTripSession(...)` and to the `*FromPtr`
-/// accessors. Create it once per page (or audio engine): it is never freed,
-/// so the address stays valid on every thread that holds it.
-// Consumers rebuild a `SharedPtr` with `SharedPtr::from_addr`; see the
-// `// SAFETY:` comment in `with_params`.
+/// Pass the handle to `new WebTripSession(...)`. Create it once per page (or
+/// audio engine): sessions may share it, and because the parameters are never
+/// freed the handle stays valid on every thread that holds it.
 #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = createAudioParams))]
-pub fn create_audio_params() -> usize {
-    SharedPtr::from_ref(Box::leak(Box::<AudioParams>::default())).addr()
-}
-
-/// Run `f` against the [`AudioParams`] at `addr`, returning `fallback` when the
-/// address is null.
-///
-/// Every exported `*FromPtr` accessor funnels through here, so the null guard
-/// and the deref are [`SharedPtr::as_ref`]'s rather than copy-pasted per
-/// accessor. All `AudioParams` methods take `&self` (state is atomic interior
-/// mutability), so setters pass a `()` fallback and mutate through the shared
-/// reference.
-fn with_params<R>(addr: usize, fallback: R, f: impl FnOnce(&AudioParams) -> R) -> R {
-    // SAFETY: `addr` is a wasm-bindgen boundary value from JS. Null falls
-    // through `as_ref` to `fallback`. Non-null addresses must be ones
-    // previously returned by [`create_audio_params`] (a leaked `AudioParams`
-    // that outlives every agent holding the integer).
-    let params = unsafe { SharedPtr::<AudioParams>::from_addr(addr) };
-    params.as_ref().map_or(fallback, f)
-}
-
-/// Get volume level from params pointer (0.0 to 100.0)
-#[doc(hidden)]
-#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getVolumeLevelFromPtr))]
-pub fn get_volume_level_from_ptr(ptr: usize) -> f32 {
-    with_params(ptr, 0.0, |p| p.get_volume_level())
-}
-
-/// Get dB level from params pointer (-60.0 to 0.0)
-#[doc(hidden)]
-#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getDbLevelFromPtr))]
-pub fn get_db_level_from_ptr(ptr: usize) -> f32 {
-    with_params(ptr, -60.0, |p| p.get_db_level())
-}
-
-/// Get peak level from params pointer (0.0 to 100.0)
-#[doc(hidden)]
-#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getPeakLevelFromPtr))]
-pub fn get_peak_level_from_ptr(ptr: usize) -> f32 {
-    with_params(ptr, 0.0, |p| p.get_peak_level())
-}
-
-/// Get peak dB level from params pointer (-60.0 to 0.0)
-#[doc(hidden)]
-#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getPeakDbLevelFromPtr))]
-pub fn get_peak_db_level_from_ptr(ptr: usize) -> f32 {
-    with_params(ptr, -60.0, |p| p.get_peak_db_level())
-}
-
-/// Set monitor volume from params pointer (0.0 to 1.0)
-#[doc(hidden)]
-#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setMonitorVolumeFromPtr))]
-pub fn set_monitor_volume_from_ptr(ptr: usize, volume: f32) {
-    with_params(ptr, (), |p| p.set_monitor_volume(volume));
-}
-
-/// Get monitor volume from params pointer (0.0 to 1.0)
-#[doc(hidden)]
-#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getMonitorVolumeFromPtr))]
-pub fn get_monitor_volume_from_ptr(ptr: usize) -> f32 {
-    with_params(ptr, 0.0, |p| p.get_monitor_volume())
-}
-
-/// Set input gain from params pointer (-20.0 to +20.0 dB)
-#[doc(hidden)]
-#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setInputGainFromPtr))]
-pub fn set_input_gain_from_ptr(ptr: usize, gain_db: f32) {
-    with_params(ptr, (), |p| p.set_input_gain(gain_db));
-}
-
-/// Get input gain from params pointer (dB)
-#[doc(hidden)]
-#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getInputGainFromPtr))]
-pub fn get_input_gain_from_ptr(ptr: usize) -> f32 {
-    with_params(ptr, 0.0, |p| p.get_input_gain())
-}
-
-/// Set output volume from params pointer (0.0 to 1.0)
-#[doc(hidden)]
-#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = setOutputVolumeFromPtr))]
-pub fn set_output_volume_from_ptr(ptr: usize, volume: f32) {
-    with_params(ptr, (), |p| p.set_output_volume(volume));
-}
-
-/// Get output volume from params pointer (0.0 to 1.0)
-#[doc(hidden)]
-#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getOutputVolumeFromPtr))]
-pub fn get_output_volume_from_ptr(ptr: usize) -> f32 {
-    with_params(ptr, 1.0, |p| p.get_output_volume())
-}
-
-/// Get callback count from params pointer
-#[doc(hidden)]
-#[cfg_attr(feature = "wasm", wasm_bindgen(js_name = getCallbackCountFromPtr))]
-pub fn get_callback_count_from_ptr(ptr: usize) -> u64 {
-    with_params(ptr, 0, |p| p.get_callback_count())
+pub fn create_audio_params() -> AudioParamsHandle {
+    AudioParamsHandle::new(Box::leak(Box::default()))
 }
 
 // ==============================================================================
@@ -348,55 +298,6 @@ mod tests {
         p.peak_db_level.store(encode_db(-80.0), Ordering::Relaxed);
         assert!((p.get_volume_level() - 0.0).abs() < EPS);
         assert!((p.get_peak_level() - 0.0).abs() < EPS);
-    }
-
-    #[test]
-    fn test_pointer_helpers_roundtrip() {
-        // `create_audio_params` leaks a 'static AudioParams and returns its address;
-        // the *_from_ptr helpers are how JS threads read/write the shared state.
-        let ptr = create_audio_params();
-        assert_ne!(ptr, 0);
-
-        // Defaults observed through the pointer.
-        assert!((get_db_level_from_ptr(ptr) - MIN_DB).abs() < EPS);
-        assert!((get_peak_db_level_from_ptr(ptr) - MIN_DB).abs() < EPS);
-        assert!((get_volume_level_from_ptr(ptr) - 0.0).abs() < EPS);
-        assert!((get_peak_level_from_ptr(ptr) - 0.0).abs() < EPS);
-        assert!((get_monitor_volume_from_ptr(ptr) - 0.0).abs() < EPS);
-        assert!((get_input_gain_from_ptr(ptr) - 0.0).abs() < EPS);
-        assert!((get_output_volume_from_ptr(ptr) - 1.0).abs() < EPS);
-        assert_eq!(get_callback_count_from_ptr(ptr), 0);
-
-        // Writes through the pointer are observed through the pointer.
-        set_monitor_volume_from_ptr(ptr, 0.5);
-        set_input_gain_from_ptr(ptr, -6.0);
-        set_output_volume_from_ptr(ptr, 0.25);
-        assert!((get_monitor_volume_from_ptr(ptr) - 0.5).abs() < EPS);
-        assert!((get_input_gain_from_ptr(ptr) - (-6.0)).abs() < EPS);
-        assert!((get_output_volume_from_ptr(ptr) - 0.25).abs() < EPS);
-
-        // Reclaim the leaked allocation so the test itself does not leak.
-        unsafe {
-            drop(Box::from_raw(ptr as *mut AudioParams));
-        }
-    }
-
-    #[test]
-    fn test_pointer_helpers_null_safe() {
-        // Every helper must tolerate a null pointer and return its documented fallback.
-        let null = SharedPtr::<AudioParams>::null().addr();
-        assert!((get_db_level_from_ptr(null) - (-60.0)).abs() < EPS);
-        assert!((get_peak_db_level_from_ptr(null) - (-60.0)).abs() < EPS);
-        assert!((get_volume_level_from_ptr(null) - 0.0).abs() < EPS);
-        assert!((get_peak_level_from_ptr(null) - 0.0).abs() < EPS);
-        assert!((get_monitor_volume_from_ptr(null) - 0.0).abs() < EPS);
-        assert!((get_input_gain_from_ptr(null) - 0.0).abs() < EPS);
-        assert!((get_output_volume_from_ptr(null) - 1.0).abs() < EPS);
-        assert_eq!(get_callback_count_from_ptr(null), 0);
-        // Setters on null are no-ops and must not panic / segfault.
-        set_monitor_volume_from_ptr(null, 0.5);
-        set_input_gain_from_ptr(null, 3.0);
-        set_output_volume_from_ptr(null, 0.5);
     }
 }
 

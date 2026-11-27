@@ -94,7 +94,8 @@ await webtrip.default(); // instantiate the WASM module (once per page)
 webtrip.init();          // install the panic hook
 
 // Shared audio parameters (volume, gain, meters) live in WASM memory so the
-// AudioWorklet can read them; the session takes their address.
+// AudioWorklet can read them; the session shares them. Never freed, so
+// create them once per page.
 const params = webtrip.createAudioParams();
 const session = new webtrip.WebTripSession(params);
 

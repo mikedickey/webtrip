@@ -5,10 +5,10 @@
 // loading the local build keeps the demo on the current source. Routing the specifier through
 // a variable keeps TypeScript and Vite from resolving it at build time; types
 // come from the wasm-pack-generated declarations instead.
-import type { DeviceInfo, WebTripSession } from "../../../pkg/webtrip";
+import type { AudioParams, DeviceInfo, WebTripSession } from "../../../pkg/webtrip";
 
 export type WebtripModule = typeof import("../../../pkg/webtrip");
-export type { DeviceInfo, WebTripSession };
+export type { AudioParams, DeviceInfo, WebTripSession };
 
 export interface AudioDevices {
   inputDevices: DeviceInfo[];
@@ -26,7 +26,8 @@ export type SessionState =
 
 export interface DemoEngine {
   m: WebtripModule;
-  paramsPtr: number;
+  /** The shared controls and meters (never freed; see getDemoEngine). */
+  params: AudioParams;
   session: WebTripSession;
 }
 
@@ -63,8 +64,8 @@ export function getDemoEngine(): Promise<DemoEngine> {
   enginePromise ??= (async () => {
     try {
       const m = await getWebtripModule();
-      const paramsPtr = m.createAudioParams();
-      return { m, paramsPtr, session: new m.WebTripSession(paramsPtr) };
+      const params = m.createAudioParams();
+      return { m, params, session: new m.WebTripSession(params) };
     } catch (error) {
       // Don't cache a rejected promise: a transient failure (e.g. fetching
       // /pkg/webtrip.js) would otherwise poison every future load attempt.

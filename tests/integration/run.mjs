@@ -163,8 +163,8 @@ async function inPageDrive({ transportName, host, port, connectTimeoutMs, sendPo
     return { skipped: true, reason: "WebTransport unavailable in this browser" };
   }
 
-  const ptr = m.createAudioParams();
-  const session = new m.WebTripSession(ptr);
+  const params = m.createAudioParams();
+  const session = new m.WebTripSession(params);
   session.setTransportType(tt);
 
   // Race the connect against a timeout, clearing the timer on settle so the

@@ -39,7 +39,6 @@ flowchart TB
         PROC["<b>AudioProcessor</b><br/>Rust DSP engine (webtrip-core:<br/>audio/processor.rs)<br/>Real-time processing on<br/>128-sample buffers<br/>Writes captured audio to<br/>the ring buffer<br/>Reads remote audio from the<br/>Regulator (jitter buffer)<br/>Volume metering (RMS → dB)<br/>Peak tracking with hold<br/>and decay<br/>Input gain, output mixing"]
     end
     UI -->|JS bindings| SESSION
-    UI --> ENGINE
     UI -->|volumes, meters| PARAMS
     SESSION -->|stream buffers| PROC
     ENGINE -->|creates node| BRIDGE

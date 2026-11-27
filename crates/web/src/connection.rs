@@ -16,6 +16,7 @@ use webtrip_core::network::transport::{Transport, TransportType};
 use webtrip_core::session_stats::{build_connection_stats, ConnectionStats};
 use webtrip_core::stream::regulator::Regulator;
 use webtrip_core::stream::ring_buffer::RingBuffer;
+use webtrip_core::stream::shared_ptr::SharedPtr;
 
 /// The published transport, shared with the audio-callback tick closure.
 pub(crate) type TransportSlot = Rc<RefCell<Option<Box<dyn Transport>>>>;
@@ -26,8 +27,8 @@ const REGULATOR_TOLERANCE_MS: f64 = -500.0;
 
 /// The buffers one connection moves audio through: the send ring (worklet →
 /// network) and the regulator (network → worklet). Both are shared with other
-/// agents through raw pointers (the worklet, and for WebTransport its worker),
-/// so they are boxed: their addresses must not move.
+/// agents through [`SharedPtr`]s (the worklet, and for WebTransport its
+/// worker), so they are boxed: their addresses must not move.
 pub(crate) struct StreamBuffers {
     pub(crate) ring: Box<RingBuffer>,
     pub(crate) regulator: Box<Regulator>,
@@ -47,12 +48,32 @@ impl StreamBuffers {
         Self { ring, regulator }
     }
 
-    pub(crate) fn ring_ptr(&self) -> *mut RingBuffer {
-        std::ptr::from_ref::<RingBuffer>(&self.ring).cast_mut()
+    /// The send ring, as the worklet and the transport reach it.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer carries no lifetime: it is valid only while these
+    /// buffers are alive, and [`SharedPtr::as_ref`] is safe. The caller must
+    /// hand it only to agents that stop using it before the buffers are freed.
+    /// That is the retirement protocol in the module docs: buffers of an ended
+    /// connection go to the `RetiredList` and are freed only once every
+    /// worklet node or worker that held the pointer has stopped.
+    pub(crate) unsafe fn ring_ptr(&self) -> SharedPtr<RingBuffer> {
+        // SAFETY: the box keeps the ring at a fixed address, and the caller
+        // guarantees the buffers outlive every holder. They are only ever
+        // reached as shared references, their mutable state being atomics and
+        // `UnsafeCell`.
+        unsafe { SharedPtr::new(std::ptr::from_ref::<RingBuffer>(&self.ring).cast_mut()) }
     }
 
-    pub(crate) fn regulator_ptr(&self) -> *mut Regulator {
-        std::ptr::from_ref::<Regulator>(&self.regulator).cast_mut()
+    /// The receive regulator, as the worklet and the transport reach it.
+    ///
+    /// # Safety
+    ///
+    /// As for [`ring_ptr`](Self::ring_ptr).
+    pub(crate) unsafe fn regulator_ptr(&self) -> SharedPtr<Regulator> {
+        // SAFETY: as for `ring_ptr`.
+        unsafe { SharedPtr::new(std::ptr::from_ref::<Regulator>(&self.regulator).cast_mut()) }
     }
 
     pub(crate) fn stats(&self) -> ConnectionStats {
