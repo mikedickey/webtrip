@@ -39,8 +39,8 @@ js-sys = "0.3.83"
 wasm-bindgen = "0.2.106"
 wasm-bindgen-futures = "0.4.56"
 
-webtrip-core = { path = "../core", version = "0.2.2", features = ["wasm"] }
-webtrip-api = { path = "../api", version = "0.2.2", features = ["wasm"] }
+webtrip-core = { path = "../core", version = "0.2.3", features = ["wasm"] }
+webtrip-api = { path = "../api", version = "0.2.3", features = ["wasm"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde-wasm-bindgen = "0.6"

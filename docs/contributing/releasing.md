@@ -9,7 +9,7 @@ Pushing a `vX.Y.Z` tag runs [`.github/workflows/release.yml`](../../.github/work
 
 ## Cutting a release
 
-1. Bump `version` under `[workspace.package]` in `Cargo.toml`. Also bump the `version = "…"` on the path dependencies in `crates/web/Cargo.toml` and `crates/webtrip/Cargo.toml`.
+1. Run `scripts/bump-version.sh X.Y.Z`. It sets `version` under `[workspace.package]` in `Cargo.toml` and on the path dependencies between the crates, and updates `Cargo.lock`.
 2. Optionally run `npm run publish:crates -- --dry-run`, which packages and verifies all four crates without uploading, and `npm run build:wasm && npm publish ./pkg --dry-run` to check the npm package.
 3. Merge to `main` and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. You don't need to wait for main CI, because the release waits for its image.
 
