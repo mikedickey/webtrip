@@ -22,7 +22,7 @@ const FEATURES = [
 const USE_CASES = [
   {
     title: "Online gaming",
-    body: "Shaving over 100 ms off every callout makes a huge difference when a team is coordinating. Everyone reacts to the same moment, not one that has already passed.",
+    body: "In a fast-moving match, a callout that arrives late is already wrong. Cutting over 100 ms of delay means your team hears it while it still matters, and everyone moves together.",
   },
   {
     title: "AI voice",
@@ -34,7 +34,7 @@ const USE_CASES = [
   },
   {
     title: "Natural conversations",
-    body: "Tone, inflection, pauses — the cues that carry meaning beyond words — are exactly what lossy compression flattens. And when the round trip is short, turn-taking just works: no talking over each other, no awkward gaps.",
+    body: "Tone, inflection and pauses carry meaning that lossy compression flattens. Timing matters just as much: with a short round trip, nobody talks over each other, and laughter arrives with the punchline, not a beat after.",
   },
   {
     title: "Therapy & guided meditation",

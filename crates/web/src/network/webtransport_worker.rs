@@ -46,6 +46,38 @@ use webtrip_core::network::transport::fit_send_fpp;
 use webtrip_core::network::transport::HIGH_RATE_WARN_INTERVAL;
 use webtrip_core::network::transport::deliver_received_packet;
 
+/// Datagrams the browser may queue for the receive loop before it drops new
+/// arrivals (`WebTransportDatagramDuplexStream.incomingMaxBufferedDatagrams`,
+/// formerly `incomingHighWaterMark`; see [`set_incoming_datagram_queue`]).
+///
+/// The receive loop takes one datagram per awaited `read()`, sharing the
+/// worker's event loop with the send loop, so datagrams that land while it is
+/// busy wait in the browser's queue. Left at the browser's small default, that
+/// queue overflowed often enough to lose ~18% of a 375 packet/s stream: the
+/// server's QUIC stack saw every datagram acknowledged, but each lost one left a
+/// single-packet gap at the regulator. 64 packets is ~170 ms at 128 frames/48 kHz:
+/// it absorbs a stalled worker without adding latency, since the queue is
+/// drained as fast as datagrams arrive.
+const INCOMING_DATAGRAM_HIGH_WATER_MARK: f64 = 64.0;
+
+/// Raise the browser's incoming datagram queue to [`INCOMING_DATAGRAM_HIGH_WATER_MARK`].
+///
+/// The spec renamed `incomingHighWaterMark` to `incomingMaxBufferedDatagrams`.
+/// Firefox 160 removed the old name (assigning it is a silent no-op there) while
+/// Chromium still ships only the old one, so set whichever the browser exposes.
+/// `web-sys` binds only the old name, hence the reflective access.
+fn set_incoming_datagram_queue(datagrams: &web_sys::WebTransportDatagramDuplexStream) {
+    let target: &JsValue = datagrams.as_ref();
+    let name = if Reflect::has(target, &"incomingMaxBufferedDatagrams".into()).unwrap_or(false) {
+        "incomingMaxBufferedDatagrams"
+    } else {
+        "incomingHighWaterMark"
+    };
+    if let Err(e) = Reflect::set(target, &name.into(), &INCOMING_DATAGRAM_HIGH_WATER_MARK.into()) {
+        web_sys::console::warn_1(&format!("[WebTransport Worker] could not set {name}: {e:?}").into());
+    }
+}
+
 /// Number of interleaved samples in one outgoing audio packet for the given
 /// buffer size (samples per channel) and channel count.
 ///
@@ -580,7 +612,9 @@ async fn connect_and_spawn_loops(server_url: String) -> Result<(), JsValue> {
     // posts "connected", so the value is there when the session publishes the
     // transport). A channel count that cannot fit even `MIN_FPP` fails the
     // connect loudly instead of dropping every packet.
-    let max_datagram_size = transport.datagrams().max_datagram_size() as usize;
+    let datagrams = transport.datagrams();
+    set_incoming_datagram_queue(&datagrams);
+    let max_datagram_size = datagrams.max_datagram_size() as usize;
     let (preferred_fpp, send_channels) = WORKER_STATE.with(|state| {
         let state = state.borrow();
         (state.buffer_size, state.send_channels)
