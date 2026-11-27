@@ -78,6 +78,23 @@ fn set_incoming_datagram_queue(datagrams: &web_sys::WebTransportDatagramDuplexSt
     }
 }
 
+/// Open the writer for outgoing datagrams.
+///
+/// The spec replaced the `datagrams.writable` attribute with
+/// `datagrams.createWritable()`. Safari ships only the method, and some
+/// browsers only the attribute, so use whichever is there. `web-sys` binds only
+/// the attribute, hence the reflective access.
+fn datagram_writer(
+    datagrams: &web_sys::WebTransportDatagramDuplexStream,
+) -> Result<web_sys::WritableStreamDefaultWriter, JsValue> {
+    let create = Reflect::get(datagrams.as_ref(), &"createWritable".into())?;
+    let writable: web_sys::WritableStream = match create.dyn_ref::<js_sys::Function>() {
+        Some(create) => create.call0(datagrams.as_ref())?.unchecked_into(),
+        None => datagrams.writable(),
+    };
+    writable.get_writer()
+}
+
 /// Number of interleaved samples in one outgoing audio packet for the given
 /// buffer size (samples per channel) and channel count.
 ///
@@ -224,16 +241,16 @@ fn post_error_to_main(msg: &str) {
     post_message_to_main(&obj.into());
 }
 
-/// Stop the worker and notify the main thread that the connection was lost.
+/// Stop the worker and notify the main thread that the connection failed.
 ///
-/// Shared by the send and receive loops' connection-error branches so the
-/// "flip `running` off + post a `Connection lost` error to main" teardown lives
-/// in one place rather than being duplicated per loop.
-fn signal_connection_lost() {
+/// Shared by the send and receive loops' fatal-error branches so the
+/// "flip `running` off + post an error to main" teardown lives in one place
+/// rather than being duplicated per loop.
+fn signal_connection_failed(reason: &str) {
     WORKER_STATE.with(|state| state.borrow().stop());
     // Cancel any pending datagram read so the receive loop exits promptly.
     cancel_datagram_reader();
-    post_error_to_main("Connection lost");
+    post_error_to_main(reason);
 }
 
 /// Whether the worker may post `"disconnected"` to the main thread.
@@ -807,15 +824,14 @@ async fn send_loop(transport: Rc<RefCell<web_sys::WebTransport>>) -> Result<(), 
 async fn send_loop_body(
     transport: Rc<RefCell<web_sys::WebTransport>>,
 ) -> (Result<(), JsValue>, bool) {
-    // Get the writable datagram stream
     let datagrams = transport.borrow().datagrams();
-    let writable = datagrams.writable();
-
-    // get_writer() returns Result<WritableStreamDefaultWriter, JsValue>
-    let writer = match writable.get_writer() {
+    let writer = match datagram_writer(&datagrams) {
         Ok(w) => w,
         Err(e) => {
             web_sys::console::error_1(&format!("[WebTransport Worker] ❌ Failed to get datagram writer: {:?}", e).into());
+            // Nothing can ever be sent, so don't leave the connection
+            // looking healthy.
+            signal_connection_failed("Failed to get datagram writer");
             return (Err(e), false);
         }
     };
@@ -867,7 +883,7 @@ async fn send_loop_body(
 
                         // Stop the worker and notify the main thread (shared
                         // with the receive loop's error branch).
-                        signal_connection_lost();
+                        signal_connection_failed("Connection lost");
 
                         break;
                     }
@@ -1085,7 +1101,7 @@ async fn receive_loop_body(
 
                 // Stop the worker and notify the main thread of the lost
                 // connection (shared with the send loop's error branch).
-                signal_connection_lost();
+                signal_connection_failed("Connection lost");
 
                 // For connection errors, break the loop
                 break;
@@ -1775,6 +1791,74 @@ mod tests {
         );
         drop(ring);
         drop(regulator);
+    }
+
+    // ── Browser tests (send-loop datagram writer) ─────────────────────────────
+
+    /// A stand-in `WebTransport` whose `datagrams` has the stream shapes named
+    /// by `shape` (a JS function body that fills `d` using `sink(name)`, a
+    /// `WritableStream` recording each chunk's length as `name:len`).
+    #[cfg(target_arch = "wasm32")]
+    fn fake_transport(shape: &str, log: &js_sys::Array) -> Rc<RefCell<web_sys::WebTransport>> {
+        let body = format!(
+            "const sink = name => new WritableStream({{ write(c) {{ log.push(name + ':' + c.byteLength); }} }}); \
+             const d = {{}}; {shape} return {{ datagrams: d }};"
+        );
+        let transport = js_sys::Function::new_with_args("log", &body)
+            .call1(&JsValue::NULL, log)
+            .expect("fake transport");
+        Rc::new(RefCell::new(transport.unchecked_into()))
+    }
+
+    /// The datagram send stream comes from `createWritable()` where the browser
+    /// has it (Safari has no `writable` attribute, and the spec dropped it),
+    /// else from `writable`. A graceful exit writes the two exit packets, which
+    /// shows which stream the loop wrote to.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn send_loop_writes_to_the_stream_the_browser_provides() {
+        let create = "d.createWritable = function () { if (this !== d) throw new Error('this'); return sink('created'); };";
+        let attribute = "d.writable = sink('attribute');";
+        let both = format!("{create} {attribute}");
+        for (shape, expected) in [(create, "created"), (attribute, "attribute"), (both.as_str(), "created")] {
+            let log = js_sys::Array::new();
+            // Not running, so the loop goes straight to its graceful exit.
+            send_loop(fake_transport(shape, &log))
+                .await
+                .unwrap_or_else(|e| panic!("{shape}: {e:?}"));
+            let written: Vec<_> = log.iter().filter_map(|v| v.as_string()).collect();
+            let packet = format!("{expected}:{}", make_exit_packet().len());
+            assert_eq!(written, [packet.clone(), packet], "{shape}");
+        }
+    }
+
+    /// With no way to get a writer nothing can ever be sent, so the connection
+    /// must be reported as failed rather than left looking connected.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    async fn send_loop_without_a_writer_fails_the_connection() {
+        let global = js_sys::global();
+        let original = Reflect::get(&global, &"postMessage".into()).unwrap();
+        let posted = js_sys::Array::new();
+        let spy = js_sys::Function::new_with_args("posted", "return m => posted.push(m);")
+            .call1(&JsValue::NULL, &posted)
+            .unwrap();
+        Reflect::set(&global, &"postMessage".into(), &spy).unwrap();
+
+        WORKER_STATE.with(|state| state.borrow().start());
+        let result = send_loop(fake_transport("", &js_sys::Array::new())).await;
+        let running = WORKER_STATE.with(|state| state.borrow().is_running());
+
+        Reflect::set(&global, &"postMessage".into(), &original).unwrap();
+        // No receive loop was spawned here; return the shared state to idle.
+        WORKER_STATE.with(|state| state.borrow().abort_start());
+
+        assert!(result.is_err());
+        assert!(!running, "the receive loop must be told to stop");
+        let error = posted
+            .iter()
+            .find(|m| Reflect::get(m, &"type".into()).ok().and_then(|v| v.as_string()).as_deref() == Some("error"));
+        assert!(error.is_some(), "the main thread must be told the connection failed");
     }
 
     // ── Browser tests (receive-loop datagram read parsing) ────────────────────

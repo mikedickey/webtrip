@@ -130,16 +130,25 @@ pub(crate) fn clamp_channel_count(channels: u32) -> u32 {
     channels.clamp(1, MAX_DEVICE_CHANNELS as u32)
 }
 
+/// The capture width assumed for a track that reports no channel count.
+/// Safari reports neither value yet delivers two channels, and assuming one
+/// would silently drop the right channel of a stereo input. The cost: a mono
+/// source it pads with a silent second channel loses 6 dB if the two are
+/// averaged into one send channel.
+const UNREPORTED_CAPTURE_CHANNELS: u32 = 2;
+
 /// Resolve an input device's channel count from what its capture track
 /// reports: the capability maximum when known, otherwise the granted
-/// settings value, otherwise 1 — clamped to `[1, MAX_DEVICE_CHANNELS]`.
-pub(crate) fn resolve_input_channels(settings: Option<u32>, capability_max: Option<u32>) -> u32 {
-    clamp_channel_count(capability_max.or(settings).unwrap_or(1))
+/// settings value, clamped to `[1, MAX_DEVICE_CHANNELS]`. `None` when the
+/// browser reports neither.
+pub(crate) fn resolve_input_channels(settings: Option<u32>, capability_max: Option<u32>) -> Option<u32> {
+    capability_max.or(settings).map(clamp_channel_count)
 }
 
 /// Resolve the width a capture track actually *delivers*: the granted settings
 /// value when the browser reports one, otherwise the capability maximum,
-/// otherwise 1 — clamped to `[1, MAX_DEVICE_CHANNELS]`.
+/// otherwise [`UNREPORTED_CAPTURE_CHANNELS`] — clamped to
+/// `[1, MAX_DEVICE_CHANNELS]`.
 ///
 /// The reverse precedence of [`resolve_input_channels`]. The probe asks what
 /// the device *offers* (capability first); capture must open the worklet at
@@ -147,7 +156,7 @@ pub(crate) fn resolve_input_channels(settings: Option<u32>, capability_max: Opti
 /// doesn't deliver arrive as silent planes that the send path's mono downmix
 /// then averages in (halving the level, e.g. Chrome's echo-cancellation mono).
 pub(crate) fn resolve_granted_channels(settings: Option<u32>, capability_max: Option<u32>) -> u32 {
-    clamp_channel_count(settings.or(capability_max).unwrap_or(1))
+    clamp_channel_count(settings.or(capability_max).unwrap_or(UNREPORTED_CAPTURE_CHANNELS))
 }
 
 /// The first audio track of `stream`, if any.
@@ -181,10 +190,10 @@ pub(crate) fn capability_max_channels(track: &MediaStreamTrack) -> Result<Option
 /// [`resolve_input_channels`] for the probe or [`resolve_granted_channels`]
 /// for capture). The single place the two raw values are read, so the probe
 /// and capture bring-up cannot drift apart on how they query the track.
-pub(crate) fn track_channels(
+pub(crate) fn track_channels<T>(
     track: &MediaStreamTrack,
-    resolve: fn(Option<u32>, Option<u32>) -> u32,
-) -> Result<u32, JsValue> {
+    resolve: fn(Option<u32>, Option<u32>) -> T,
+) -> Result<T, JsValue> {
     capability_max_channels(track).map(|max| resolve(settings_channels(track), max))
 }
 
@@ -193,19 +202,20 @@ pub(crate) fn track_channels(
 /// Opens the device (the default input when `deviceId` is absent or empty)
 /// with processing off and the native-width channel request, reads the
 /// capture track's channel capability, and stops the stream. Resolves to a
-/// count from 1 to 32.
+/// count from 1 to 32, or `undefined` when the browser reports none (Safari);
+/// capture then opens two channels.
 ///
 /// A module-level function rather than a session method: it probes hardware
 /// and needs nothing from a session.
 #[wasm_bindgen(js_name = getInputDeviceChannels)]
-pub async fn get_input_device_channels(device_id: Option<String>) -> Result<u32, JsValue> {
+pub async fn get_input_device_channels(device_id: Option<String>) -> Result<Option<u32>, JsValue> {
     let media_devices = get_media_devices()?;
     let constraints = AudioConstraints::resolve(device_id, false, false, false).to_js()?;
     let stream = get_user_media_audio(&media_devices, &constraints).await?;
 
     let channels = match first_audio_track(&stream) {
         Some(track) => track_channels(&track, resolve_input_channels),
-        None => Ok(1),
+        None => Ok(Some(1)),
     };
 
     stop_media_stream(&stream);
@@ -411,22 +421,22 @@ mod tests {
     #[test]
     fn test_resolve_input_channels_boundaries() {
         // (settings, capability_max) -> expected
-        let cases: &[(Option<u32>, Option<u32>, u32)] = &[
-            // Nothing reported: assume mono.
-            (None, None, 1),
+        let cases: &[(Option<u32>, Option<u32>, Option<u32>)] = &[
+            // Nothing reported: the count is unknown, not mono.
+            (None, None, None),
             // Capability only.
-            (None, Some(4), 4),
+            (None, Some(4), Some(4)),
             // Settings fallback when capabilities are unavailable.
-            (Some(2), None, 2),
+            (Some(2), None, Some(2)),
             // The capability wins over a narrower granted setting.
-            (Some(1), Some(2), 2),
+            (Some(1), Some(2), Some(2)),
             // Clamped to [1, MAX_DEVICE_CHANNELS] on both sides.
-            (Some(0), None, 1),
-            (None, Some(0), 1),
-            (None, Some(MAX_DEVICE_CHANNELS as u32 + 1), MAX_DEVICE_CHANNELS as u32),
-            (Some(MAX_DEVICE_CHANNELS as u32 + 1), None, MAX_DEVICE_CHANNELS as u32),
+            (Some(0), None, Some(1)),
+            (None, Some(0), Some(1)),
+            (None, Some(MAX_DEVICE_CHANNELS as u32 + 1), Some(MAX_DEVICE_CHANNELS as u32)),
+            (Some(MAX_DEVICE_CHANNELS as u32 + 1), None, Some(MAX_DEVICE_CHANNELS as u32)),
             // A wide interface is addressed past the wire ceiling.
-            (None, Some(18), 18),
+            (None, Some(18), Some(18)),
         ];
         for &(settings, capability_max, expected) in cases {
             assert_eq!(
@@ -443,7 +453,9 @@ mod tests {
     #[test]
     fn test_resolve_granted_channels_prefers_settings() {
         let cases: &[(Option<u32>, Option<u32>, u32)] = &[
-            (None, None, 1),
+            // Regression: Safari reports no count yet delivers stereo; opening
+            // 1 channel silently dropped everything on the right.
+            (None, None, 2),
             (Some(1), Some(2), 1),
             (Some(2), Some(32), 2),
             (None, Some(18), 18),
@@ -601,7 +613,8 @@ mod tests {
     async fn get_input_device_channels_resolves_count_or_rejects() {
         let channels = get_input_device_channels(None)
             .await
-            .expect("probing the default fake input should resolve");
+            .expect("probing the default fake input should resolve")
+            .expect("Chrome reports the fake input's channel count");
         assert!(
             (1..=MAX_DEVICE_CHANNELS as u32).contains(&channels),
             "input probe must resolve within [1, MAX_DEVICE_CHANNELS], got {channels}"

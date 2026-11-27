@@ -120,6 +120,7 @@ module-level async functions in `devices.rs`:
   `getSettings().channelCount` when capabilities are unavailable (Safari
   doesn't implement `getCapabilities`) — then stops the stream. The pure
   resolution, clamped to `[1, MAX_DEVICE_CHANNELS]`, is `resolve_input_channels`.
+  It resolves to `undefined` when the browser reports neither (Safari).
 - **`getOutputDeviceChannels(deviceId?)`** creates a throwaway `AudioContext`,
   routes it to the device via `setSinkId` when an id is given, reads
   `destination.maxChannelCount` clamped to `[1, MAX_DEVICE_CHANNELS]`, and closes the
@@ -186,10 +187,10 @@ output counts (`engine.rs`):
 2. Read the width the track **delivers** with `track_channels(…,
    resolve_granted_channels)`: the granted `getSettings().channelCount`,
    falling back to `getCapabilities().channelCount.max` only when settings
-   are unreported (so Safari-style gaps no longer force mono). This is the
+   are unreported. This is the
    reverse precedence of the probe (`resolve_input_channels`, capability
    first), because a node opened wider than the track delivers receives
-   silent planes that the mono downmix averages in. Neither reported means 1.
+   silent planes that the mono downmix averages in. Neither reported means 2.
 3. Build the `AudioWorkletNode` with an input width of
    `min(input_channels, granted)`. The node's `channelCount` is
    `Explicit`/`Discrete`, so per the Web Audio spec the extra source channels
@@ -353,11 +354,12 @@ A 1-channel input device shows a locked "Mono". Otherwise a cycling button
 picks between three modes, each just an (input, send) pair — the mixing falls
 out of `conform_interleaved_channels`. Selecting a 1-channel device doesn't
 overwrite the chosen mode, so switching back to a multi-channel device
-restores it (Mix to Mono by default).
+restores it. Until you choose, the default is Mix to Mono, or Mono when the
+browser reports no channel count.
 
 | Mode | Input channels | Send channels | Mapping |
 |---|---|---|---|
-| Mix to Mono (default) | 2 | 1 | 2 → 1 averages (rule 1) |
+| Mix to Mono | 2 | 1 | 2 → 1 averages (rule 1) |
 | Stereo | 2 | 2 | 1:1 (rule 4) |
 | Mono | 1 | 1 | identity; the worklet node keeps only channel 0 |
 
@@ -393,9 +395,12 @@ stay live.
 - **A browser reporting 0 channels is floored to 1** (`clamp_channel_count`),
   not surfaced as an error. Current browsers fail `getUserMedia` outright for
   an input with no channels rather than resolve with a degenerate track.
-- **An unreported channel count means 1.** If a track reports neither
-  `getCapabilities().channelCount` nor `getSettings().channelCount`, both the
-  input probe and capture resolve to 1, and the demo locks Mono.
+- **An unreported channel count is captured as 2.** If a track reports neither
+  `getCapabilities().channelCount` nor `getSettings().channelCount` (Safari),
+  the input probe resolves to `undefined` and capture opens up to 2 channels.
+  Safari delivers two even for a mono microphone, with the second silent, so
+  averaging them into one send channel halves the level; send 2, or set the
+  input count to 1 to keep only the first. The demo defaults to the latter.
 - **`RENDER_QUANTUM_FRAMES` (128) and `MAX_DEVICE_CHANNELS` (32) bound the
   worklet's planar scratch buffers** (`ProcessorHandle::input_scratch`/
   `output_scratch` in `worklet.rs`, sized `RENDER_QUANTUM_FRAMES *

@@ -19,7 +19,8 @@ export interface DeviceSettings {
   agc: boolean;
   echo: boolean;
   noise: boolean;
-  captureMode: CaptureMode;
+  // null until the user picks one: the default depends on the input device.
+  captureMode: CaptureMode | null;
   inputGain: number;
   outputVolume: number;
   monitorVolume: number;
@@ -51,7 +52,7 @@ export function defaultSettings(devices: AudioDevices): Settings {
     agc: false,
     echo: false,
     noise: false,
-    captureMode: "mixToMono",
+    captureMode: null,
     inputGain: 0,
     outputVolume: 100,
     monitorVolume: 0,
@@ -67,7 +68,7 @@ function sanitize(raw: unknown, fallback: Settings): Settings {
   const bool = (k: keyof Settings) => (typeof r[k] === "boolean" ? (r[k] as boolean) : (fallback[k] as boolean));
   const num = (k: keyof Settings) =>
     typeof r[k] === "number" && Number.isFinite(r[k]) ? (r[k] as number) : (fallback[k] as number);
-  const oneOf = <T extends string>(k: keyof Settings, allowed: readonly T[]) =>
+  const oneOf = <T extends string | null>(k: keyof Settings, allowed: readonly T[]) =>
     allowed.includes(r[k] as T) ? (r[k] as T) : (fallback[k] as T);
   return {
     serverHost: str("serverHost"),
