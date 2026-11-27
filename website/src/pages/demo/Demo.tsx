@@ -44,6 +44,17 @@ const CAPTURE_MODES: Record<
   mono: { next: "mixToMono", line1: "Mono", line2: "1st ch", inputChannels: 1, sendChannels: 1 },
 };
 
+// The probed input count: null when the browser reports none (Safari).
+type InputChannels = number | null;
+
+// The capture mode in effect. A 1-channel input is always Mono; otherwise the
+// user's choice wins. With no choice, an unreported count defaults to Mono:
+// the second channel may be silent padding, which mixing would average in.
+function effectiveCaptureMode(channels: InputChannels, choice: CaptureMode | null): CaptureMode {
+  if (channels === 1) return "mono";
+  return choice ?? (channels === null ? "mono" : "mixToMono");
+}
+
 // The demo always asks the peer for stereo; the library maps whatever the
 // peer actually sends onto the output device.
 const RECEIVE_CHANNELS = 2;
@@ -54,7 +65,8 @@ function errorMessage(error: unknown): string {
 
 // The channel count of a selected device, probed before connecting and again
 // whenever the id or probe nonce changes. undefined means "not yet known" (a
-// probe is in flight). A failed probe assumes 2: capture and playback clamp to
+// probe is in flight), null that the browser reports no count. A failed probe
+// assumes 2: capture and playback clamp to
 // what the device really grants, so this never over-requests.
 //
 // Probing is skipped while `locked`: counts are only applied at the next
@@ -62,14 +74,14 @@ function errorMessage(error: unknown): string {
 // capturing may disturb the live track. A probe skipped or cancelled while
 // locked runs on unlock; one already completed for this id and nonce does not
 // repeat.
-function useDeviceChannels(
-  probe: ((deviceId?: string) => Promise<number>) | undefined,
+function useDeviceChannels<T extends number | undefined>(
+  probe: ((deviceId?: string) => Promise<T>) | undefined,
   deviceId: string,
   probeNonce: number,
   locked: boolean,
   kind: "input" | "output",
-): number | undefined {
-  const [channels, setChannels] = useState<number | undefined>(undefined);
+): number | null | undefined {
+  const [channels, setChannels] = useState<number | null | undefined>(undefined);
   const probedKey = useRef<string | null>(null);
   useEffect(() => {
     const key = `${deviceId}\n${probeNonce}`;
@@ -84,7 +96,7 @@ function useDeviceChannels(
       .then((count) => {
         if (cancelled) return;
         probedKey.current = key;
-        setChannels(count);
+        setChannels(count ?? null);
       });
     return () => {
       cancelled = true;
@@ -141,10 +153,10 @@ export default function Demo() {
   const [agc, setAgc] = useState(false);
   const [echo, setEcho] = useState(false);
   const [noise, setNoise] = useState(false);
-  // The user's choice for multi-channel inputs. A 1-channel input always
-  // captures Mono without overwriting this, so switching back to a
-  // multi-channel device restores the choice.
-  const [captureMode, setCaptureMode] = useState<CaptureMode>("mixToMono");
+  // The user's choice for multi-channel inputs, null until they make one. A
+  // 1-channel input always captures Mono without overwriting this, so
+  // switching back to a multi-channel device restores the choice.
+  const [captureMode, setCaptureMode] = useState<CaptureMode | null>(null);
 
   const [inputGain, setInputGain] = useState(0);
   const [outputVolume, setOutputVolume] = useState(100);
@@ -316,7 +328,7 @@ export default function Demo() {
   }, [sessionState]);
 
   const handleConnect = async () => {
-    if (!engine || inputDeviceChannels === undefined || outputDeviceChannels === undefined) {
+    if (!engine || inputDeviceChannels === undefined || outputDeviceChannels == null) {
       return;
     }
     const host = serverHost.trim();
@@ -326,7 +338,7 @@ export default function Demo() {
     }
     const port = parseInt(serverPort, 10) || 4464;
     const outputChannels = outputDeviceChannels >= 2 ? 2 : 1;
-    const mode = CAPTURE_MODES[inputDeviceChannels === 1 ? "mono" : captureMode];
+    const mode = CAPTURE_MODES[effectiveCaptureMode(inputDeviceChannels, captureMode)];
     if (connectingRef.current) return;
 
     connectingRef.current = true;
@@ -428,6 +440,7 @@ export default function Demo() {
     );
   }
 
+  const shownCaptureMode = effectiveCaptureMode(inputDeviceChannels ?? null, captureMode);
   const deviceChannelsKnown = inputDeviceChannels !== undefined && outputDeviceChannels !== undefined;
   const statusLabel = connected
     ? `Connected (${activeTransport === "webtransport" ? "WebTransport" : "WebRTC"})`
@@ -618,10 +631,10 @@ export default function Demo() {
           ) : (
             inputDeviceChannels !== undefined && (
               <ToggleButton
-                active={captureMode === "stereo"}
-                line1={CAPTURE_MODES[captureMode].line1}
-                line2={CAPTURE_MODES[captureMode].line2}
-                onClick={() => setCaptureMode(CAPTURE_MODES[captureMode].next)}
+                active={shownCaptureMode === "stereo"}
+                line1={CAPTURE_MODES[shownCaptureMode].line1}
+                line2={CAPTURE_MODES[shownCaptureMode].line2}
+                onClick={() => setCaptureMode(CAPTURE_MODES[shownCaptureMode].next)}
                 disabled={configLocked}
               />
             )
